@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyright/
+.coverage
+htmlcov/
+
+# Environments and packaging
+.venv/
+dist/
+build/
+*.egg-info/
+
+# Local runtime data
+.weavria/
+*.db
+*.sqlite
+*.sqlite3
+*.log
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/
+

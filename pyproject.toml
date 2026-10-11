@@ -1,0 +1,46 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "weavria"
+version = "0.0.0"
+description = "一套可控制、可观测、可评测的 Python Agent Runtime。"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [
+  { name = "Weavria contributors" },
+]
+dependencies = [
+  "pydantic>=2.10,<3",
+]
+
+[dependency-groups]
+dev = [
+  "pyright>=1.1.390",
+  "pytest>=8.3",
+  "pytest-asyncio>=0.24",
+  "ruff>=0.9",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/weavria"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-config --strict-markers"
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC", "RUF"]
+
+[tool.pyright]
+include = ["src", "apps", "tests"]
+pythonVersion = "3.12"
+typeCheckingMode = "strict"
+
