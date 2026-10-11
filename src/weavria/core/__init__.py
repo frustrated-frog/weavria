@@ -4,6 +4,7 @@ from .actions import AgentAction, FinishAction, ToolCallAction, parse_action
 from .errors import ErrorCategory, InvalidActionError, RunError
 from .lifecycle import InvalidStateTransitionError, RunStatus, transition_status
 from .messages import AgentRequest, Message, MessageRole
+from .model_io import HistoryEntry, ModelRequest, ModelResponse, TaskInput, ToolExchange
 from .outcomes import (
     AgentResult,
     Observation,
@@ -17,14 +18,19 @@ __all__ = [
     "AgentResult",
     "ErrorCategory",
     "FinishAction",
+    "HistoryEntry",
     "InvalidActionError",
     "InvalidStateTransitionError",
     "Message",
     "MessageRole",
+    "ModelRequest",
+    "ModelResponse",
     "Observation",
     "RunError",
     "RunStatus",
+    "TaskInput",
     "ToolCallAction",
+    "ToolExchange",
     "ToolFailedObservation",
     "ToolSucceededObservation",
     "parse_action",

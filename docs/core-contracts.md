@@ -68,4 +68,4 @@ uv run pytest
 
 使用已有的 Pydantic 统一校验和序列化契约，避免再维护一套同名 Dataclass。用封闭联合明确决策，后续添加新 Action 必须同时扩展 Runtime 的穷尽处理。
 
-当前没有 RunState、Event、Trace、预算执行、Deadline、模型端口、工具端口或异步任务。下一小步建议实现 `ModelProvider` 能力声明、`FakeModelProvider`、完整 `ToolDescriptor`、`ToolRegistry` 与 add 工具的双向校验。再通过事件驱动的状态归约接入 Agent Loop。
+第一小步没有实现 RunState、Event、Trace、预算执行、Deadline、模型端口、工具端口或异步任务。后续的[模型上下文第二小步](model-context-selection.md)已经加入 ModelProvider、Fake Provider 与上下文选择机制；ToolDescriptor、ToolRegistry 与事件驱动 Agent Loop 仍待实现。
