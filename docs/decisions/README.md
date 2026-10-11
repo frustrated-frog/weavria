@@ -7,3 +7,4 @@
 - [0001 核心契约](0001-core-contracts.md)
 - [0002 模型输入与历史选择基线](0002-model-context-selection.md)
 - [0003 执行事实驱动的可回取上下文](0003-execution-backed-context.md)
+- [0004 模型轮次与完整反馈汇合](0004-model-turn-feedback.md)

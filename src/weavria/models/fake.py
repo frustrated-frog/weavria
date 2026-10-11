@@ -2,7 +2,7 @@
 
 import asyncio
 
-from weavria.core import ModelRequest, ModelResponse
+from weavria.core import ModelRequest, ModelResponse, ModelTurn
 
 from .provider import ModelCapabilities
 
@@ -43,5 +43,37 @@ class FakeModelProvider:
             if index >= len(self._responses):
                 raise RuntimeError("Fake model response script exhausted")
             return ModelResponse.model_validate_json(self._responses[index])
+        finally:
+            self._active = False
+
+
+class FakeTurnProvider:
+    """Scripted turn port for contract tests; does not establish planning quality."""
+
+    capabilities = ModelCapabilities(tool_calls=True, multi_tool_calls=True)
+
+    def __init__(self, turns: tuple[ModelTurn, ...]) -> None:
+        self._turns = tuple(ModelTurn.model_validate(t).model_dump_json() for t in turns)
+        self._requests: list[str] = []
+        self._cursor = 0
+        self._active = False
+
+    @property
+    def requests(self) -> tuple[ModelRequest, ...]:
+        return tuple(ModelRequest.model_validate_json(value) for value in self._requests)
+
+    async def generate_turn(self, request: ModelRequest) -> ModelTurn:
+        """Consume an attempt at a cancellation point; reject overlapping calls."""
+        if self._active:
+            raise RuntimeError("Fake turn provider supports one active call")
+        self._active = True
+        try:
+            self._requests.append(ModelRequest.model_validate(request).model_dump_json())
+            index = self._cursor
+            self._cursor += 1
+            await asyncio.sleep(0)
+            if index >= len(self._turns):
+                raise RuntimeError("Fake turn script exhausted")
+            return ModelTurn.model_validate_json(self._turns[index])
         finally:
             self._active = False

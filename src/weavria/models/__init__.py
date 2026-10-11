@@ -1,12 +1,22 @@
 """Public model port, checked invocation and deterministic provider."""
 
-from .fake import FakeModelProvider
-from .provider import ModelCallError, ModelCapabilities, ModelProvider, call_model
+from .fake import FakeModelProvider, FakeTurnProvider
+from .provider import (
+    ModelCallError,
+    ModelCapabilities,
+    ModelProvider,
+    TurnModelProvider,
+    call_model,
+    call_model_turn,
+)
 
 __all__ = [
     "FakeModelProvider",
+    "FakeTurnProvider",
     "ModelCallError",
     "ModelCapabilities",
     "ModelProvider",
+    "TurnModelProvider",
     "call_model",
+    "call_model_turn",
 ]

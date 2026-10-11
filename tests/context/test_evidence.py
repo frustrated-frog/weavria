@@ -320,3 +320,62 @@ async def test_declared_content_paths_keep_protocol_metadata_out_of_retrieval_sc
     assert record.artifact is not None
     raw = (await store.get("run", record.artifact.artifact_id)).value
     assert isinstance(raw, dict) and "metadata" in raw
+
+
+async def test_batch_minimum_feedback_is_indivisible_under_tight_budget() -> None:
+    from weavria.core import ErrorCategory, RunError, ToolFailedObservation
+
+    store, records = await execute_sources(("Large " * 1000, "Another " * 1000))
+    failure = ToolRecord(
+        exchange=ToolExchange(
+            action=ToolCallAction(
+                call_id="failed", tool_name="fetch", arguments={"key": "missing"}
+            ),
+            observation=ToolFailedObservation(
+                call_id="failed",
+                tool_name="fetch",
+                error=RunError(category=ErrorCategory.TOOL_FAILURE, message="Source unavailable"),
+            ),
+        )
+    )
+    records = (*records, failure)
+    task = TaskInput(goal="Large")
+    required = ("c0", "c1", "failed")
+    # The baseline fits the most recent single failure; complete batch feedback cannot.
+    baseline = await EvidenceContextBuilder(store).build(
+        run_id="run",
+        instructions="Read",
+        task=task,
+        records=records,
+        max_request_bytes=800,
+    )
+    assert sum(d.selected for d in baseline.decisions) == 1
+    with pytest.raises(ContextBudgetError):
+        await EvidenceContextBuilder(store).build(
+            run_id="run",
+            instructions="Read",
+            task=task,
+            records=records,
+            max_request_bytes=800,
+            feedback_call_ids=required,
+        )
+    complete = await EvidenceContextBuilder(store).build(
+        run_id="run",
+        instructions="Read",
+        task=task,
+        records=records,
+        max_request_bytes=2500,
+        feedback_call_ids=required,
+    )
+    assert all(d.selected for d in complete.decisions)
+    assert "Source unavailable" in complete.request_json
+    assert complete.request_bytes <= 2500
+    with pytest.raises(ContextBuildError, match="feedback"):
+        await EvidenceContextBuilder(store).build(
+            run_id="run",
+            instructions="Read",
+            task=task,
+            records=records,
+            max_request_bytes=2500,
+            feedback_call_ids=("absent",),
+        )

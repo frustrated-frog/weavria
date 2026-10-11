@@ -181,6 +181,7 @@ class EvidenceContextBuilder:
         task: TaskInput,
         records: tuple[ToolRecord, ...],
         max_request_bytes: int,
+        feedback_call_ids: tuple[str, ...] | None = None,
     ) -> EvidencePlan:
         """Fail on invalid provenance or insufficient minimum feedback budget."""
         if type(max_request_bytes) is not int or max_request_bytes <= 0:
@@ -319,20 +320,26 @@ class EvidenceContextBuilder:
             return result
 
         last = len(records) - 1
-        if records:
-            selected = proposal(last, references[last])
-            reasons = {i: "dependency" for i in selected}
-            reasons[last] = "latest_feedback"
+        mandatory = (last,) if records else ()
+        if feedback_call_ids:
+            if len(set(feedback_call_ids)) != len(feedback_call_ids) or any(
+                c not in identities for c in feedback_call_ids
+            ):
+                raise ContextBuildError("feedback references unaccepted or duplicate calls")
+            mandatory = tuple(identities[c] for c in feedback_call_ids)
+        for index in mandatory:
+            selected = proposal(index, references[index])
+        reasons = dict.fromkeys(selected, "dependency")
+        reasons.update(dict.fromkeys(mandatory, "latest_feedback"))
         if total(selected) > max_request_bytes:
             raise ContextBudgetError(total(selected), max_request_bytes)
-        initial_level = -1
-        if records:
-            # Give the latest feedback a useful view before optimizing older evidence.
-            # A receipt remains the fallback when even one source passage cannot fit.
-            candidate = proposal(last, alternatives[last][0][0])
+        initial_levels: dict[int, int] = {}
+        for index in mandatory:
+            # Each sibling keeps a receipt; offer one useful view before older evidence.
+            candidate = proposal(index, alternatives[index][0][0])
             if total(candidate) <= max_request_bytes:
                 selected = candidate
-                initial_level = 0
+                initial_levels[index] = 0
 
         if self._mode is EvidenceMode.FULL:
             selected = dict(enumerate(full))
@@ -352,9 +359,9 @@ class EvidenceContextBuilder:
         else:
             levels = dict.fromkeys(range(len(records)), -1)
             utilities = dict.fromkeys(range(len(records)), 0.0)
-            if records and initial_level >= 0:
-                levels[last] = initial_level
-                utilities[last] = alternatives[last][initial_level][1]
+            for index, level in initial_levels.items():
+                levels[index] = level
+                utilities[index] = alternatives[index][level][1]
             while True:
                 feasible: list[tuple[float, float, int, int, dict[int, ToolExchange]]] = []
                 for index in range(len(records)):

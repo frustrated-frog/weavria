@@ -1,9 +1,11 @@
 """Execution backed by accepted facts, bounded resources and task-aware views."""
 
-from .agent import AgentRun, Clock, RunLimits, SystemClock
+from .agent import AgentLoop, AgentRun, Clock, RunLimits, SystemClock
+from .scheduling import ToolScheduling
 from .state import EventAcceptanceError, Phase, RunState, reduce_event
 
 __all__ = [
+    "AgentLoop",
     "AgentRun",
     "Clock",
     "EventAcceptanceError",
@@ -11,5 +13,6 @@ __all__ = [
     "RunLimits",
     "RunState",
     "SystemClock",
+    "ToolScheduling",
     "reduce_event",
 ]
