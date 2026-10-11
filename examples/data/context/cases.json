@@ -1,0 +1,43 @@
+[
+  {
+    "name": "small",
+    "topic": "Aurora",
+    "sources": [
+      "small.txt"
+    ],
+    "answer": "AMBER",
+    "budget": 4000
+  },
+  {
+    "name": "old-evidence",
+    "topic": "Aurora",
+    "sources": [
+      "old.txt",
+      "noise-0.txt",
+      "noise-1.txt",
+      "noise-2.txt",
+      "noise-3.txt"
+    ],
+    "answer": "AMBER",
+    "budget": 4000
+  },
+  {
+    "name": "large-tail",
+    "topic": "Aurora",
+    "sources": [
+      "large.txt"
+    ],
+    "answer": "VIOLET",
+    "budget": 4000
+  },
+  {
+    "name": "explicit-recovery",
+    "topic": "Aurora",
+    "sources": [
+      "small.txt"
+    ],
+    "answer": "AMBER",
+    "budget": 2800,
+    "recover": true
+  }
+]

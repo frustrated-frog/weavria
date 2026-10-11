@@ -1,5 +1,6 @@
 """Public deterministic context policies and inspected model input plans."""
 
+from .evidence import EvidenceContextBuilder, EvidenceDecision, EvidenceMode, EvidencePlan
 from .policies import (
     FocusedHistory,
     FullHistory,
@@ -20,6 +21,10 @@ __all__ = [
     "ContextBudgetError",
     "ContextBuildError",
     "ContextPlan",
+    "EvidenceContextBuilder",
+    "EvidenceDecision",
+    "EvidenceMode",
+    "EvidencePlan",
     "FocusedHistory",
     "FullHistory",
     "HistoryCandidate",

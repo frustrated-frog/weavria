@@ -58,6 +58,8 @@ async def call_model(
     # Revalidation precedes serialization, including model_construct/model_copy inputs.
     validated = ModelRequest.model_validate(request)
     snapshot = ModelRequest.model_validate_json(validated.model_dump_json())
+    owner = asyncio.current_task()
+    cancellation_count = owner.cancelling() if owner is not None else 0
     try:
         capabilities = provider.capabilities
         async with asyncio.timeout(max_duration) as limit:
@@ -65,7 +67,11 @@ async def call_model(
         if limit.expired():
             # A backend that suppresses timeout cancellation cannot turn it into success.
             raise TimeoutError("Model provider returned after its deadline")
+        if owner is not None and owner.cancelling() > cancellation_count:
+            raise asyncio.CancelledError
     except TimeoutError as exc:
+        if owner is not None and owner.cancelling() > cancellation_count:
+            raise asyncio.CancelledError from exc
         raise ModelCallError(
             RunError(
                 category=ErrorCategory.TIMEOUT,
@@ -74,6 +80,8 @@ async def call_model(
             )
         ) from exc
     except Exception as exc:
+        if owner is not None and owner.cancelling() > cancellation_count:
+            raise asyncio.CancelledError from exc
         raise ModelCallError(
             RunError(
                 category=ErrorCategory.MODEL_FAILURE,

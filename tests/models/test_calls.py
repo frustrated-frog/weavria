@@ -194,3 +194,29 @@ async def test_fake_rejects_overlapping_calls_without_consuming_an_extra_respons
     assert isinstance(outcomes[1], ModelCallError)
     assert outcomes[1].error.category is ErrorCategory.MODEL_FAILURE
     assert len(provider.requests) == 1
+
+
+@pytest.mark.parametrize("raise_after_cancel", [False, True])
+async def test_suppressed_external_cancel_never_becomes_success_or_failure(
+    model_request: ModelRequest, raise_after_cancel: bool
+) -> None:
+    started = asyncio.Event()
+
+    class Nonconforming:
+        capabilities = ModelCapabilities(tool_calls=False)
+
+        async def generate(self, request: ModelRequest) -> ModelResponse:
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                if raise_after_cancel:
+                    raise RuntimeError("after cancellation") from None
+            return ModelResponse(action=FinishAction(output="cancelled result"))
+
+    task = asyncio.create_task(call_model(Nonconforming(), model_request))
+    async with asyncio.timeout(1):
+        await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task

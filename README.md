@@ -1,15 +1,12 @@
 # Weavria
 
-Weavria 是一套实验性的 Python Agent Harness 与 Runtime，重点关注可控执行、结构化 Trace、可复现评测和可持续演进。它是完全独立、领域无关的通用框架；FinScope 只是未来可能接入的第一个真实场景之一，不能参与定义框架核心。
+Weavria 是一套实验性的 Python Agent Harness 与 Runtime，重点是让模型决策、工具反馈、工作成果和上下文治理形成可理解、可控制、可验证的执行过程。框架独立且领域无关；FinScope 只是未来可能接入的应用之一。
 
-仓库目前已完成核心数据契约、高层生命周期规则，以及可观察的模型调用与上下文选择切片。完整 Agent 执行循环尚未实现。项目开发规则和架构不变量参见 [AGENTS.md](AGENTS.md)。
+当前已实现类型化核心契约、串行 Agent 循环、只读工具授权与执行、成果快照及按需读取、任务相关的片段选择、任务修订、预算和取消，以及事件驱动的状态投影。仍处于内核验证阶段，尚未接入真实模型供应商和持久化恢复。开发规范见 [AGENTS.md](AGENTS.md)。
 
 ## 开发环境
 
-环境要求：
-
-- Python 3.12+
-- uv
+需要 Python 3.12+ 与 uv：
 
 ```bash
 uv sync
@@ -19,23 +16,22 @@ uv run pyright
 uv run pytest
 ```
 
-第一个里程碑是构建类型安全、可独立测试的单 Agent Kernel。在增加产品界面或多 Agent 能力之前，先确定 Model、Tool、Event、State、Budget、Cancellation 和 Trace 的核心契约。
+## 运行当前能力
 
-## 当前可以观察什么
+```bash
+uv run python examples/execution_context.py
+uv run python examples/execution_context.py --json
+```
+
+示例实际读取本地资料、保存成果、调用读取工具，并从模型可见内容计算答案。相同任务与预算下比较完整历史、近期窗口和相关片段策略，检查答案来源、调用成本、依赖闭包与状态回放。这是确定性的信息交付实验，不是真实 LLM 能力评测。
+
+当前设计、源码流程、实验结果和局限见 [执行驱动的模型上下文](docs/model-context-selection.md) 与 [ADR 0003](docs/decisions/0003-execution-backed-context.md)。公开端口分别位于 `weavria.core`、`models`、`tools`、`artifacts`、`context` 与 `runtime`。
+
+历史契约与选择基线仍可观察：
 
 ```bash
 uv run python examples/core_contracts.py
-```
-
-示例手动展示一次 `add(2, 3)` 请求的数据流：Request、ToolCallAction、Observation、FinishAction 和 AgentResult。它不调用模型或执行工具，不产生 Runtime Trace。
-
-设计和代码讲解见 [核心契约第一小步](docs/core-contracts.md)，取舍见 [ADR 0001](docs/decisions/0001-core-contracts.md)。核心契约从 `weavria.core` 导入。
-
-```bash
 uv run python examples/context_selection.py --demo
-uv run python examples/context_selection.py
 ```
 
-第二个示例实际调用 Fake Provider，观察任务约束更新和完整工具历史的选择；同时用固定字节预算比较完整历史、近期窗口与必要证据优先策略。它验证输入交付与证据保留，不评估真实模型答案质量。
-
-设计、实验结果与局限见 [模型上下文第二小步](docs/model-context-selection.md) 和 [ADR 0002](docs/decisions/0002-model-context-selection.md)。模型端口从 `weavria.models` 导入，上下文策略从 `weavria.context` 导入。
+它们分别展示手工数据契约、Fake 模型调用与显式必要性选择，未执行工具。第一步讲解见 [核心契约](docs/core-contracts.md)，旧选择决策见 [ADR 0002](docs/decisions/0002-model-context-selection.md)。
