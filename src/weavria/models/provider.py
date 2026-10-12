@@ -10,6 +10,7 @@ from typing import Protocol
 from pydantic import BaseModel, ValidationError
 
 from weavria.core import (
+    ControlRequest,
     ErrorCategory,
     ModelRequest,
     ModelResponse,
@@ -74,6 +75,31 @@ class TurnModelProvider(Protocol):
         ...
 
 
+class ControlModelProvider(Protocol):
+    """v3 model port: consume typed admission and completion observations."""
+
+    @property
+    def capabilities(self) -> ModelCapabilities: ...
+
+    async def generate_turn(self, request: ControlRequest) -> ModelTurn: ...
+
+
+async def call_controlled_model(
+    provider: ControlModelProvider, request: ControlRequest, *, max_duration: float = 30.0
+) -> ModelTurn:
+    """Apply the shared model boundary without converting v3 feedback into instructions."""
+    result, capabilities = await _invoke_model(
+        provider.generate_turn,
+        lambda: provider.capabilities,
+        request,
+        ControlRequest,
+        ModelTurn,
+        max_duration,
+    )
+    _validate_batch_capabilities(result, capabilities)
+    return result
+
+
 async def call_model(
     provider: ModelProvider, request: ModelRequest, *, max_duration: float = 30.0
 ) -> ModelResponse:
@@ -108,6 +134,11 @@ async def call_model_turn(
         ModelTurn,
         max_duration,
     )
+    _validate_batch_capabilities(result, capabilities)
+    return result
+
+
+def _validate_batch_capabilities(result: ModelTurn, capabilities: ModelCapabilities) -> None:
     if isinstance(result.decision, ToolBatch) and (
         not capabilities.tool_calls
         or (len(result.decision.calls) > 1 and not capabilities.multi_tool_calls)
@@ -118,10 +149,9 @@ async def call_model_turn(
                 message="Model proposed a batch without declaring its capabilities",
             )
         )
-    return result
 
 
-async def _invoke_model[Input: ModelRequest | TurnRequest, Response: BaseModel](
+async def _invoke_model[Input: ModelRequest | TurnRequest | ControlRequest, Response: BaseModel](
     generate: Callable[[Input], Awaitable[Response]],
     get_capabilities: Callable[[], ModelCapabilities],
     request: Input,

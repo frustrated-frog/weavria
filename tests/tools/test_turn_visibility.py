@@ -14,7 +14,8 @@ from weavria.core import (
     ToolFailedObservation,
 )
 from weavria.models import FakeTurnProvider
-from weavria.runtime import AgentLoop, ToolScheduling
+from weavria.runtime import LegacyAgentLoop as AgentLoop
+from weavria.runtime import ToolScheduling
 from weavria.tools import ToolContext, ToolRegistry, TypedTool, artifact_read_tool
 
 

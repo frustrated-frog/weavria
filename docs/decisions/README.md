@@ -9,3 +9,4 @@
 - [0003 执行事实驱动的可回取上下文](0003-execution-backed-context.md)
 - [0004 模型轮次与完整反馈汇合](0004-model-turn-feedback.md)
 - [0005 超时来源、结构化观察与执行成果语义](0005-timeout-feedback-outcome.md)
+- [0006 反馈预算准入与候选成果验收](0006-feedback-admission-completion-control.md)

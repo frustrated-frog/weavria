@@ -28,7 +28,8 @@ from weavria.core import (
     decode_event,
 )
 from weavria.models import FakeTurnProvider, ModelCapabilities, TurnModelProvider
-from weavria.runtime import AgentLoop, EventAcceptanceError, RunLimits, ToolScheduling, reduce_event
+from weavria.runtime import EventAcceptanceError, RunLimits, ToolScheduling, reduce_event
+from weavria.runtime import LegacyAgentLoop as AgentLoop
 from weavria.tools import ToolContext, ToolRegistry, TypedTool
 
 

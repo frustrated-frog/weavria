@@ -1,4 +1,6 @@
-# AgentLoop：决策、调度与反馈闭环
+# AgentLoop：轮次、调度与反馈的 v2 对照机制
+
+当前公开 AgentLoop 使用 v3，新增反馈预算准入与成果验收，见 [AgentLoop v3 控制机制](agent-loop-control.md) 和 [ADR 0006](decisions/0006-feedback-admission-completion-control.md)。以下保留 LegacyAgentLoop v2 的源码说明与冻结实验；其直接接受 Finish 的行为仅属于旧版。
 
 这一阶段把一次模型决策提升为“一个完整轮次”：模型可以提出多个独立调用，Runtime 决定如何派发，逐条接受真实结果，然后把整轮反馈交给下一次决策。重点是让失败能够被看见和修正，成功成果能够留下，任务变更与执行事实之间有明确关系。
 
@@ -20,7 +22,7 @@
 
 ## 实际调用路径
 
-公开入口位于 `weavria.runtime.AgentLoop`；模型端口为 `weavria.models.TurnModelProvider`：
+公开入口位于 `weavria.runtime.LegacyAgentLoop`；模型端口为 `weavria.models.TurnModelProvider`：
 
 ```python
 from weavria.core import ModelTurn, ToolBatch, ToolCallAction
@@ -46,7 +48,7 @@ Provider 声明 `ModelCapabilities(tool_calls=True, multi_tool_calls=True)`，�
 - `runtime/state.py` 校验每条事实。所有调用已有结果或跳过事实，才接受 `TurnSettled`。它按原提出顺序重排本轮的状态投影，并形成 `TurnFeedback`。
 - 下一次上下文使用 `feedback_call_ids` 强制保留整轮反馈及依赖闭包，余下预算交给现有选择策略。模型看到完整反馈后，选择修正、查新来源或结束。
 
-旧 `AgentRun` 与新 `AgentLoop` 共享内核；前者仍产生单动作 v1 日志，后者产生轮次 v2 日志。日志格式取舍见 [ADR 0004](decisions/0004-model-turn-feedback.md)，请求与结果迁移见 [ADR 0005](decisions/0005-timeout-feedback-outcome.md)。
+旧 `AgentRun` 与新 `LegacyAgentLoop` 共享内核；前者仍产生单动作 v1 日志，后者产生轮次 v2 日志。日志格式取舍见 [ADR 0004](decisions/0004-model-turn-feedback.md)，请求与结果迁移见 [ADR 0005](decisions/0005-timeout-feedback-outcome.md)。
 
 ## 状态和数据结构
 

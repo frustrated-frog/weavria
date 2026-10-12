@@ -17,7 +17,8 @@ from weavria.core import (
     TurnRequest,
 )
 from weavria.models import FakeModelProvider, FakeTurnProvider, ModelCapabilities
-from weavria.runtime import AgentLoop, AgentRun, RunLimits, reduce_event
+from weavria.runtime import AgentRun, RunLimits, reduce_event
+from weavria.runtime import LegacyAgentLoop as AgentLoop
 from weavria.tools import ToolRegistry
 
 

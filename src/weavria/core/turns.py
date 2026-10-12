@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import Annotated, Literal, Self
 
-from pydantic import BaseModel, Field, TypeAdapter, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from ._schema import ContractModel, NonBlankString
 from .actions import FinishAction, ToolCallAction
@@ -105,24 +105,30 @@ class TurnRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_feedback(self) -> Self:
-        validate_history(self.history)
-        if self.feedback is None:
-            return self
-        if self.feedback.task_revision > self.task.revision:
-            raise ValueError("feedback cannot belong to a future task revision")
-        exchanges = {e.action.call_id: e for e in self.history if isinstance(e, ToolExchange)}
-        for call in self.feedback.calls:
-            exchange = exchanges.get(call.call_id)
-            if call.status == "skipped":
-                if exchange is not None:
-                    raise ValueError("skipped feedback cannot have an executed exchange")
-            elif exchange is None:
-                raise ValueError("feedback requires its paired execution observation")
-            elif (call.status == "failed") != isinstance(
-                exchange.observation, ToolFailedObservation
-            ):
-                raise ValueError("feedback status contradicts its execution observation")
+        validate_turn_feedback(self.task, self.history, self.feedback)
         return self
+
+
+def validate_turn_feedback(
+    task: TaskInput,
+    history: tuple[HistoryEntry, ...],
+    feedback: TurnFeedback | None,
+) -> None:
+    validate_history(history)
+    if feedback is None:
+        return
+    if feedback.task_revision > task.revision:
+        raise ValueError("feedback cannot belong to a future task revision")
+    exchanges = {e.action.call_id: e for e in history if isinstance(e, ToolExchange)}
+    for call in feedback.calls:
+        exchange = exchanges.get(call.call_id)
+        if call.status == "skipped":
+            if exchange is not None:
+                raise ValueError("skipped feedback cannot have an executed exchange")
+        elif exchange is None:
+            raise ValueError("feedback requires its paired execution observation")
+        elif (call.status == "failed") != isinstance(exchange.observation, ToolFailedObservation):
+            raise ValueError("feedback status contradicts its execution observation")
 
 
 type LoopData = Annotated[
@@ -168,11 +174,3 @@ class LoopEvent(BaseModel):
         if self.attempt_id is not None and self.step_id is None:
             raise ValueError("attempt identity requires a step")
         return self
-
-
-type JournalEvent = ExecutionEvent | LoopEvent
-
-
-def decode_event(encoded: str) -> JournalEvent:
-    """Decode either supported journal version without changing its execution meaning."""
-    return TypeAdapter[JournalEvent](JournalEvent).validate_json(encoded)

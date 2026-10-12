@@ -1,0 +1,995 @@
+"""v3 behavior: effects require admission; completion requires accepted evidence."""
+
+import asyncio
+from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
+
+import pytest
+from pydantic import BaseModel, ConfigDict, JsonValue, TypeAdapter, ValidationError
+
+from weavria.artifacts import ArtifactAccessError, ArtifactSnapshot, InMemoryArtifactStore
+from weavria.context import EvidenceMode, reserve_feedback
+from weavria.core import (
+    AdmissionNotice,
+    AgentResult,
+    BatchAdmitted,
+    BatchRejected,
+    CompletionAccept,
+    CompletionChecked,
+    CompletionDecision,
+    CompletionDiscarded,
+    CompletionNotice,
+    CompletionRepair,
+    CompletionUnverifiable,
+    ControlEvent,
+    ControlRequest,
+    ErrorCategory,
+    FeedbackBounds,
+    FinishAction,
+    ModelTurn,
+    RunEnded,
+    RunReport,
+    RunStatus,
+    TaskInput,
+    ToolBatch,
+    ToolCallAction,
+    ToolExchange,
+    ToolFailedObservation,
+    ToolStarted,
+    VerificationStarted,
+    decode_event,
+    maximum_exchange_bytes,
+    minimum_exchange,
+)
+from weavria.models import FakeControlProvider
+from weavria.runtime import (
+    AgentLoop,
+    CompletionContext,
+    CompletionPolicy,
+    EventAcceptanceError,
+    RunLimits,
+    ToolScheduling,
+    reduce_event,
+)
+from weavria.tools import ToolContext, ToolRegistry, TypedTool
+
+
+class Input(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid")
+    value: str = "data"
+    parent: str | None = None
+
+
+class Output(BaseModel):
+    value: str
+
+
+async def echo(arguments: Input, context: ToolContext) -> Output:
+    if arguments.parent:
+        await context.read_artifact(arguments.parent)
+    return Output(value=arguments.value)
+
+
+def call(
+    identity: str, value: str = "data", *, name: str = "echo", parent: str | None = None
+) -> ToolCallAction:
+    return ToolCallAction(
+        call_id=identity, tool_name=name, arguments={"value": value, "parent": parent}
+    )
+
+
+def batch(*calls: ToolCallAction) -> ModelTurn:
+    return ModelTurn(decision=ToolBatch(calls=calls))
+
+
+def finish(output: str = "done") -> ModelTurn:
+    return ModelTurn(decision=FinishAction(output=output))
+
+
+def make_loop(
+    model: FakeControlProvider,
+    *,
+    completion: CompletionPolicy | None = None,
+    budget: int = 12000,
+    store: InMemoryArtifactStore | None = None,
+    execute: Callable[[Input, ToolContext], Awaitable[Output]] = echo,
+    limits: RunLimits | None = None,
+    mode: EvidenceMode = EvidenceMode.RELEVANT,
+    bounds: FeedbackBounds | None = None,
+) -> AgentLoop:
+    return AgentLoop(
+        run_id="run",
+        task=TaskInput(goal="Read and report the value"),
+        instructions="Use evidence",
+        model=model,
+        artifacts=store or InMemoryArtifactStore(),
+        completion=completion,
+        tools=ToolRegistry(
+            (
+                TypedTool(
+                    name="echo",
+                    version="1",
+                    description="Read a value",
+                    input_type=Input,
+                    output_type=Output,
+                    execute=execute,
+                ),
+            )
+        ),
+        limits=limits or RunLimits(max_request_bytes=budget),
+        mode=mode,
+        feedback_bounds=bounds,
+        scheduling=ToolScheduling(2, frozenset({"echo"})),
+    )
+
+
+def replay(agent: AgentLoop) -> None:
+    state = None
+    for event in agent.events:
+        assert event.schema_version == 3
+        assert decode_event(event.model_dump_json()) == event
+        state = reduce_event(state, event)
+    assert state == agent.state
+
+
+async def sizing_instructions() -> str:
+    probe = make_loop(FakeControlProvider((finish(),)))
+    await probe.execute()
+    return probe.plans[0].request.instructions
+
+
+@pytest.mark.parametrize("mode", list(EvidenceMode))
+async def test_rejected_batch_has_zero_effects_then_smaller_batch_receives_feedback(
+    mode: EvidenceMode,
+) -> None:
+    one, two = call("short-1", "x" * 50), call("short-2", "x" * 50)
+    reservation = reserve_feedback(
+        instructions=await sizing_instructions(),
+        task=TaskInput(goal="Read and report the value"),
+        records=(),
+        batch=ToolBatch(calls=(one,)),
+        bounds=FeedbackBounds(),
+        budget_bytes=99999,
+    )
+    provider = FakeControlProvider(
+        (batch(call("too-big", "x" * 4000), call("also-big", "y" * 4000)), batch(one), finish())
+    )
+    agent = make_loop(provider, budget=reservation.required_bytes, mode=mode)
+    result = await agent.execute()
+    assert result.status is RunStatus.COMPLETED
+    rejected = [e.data for e in agent.events if isinstance(e.data, BatchRejected)]
+    assert len(rejected) == 1 and rejected[0].notice.reason == "feedback_budget"
+    assert rejected[0].notice.required_bytes > rejected[0].notice.budget_bytes
+    assert [e.data.call_id for e in agent.events if isinstance(e.data, ToolStarted)] == [
+        one.call_id
+    ]
+    assert isinstance(provider.requests[1].control, AdmissionNotice)
+    assert "too-big" not in provider.requests[1].model_dump_json()
+    feedback = provider.requests[2].feedback
+    assert feedback is not None and feedback.calls[0].status == "succeeded"
+    assert max(p.request_bytes for p in agent.plans) <= reservation.required_bytes
+    assert result.task_outcome == "unverifiable"
+    assert two.call_id not in agent.state.consumed_call_ids
+    replay(agent)
+
+
+async def test_tool_budget_rejects_whole_batch_and_model_can_change_plan() -> None:
+    provider = FakeControlProvider(
+        (batch(call("reject-a"), call("reject-b")), batch(call("single")), finish())
+    )
+    agent = make_loop(provider, limits=RunLimits(max_tool_calls=1))
+    assert (await agent.execute()).status is RunStatus.COMPLETED
+    notice = provider.requests[1].control
+    assert isinstance(notice, AdmissionNotice) and notice.reason == "tool_budget"
+    assert notice.remaining_tool_calls == 1
+    assert agent.state.tool_calls == 1
+    replay(agent)
+
+
+async def test_rejected_ids_are_consumed_and_repeated_rejection_is_bounded() -> None:
+    agent = make_loop(FakeControlProvider((batch(call("same")), batch(call("same")))), budget=2600)
+    result = await agent.execute()
+    assert result.status is RunStatus.FAILED
+    assert (
+        result.error is not None and result.error.category is ErrorCategory.INVALID_MODEL_RESPONSE
+    )
+    assert agent.state.tool_calls == 0
+    provider = FakeControlProvider(tuple(batch(call(str(i), "x" * 8000)) for i in range(3)))
+    agent = make_loop(provider, limits=RunLimits(max_model_calls=3, max_request_bytes=3000))
+    assert (await agent.execute()).status is RunStatus.BUDGET_EXHAUSTED
+    assert agent.state.tool_calls == 0
+    assert (
+        isinstance(agent.events[-1].data, RunEnded)
+        and agent.events[-1].data.reason == "model_calls"
+    )
+
+
+async def test_full_mode_downgrades_to_real_receipt_without_losing_failure() -> None:
+    provider = FakeControlProvider((batch(call("ok"), call("bad", name="missing")), finish()))
+
+    async def large(arguments: Input, context: ToolContext) -> Output:
+        return Output(value="x" * 30000)
+
+    agent = make_loop(provider, budget=5000, execute=large, mode=EvidenceMode.FULL)
+    assert (await agent.execute()).status is RunStatus.COMPLETED
+    request = provider.requests[-1]
+    exchanges = {e.action.call_id: e for e in request.history if isinstance(e, ToolExchange)}
+    assert set(exchanges) == {"ok", "bad"}
+    success = exchanges["ok"].observation
+    assert not isinstance(success, ToolFailedObservation)
+    output = success.output
+    assert isinstance(output, dict)
+    reference = agent.state.records[0].artifact
+    assert reference is not None and output["artifact_id"] == reference.artifact_id
+    assert output["sha256"] == reference.sha256 and output["size_bytes"] == reference.size_bytes
+    failure = exchanges["bad"].observation
+    assert (
+        isinstance(failure, ToolFailedObservation)
+        and failure.error.category is ErrorCategory.UNKNOWN_TOOL
+    )
+    assert request.feedback is not None and tuple(c.status for c in request.feedback.calls) == (
+        "succeeded",
+        "failed",
+    )
+    assert any(d.reason == "full_budget_fallback" for d in agent.plans[-1].decisions)
+    replay(agent)
+
+
+async def test_reservation_covers_actual_readable_ancestor_closure_at_exact_budget() -> None:
+    store = InMemoryArtifactStore()
+    # The known artifact identity is computed by the actual store, not invented as feedback.
+    root_snapshot = await store.put("run", "root", {"value": "root"})
+    child = call("child", parent=root_snapshot.reference.artifact_id)
+    probe = make_loop(FakeControlProvider((batch(call("root", "root")), finish())), store=store)
+    await probe.execute()
+    reservation = reserve_feedback(
+        instructions=probe.plans[0].request.instructions,
+        task=probe.state.task,
+        records=probe.state.records,
+        batch=ToolBatch(calls=(child,)),
+        bounds=FeedbackBounds(),
+        budget_bytes=99999,
+    )
+    provider = FakeControlProvider((batch(call("root", "root")), batch(child), finish()))
+    agent = make_loop(provider, store=store, budget=reservation.required_bytes)
+    assert (await agent.execute()).status is RunStatus.COMPLETED
+    assert agent.state.records[-1].dependencies == ("root",)
+    admissions = [e.data for e in agent.events if isinstance(e.data, BatchAdmitted)]
+    assert admissions[-1].readable_call_ids == ("root",)
+    assert admissions[-1].reserved_bytes == reservation.required_bytes
+    assert {
+        e.action.call_id for e in provider.requests[-1].history if isinstance(e, ToolExchange)
+    } == {"root", "child"}
+    assert agent.plans[-1].request_bytes <= reservation.required_bytes
+    replay(agent)
+
+
+@pytest.mark.parametrize("category", list(ErrorCategory))
+@pytest.mark.parametrize("identity", ["plain", '中文\\"\n', "a" * 128])
+async def test_minimum_exchange_byte_bound_handles_success_and_all_failure_categories(
+    category: ErrorCategory, identity: str
+) -> None:
+    from weavria.core import RunError, ToolRecord
+
+    action = call(identity, "中文\n\\" * 20)
+    failure = ToolRecord(
+        exchange=ToolExchange(
+            action=action,
+            observation=ToolFailedObservation(
+                call_id=identity,
+                tool_name="echo",
+                error=RunError(category=category, message="long" * 10000, retryable=True),
+            ),
+        )
+    )
+    minimum = minimum_exchange(failure)
+    assert len(minimum.model_dump_json().encode()) <= maximum_exchange_bytes(
+        action, FeedbackBounds()
+    )
+    assert isinstance(minimum.observation, ToolFailedObservation)
+    assert minimum.observation.error.category is category and minimum.observation.error.retryable
+
+
+@pytest.mark.parametrize("violation", ["identity", "size"])
+async def test_store_violating_admitted_bounds_fails_without_fabricated_receipt(
+    violation: str,
+) -> None:
+    class BrokenStore(InMemoryArtifactStore):
+        async def put(self, run_id: str, call_id: str, value: JsonValue) -> ArtifactSnapshot:
+            original = await super().put(run_id, call_id, value)
+            ref = (
+                original.reference.model_copy(update={"artifact_id": "x" * 200})
+                if violation == "identity"
+                else original.reference
+            )
+            return ArtifactSnapshot(ref.model_dump_json(), original.content_json)
+
+    agent = make_loop(
+        FakeControlProvider((batch(call("a")),)),
+        store=BrokenStore(),
+        bounds=FeedbackBounds(max_result_bytes=2) if violation == "size" else FeedbackBounds(),
+    )
+    result = await agent.execute()
+    assert result.status is RunStatus.FAILED and agent.state.records == ()
+    assert (
+        result.error is not None
+        and result.error.category is ErrorCategory.RUNTIME_INVARIANT_VIOLATION
+    )
+    assert agent.failure_cause is not None
+    replay(agent)
+
+
+class ValueVerifier:
+    version = "value_match/1"
+
+    async def verify(self, context: CompletionContext) -> CompletionDecision:
+        records = context.records
+        if not records or records[-1].artifact is None:
+            return CompletionUnverifiable(reason="No accepted source")
+        snapshot = await context.read_artifact(records[-1].artifact.artifact_id)
+        data = snapshot.value
+        assert isinstance(data, dict)
+        if context.candidate.output != data["value"]:
+            return CompletionRepair(
+                issue_codes=("value_mismatch",),
+                guidance="Report the value from the accepted source",
+            )
+        return CompletionAccept(outcome="verified")
+
+
+async def test_actual_evidence_rejects_candidate_and_corrected_finish_is_verified() -> None:
+    provider = FakeControlProvider(
+        (batch(call("source", "real")), finish("invented"), finish("real"))
+    )
+    agent = make_loop(provider, completion=ValueVerifier())
+    result = await agent.execute()
+    assert result.status is RunStatus.COMPLETED and result.output == "real"
+    assert result.task_outcome == "verified" and result.assessment is not None
+    assert result.assessment.evidence_call_ids == ("source",)
+    control = provider.requests[-1].control
+    assert isinstance(control, CompletionNotice) and control.decision.issue_codes == (
+        "value_mismatch",
+    )
+    assert agent.state.completion_repairs == 1 and agent.state.model_calls == 3
+    checks = [e.data for e in agent.events if isinstance(e.data, CompletionChecked)]
+    assert [c.assessment.decision.kind for c in checks] == ["repair", "accept"]
+    assert "Report the value" not in provider.requests[-1].instructions
+    replay(agent)
+
+
+async def test_baseline_accepts_bad_candidate_but_explicitly_reports_missing_verification() -> None:
+    baseline = make_loop(FakeControlProvider((batch(call("source", "real")), finish("invented"))))
+    result = await baseline.execute()
+    assert result.output == "invented" and result.task_outcome == "unverifiable"
+    assert result.assessment is not None and result.assessment.policy_version == "none/1"
+    assert baseline.state.model_calls == 2
+
+
+async def test_unverifiable_is_distinct_from_verified_and_retains_explanation() -> None:
+    agent = make_loop(FakeControlProvider((finish("unknown"),)), completion=ValueVerifier())
+    result = await agent.execute()
+    assert result.status is RunStatus.COMPLETED and result.task_outcome == "unverifiable"
+    assert result.assessment is not None and isinstance(
+        result.assessment.decision, CompletionUnverifiable
+    )
+    assert result.assessment.decision.reason == "No accepted source"
+    replay(agent)
+
+
+async def test_repeated_unsatisfied_finish_consumes_repair_budget_without_accepting_output() -> (
+    None
+):
+    agent = make_loop(
+        FakeControlProvider((batch(call("source")), finish("bad"), finish("still bad"))),
+        completion=ValueVerifier(),
+        limits=RunLimits(max_completion_repairs=1),
+    )
+    result = await agent.execute()
+    assert result.status is RunStatus.BUDGET_EXHAUSTED and result.output is None
+    assert result.task_outcome == "unverified" and result.assessment is None
+    assert (
+        isinstance(agent.events[-1].data, RunEnded)
+        and agent.events[-1].data.reason == "completion_repairs"
+    )
+    replay(agent)
+
+
+@pytest.mark.parametrize("deadline", [False, True])
+async def test_completion_cancellation_and_timeout_clean_up_owned_context(deadline: bool) -> None:
+    started, cleaned = asyncio.Event(), asyncio.Event()
+    contexts: list[CompletionContext] = []
+
+    class Waiting:
+        version = "wait/1"
+
+        async def verify(self, context: CompletionContext) -> CompletionDecision:
+            contexts.append(context)
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cleaned.set()
+            return CompletionAccept(outcome="verified")
+
+    agent = make_loop(
+        FakeControlProvider((finish(),)),
+        completion=Waiting(),
+        limits=RunLimits(max_completion_duration=0.02 if deadline else 1.0),
+    )
+    task = asyncio.create_task(agent.execute())
+    async with asyncio.timeout(1):
+        await started.wait()
+    if deadline:
+        result = await task
+        assert (
+            result.status is RunStatus.FAILED
+            and result.error is not None
+            and result.error.category is ErrorCategory.TIMEOUT
+        )
+        assert (
+            isinstance(agent.events[-1].data, RunEnded)
+            and agent.events[-1].data.reason == "completion_timeout"
+        )
+    else:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert agent.state.result is not None and agent.state.result.status is RunStatus.CANCELLED
+    assert cleaned.is_set()
+    with pytest.raises(ArtifactAccessError):
+        await contexts[0].read_artifact("late")
+    replay(agent)
+
+
+@pytest.mark.parametrize("after_cancel", ["return", "raise"])
+async def test_suppressed_completion_timeout_cannot_become_success(after_cancel: str) -> None:
+    class Suppressed:
+        version = "suppressed/1"
+
+        async def verify(self, context: CompletionContext) -> CompletionDecision:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                if after_cancel == "raise":
+                    raise ValueError("private validator detail") from None
+                return CompletionAccept(outcome="verified")
+            return CompletionAccept(outcome="verified")
+
+    agent = make_loop(
+        FakeControlProvider((finish(),)),
+        completion=Suppressed(),
+        limits=RunLimits(max_completion_duration=0.01),
+    )
+    result = await agent.execute()
+    assert result.status is RunStatus.FAILED and result.task_outcome == "unverified"
+    assert result.error is not None and result.error.category is ErrorCategory.TIMEOUT
+    assert "private" not in result.model_dump_json()
+    replay(agent)
+
+
+async def test_total_deadline_during_verification_is_run_budget_exhaustion() -> None:
+    class Waiting:
+        version = "wait/1"
+
+        async def verify(self, context: CompletionContext) -> CompletionDecision:
+            await asyncio.Event().wait()
+            return CompletionAccept(outcome="verified")
+
+    agent = make_loop(
+        FakeControlProvider((finish(),)),
+        completion=Waiting(),
+        limits=RunLimits(max_duration=0.02, max_completion_duration=1.0),
+    )
+    assert (await agent.execute()).status is RunStatus.BUDGET_EXHAUSTED
+    assert (
+        isinstance(agent.events[-1].data, RunEnded) and agent.events[-1].data.reason == "deadline"
+    )
+    replay(agent)
+
+
+async def test_task_revision_discards_in_flight_verification_and_replans() -> None:
+    started, release = asyncio.Event(), asyncio.Event()
+
+    class Waiting:
+        version = "revision/1"
+
+        async def verify(self, context: CompletionContext) -> CompletionDecision:
+            if context.task.revision == 1:
+                started.set()
+                await release.wait()
+            return CompletionAccept(outcome="verified")
+
+    provider = FakeControlProvider((finish("old"), finish("new")))
+    agent = make_loop(provider, completion=Waiting())
+    task = asyncio.create_task(agent.execute())
+    async with asyncio.timeout(1):
+        await started.wait()
+    agent.revise_task(TaskInput(goal="Changed requirements", revision=2), expected_revision=1)
+    release.set()
+    result = await task
+    assert (
+        result.output == "new"
+        and result.assessment is not None
+        and result.assessment.task_revision == 2
+    )
+    assert sum(isinstance(e.data, CompletionDiscarded) for e in agent.events) == 1
+    assert provider.requests[-1].task.revision == 2
+    replay(agent)
+
+
+@pytest.mark.parametrize("fault", ["private_exception", "invalid_decision", "unaccepted_read"])
+async def test_policy_faults_are_safe_failures_not_verification_or_repair(fault: str) -> None:
+    class Broken:
+        version = "broken/1"
+
+        async def verify(self, context: CompletionContext) -> CompletionDecision:
+            if fault == "private_exception":
+                raise ValueError("secret candidate content")
+            if fault == "unaccepted_read":
+                await context.read_artifact("unknown")
+            return CompletionAccept.model_construct(outcome="fake")
+
+    agent = make_loop(FakeControlProvider((finish(),)), completion=Broken())
+    result = await agent.execute()
+    assert result.status is RunStatus.FAILED and result.task_outcome == "unverified"
+    assert "secret" not in result.model_dump_json()
+    assert agent.failure_cause is not None and agent.failure_cause.__cause__ is not None
+    replay(agent)
+
+
+async def test_replay_cannot_execute_unadmitted_proposal_or_end_unchecked_candidate() -> None:
+    tool_agent = make_loop(FakeControlProvider((batch(call("a")), finish())))
+    await tool_agent.execute()
+    prefix = None
+    for event in tool_agent.events:
+        if isinstance(event.data, BatchAdmitted):
+            break
+        prefix = reduce_event(prefix, event)
+    assert prefix is not None
+    forged = ControlEvent(
+        run_id="run",
+        sequence=prefix.sequence + 1,
+        occurred_at=datetime.now(UTC),
+        data=ToolStarted(call_id="a"),
+    )
+    with pytest.raises(EventAcceptanceError, match="admitted"):
+        reduce_event(prefix, forged)
+    finish_agent = make_loop(FakeControlProvider((finish(),)))
+    await finish_agent.execute()
+    prefix = None
+    for event in finish_agent.events:
+        if isinstance(event.data, VerificationStarted):
+            break
+        prefix = reduce_event(prefix, event)
+    assert prefix is not None
+    forged = ControlEvent(
+        run_id="run",
+        sequence=prefix.sequence + 1,
+        occurred_at=datetime.now(UTC),
+        data=RunEnded(
+            result=AgentResult(run_id="run", status=RunStatus.COMPLETED, output="done"),
+            reason="bypass",
+        ),
+    )
+    with pytest.raises(EventAcceptanceError, match="accepted finish"):
+        reduce_event(prefix, forged)
+
+
+@pytest.mark.parametrize(
+    "field", ["candidate_sha256", "policy_version", "task_revision", "evidence_call_ids"]
+)
+async def test_replay_rejects_misbound_assessment(field: str) -> None:
+    agent = make_loop(FakeControlProvider((finish(),)))
+    await agent.execute()
+    prefix = None
+    for event in agent.events:
+        if isinstance(event.data, CompletionChecked):
+            value: object = {
+                "candidate_sha256": "f" * 64,
+                "policy_version": "other/1",
+                "task_revision": 2,
+                "evidence_call_ids": ("invented",),
+            }[field]
+            data = event.data.model_dump()
+            data["assessment"][field] = value
+            forged = ControlEvent.model_validate({**event.model_dump(), "data": data})
+            with pytest.raises(EventAcceptanceError):
+                reduce_event(prefix, forged)
+            return
+        prefix = reduce_event(prefix, event)
+    pytest.fail("missing completion event")
+
+
+async def test_report_cannot_forge_verified_outcome_or_change_accepted_candidate() -> None:
+    agent = make_loop(FakeControlProvider((finish(),)))
+    result = await agent.execute()
+    with pytest.raises(ValidationError):
+        RunReport.model_validate({**result.model_dump(), "task_outcome": "verified"})
+    with pytest.raises(ValidationError):
+        RunReport.model_validate(
+            {
+                **result.model_dump(),
+                "execution": {**result.execution.model_dump(), "output": "different"},
+            }
+        )
+
+
+async def test_scoped_completion_reads_track_real_ids_and_close_even_on_accept() -> None:
+    store = InMemoryArtifactStore()
+    saved: list[CompletionContext] = []
+
+    class Capture(ValueVerifier):
+        async def verify(self, context: CompletionContext) -> CompletionDecision:
+            saved.append(context)
+            return await super().verify(context)
+
+    agent = make_loop(
+        FakeControlProvider((batch(call("read", "data")), finish("data"))),
+        store=store,
+        completion=Capture(),
+    )
+    assert (await agent.execute()).task_outcome == "verified"
+    reference = agent.state.records[0].artifact
+    assert reference is not None and saved[0].evidence_call_ids == ("read",)
+    with pytest.raises(ArtifactAccessError):
+        await saved[0].read_artifact(reference.artifact_id)
+
+
+async def test_last_model_attempt_cannot_dispatch_tools_without_a_feedback_turn() -> None:
+    agent = make_loop(FakeControlProvider((batch(call("a")),)), limits=RunLimits(max_model_calls=1))
+    assert (await agent.execute()).status is RunStatus.BUDGET_EXHAUSTED
+    assert agent.state.tool_calls == 0
+
+
+@pytest.mark.parametrize("after_cancel", ["return", "raise"])
+async def test_suppressed_owner_cancellation_remains_cancellation(after_cancel: str) -> None:
+    started = asyncio.Event()
+
+    class Suppressed:
+        version = "suppressed/1"
+
+        async def verify(self, context: CompletionContext) -> CompletionDecision:
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                if after_cancel == "raise":
+                    raise ValueError("late failure") from None
+                return CompletionAccept(outcome="verified")
+            return CompletionAccept(outcome="verified")
+
+    agent = make_loop(FakeControlProvider((finish(),)), completion=Suppressed())
+    task = asyncio.create_task(agent.execute())
+    async with asyncio.timeout(1):
+        await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert agent.state.result is not None and agent.state.result.status is RunStatus.CANCELLED
+    replay(agent)
+
+
+async def test_late_synchronous_completion_return_is_rejected() -> None:
+    import time
+
+    class Blocking:
+        version = "blocking/1"
+
+        async def verify(self, context: CompletionContext) -> CompletionDecision:
+            time.sleep(0.02)  # noqa: ASYNC251 -- Non-cooperative plugin fault injection.
+            return CompletionAccept(outcome="verified")
+
+    agent = make_loop(
+        FakeControlProvider((finish(),)),
+        completion=Blocking(),
+        limits=RunLimits(max_completion_duration=0.005),
+    )
+    result = await agent.execute()
+    assert (
+        result.status is RunStatus.FAILED
+        and result.error is not None
+        and result.error.category is ErrorCategory.TIMEOUT
+    )
+
+
+async def test_verifier_input_mutation_cannot_rewrite_execution_records() -> None:
+    class Mutating(ValueVerifier):
+        async def verify(self, context: CompletionContext) -> CompletionDecision:
+            context.records[0].exchange.action.arguments["value"] = "changed"
+            return await super().verify(context)
+
+    agent = make_loop(
+        FakeControlProvider((batch(call("read", "data")), finish("data"))), completion=Mutating()
+    )
+    assert (await agent.execute()).task_outcome == "verified"
+    assert agent.state.records[0].exchange.action.arguments["value"] == "data"
+
+
+async def test_store_substitution_cannot_supply_verification_evidence() -> None:
+    class Substituting(InMemoryArtifactStore):
+        substitute = False
+
+        async def get(self, run_id: str, artifact_id: str) -> ArtifactSnapshot:
+            if self.substitute:
+                return await self.put(run_id, "different", {"value": "data"})
+            return await super().get(run_id, artifact_id)
+
+    store = Substituting()
+
+    class Verify(ValueVerifier):
+        async def verify(self, context: CompletionContext) -> CompletionDecision:
+            store.substitute = True
+            return await super().verify(context)
+
+    agent = make_loop(
+        FakeControlProvider((batch(call("read", "data")), finish("data"))),
+        completion=Verify(),
+        store=store,
+    )
+    result = await agent.execute()
+    assert result.status is RunStatus.FAILED and result.task_outcome == "unverified"
+    assert agent.failure_cause is not None and isinstance(
+        agent.failure_cause.__cause__, ArtifactAccessError
+    )
+
+
+@pytest.mark.parametrize("artifact_id", ["a" * 128, '中文"\\\n' * 8])
+async def test_success_projection_size_bounds_encoded_source_identity(artifact_id: str) -> None:
+    from weavria.core import ArtifactRef, ToolAuthorization, ToolRecord, ToolSucceededObservation
+
+    action = call('中文"\\\n', "☃" * 30)
+    size = 9999999
+    reference = ArtifactRef(
+        artifact_id=artifact_id,
+        run_id="run",
+        call_id=action.call_id,
+        sha256="f" * 64,
+        size_bytes=size,
+    )
+    record = ToolRecord(
+        exchange=ToolExchange(
+            action=action,
+            observation=ToolSucceededObservation(
+                call_id=action.call_id,
+                tool_name=action.tool_name,
+                output={
+                    "artifact_id": artifact_id,
+                    "sha256": reference.sha256,
+                    "size_bytes": size,
+                    "policy_version": "p/1",
+                },
+            ),
+        ),
+        artifact=reference,
+        authorization=ToolAuthorization(
+            tool_version="1",
+            policy_version="p/1",
+            allowed=True,
+            reason="test",
+            normalized_arguments=action.arguments,
+        ),
+    )
+    bounds = FeedbackBounds(
+        max_artifact_id_json_bytes=len(TypeAdapter(str).dump_json(artifact_id)),
+        max_result_bytes=size,
+    )
+    assert len(minimum_exchange(record).model_dump_json().encode()) <= maximum_exchange_bytes(
+        action, bounds
+    )
+
+
+async def test_batch_denial_preserves_previous_success_failure_and_source_receipts() -> None:
+    provider = FakeControlProvider(
+        (
+            batch(call("source"), call("failure", name="missing")),
+            batch(call("denied", "x" * 10000)),
+            finish(),
+        )
+    )
+    agent = make_loop(provider, budget=5000)
+    assert (await agent.execute()).status is RunStatus.COMPLETED
+    request = provider.requests[-1]
+    assert isinstance(request.control, AdmissionNotice)
+    assert request.feedback is not None and tuple(c.status for c in request.feedback.calls) == (
+        "succeeded",
+        "failed",
+    )
+    visible = {e.action.call_id: e for e in request.history if isinstance(e, ToolExchange)}
+    assert set(visible) == {"source", "failure"}
+    assert isinstance(visible["failure"].observation, ToolFailedObservation)
+    reference = agent.state.records[0].artifact
+    assert reference is not None
+    assert reference.artifact_id in visible["source"].model_dump_json()
+    assert agent.state.tool_calls == 2
+    replay(agent)
+
+
+async def test_completion_repair_can_drive_more_tools_before_acceptance() -> None:
+    provider = FakeControlProvider(
+        (
+            batch(call("original", "first")),
+            finish("invented"),
+            batch(call("correction", "correct")),
+            finish("correct"),
+        )
+    )
+    agent = make_loop(provider, completion=ValueVerifier())
+    result = await agent.execute()
+    assert result.task_outcome == "verified" and result.output == "correct"
+    assert result.assessment is not None and result.assessment.evidence_call_ids == ("correction",)
+    assert agent.state.tool_calls == 2 and agent.state.model_calls == 4
+    assert isinstance(provider.requests[2].control, CompletionNotice)
+    assert (
+        provider.requests[3].feedback is not None
+        and provider.requests[3].feedback.calls[0].call_id == "correction"
+    )
+    replay(agent)
+
+
+async def test_v3_cancellation_joins_running_tool_children_without_fake_settlement() -> None:
+    started = asyncio.Event()
+    active = 0
+    cleaned = 0
+
+    async def wait(arguments: Input, context: ToolContext) -> Output:
+        nonlocal active, cleaned
+        active += 1
+        if active == 2:
+            started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            active -= 1
+            cleaned += 1
+        return Output(value="unreachable")
+
+    agent = make_loop(
+        FakeControlProvider((batch(call("a"), call("b"), call("queued")),)), execute=wait
+    )
+    task = asyncio.create_task(agent.execute())
+    async with asyncio.timeout(1):
+        await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert active == 0 and cleaned == 2 and agent.state.tool_calls == 2
+    assert (
+        agent.state.records == ()
+        and agent.state.result is not None
+        and agent.state.result.status is RunStatus.CANCELLED
+    )
+    replay(agent)
+
+
+async def test_v3_task_revision_keeps_started_results_skips_queued_calls_and_replans() -> None:
+    started, release = asyncio.Event(), asyncio.Event()
+    count = 0
+
+    async def wait(arguments: Input, context: ToolContext) -> Output:
+        nonlocal count
+        count += 1
+        if count == 2:
+            started.set()
+        await release.wait()
+        return Output(value=arguments.value)
+
+    provider = FakeControlProvider((batch(call("a"), call("b"), call("queued")), finish("revised")))
+    agent = make_loop(provider, execute=wait)
+    task = asyncio.create_task(agent.execute())
+    async with asyncio.timeout(1):
+        await started.wait()
+    agent.revise_task(TaskInput(goal="Revised task", revision=2), expected_revision=1)
+    release.set()
+    result = await task
+    assert (
+        result.output == "revised"
+        and result.assessment is not None
+        and result.assessment.task_revision == 2
+    )
+    assert agent.state.tool_calls == 2
+    feedback = provider.requests[-1].feedback
+    assert feedback is not None and tuple(c.status for c in feedback.calls) == (
+        "succeeded",
+        "succeeded",
+        "skipped",
+    )
+    assert provider.requests[-1].task.revision == 2 and feedback.task_revision == 1
+    replay(agent)
+
+
+async def test_maximum_batch_reserves_failures_sources_and_bounded_repair_channel_together() -> (
+    None
+):
+    from weavria.tools import ToolFault
+
+    proposed = tuple(call(f'来源-"{i}"', "fail" if i % 2 else "ok") for i in range(32))
+    reservation = reserve_feedback(
+        instructions=await sizing_instructions(),
+        task=TaskInput(goal="Read and report the value"),
+        records=(),
+        batch=ToolBatch(calls=proposed),
+        bounds=FeedbackBounds(),
+        budget_bytes=999999,
+    )
+
+    async def mixed(arguments: Input, context: ToolContext) -> Output:
+        if arguments.value == "fail":
+            raise ToolFault(ErrorCategory.POLICY_DENIED, "safe detail " * 4000)
+        return Output(value="x" * 10000)
+
+    class Check:
+        version = "feedback/1"
+
+        async def verify(self, context: CompletionContext) -> CompletionDecision:
+            for record in context.records:
+                if record.artifact is not None:
+                    await context.read_artifact(record.artifact.artifact_id)
+            if context.candidate.output == "bad":
+                return CompletionRepair(
+                    issue_codes=tuple(f"issue_{i}" for i in range(8)), guidance="x" * 256
+                )
+            return CompletionAccept(outcome="verified")
+
+    provider = FakeControlProvider((batch(*proposed), finish("bad"), finish("good")))
+    agent = make_loop(
+        provider,
+        execute=mixed,
+        completion=Check(),
+        limits=RunLimits(max_tool_calls=32, max_request_bytes=reservation.required_bytes),
+        mode=EvidenceMode.FULL,
+    )
+    result = await agent.execute()
+    assert result.task_outcome == "verified"
+    request = provider.requests[-1]
+    assert request.control is not None and len(request.control.model_dump_json().encode()) <= 1024
+    assert request.feedback is not None and len(request.feedback.calls) == 32
+    assert len(request.history) == 32 and agent.state.tool_calls == 32
+    assert agent.plans[-1].request_bytes <= reservation.required_bytes
+    for entry in request.history:
+        assert isinstance(entry, ToolExchange)
+        if isinstance(entry.observation, ToolFailedObservation):
+            assert entry.observation.error.category is ErrorCategory.POLICY_DENIED
+        else:
+            assert (
+                isinstance(entry.observation.output, dict)
+                and entry.observation.output["artifact_id"]
+            )
+    replay(agent)
+
+
+async def test_first_request_must_fit_control_channel_before_consuming_a_model_attempt() -> None:
+    base = ControlRequest(
+        instructions=await sizing_instructions(), task=TaskInput(goal="Read and report the value")
+    )
+    provider = FakeControlProvider((batch(call("oversized", "x" * 10000)),))
+    agent = make_loop(provider, budget=len(base.model_dump_json().encode()) + 700)
+    result = await agent.execute()
+    assert result.status is RunStatus.BUDGET_EXHAUSTED
+    assert provider.requests == () and agent.state.model_calls == agent.state.tool_calls == 0
+    assert (
+        isinstance(agent.events[-1].data, RunEnded)
+        and agent.events[-1].data.reason == "context_bytes"
+    )
+    replay(agent)
+
+
+def test_oversized_control_fact_is_rejected_before_it_can_enter_the_journal() -> None:
+    with pytest.raises(ValidationError, match="reserved channel"):
+        AdmissionNotice(
+            reason="tool_budget",
+            proposal_sha256="a" * 64,
+            proposed_calls=1,
+            required_bytes=1,
+            budget_bytes=12000,
+            remaining_tool_calls=10**900,
+        )
+
+
+async def test_noncompleted_report_cannot_publish_an_accepted_verification() -> None:
+    agent = make_loop(FakeControlProvider((finish(),)))
+    result = await agent.execute()
+    with pytest.raises(ValidationError, match="unfinished"):
+        RunReport(
+            execution=AgentResult(run_id="run", status=RunStatus.CANCELLED),
+            assessment=result.assessment,
+        )

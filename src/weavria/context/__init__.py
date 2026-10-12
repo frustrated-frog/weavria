@@ -1,6 +1,8 @@
 """Public deterministic context policies and inspected model input plans."""
 
+from .admission import FeedbackReservation, reserve_feedback
 from .evidence import (
+    ControlEvidencePlan,
     EvidenceContextBuilder,
     EvidenceDecision,
     EvidenceMode,
@@ -27,10 +29,12 @@ __all__ = [
     "ContextBudgetError",
     "ContextBuildError",
     "ContextPlan",
+    "ControlEvidencePlan",
     "EvidenceContextBuilder",
     "EvidenceDecision",
     "EvidenceMode",
     "EvidencePlan",
+    "FeedbackReservation",
     "FocusedHistory",
     "FullHistory",
     "HistoryCandidate",
@@ -40,4 +44,5 @@ __all__ = [
     "SelectionReason",
     "TurnEvidencePlan",
     "build_context",
+    "reserve_feedback",
 ]

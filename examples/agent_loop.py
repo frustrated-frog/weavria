@@ -23,7 +23,8 @@ from weavria.core import (
     TurnRequest,
 )
 from weavria.models import ModelCapabilities
-from weavria.runtime import AgentLoop, RunLimits, ToolScheduling, reduce_event
+from weavria.runtime import LegacyAgentLoop as AgentLoop
+from weavria.runtime import RunLimits, ToolScheduling, reduce_event
 from weavria.tools import ToolContext, ToolRegistry, TypedTool, resolve_pointer
 
 

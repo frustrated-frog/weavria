@@ -22,6 +22,7 @@ from weavria.artifacts import ArtifactSnapshot, ArtifactStore
 from weavria.core import (
     ArtifactRef,
     ErrorCategory,
+    FeedbackBounds,
     JsonPointer,
     RunError,
     ToolAuthorization,
@@ -269,9 +270,13 @@ class ToolExecutor:
         registry: ToolRegistry,
         store: ArtifactStore,
         policy: ToolPolicy,
+        feedback_bounds: FeedbackBounds | None = None,
     ) -> None:
         self._run_id, self._registry, self._store, self._policy = run_id, registry, store, policy
         self._failures: dict[str, BaseException] = {}
+        self._bounds = (
+            FeedbackBounds.model_validate(feedback_bounds) if feedback_bounds is not None else None
+        )
 
     def failure_cause(self, call_id: str) -> BaseException | None:
         """Owner-only diagnostics, including exception chains; never serialize to model or trace."""
@@ -350,6 +355,12 @@ class ToolExecutor:
             reference = snapshot.reference
             if reference.run_id != self._run_id or reference.call_id != action.call_id:
                 raise ToolExecutionError("artifact store violated execution identity")
+            if self._bounds is not None and (
+                len(TypeAdapter(str).dump_json(reference.artifact_id))
+                > self._bounds.max_artifact_id_json_bytes
+                or reference.size_bytes > self._bounds.max_result_bytes
+            ):
+                raise ToolExecutionError("artifact store violated admitted feedback bounds")
             receipt: dict[str, JsonValue] = {
                 "artifact_id": reference.artifact_id,
                 "sha256": reference.sha256,
