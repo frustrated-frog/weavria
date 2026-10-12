@@ -7,11 +7,11 @@ from pydantic import ValidationError
 from weavria.core import (
     ErrorCategory,
     FinishAction,
-    ModelRequest,
     ModelTurn,
     TaskInput,
     ToolBatch,
     ToolCallAction,
+    TurnRequest,
 )
 from weavria.models import (
     FakeTurnProvider,
@@ -38,8 +38,8 @@ def batch() -> ModelTurn:
     )
 
 
-def request() -> ModelRequest:
-    return ModelRequest(instructions="Use tools", task=TaskInput(goal="Read"))
+def request() -> TurnRequest:
+    return TurnRequest(instructions="Use tools", task=TaskInput(goal="Read"))
 
 
 async def test_provider_returns_completion_and_supported_batch(
@@ -68,7 +68,7 @@ async def test_batch_capabilities_are_enforced(capabilities: ModelCapabilities) 
         def capabilities(self) -> ModelCapabilities:
             return capabilities
 
-        async def generate_turn(self, request: ModelRequest) -> ModelTurn:
+        async def generate_turn(self, request: TurnRequest) -> ModelTurn:
             return batch()
 
     with pytest.raises(ModelCallError) as raised:
@@ -80,7 +80,7 @@ async def test_constructed_invalid_batch_is_revalidated() -> None:
     class Invalid:
         capabilities = ModelCapabilities(True, True)
 
-        async def generate_turn(self, request: ModelRequest) -> ModelTurn:
+        async def generate_turn(self, request: TurnRequest) -> ModelTurn:
             action = batch().decision
             assert isinstance(action, ToolBatch)
             return ModelTurn.model_construct(
@@ -100,7 +100,7 @@ async def test_boundary_cleans_up_provider_and_preserves_cancellation(deadline: 
     class Waiting:
         capabilities = ModelCapabilities(True, True)
 
-        async def generate_turn(self, request: ModelRequest) -> ModelTurn:
+        async def generate_turn(self, request: TurnRequest) -> ModelTurn:
             started.set()
             try:
                 await asyncio.Event().wait()
@@ -128,7 +128,7 @@ async def test_boundary_snapshots_requests_and_preserves_original_failure() -> N
     class Mutating:
         capabilities = ModelCapabilities(True, True)
 
-        async def generate_turn(self, request: ModelRequest) -> ModelTurn:
+        async def generate_turn(self, request: TurnRequest) -> ModelTurn:
             entry = request.history[0]
             from weavria.core import ToolExchange
 
@@ -139,7 +139,7 @@ async def test_boundary_snapshots_requests_and_preserves_original_failure() -> N
     from weavria.core import ToolExchange, ToolSucceededObservation
 
     action = ToolCallAction(call_id="read", tool_name="read", arguments={"secret": "original"})
-    original = ModelRequest(
+    original = TurnRequest(
         instructions="Read",
         task=TaskInput(goal="Read"),
         history=(
@@ -155,3 +155,67 @@ async def test_boundary_snapshots_requests_and_preserves_original_failure() -> N
     assert raised.value.error.category is ErrorCategory.MODEL_FAILURE
     assert "private" not in raised.value.error.message
     assert isinstance(raised.value.__cause__, ValueError)
+
+
+@pytest.mark.parametrize("after_cancel", ["return", "raise"])
+async def test_attempt_timeout_remains_timeout_when_provider_suppresses_its_cancel(
+    after_cancel: str,
+) -> None:
+    from weavria.models import ModelTimeoutOrigin
+
+    class Nonconforming:
+        capabilities = ModelCapabilities(True, True)
+
+        async def generate_turn(self, request: TurnRequest) -> ModelTurn:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                if after_cancel == "raise":
+                    raise ValueError("private error after expiry") from None
+            return batch()
+
+    with pytest.raises(ModelCallError) as raised:
+        await call_model_turn(Nonconforming(), request(), max_duration=0.02)
+    assert raised.value.error.category is ErrorCategory.TIMEOUT
+    assert raised.value.timeout_origin is ModelTimeoutOrigin.ATTEMPT
+    assert "private" not in raised.value.error.message
+    assert raised.value.__cause__ is not None
+
+
+async def test_provider_timeout_preserves_origin_and_does_not_consume_full_attempt_limit() -> None:
+    from weavria.models import ModelTimeoutOrigin
+
+    class Failing:
+        capabilities = ModelCapabilities(True, True)
+
+        async def generate_turn(self, request: TurnRequest) -> ModelTurn:
+            raise TimeoutError("private HTTP error")
+
+    with pytest.raises(ModelCallError) as raised:
+        await call_model_turn(Failing(), request(), max_duration=1)
+    assert raised.value.timeout_origin is ModelTimeoutOrigin.PROVIDER
+    assert raised.value.error.category is ErrorCategory.TIMEOUT
+    assert isinstance(raised.value.__cause__, TimeoutError)
+
+
+async def test_blocking_provider_cannot_return_success_after_attempt_deadline() -> None:
+    import time
+
+    from weavria.models import ModelTimeoutOrigin
+
+    def blocking_backend() -> ModelTurn:
+        # Fault injection: an adapter incorrectly uses a synchronous backend,
+        # preventing the event loop's timeout callback from running in time.
+        time.sleep(0.005)
+        return batch()
+
+    class Blocking:
+        capabilities = ModelCapabilities(True, True)
+
+        async def generate_turn(self, request: TurnRequest) -> ModelTurn:
+            return blocking_backend()
+
+    with pytest.raises(ModelCallError) as raised:
+        await call_model_turn(Blocking(), request(), max_duration=0.001)
+    assert raised.value.error.category is ErrorCategory.TIMEOUT
+    assert raised.value.timeout_origin is ModelTimeoutOrigin.ATTEMPT

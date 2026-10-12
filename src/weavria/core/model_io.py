@@ -38,6 +38,19 @@ class ToolExchange(ContractModel):
 type HistoryEntry = Message | ToolExchange
 
 
+def validate_history(history: tuple[HistoryEntry, ...]) -> None:
+    """Shared pairing and role checks for both supported request protocols."""
+    seen: set[str] = set()
+    for entry in history:
+        if isinstance(entry, Message):
+            if entry.role not in (MessageRole.USER, MessageRole.ASSISTANT):
+                raise ValueError("history accepts only user/assistant text or tool exchanges")
+        else:
+            if entry.action.call_id in seen:
+                raise ValueError("history tool call IDs must be unique")
+            seen.add(entry.action.call_id)
+
+
 class ModelRequest(ContractModel):
     """Host instructions, current task and selected chronological history."""
 
@@ -48,15 +61,7 @@ class ModelRequest(ContractModel):
     @model_validator(mode="after")
     def validate_history(self) -> Self:
         """Reject role injection, orphan tool text and duplicate call identities."""
-        seen: set[str] = set()
-        for entry in self.history:
-            if isinstance(entry, Message):
-                if entry.role not in (MessageRole.USER, MessageRole.ASSISTANT):
-                    raise ValueError("history accepts only user/assistant text or tool exchanges")
-            else:
-                if entry.action.call_id in seen:
-                    raise ValueError("history tool call IDs must be unique")
-                seen.add(entry.action.call_id)
+        validate_history(self.history)
         return self
 
 

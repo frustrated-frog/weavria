@@ -18,6 +18,8 @@ from .execution import (
     ToolRecorded,
     ToolStarted,
 )
+from .model_io import HistoryEntry, TaskInput, ToolExchange, validate_history
+from .outcomes import ToolFailedObservation
 
 
 class ToolBatch(ContractModel):
@@ -79,6 +81,47 @@ class TurnFeedback(ContractModel):
         identities = [call.call_id for call in self.calls]
         if len(set(identities)) != len(identities):
             raise ValueError("feedback call identifiers must be unique")
+        return self
+
+
+class TurnRequest(BaseModel):
+    """v2 model input: host instructions and execution observations have distinct fields.
+
+    Adapters must encode feedback as observation data, never as host instructions.
+    No native supplier transcript or lossless history grouping is implied.
+    """
+
+    model_config = ContractModel.model_config
+    schema_version: Literal[2] = 2
+    instructions: str
+    task: TaskInput
+    history: tuple[HistoryEntry, ...] = ()
+    feedback: TurnFeedback | None = None
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def validate_version_type(cls, value: object) -> object:
+        return ContractModel.validate_version_type(value)
+
+    @model_validator(mode="after")
+    def validate_feedback(self) -> Self:
+        validate_history(self.history)
+        if self.feedback is None:
+            return self
+        if self.feedback.task_revision > self.task.revision:
+            raise ValueError("feedback cannot belong to a future task revision")
+        exchanges = {e.action.call_id: e for e in self.history if isinstance(e, ToolExchange)}
+        for call in self.feedback.calls:
+            exchange = exchanges.get(call.call_id)
+            if call.status == "skipped":
+                if exchange is not None:
+                    raise ValueError("skipped feedback cannot have an executed exchange")
+            elif exchange is None:
+                raise ValueError("feedback requires its paired execution observation")
+            elif (call.status == "failed") != isinstance(
+                exchange.observation, ToolFailedObservation
+            ):
+                raise ValueError("feedback status contradicts its execution observation")
         return self
 
 

@@ -2,7 +2,7 @@
 
 这一阶段把一次模型决策提升为“一个完整轮次”：模型可以提出多个独立调用，Runtime 决定如何派发，逐条接受真实结果，然后把整轮反馈交给下一次决策。重点是让失败能够被看见和修正，成功成果能够留下，任务变更与执行事实之间有明确关系。
 
-它解决的是闭环的执行与信息交付问题。通用规划、任务拆解、完成验证和策略学习仍需后续研究；有这些接口和测试不代表 Agent 已经成熟。
+它解决的是闭环的执行与信息交付问题。通用规划、任务拆解、完成验证和策略学习仍需后续研究；有这些接口和测试不代表 Agent 已经成熟。2026-10-12 的协议修复见 [ADR 0005](decisions/0005-timeout-feedback-outcome.md)：结构化观察输入、超时归因和明确未验证的成果报告。
 
 ## 从一个具体问题看机制
 
@@ -35,7 +35,7 @@ turn = ModelTurn(
 )
 ```
 
-Provider 声明 `ModelCapabilities(tool_calls=True, multi_tool_calls=True)`，实现异步 `generate_turn(request)`。边界会重新校验返回值。`ToolBatch` 非空，最多 32 调用，标识唯一；完成则返回 `ModelTurn(decision=FinishAction(output=...))`。同一决策不能同时结束与调用工具。
+Provider 声明 `ModelCapabilities(tool_calls=True, multi_tool_calls=True)`，实现异步 `generate_turn(request: TurnRequest)`，其中 TurnRequest 的 Schema 为 v2。边界会重新校验输入和返回值。`ToolBatch` 非空，最多 32 调用，标识唯一；完成则返回 `ModelTurn(decision=FinishAction(output=...))`。同一决策不能同时结束与调用工具。
 
 一次请求对应的代码流转是：
 
@@ -46,7 +46,7 @@ Provider 声明 `ModelCapabilities(tool_calls=True, multi_tool_calls=True)`，�
 - `runtime/state.py` 校验每条事实。所有调用已有结果或跳过事实，才接受 `TurnSettled`。它按原提出顺序重排本轮的状态投影，并形成 `TurnFeedback`。
 - 下一次上下文使用 `feedback_call_ids` 强制保留整轮反馈及依赖闭包，余下预算交给现有选择策略。模型看到完整反馈后，选择修正、查新来源或结束。
 
-旧 `AgentRun` 与新 `AgentLoop` 共享内核；前者仍产生单动作 v1 日志，后者产生轮次 v2 日志。格式与迁移取舍见 [ADR 0004](decisions/0004-model-turn-feedback.md)。
+旧 `AgentRun` 与新 `AgentLoop` 共享内核；前者仍产生单动作 v1 日志，后者产生轮次 v2 日志。日志格式取舍见 [ADR 0004](decisions/0004-model-turn-feedback.md)，请求与结果迁移见 [ADR 0005](decisions/0005-timeout-feedback-outcome.md)。
 
 ## 状态和数据结构
 
@@ -60,6 +60,8 @@ Provider 声明 `ModelCapabilities(tool_calls=True, multi_tool_calls=True)`，�
 | `ToolRecord` | 配对反馈、Artifact 身份、授权及实际读取依赖 |
 | `TurnSettled` | 全部调用闭合；允许下一轮决策的边界 |
 | `feedback_call_ids` / `TurnFeedback` | 下一轮必需反馈集合与内容无关的状态摘要 |
+| `TurnRequest` v2 | instructions 与执行观察分开；feedback 状态须与 history 中的观察对应 |
+| `LoopResult` v2 | execution 终态与 task_outcome 分开；当前后者始终 unverified |
 
 `RunState` 是不可变内存投影，嵌套内容以独立 JSON 快照存放；事件才是权威事实。事件接受与追加之间没有 await，单事件循环中的多个 Worker 不能交错提交一半的状态。事件发生顺序允许不同，最终汇合投影与反馈顺序稳定。这里的回放是重新计算状态，未实现重新执行或崩溃恢复。
 
@@ -81,6 +83,7 @@ Provider 声明 `ModelCapabilities(tool_calls=True, multi_tool_calls=True)`，�
 | --- | --- |
 | 参数非法、未知工具、策略拒绝、后端失败 | 产生对应调用的安全错误反馈，成功兄弟保留；下一轮可修正 |
 | 工具自身超时 | 错误反馈，并等待后端退出；不取消成功兄弟 |
+| 模型 Attempt / Provider 或上下文依赖提前超时 | 分类为执行失败，保留先前结果；不误报 Run Deadline 耗尽 |
 | Store 返回错误 Run/Call 身份 | 框架故障；终止并清理未完成子任务，保留已接受结果 |
 | 外部取消或子调用自行取消 | Run 取消并传播 `CancelledError`；所有子任务退出，无伪造失败或完整汇合 |
 | Run Deadline 到期 | 预算耗尽，清理未完成子任务；派发前到期不会开始调用 |
@@ -88,7 +91,7 @@ Provider 声明 `ModelCapabilities(tool_calls=True, multi_tool_calls=True)`，�
 | 执行中 Task 修订 | 已开始只读调用保留结果；未开始调用记录 `CallSkipped` |
 | 下一轮最低反馈装不下 | Context Budget 耗尽，不能隐去某个失败后继续 |
 
-当父 Run 超时触发子任务超时，终态由 Run Deadline 控制；工具反馈不是 Run 成功。异常链可以通过 owner-only 的 `failure_cause` / `tool_failure_cause` 查看，公开错误不包含原始私有异常文字。原始 events、plans 和 Tool 参数仍是宿主本地调试材料，未提供可安全导出的脱敏 Trace。
+当父 Run 超时触发子任务超时，终态由实际 Run Deadline 控制。RunLimits 另设 max_model_duration（默认 30 秒）；局部超时不能证明 Run 预算耗尽。接受 Finish 表示执行 completed，返回 LoopResult 中的 task_outcome 仍为 unverified；模型在输出里自报 complete:true/false 不会改变它。异常链可以通过 owner-only 的 `failure_cause` / `tool_failure_cause` 查看，公开错误不包含原始私有异常文字。原始 events、plans 和 Tool 参数仍是宿主本地调试材料，未提供可安全导出的脱敏 Trace。
 
 ToolContext 的读能力被绑定到本轮开始前接受的 Artifact 身份。即使兄弟已经发布结果、后端知道它的 ID，也会被拒绝。这避免同轮结果顺序改变执行依赖；真正需要它时在下一轮发起读取。该限制只约束统一上下文端口，不能阻止可信插件直接使用自己持有的其他资源。
 
@@ -103,9 +106,9 @@ uv run pytest tests/runtime/test_loop.py tests/models/test_turn_contract.py \
   tests/core/test_turns.py tests/tools/test_turn_visibility.py tests/test_loop_experiment.py
 ```
 
-数据位于 `examples/data/loop`，Dataset / Solver / Evaluator 均为 v1。报告输出全部文件 SHA256、实现 SHA256 与预算配置。解释器只接收当前模型请求；不接收 `cases.json` 中的答案或任务成功标签。其读取计划来自实际目录内容，恢复来自实际失败反馈和目录中的替代来源。它仍是固定规则解释器，不具备通用任务规划。
+数据位于 `examples/data/loop`，Dataset 为 v1，Solver / Evaluator 为 v2。报告输出全部文件 SHA256、实现 SHA256 与预算配置。解释器只接收当前模型请求；不接收 `cases.json` 中的答案或任务成功标签。其读取计划来自实际目录内容，恢复来自实际失败反馈和目录中的替代来源。它仍是固定规则解释器，不具备通用任务规划。
 
-唯一对照变量是 `max_in_flight=1` 或 `2`，其余工具、模型解释器、12,000 字节预算、最多 16 次模型调用、12 次工具调用、60 秒期限及 full 历史均一致。后端注入固定 5 ms 等待以观察并发，随后读取真实本地 Fixture 文件；不是外部服务性能测试。
+唯一对照变量是 `max_in_flight=1` 或 `2`，其余工具、模型解释器、12,000 字节预算、最多 16 次模型调用、12 次工具调用、60 秒 Run 期限、30 秒模型 Attempt 期限及 full 历史均一致。后端注入固定 5 ms 等待以观察并发，随后读取真实本地 Fixture 文件；不是外部服务性能测试。
 
 | 用例 | 任务完成 | 模型调用 | 工具调用 | 失败反馈 | 串行 / 并发峰值 | 两种策略均满足 |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -113,9 +116,9 @@ uv run pytest tests/runtime/test_loop.py tests/models/test_turn_contract.py \
 | missing | 是，补读替代资料 | 4 | 4 | 1 | 1 / 2 | 成功兄弟保留，修复后有真实来源 |
 | unrecoverable | 否，明确返回 incomplete | 3 | 3 | 1 | 1 / 2 | 不补造答案，已获得成果有来源 |
 
-两种策略的输入字节和调用次数相同。一次本地观察的串行 / 并发延迟约为 clean 29 / 20 ms、missing 41 / 32 ms、unrecoverable 27 / 19 ms；计时会随环境变化，测试不以该差值作为通过条件，不推断真实 LLM 或服务的性能收益。两种策略都完成 2/3 任务，3/3 符合各用例的答案与诚实缺失判定；`correct=True` 不代表 unrecoverable 的任务已完成。
+两种策略的输入字节和调用次数相同。v2 协议下的一次本地观察，串行 / 并发延迟约为 clean 31 / 24 ms、missing 41 / 30 ms、unrecoverable 25 / 18 ms；计时会随环境变化，测试不以该差值作为通过条件，不推断真实 LLM 或服务的性能收益。两种策略都完成 2/3 任务，3/3 符合各用例的答案与诚实缺失判定；`correct=True` 不代表 unrecoverable 的任务已完成。报告另外输出 execution_status=completed、task_outcome=unverified，后者是 Runtime 的判断边界，独立评测的正确性标签不充当完成验证。
 
-除此之外，测试使用受控事件而非睡眠时序验证乱序完成与固定反馈、空闲槽位补充、独占屏障、参数修复、部分成功、任务修订、重复及跳过身份、完整反馈预算、同轮读取限制、取消清理、框架故障和 Fake Clock Deadline。旧 v1 测试与旧执行实验继续通过。
+除此之外，测试使用受控事件而非睡眠时序验证乱序完成与固定反馈、空闲槽位补充、独占屏障、参数修复、部分成功、任务修订、重复及跳过身份、完整反馈预算、同轮读取限制、取消清理、框架故障和 Fake Clock Deadline。协议修复还覆盖不同超时来源、逾期返回、结构化反馈与 instructions 分离、精确最低反馈预算，以及新旧请求、结果和日志的版本边界。旧 v1 测试与旧执行实验继续通过。
 
 当前实验结论是：并发能在固定等待的场景重叠工具时间，反馈完整性没有因派发方式改变；实际失败能够驱动固定解释器采取修正。尚无真实模型对照，所以不能推断纠错成功率、长期规划能力或模型成本改善。
 

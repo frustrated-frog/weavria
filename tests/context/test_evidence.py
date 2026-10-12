@@ -379,3 +379,77 @@ async def test_batch_minimum_feedback_is_indivisible_under_tight_budget() -> Non
             max_request_bytes=2500,
             feedback_call_ids=("absent",),
         )
+
+
+async def test_structured_feedback_cost_is_counted_before_evidence_allocation() -> None:
+    from weavria.core import CallFeedback, TurnFeedback, TurnRequest
+
+    store, records = await execute_sources(("Aurora password amber.",))
+    feedback = TurnFeedback(
+        task_revision=1, calls=(CallFeedback(call_id="c0", status="succeeded"),)
+    )
+    task = TaskInput(goal="Aurora")
+    builder = EvidenceContextBuilder(store)
+    plan = await builder.build_turn(
+        run_id="run",
+        instructions="Host",
+        task=task,
+        records=records,
+        max_request_bytes=2500,
+        feedback=feedback,
+    )
+    assert isinstance(plan.request, TurnRequest) and plan.request.feedback == feedback
+    assert plan.request.instructions == "Host"
+    encoded = plan.request.model_dump_json()
+    assert plan.request_bytes == len(encoded.encode("utf-8"))
+    assert plan.metadata()["schema_version"] == 2
+    # Force reference-only views at their exact minimum; one fewer byte must fail.
+    minimum = TurnRequest(
+        instructions="Host", task=task, history=(records[0].exchange,), feedback=feedback
+    )
+    exact_bytes = len(minimum.model_dump_json().encode("utf-8"))
+    exact = await builder.build_turn(
+        run_id="run",
+        instructions="Host",
+        task=task,
+        records=records,
+        max_request_bytes=exact_bytes,
+        feedback=feedback,
+    )
+    assert exact.request_bytes == exact_bytes and exact.request == minimum
+    with pytest.raises(ContextBudgetError):
+        await builder.build_turn(
+            run_id="run",
+            instructions="Host",
+            task=task,
+            records=records,
+            max_request_bytes=exact_bytes - 1,
+            feedback=feedback,
+        )
+
+
+async def test_all_skipped_turn_feedback_is_kept_and_budgeted_without_fabricated_history() -> None:
+    from weavria.core import CallFeedback, TurnFeedback
+
+    feedback = TurnFeedback(
+        task_revision=1, calls=(CallFeedback(call_id="skip", status="skipped"),)
+    )
+    builder = EvidenceContextBuilder(InMemoryArtifactStore())
+    plan = await builder.build_turn(
+        run_id="run",
+        instructions="Host",
+        task=TaskInput(goal="New", revision=2),
+        records=(),
+        max_request_bytes=1000,
+        feedback=feedback,
+    )
+    assert not plan.request.history and plan.request.feedback == feedback
+    with pytest.raises(ContextBudgetError):
+        await builder.build_turn(
+            run_id="run",
+            instructions="Host",
+            task=TaskInput(goal="New", revision=2),
+            records=(),
+            max_request_bytes=plan.request_bytes - 1,
+            feedback=feedback,
+        )

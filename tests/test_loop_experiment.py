@@ -15,12 +15,8 @@ def test_file_experiment_compares_scheduling_without_changing_feedback_or_outcom
         timeout=10,
     )
     payload = json.loads(report.stdout)
-    assert (
-        payload["dataset_version"]
-        == payload["solver_version"]
-        == payload["evaluator_version"]
-        == "1"
-    )
+    assert payload["schema_version"] == 2 and payload["dataset_version"] == "1"
+    assert payload["solver_version"] == payload["evaluator_version"] == "2"
     assert len(payload["implementation_sha256"]) == 64 and len(payload["manifest"]) == 9
     rows = payload["results"]
     assert len(rows) == 6
@@ -34,6 +30,7 @@ def test_file_experiment_compares_scheduling_without_changing_feedback_or_outcom
         for row in (serial, parallel):
             assert row["correct"] and row["grounded"] and row["replay_valid"]
             assert row["complete"] is complete
+            assert row["execution_status"] == "completed" and row["task_outcome"] == "unverified"
             assert (row["model_calls"], row["tool_calls"], row["failures"]) == (
                 models,
                 tools,

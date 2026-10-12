@@ -294,6 +294,15 @@ class ToolExecutor:
         cancellations = owner.cancelling() if owner is not None else 0
         context = ToolContext(self._run_id, self._store, accepted_artifacts)
         authorization: ToolAuthorization | None = None
+        loop = asyncio.get_running_loop()
+        deadline: float | None = None
+        limit: asyncio.Timeout | None = None
+
+        def attempt_expired() -> bool:
+            return deadline is not None and (
+                loop.time() >= deadline or (limit is not None and limit.expired())
+            )
+
         try:
             tool = self._registry.get(action.tool_name)
             descriptor = tool.descriptor
@@ -306,7 +315,9 @@ class ToolExecutor:
                     ErrorCategory.POLICY_DENIED,
                     "This executor supports replay-safe reads without approval only",
                 )
-            async with asyncio.timeout(min(max_duration, descriptor.timeout_seconds)) as limit:
+            deadline = loop.time() + min(max_duration, descriptor.timeout_seconds)
+            limit = asyncio.timeout_at(deadline)
+            async with limit:
                 arguments = tool.validate_arguments(action.arguments)
                 normalized = TypeAdapter[JsonValue](JsonValue).validate_json(
                     arguments.model_dump_json()
@@ -329,8 +340,10 @@ class ToolExecutor:
                 value = await tool.invoke(arguments, context)
                 if owner is not None and owner.cancelling() > cancellations:
                     raise asyncio.CancelledError
+                if attempt_expired():
+                    raise TimeoutError("tool backend returned after its deadline")
                 snapshot = await self._store.put(self._run_id, action.call_id, value)
-            if limit.expired():
+            if attempt_expired():
                 raise TimeoutError("tool returned after its deadline")
             if owner is not None and owner.cancelling() > cancellations:
                 raise asyncio.CancelledError
@@ -360,7 +373,10 @@ class ToolExecutor:
         except ToolExecutionError:
             raise
         except ToolFault as exc:
-            category, message, cause = exc.category, str(exc), exc.__cause__
+            if attempt_expired():
+                category, message, cause = ErrorCategory.TIMEOUT, "Tool call timed out", exc
+            else:
+                category, message, cause = exc.category, str(exc), exc.__cause__
         except TimeoutError as exc:
             if owner is not None and owner.cancelling() > cancellations:
                 raise asyncio.CancelledError from exc
@@ -368,7 +384,10 @@ class ToolExecutor:
         except Exception as exc:
             if owner is not None and owner.cancelling() > cancellations:
                 raise asyncio.CancelledError from exc
-            category, message, cause = ErrorCategory.TOOL_FAILURE, "Tool backend failed", exc
+            if attempt_expired():
+                category, message, cause = ErrorCategory.TIMEOUT, "Tool call timed out", exc
+            else:
+                category, message, cause = ErrorCategory.TOOL_FAILURE, "Tool backend failed", exc
         finally:
             context.close()
         if owner is not None and owner.cancelling() > cancellations:

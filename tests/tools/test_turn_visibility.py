@@ -86,7 +86,7 @@ async def test_sibling_artifact_cannot_be_read_even_after_it_was_published() -> 
 
 
 async def test_later_turn_can_read_accepted_source_and_context_remains_dependency_closed() -> None:
-    from weavria.core import ModelRequest, ToolExchange, ToolSucceededObservation
+    from weavria.core import ToolExchange, ToolSucceededObservation, TurnRequest
     from weavria.models import ModelCapabilities
 
     async def read(arguments: Input, context: ToolContext) -> Output:
@@ -104,7 +104,7 @@ async def test_later_turn_can_read_accepted_source_and_context_remains_dependenc
     class Recover:
         capabilities = ModelCapabilities(True, True)
 
-        async def generate_turn(self, request: ModelRequest) -> ModelTurn:
+        async def generate_turn(self, request: TurnRequest) -> ModelTurn:
             if not request.history:
                 action = ToolCallAction(
                     call_id="source", tool_name="read", arguments={"read": False}

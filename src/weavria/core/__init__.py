@@ -24,6 +24,7 @@ from .messages import AgentRequest, Message, MessageRole
 from .model_io import HistoryEntry, ModelRequest, ModelResponse, TaskInput, ToolExchange
 from .outcomes import (
     AgentResult,
+    LoopResult,
     Observation,
     ToolFailedObservation,
     ToolSucceededObservation,
@@ -38,6 +39,7 @@ from .turns import (
     ToolBatch,
     TurnDecided,
     TurnFeedback,
+    TurnRequest,
     TurnSettled,
     decode_event,
 )
@@ -62,6 +64,7 @@ __all__ = [
     "JsonPointer",
     "LoopData",
     "LoopEvent",
+    "LoopResult",
     "Message",
     "MessageRole",
     "ModelDecided",
@@ -87,6 +90,7 @@ __all__ = [
     "ToolSucceededObservation",
     "TurnDecided",
     "TurnFeedback",
+    "TurnRequest",
     "TurnSettled",
     "decode_event",
     "parse_action",

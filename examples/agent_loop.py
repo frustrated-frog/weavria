@@ -14,13 +14,13 @@ from weavria.artifacts import InMemoryArtifactStore
 from weavria.context import EvidenceMode
 from weavria.core import (
     FinishAction,
-    ModelRequest,
     ModelTurn,
     TaskInput,
     ToolBatch,
     ToolCallAction,
     ToolExchange,
     ToolFailedObservation,
+    TurnRequest,
 )
 from weavria.models import ModelCapabilities
 from weavria.runtime import AgentLoop, RunLimits, ToolScheduling, reduce_event
@@ -98,7 +98,7 @@ class CatalogueReader:
 
     capabilities = ModelCapabilities(tool_calls=True, multi_tool_calls=True)
 
-    async def generate_turn(self, request: ModelRequest) -> ModelTurn:
+    async def generate_turn(self, request: TurnRequest) -> ModelTurn:
         await asyncio.sleep(0)
         exchanges = [e for e in request.history if isinstance(e, ToolExchange)]
         documents: dict[str, tuple[dict[str, JsonValue], str]] = {}
@@ -188,6 +188,8 @@ class Result:
     input_bytes: int
     elapsed_ms: float
     replay_valid: bool
+    execution_status: str
+    task_outcome: str
 
 
 async def evaluate(case: Case, root: Path, concurrency: int) -> Result:
@@ -239,6 +241,8 @@ async def evaluate(case: Case, root: Path, concurrency: int) -> Result:
         sum(p.request_bytes for p in agent.plans),
         round(elapsed, 3),
         replay == agent.state,
+        terminal.execution.status.value,
+        terminal.task_outcome,
     )
 
 
@@ -251,10 +255,10 @@ async def experiment(
     results = [await evaluate(case, root, concurrency) for case in cases for concurrency in (1, 2)]
     return TypeAdapter(dict[str, JsonValue]).validate_python(
         {
-            "schema_version": 1,
+            "schema_version": 2,
             "dataset_version": "1",
-            "solver_version": "1",
-            "evaluator_version": "1",
+            "solver_version": "2",
+            "evaluator_version": "2",
             "scope": "feedback and dispatch mechanism; no LLM planning quality claims",
             "configuration": {
                 "mode": "full",
@@ -287,7 +291,7 @@ def main() -> None:
     if args.json:
         print(json.dumps(report, ensure_ascii=False, indent=2))
     else:
-        print("Dataset / solver / evaluator v1; fixed 5 ms service latency, no LLM.")
+        print("Dataset v1 / solver v2 / evaluator v2; fixed 5 ms latency, no LLM.")
         rows = report["results"]
         assert isinstance(rows, list)
         for row in rows:
@@ -296,7 +300,8 @@ def main() -> None:
                 f"{row['case']:<14} {row['scheduling']:<10} correct={row['correct']} "
                 f"grounded={row['grounded']} complete={row['complete']} "
                 f"model={row['model_calls']} tools={row['tool_calls']} "
-                f"failures={row['failures']} peak={row['peak_in_flight']} ms={row['elapsed_ms']}"
+                f"failures={row['failures']} peak={row['peak_in_flight']} "
+                f"task={row['task_outcome']} ms={row['elapsed_ms']}"
             )
 
 

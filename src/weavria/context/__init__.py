@@ -1,6 +1,12 @@
 """Public deterministic context policies and inspected model input plans."""
 
-from .evidence import EvidenceContextBuilder, EvidenceDecision, EvidenceMode, EvidencePlan
+from .evidence import (
+    EvidenceContextBuilder,
+    EvidenceDecision,
+    EvidenceMode,
+    EvidencePlan,
+    TurnEvidencePlan,
+)
 from .policies import (
     FocusedHistory,
     FullHistory,
@@ -32,5 +38,6 @@ __all__ = [
     "HistorySelector",
     "RecentHistory",
     "SelectionReason",
+    "TurnEvidencePlan",
     "build_context",
 ]

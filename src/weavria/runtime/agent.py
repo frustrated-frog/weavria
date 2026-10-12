@@ -16,6 +16,7 @@ from weavria.context import (
     EvidenceContextBuilder,
     EvidenceMode,
     EvidencePlan,
+    TurnEvidencePlan,
 )
 from weavria.core import (
     AgentResult,
@@ -30,6 +31,7 @@ from weavria.core import (
     JournalEvent,
     LoopData,
     LoopEvent,
+    LoopResult,
     ModelDecided,
     ModelRequest,
     ModelResponse,
@@ -46,12 +48,14 @@ from weavria.core import (
     ToolRecorded,
     ToolStarted,
     TurnDecided,
+    TurnRequest,
     TurnSettled,
     decode_event,
 )
 from weavria.models import (
     ModelCallError,
     ModelProvider,
+    ModelTimeoutOrigin,
     TurnModelProvider,
     call_model,
     call_model_turn,
@@ -80,6 +84,10 @@ class SystemClock:
         return datetime.now(UTC)
 
 
+class _ContextDependencyTimeout(TimeoutError):
+    """A context backend timed out without consuming the Run's total deadline."""
+
+
 class _DispatchDeadlineExpired(TimeoutError):
     """Run budget expired before a worker started, distinct from tool feedback."""
 
@@ -92,17 +100,15 @@ class RunLimits:
     max_tool_calls: int = 12
     max_request_bytes: int = 12_000
     max_duration: float = 60.0
+    max_model_duration: float = 30.0
 
     def __post_init__(self) -> None:
         for value in (self.max_model_calls, self.max_tool_calls, self.max_request_bytes):
             if type(value) is not int or value <= 0:
                 raise ValueError("run counter and input limits must be positive integers")
-        if (
-            isinstance(self.max_duration, bool)
-            or not math.isfinite(self.max_duration)
-            or self.max_duration <= 0
-        ):
-            raise ValueError("run duration must be positive and finite")
+        for duration in (self.max_duration, self.max_model_duration):
+            if isinstance(duration, bool) or not math.isfinite(duration) or duration <= 0:
+                raise ValueError("run and model attempt durations must be positive and finite")
 
 
 class _AgentKernel:
@@ -114,7 +120,7 @@ class _AgentKernel:
         run_id: str,
         task: TaskInput,
         instructions: str,
-        decide: Callable[[ModelRequest, float], Awaitable[ModelResponse | ModelTurn]],
+        decide: Callable[[ModelRequest | TurnRequest, float], Awaitable[ModelResponse | ModelTurn]],
         journal_version: Literal[1, 2],
         scheduling: ToolScheduling,
         tools: ToolRegistry,
@@ -156,7 +162,7 @@ class _AgentKernel:
                 "arguments, seek another source, or finish. Scheduling is host-controlled."
             )
         self._events_json: list[str] = []
-        self._plans: list[EvidencePlan] = []
+        self._plans: list[EvidencePlan | TurnEvidencePlan] = []
         self._state: RunState | None = None
         self._run_id = run_id
         self._executed = False
@@ -173,9 +179,15 @@ class _AgentKernel:
         """Independent fact copies; raw parameters are not a redacted export."""
         return tuple(decode_event(value) for value in self._events_json)
 
-    @property
-    def plans(self) -> tuple[EvidencePlan, ...]:
-        return tuple(self._plans)
+    def _plan_snapshots[Plan: EvidencePlan | TurnEvidencePlan](
+        self, expected: type[Plan]
+    ) -> tuple[Plan, ...]:
+        snapshots: list[Plan] = []
+        for plan in self._plans:
+            if not isinstance(plan, expected):
+                raise RuntimeError("context plan does not match its execution protocol")
+            snapshots.append(plan)
+        return tuple(snapshots)
 
     @property
     def failure_cause(self) -> BaseException | None:
@@ -192,7 +204,7 @@ class _AgentKernel:
             raise EventAcceptanceError("task update lost its revision race")
         self._emit(TaskRevised(task=task))
 
-    async def execute(self) -> AgentResult:
+    async def _execute(self) -> AgentResult:
         """Own every await; cancellation is recorded then re-raised, never returned as failure."""
         if self._executed:
             raise RuntimeError("a run can only execute once")
@@ -200,30 +212,16 @@ class _AgentKernel:
         deadline = self._clock.monotonic() + self._limits.max_duration
         owner = asyncio.current_task()
         cancellation_count = owner.cancelling() if owner else 0
+        run_timeout = asyncio.timeout(self._limits.max_duration)
         try:
-            async with asyncio.timeout(self._limits.max_duration):
+            async with run_timeout:
                 while self.state.phase is not Phase.TERMINAL:
                     if self._remaining(deadline) <= 0:
                         return self._end(RunStatus.BUDGET_EXHAUSTED, "deadline")
                     if self.state.model_calls >= self._limits.max_model_calls:
                         return self._end(RunStatus.BUDGET_EXHAUSTED, "model_calls")
                     task = self.state.task
-                    plan = await self._builder.build(
-                        run_id=self._run_id,
-                        instructions=(
-                            self._instructions
-                            + (
-                                "\nLast settled turn (runtime status, not evidence content):\n"
-                                + self.state.feedback_json
-                                if self.state.feedback_json
-                                else ""
-                            )
-                        ),
-                        task=task,
-                        records=self.state.records,
-                        max_request_bytes=self._limits.max_request_bytes,
-                        feedback_call_ids=self.state.feedback_call_ids,
-                    )
+                    plan = await self._build_context(task)
                     self._check_cancel(owner, cancellation_count)
                     if task.revision != self.state.task.revision:
                         continue
@@ -241,7 +239,10 @@ class _AgentKernel:
                         )
                     )
                     self._emit(ModelStarted(task_revision=task.revision))
-                    response = await self._decide(plan.request, max(0, self._remaining(deadline)))
+                    response = await self._decide(
+                        plan.request,
+                        min(self._limits.max_model_duration, max(0, self._remaining(deadline))),
+                    )
                     self._check_cancel(owner, cancellation_count)
                     if task.revision != self.state.task.revision:
                         self._emit(DecisionDiscarded())
@@ -299,14 +300,37 @@ class _AgentKernel:
             if owner is not None and owner.cancelling() > cancellation_count:
                 self._end(RunStatus.CANCELLED, "cancelled")
                 raise asyncio.CancelledError from exc
-            if isinstance(exc, TimeoutError):
+            if (
+                run_timeout.expired()
+                or self._remaining(deadline) <= 0
+                or isinstance(exc, _DispatchDeadlineExpired)
+            ):
                 return self._end(RunStatus.BUDGET_EXHAUSTED, "deadline")
             if isinstance(exc, ContextBudgetError):
                 return self._end(RunStatus.BUDGET_EXHAUSTED, "context_bytes")
             if isinstance(exc, ModelCallError):
                 if exc.error.category is ErrorCategory.TIMEOUT:
-                    return self._end(RunStatus.BUDGET_EXHAUSTED, "deadline")
+                    reason = (
+                        "model_attempt_timeout"
+                        if exc.timeout_origin is ModelTimeoutOrigin.ATTEMPT
+                        else "model_provider_timeout"
+                        if exc.timeout_origin is ModelTimeoutOrigin.PROVIDER
+                        else "model_timeout"
+                    )
+                    return self._end(RunStatus.FAILED, reason, error=exc.error)
                 return self._end(RunStatus.FAILED, "model_failure", error=exc.error)
+            if isinstance(exc, TimeoutError):
+                return self._end(
+                    RunStatus.FAILED,
+                    "context_dependency_timeout"
+                    if isinstance(exc, _ContextDependencyTimeout)
+                    else "dependency_timeout",
+                    error=RunError(
+                        category=ErrorCategory.TIMEOUT,
+                        message="Runtime dependency timed out",
+                        cause_type=type(exc.__cause__ or exc).__name__,
+                    ),
+                )
             return self._end(
                 RunStatus.FAILED,
                 "runtime_failure",
@@ -319,6 +343,27 @@ class _AgentKernel:
         result = self.state.result
         assert result is not None
         return result
+
+    async def _build_context(self, task: TaskInput) -> EvidencePlan | TurnEvidencePlan:
+        try:
+            if self._journal_version == 1:
+                return await self._builder.build(
+                    run_id=self._run_id,
+                    instructions=self._instructions,
+                    task=task,
+                    records=self.state.records,
+                    max_request_bytes=self._limits.max_request_bytes,
+                )
+            return await self._builder.build_turn(
+                run_id=self._run_id,
+                instructions=self._instructions,
+                task=task,
+                records=self.state.records,
+                max_request_bytes=self._limits.max_request_bytes,
+                feedback=self.state.feedback,
+            )
+        except TimeoutError as exc:
+            raise _ContextDependencyTimeout("Context dependency timed out") from exc
 
     async def _execute_turn(self, calls: tuple[ToolCallAction, ...], deadline: float) -> None:
         accepted = tuple(r.artifact for r in self.state.records if r.artifact is not None)
@@ -341,7 +386,7 @@ class _AgentKernel:
         except ExceptionGroup as exc:
             _, other = exc.split(_DispatchDeadlineExpired)
             if other is None:
-                raise TimeoutError("Run deadline expired before dispatch") from exc
+                raise _DispatchDeadlineExpired("Run deadline expired before dispatch") from exc
             raise
         self._emit(TurnSettled())
 
@@ -451,7 +496,8 @@ class AgentRun(_AgentKernel):
         policy: ToolPolicy | None = None,
         clock: Clock | None = None,
     ) -> None:
-        async def decide(request: ModelRequest, duration: float) -> ModelResponse:
+        async def decide(request: ModelRequest | TurnRequest, duration: float) -> ModelResponse:
+            assert isinstance(request, ModelRequest)
             return await call_model(model, request, max_duration=duration)
 
         super().__init__(
@@ -468,6 +514,14 @@ class AgentRun(_AgentKernel):
             policy=policy,
             clock=clock,
         )
+
+    @property
+    def plans(self) -> tuple[EvidencePlan, ...]:
+        return self._plan_snapshots(EvidencePlan)
+
+    async def execute(self) -> AgentResult:
+        """Execute once using the v1 result contract; cancellation propagates."""
+        return await self._execute()
 
     @property
     def events(self) -> tuple[ExecutionEvent, ...]:
@@ -492,7 +546,8 @@ class AgentLoop(_AgentKernel):
         policy: ToolPolicy | None = None,
         clock: Clock | None = None,
     ) -> None:
-        async def decide(request: ModelRequest, duration: float) -> ModelTurn:
+        async def decide(request: ModelRequest | TurnRequest, duration: float) -> ModelTurn:
+            assert isinstance(request, TurnRequest)
             return await call_model_turn(model, request, max_duration=duration)
 
         scheduling = scheduling if scheduling is not None else ToolScheduling()
@@ -514,6 +569,14 @@ class AgentLoop(_AgentKernel):
             policy=policy,
             clock=clock,
         )
+
+    @property
+    def plans(self) -> tuple[TurnEvidencePlan, ...]:
+        return self._plan_snapshots(TurnEvidencePlan)
+
+    async def execute(self) -> LoopResult:
+        """Return execution and explicit unverified task outcome; cancellation propagates."""
+        return LoopResult(execution=await self._execute())
 
     @property
     def events(self) -> tuple[LoopEvent, ...]:

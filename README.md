@@ -29,7 +29,7 @@ uv run python examples/agent_loop.py --json
 
 当前设计、源码流程、实验结果和局限见 [执行驱动的模型上下文](docs/model-context-selection.md) 与 [ADR 0003](docs/decisions/0003-execution-backed-context.md)。公开端口分别位于 `weavria.core`、`models`、`tools`、`artifacts`、`context` 与 `runtime`。
 
-新增轮次实验从实际目录内容发现多个资料源，批量读取并依据失败反馈寻找替代资料；在串行与有界并发下核验结果、来源、成本和回放。设计及 Pi、smolagents、LangGraph 源码调研见 [AgentLoop](docs/agent-loop.md) 与 [ADR 0004](docs/decisions/0004-model-turn-feedback.md)。它使用固定解释器验证机制，尚不能证明真实 LLM 的规划或纠错收益。原有 `AgentRun` 和 v1 日志保持兼容。
+新增轮次实验从实际目录内容发现多个资料源，批量读取并依据失败反馈寻找替代资料；在串行与有界并发下核验结果、来源、成本和回放。设计及 Pi、smolagents、LangGraph 源码调研见 [AgentLoop](docs/agent-loop.md) 与 [ADR 0004](docs/decisions/0004-model-turn-feedback.md)。它使用固定解释器验证机制，尚不能证明真实 LLM 的规划或纠错收益。原有 `AgentRun` 和 v1 日志保持兼容。AgentLoop 当前使用 `TurnRequest` v2 单独传递反馈，返回 `LoopResult` v2 区分执行状态与尚未验证的任务成果；超时来源和接口迁移见 [ADR 0005](docs/decisions/0005-timeout-feedback-outcome.md)。
 
 历史契约与选择基线仍可观察：
 

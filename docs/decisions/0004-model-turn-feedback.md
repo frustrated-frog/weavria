@@ -4,6 +4,7 @@
 - 日期：2026-10-11
 - 范围：决策、只读工具调度、反馈与任务修订
 - 前置：[ADR 0003](0003-execution-backed-context.md)
+- 后续协议修复：[ADR 0005](0005-timeout-feedback-outcome.md)，明确 v2 请求与成果报告；本 ADR 的日志规则继续适用。
 
 ## 问题
 

@@ -2,7 +2,7 @@
 
 import asyncio
 
-from weavria.core import ModelRequest, ModelResponse, ModelTurn
+from weavria.core import ModelRequest, ModelResponse, ModelTurn, TurnRequest
 
 from .provider import ModelCapabilities
 
@@ -59,16 +59,16 @@ class FakeTurnProvider:
         self._active = False
 
     @property
-    def requests(self) -> tuple[ModelRequest, ...]:
-        return tuple(ModelRequest.model_validate_json(value) for value in self._requests)
+    def requests(self) -> tuple[TurnRequest, ...]:
+        return tuple(TurnRequest.model_validate_json(value) for value in self._requests)
 
-    async def generate_turn(self, request: ModelRequest) -> ModelTurn:
+    async def generate_turn(self, request: TurnRequest) -> ModelTurn:
         """Consume an attempt at a cancellation point; reject overlapping calls."""
         if self._active:
             raise RuntimeError("Fake turn provider supports one active call")
         self._active = True
         try:
-            self._requests.append(ModelRequest.model_validate(request).model_dump_json())
+            self._requests.append(TurnRequest.model_validate(request).model_dump_json())
             index = self._cursor
             self._cursor += 1
             await asyncio.sleep(0)

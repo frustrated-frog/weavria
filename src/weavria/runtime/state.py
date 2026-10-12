@@ -73,6 +73,10 @@ class RunState:
     feedback_json: str | None = None
 
     @property
+    def feedback(self) -> TurnFeedback | None:
+        return TurnFeedback.model_validate_json(self.feedback_json) if self.feedback_json else None
+
+    @property
     def turn(self) -> ModelTurn | None:
         return ModelTurn.model_validate_json(self.turn_json) if self.turn_json else None
 

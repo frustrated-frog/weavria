@@ -2,7 +2,7 @@
 
 from typing import Annotated, Literal, Self
 
-from pydantic import Field, JsonValue, model_validator
+from pydantic import BaseModel, Field, JsonValue, field_validator, model_validator
 
 from ._schema import ContractModel, NonBlankString
 from .errors import RunError
@@ -33,7 +33,7 @@ type Observation = Annotated[
 
 
 class AgentResult(ContractModel):
-    """Terminal outcome: completed has output, failed has error, others neither."""
+    """v1 execution result: completed has output, without asserting task quality."""
 
     run_id: NonBlankString
     status: Literal[
@@ -54,3 +54,38 @@ class AgentResult(ContractModel):
         elif self.output is not None or self.error is not None:
             raise ValueError("cancelled/budget_exhausted result forbids output and error")
         return self
+
+
+class LoopResult(BaseModel):
+    """v2 report separates execution termination from task quality.
+
+    Finish only completes execution. No task verifier is implemented, so every
+    report explicitly says unverified, including cancelled and failed execution.
+    """
+
+    model_config = ContractModel.model_config
+    schema_version: Literal[2] = 2
+    execution: AgentResult
+    task_outcome: Literal["unverified"] = "unverified"
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def validate_version_type(cls, value: object) -> object:
+        return ContractModel.validate_version_type(value)
+
+    @property
+    def run_id(self) -> str:
+        return self.execution.run_id
+
+    @property
+    def status(self) -> RunStatus:
+        """Execution status only; completed makes no assertion about task success."""
+        return self.execution.status
+
+    @property
+    def output(self) -> str | None:
+        return self.execution.output
+
+    @property
+    def error(self) -> RunError | None:
+        return self.execution.error
