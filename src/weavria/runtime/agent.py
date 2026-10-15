@@ -744,63 +744,120 @@ class LegacyAgentLoop(_AgentKernel):
         return tuple(LoopEvent.model_validate_json(value) for value in self._events_json)
 
 
+# 声明第三版 Agent 循环;公共行为复用基类的状态机,当前类负责接入 v3 控制协议。
 class AgentLoop(_AgentKernel):
+    # 说明 v3 与旧循环的关键差异:副作用发生前预留反馈空间,结束候选还要经过验收。
     """v3 loop: reserve feedback before effects and resolve candidate completion."""
 
+    # 构造一次性执行的 Agent;初始化会校验并行配置,并由基类写入 RunStarted 事件。
     def __init__(
+        # 当前 AgentLoop 实例;Python 会在实例化时自动传入,不需要调用方显式提供。
         self,
+        # 强制其后的公开参数全部使用关键字传递,避免多个同类型参数因位置写错。
         *,
+        # 本次运行的稳定标识;会关联状态、事件、工具执行记录与 Artifact 的归属。
         run_id: str,
+        # 当前任务的类型化输入,包含目标、约束和修订号;任务修订时用于识别过期决策。
         task: TaskInput,
+        # 宿主提供给模型的基础指令;基类还会追加工具目录与不可信证据边界说明。
         instructions: str,
+        # 支持 v3 ControlRequest 的模型端口;供应商响应会在统一边界再次校验。
         model: ControlModelProvider,
+        # 可用工具注册表;既用于向模型公布工具契约,也用于解析和执行工具调用。
         tools: ToolRegistry,
+        # Artifact 存储端口;承载从模型上下文卸载的大结果,并供验收策略受控读取。
         artifacts: ArtifactStore,
+        # 工具调度策略;None 表示串行默认值,显式配置可限制并发并声明可并行工具。
         scheduling: ToolScheduling | None = None,
+        # 模型次数、工具次数、请求字节数和各类时限;None 时使用 RunLimits 默认值。
         limits: RunLimits | None = None,
+        # 上下文证据选择策略;默认按当前任务相关性和因果闭包选择工具结果。
         mode: EvidenceMode = EvidenceMode.RELEVANT,
+        # 每次工具调用的授权策略;None 时基类采用只允许只读工具的默认策略。
         policy: ToolPolicy | None = None,
+        # 结束候选的可信验收策略;None 表示无法验证,而不是自动把模型自报视为完成。
         completion: CompletionPolicy | None = None,
+        # 工具回执的序列化大小边界;用于在执行副作用前证明最低反馈能够放入上下文。
         feedback_bounds: FeedbackBounds | None = None,
+        # 可注入的单调时钟和 UTC 墙上时钟;None 时使用系统实现,测试可传确定性 Fake。
         clock: Clock | None = None,
+        # 构造函数只建立依赖、初始状态和首个事件,不在初始化阶段执行模型或工具。
     ) -> None:
+        # 把基类的通用“决策”回调适配为 v3 模型调用,同时保留统一的超时边界。
         async def decide(
-            request: ModelRequest | TurnRequest | ControlRequest, duration: float
+            # 基类兼容三代请求;当前适配器只接受 v3 ControlRequest,其他类型表示内部接线错误。
+            request: ModelRequest | TurnRequest | ControlRequest,
+            # 本次模型调用允许占用的秒数,由运行总期限与单次模型时限共同约束。
+            duration: float,
+            # 返回一个结构化模型回合,其中只能包含结束候选或一批待准入的工具调用。
         ) -> ModelTurn:
+            # 收窄联合类型并立即暴露协议错配,避免把旧版请求交给 v3 Provider。
             assert isinstance(request, ControlRequest)
+            # 经统一模型边界执行调用:限制等待时间、重校验输入输出,并检查批量调用能力。
             return await call_controlled_model(model, request, max_duration=duration)
 
+        # 将可选配置归一化成确定的调度对象,后续基类无需反复处理 None 分支。
         scheduling = scheduling if scheduling is not None else ToolScheduling()
+        # 逐个验证调用方声明“可并行”的工具,因为并发会改变副作用顺序和重试风险。
         for name in scheduling.parallel_tools:
+            # 从注册表取得工具描述;名称未注册时会在构造阶段直接失败,避免运行中才发现。
             descriptor = tools.get(name).descriptor
+            # 只有只读且明确可安全重放的工具才允许并行,两个条件缺一不可。
             if descriptor.behavior != "read_only" or descriptor.idempotency != "replay_safe":
+                # 拒绝不安全配置,防止有副作用或不可重放的调用并发执行。
                 raise ValueError("parallel tools must be explicitly replay-safe reads")
+        # 把已验证并归一化的依赖交给共享内核,建立状态机、执行器和上下文构建器。
         super().__init__(
+            # 传递运行标识,使所有事件、工具记录和 Artifact 使用同一归属范围。
             run_id=run_id,
+            # 传递当前任务快照,作为状态归约、上下文选择与完成验收的目标。
             task=task,
+            # 传递宿主指令;共享内核会在其后追加安全规则和工具描述。
             instructions=instructions,
+            # 注入上面的 v3 决策适配器,使共享执行循环不依赖具体模型协议实现。
             decide=decide,
+            # 固定使用第三版 Journal Schema,确保请求、事件和回放契约保持一致。
             journal_version=3,
+            # 传递已补全默认值且通过并行安全校验的调度配置。
             scheduling=scheduling,
+            # 传递工具注册表,用于工具发现、参数校验和具体执行。
             tools=tools,
+            # 传递 Artifact 存储,供大结果卸载、上下文恢复和完成验收使用。
             artifacts=artifacts,
+            # 传递可选运行预算;基类在值为 None 时创建默认 RunLimits。
             limits=limits,
+            # 传递证据选择模式,决定每轮模型请求看到哪些已接受工具结果。
             mode=mode,
+            # 传递工具授权策略;描述工具能力本身不会自动授予执行权限。
             policy=policy,
+            # 传递时钟端口,使 Deadline 计算和事件时间既可生产使用也可确定性测试。
             clock=clock,
+            # 传递完成验收策略,用独立判断约束模型提出的 FinishAction。
             completion=completion,
+            # 传递反馈大小边界,使 v3 在工具执行前完成反馈预算准入判断。
             feedback_bounds=feedback_bounds,
+            # 完成共享内核初始化;此时实例已拥有初始状态,但尚未进入异步执行循环。
         )
 
+    # 将 plans 暴露为只读属性,调用方不能通过该接口替换内核保存的计划集合。
     @property
+    # 返回每轮 v3 模型请求的证据计划快照,用于解释上下文选择与预算消耗。
     def plans(self) -> tuple[ControlEvidencePlan, ...]:
+        # 通过重新反序列化生成独立快照,并断言所有计划都属于 v3 ControlEvidencePlan。
         return self._plan_snapshots(ControlEvidencePlan)
 
+    # 执行完整 Agent 状态机;该异步入口会等待模型、工具及验收生命周期收敛。
     async def execute(self) -> RunReport:
+        # 明确一次性执行语义,以及任务结果必须来自绑定当前修订的已接受验收结论。
         """Execute once; task outcome comes from the accepted, revision-bound check."""
+        # 运行共享内核,得到执行层结果;重复调用会由基类的一次性约束拒绝。
         execution = await self._execute()
+        # 将执行结果与最终状态中的验收快照组合,并由 RunReport 校验两者一致性。
         return RunReport.from_execution(execution, self.state.assessment)
 
+    # 将 events 暴露为只读属性,供诊断、回放和测试检查完整的 v3 事实序列。
     @property
+    # 返回按发生顺序排列的 ControlEvent,不直接泄露内部可变 JSON 列表。
     def events(self) -> tuple[ControlEvent, ...]:
+        # 逐条从持久化 JSON 重建并校验事件,最终用 tuple 提供不可变的独立视图。
         return tuple(ControlEvent.model_validate_json(value) for value in self._events_json)
