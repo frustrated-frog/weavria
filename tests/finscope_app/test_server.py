@@ -49,6 +49,7 @@ async def test_widget_session_executes_real_runtime_and_reports_tool_trace(
                     )
                 )
             ),
+            ModelTurn(decision=FinishAction(output="当前为震荡轮动。数据质量: READY。")),
             ModelTurn(
                 decision=FinishAction(
                     output="当前为震荡轮动。数据质量: READY。[来源:market-pulse:2026-10-15]"
