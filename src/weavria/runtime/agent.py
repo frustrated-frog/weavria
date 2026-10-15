@@ -991,7 +991,6 @@ class LegacyAgentLoop(_AgentKernel):
 
 # 声明第三版 Agent 循环;公共行为复用基类的状态机,当前类负责接入 v3 控制协议。
 class AgentLoop(_AgentKernel):
-    # 说明 v3 与旧循环的关键差异:副作用发生前预留反馈空间,结束候选还要经过验收。
     """v3 loop: reserve feedback before effects and resolve candidate completion."""
 
     # 构造一次性执行的 Agent;初始化会校验并行配置,并由基类写入 RunStarted 事件。
@@ -1000,13 +999,11 @@ class AgentLoop(_AgentKernel):
         self,
         # 强制其后的公开参数全部使用关键字传递,避免多个同类型参数因位置写错。
         *,
-        # 本次运行的稳定标识;会关联状态、事件、工具执行记录与 Artifact 的归属。
+        # 会关联状态、事件、工具执行记录与 Artifact 的归属。
         run_id: str,
-        # 当前任务的类型化输入,包含目标、约束和修订号;任务修订时用于识别过期决策。
         task: TaskInput,
         # 宿主提供给模型的基础指令;基类还会追加工具目录与不可信证据边界说明。
         instructions: str,
-        # 支持 v3 ControlRequest 的模型端口;供应商响应会在统一边界再次校验。
         model: ControlModelProvider,
         # 可用工具注册表;既用于向模型公布工具契约,也用于解析和执行工具调用。
         tools: ToolRegistry,
@@ -1097,7 +1094,6 @@ class AgentLoop(_AgentKernel):
 
     # 执行完整 Agent 状态机;该异步入口会等待模型、工具及验收生命周期收敛。
     async def execute(self) -> RunReport:
-        # 明确一次性执行语义,以及任务结果必须来自绑定当前修订的已接受验收结论。
         """Execute once; task outcome comes from the accepted, revision-bound check."""
         # 运行共享内核,得到执行层结果;重复调用会由基类的一次性约束拒绝。
         execution = await self._execute()
