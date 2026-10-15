@@ -39,6 +39,11 @@ uv run python examples/steering_experiment.py
 
 当前 `AgentLoop` 使用 `ControlRequest` / `ControlEvent` / `RunReport` v3：批次先计算最低反馈和依赖闭包上界，预算不足给模型拒绝观察；Finish 先成为候选，由 `CompletionPolicy` 检查实际成果、反馈缺口继续修正，或报告无法验证。默认没有验收规则时明确返回 `unverifiable`，不会自动调用评判模型。设计、迁移及冻结的文件任务对照见 [AgentLoop v3](docs/agent-loop-control.md) 与 [ADR 0006](docs/decisions/0006-feedback-admission-completion-control.md)。实验验证控制机制及额外调用成本，尚不能证明真实 LLM 的规划或纠错收益。
 
+首个真实应用实验位于 `apps/finscope`：独立 sidecar 使用 OpenAI-compatible Provider 和
+FinScope 现有只读 Market Pulse API，在隔离 iframe 中提供持久多轮 Agent。金融类型和规则
+不进入通用包，FinScope 不需要共享数据库或替换其 Java Runtime。启动方式与限制见
+[FinScope 适配器](apps/finscope/README.md) 和 [ADR 0009](docs/decisions/0009-external-application-sidecar.md)。
+
 历史契约与选择基线仍可观察：
 
 ```bash

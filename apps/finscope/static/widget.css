@@ -1,0 +1,64 @@
+:root {
+  color-scheme: light;
+  font-family: Inter, "PingFang SC", "Microsoft YaHei", sans-serif;
+  color: #122433;
+  background: #f5f8fa;
+  --blue: #1967d2;
+  --blue-soft: #eaf2ff;
+  --ink: #122433;
+  --muted: #607281;
+  --line: #dbe4e9;
+  --paper: #ffffff;
+}
+
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+button, textarea { font: inherit; }
+button { cursor: pointer; }
+
+.agent-shell { display: grid; grid-template-rows: auto 1fr auto; height: 100%; background: linear-gradient(180deg, #fbfdff, #f4f7f8); }
+.agent-header { display: grid; grid-template-columns: auto 1fr auto; gap: 12px; align-items: center; min-height: 66px; border-bottom: 1px solid var(--line); background: rgba(255,255,255,.92); padding: 10px 15px; }
+.agent-header > div:nth-child(2) { display: grid; gap: 3px; }
+.agent-header strong { font-size: 14px; letter-spacing: .01em; }
+.agent-header span { color: var(--muted); font-size: 11px; }
+.agent-mark { display: flex; gap: 3px; align-items: end; width: 32px; height: 32px; border: 1px solid #bdd0dc; border-radius: 9px; background: #f7fbfd; padding: 7px; }
+.agent-mark i { display: block; flex: 1; border-radius: 2px 2px 0 0; background: var(--blue); }
+.agent-mark i:nth-child(1) { height: 35%; opacity: .5; }
+.agent-mark i:nth-child(2) { height: 80%; }
+.agent-mark i:nth-child(3) { height: 55%; opacity: .72; }
+.agent-status { border: 1px solid #bfd3c7; border-radius: 99px; background: #f4faf6; color: #267048 !important; padding: 4px 7px; }
+.agent-status.busy { border-color: #bed0e9; background: var(--blue-soft); color: var(--blue) !important; }
+.agent-status.error { border-color: #e3c5c5; background: #fff4f3; color: #a43a35 !important; }
+
+.conversation { overflow-y: auto; padding: 17px; }
+.intro { border: 1px solid var(--line); border-radius: 12px; background: var(--paper); padding: 18px; box-shadow: 0 12px 32px rgba(18,36,51,.05); }
+.intro > span { color: var(--blue); font: 750 10px/1 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .14em; }
+.intro h1 { margin: 10px 0 8px; font: 540 24px/1.18 "Iowan Old Style", "Songti SC", serif; letter-spacing: -.02em; }
+.intro p { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.65; }
+.suggestions { display: grid; gap: 7px; margin-top: 15px; }
+.suggestions button { border: 1px solid var(--line); border-radius: 8px; background: #f8fafb; color: var(--ink); padding: 9px 10px; text-align: left; font-size: 12px; }
+.suggestions button:hover { border-color: #9bbce6; background: var(--blue-soft); }
+
+.message { display: grid; gap: 7px; margin-top: 14px; }
+.message > span { color: var(--muted); font-size: 10px; font-weight: 750; letter-spacing: .08em; }
+.message p { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13px; line-height: 1.68; }
+.message.user { justify-items: end; }
+.message.user p { max-width: 88%; border-radius: 12px 12px 3px 12px; background: var(--blue); color: white; padding: 10px 12px; }
+.message.agent { border-left: 2px solid var(--blue); background: var(--paper); padding: 12px 13px; }
+.trace { display: flex; flex-wrap: wrap; gap: 5px; }
+.trace i { border: 1px solid var(--line); border-radius: 99px; background: #f7f9fa; color: var(--muted); padding: 3px 6px; font: 10px ui-monospace, monospace; }
+.trace i.failed { border-color: #e3c5c5; color: #a43a35; }
+
+.composer { border-top: 1px solid var(--line); background: var(--paper); padding: 11px 13px 12px; }
+.composer label { display: block; margin-bottom: 7px; color: var(--muted); font-size: 11px; font-weight: 700; }
+.composer > div { display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: end; }
+.composer textarea { width: 100%; resize: none; border: 1px solid #cbd8df; border-radius: 9px; background: #fbfcfd; color: var(--ink); padding: 9px 10px; outline: none; line-height: 1.5; }
+.composer textarea:focus { border-color: var(--blue); box-shadow: 0 0 0 3px rgba(25,103,210,.1); }
+.composer button { height: 42px; border: 0; border-radius: 8px; background: var(--blue); color: white; padding: 0 14px; font-weight: 750; }
+.composer button:disabled { cursor: wait; opacity: .55; }
+.composer small { display: block; margin-top: 6px; color: #83919b; font-size: 10px; }
+
+@media (prefers-reduced-motion: no-preference) {
+  .agent-status.busy { animation: pulse 1.2s ease-in-out infinite alternate; }
+  @keyframes pulse { to { box-shadow: 0 0 0 4px rgba(25,103,210,.09); } }
+}

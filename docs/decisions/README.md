@@ -12,3 +12,4 @@
 - [0006 反馈预算准入与候选成果验收](0006-feedback-admission-completion-control.md)
 - [0007 单用户持久会话与历史证据](0007-persistent-conversations.md)
 - [0008 运行中任务干预与回合 Harness 控制](0008-interactive-turn-harness.md)
+- [0009 以外置 Sidecar 验证领域应用接入](0009-external-application-sidecar.md)
