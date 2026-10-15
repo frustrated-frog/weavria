@@ -9,6 +9,7 @@ from ._schema import ContractModel, NonBlankString
 from .control import ControlEvent, ControlRequest, RunReport
 from .errors import ErrorCategory
 from .execution import ArtifactRef, ExecutionEvent
+from .intervention import TaskUpdate, TurnResolution
 
 
 class PastCall(ContractModel):
@@ -33,8 +34,16 @@ class SourceUse(ContractModel):
     source: ArtifactRef
 
 
-class ConversationTurn(ContractModel):
+class ConversationTurn(BaseModel):
     """A complete user interaction; incomplete calls are listed, never fabricated failures."""
+
+    model_config = ContractModel.model_config
+    schema_version: Literal[2] = 2
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def validate_version_type(cls, value: object) -> object:
+        return ContractModel.validate_version_type(value)
 
     run_id: NonBlankString
     input_id: NonBlankString
@@ -47,6 +56,7 @@ class ConversationTurn(ContractModel):
     source_uses: tuple[SourceUse, ...] = ()
     unfinished_call_ids: tuple[NonBlankString, ...] = ()
     undispatched_call_ids: tuple[NonBlankString, ...] = ()
+    updates: tuple[TaskUpdate, ...] = ()
 
     @model_validator(mode="after")
     def validate_scope(self) -> Self:
@@ -58,6 +68,10 @@ class ConversationTurn(ContractModel):
             raise ValueError("past source belongs to another run")
         if any(u.consumer_run_id != self.run_id for u in self.source_uses):
             raise ValueError("source use belongs to another interaction")
+        if any(u.run_id != self.run_id for u in self.updates) or tuple(
+            u.task.revision for u in self.updates
+        ) != tuple(range(2, len(self.updates) + 2)):
+            raise ValueError("task updates must be an ordered revision chain in this run")
         return self
 
 
@@ -80,7 +94,21 @@ class TextExcerpt(ContractModel):
         return self
 
 
-class ConversationItem(ContractModel):
+class DirectiveView(ContractModel):
+    input_id: NonBlankString
+    revision: int = Field(ge=2)
+    text: TextExcerpt
+
+
+class ConversationItem(BaseModel):
+    model_config = ContractModel.model_config
+    schema_version: Literal[2] = 2
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def validate_version_type(cls, value: object) -> object:
+        return ContractModel.validate_version_type(value)
+
     run_id: NonBlankString
     ordinal: int = Field(ge=1)
     user: TextExcerpt
@@ -91,14 +119,23 @@ class ConversationItem(ContractModel):
     source_uses: tuple[SourceUse, ...] = ()
     unfinished_call_ids: tuple[NonBlankString, ...] = ()
     undispatched_call_ids: tuple[NonBlankString, ...] = ()
+    updates: tuple[DirectiveView, ...] = ()
 
 
-class ConversationView(ContractModel):
+class ConversationView(BaseModel):
+    model_config = ContractModel.model_config
+    schema_version: Literal[2] = 2
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def validate_version_type(cls, value: object) -> object:
+        return ContractModel.validate_version_type(value)
+
     session_id: NonBlankString
     through_sequence: int = Field(ge=0)
     turns: tuple[ConversationItem, ...] = ()
     omitted_turns: int = Field(default=0, ge=0)
-    policy_version: Literal["conversation/1"] = "conversation/1"
+    policy_version: Literal["conversation/2"] = "conversation/2"
 
     @model_validator(mode="after")
     def validate_order(self) -> Self:
@@ -110,10 +147,10 @@ class ConversationView(ContractModel):
 
 
 class SessionRequest(BaseModel):
-    """v4 envelope: scoped conversation and v3 current-run observations keep their roles."""
+    """v5 envelope: conversation v2 includes authored updates; current control stays v3."""
 
     model_config = ContractModel.model_config
-    schema_version: Literal[4] = 4
+    schema_version: Literal[5] = 5
     conversation: ConversationView
     current: ControlRequest
 
@@ -175,7 +212,25 @@ class SessionContextPrepared(ContractModel):
         return self
 
 
-class SessionEvent(ContractModel):
+class SessionTaskUpdated(ContractModel):
+    kind: Literal["task_updated"] = "task_updated"
+    update: TaskUpdate
+
+
+class SessionControlDecided(ContractModel):
+    kind: Literal["control_decided"] = "control_decided"
+    resolution: TurnResolution
+
+
+class SessionEvent(BaseModel):
+    model_config = ContractModel.model_config
+    schema_version: Literal[1, 2] = 2
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def validate_version_type(cls, value: object) -> object:
+        return ContractModel.validate_version_type(value)
+
     occurred_at: datetime
 
     @field_validator("occurred_at")
@@ -191,4 +246,14 @@ class SessionEvent(ContractModel):
         | SessionSourceRead
         | SessionInterrupted
         | SessionContextPrepared
+        | SessionTaskUpdated
+        | SessionControlDecided
     ) = Field(discriminator="kind")
+
+    @model_validator(mode="after")
+    def validate_payload_version(self) -> Self:
+        if self.schema_version == 1 and isinstance(
+            self.data, (SessionTaskUpdated, SessionControlDecided)
+        ):
+            raise ValueError("new Harness facts require session event v2")
+        return self

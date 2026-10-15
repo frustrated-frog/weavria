@@ -11,3 +11,4 @@
 - [0005 超时来源、结构化观察与执行成果语义](0005-timeout-feedback-outcome.md)
 - [0006 反馈预算准入与候选成果验收](0006-feedback-admission-completion-control.md)
 - [0007 单用户持久会话与历史证据](0007-persistent-conversations.md)
+- [0008 运行中任务干预与回合 Harness 控制](0008-interactive-turn-harness.md)

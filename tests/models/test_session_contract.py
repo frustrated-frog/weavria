@@ -32,7 +32,7 @@ def request() -> SessionRequest:
     )
 
 
-async def test_provider_checks_v4_request_and_returns_normalized_decision(
+async def test_provider_checks_v5_request_and_returns_normalized_decision(
     session_provider_factory: Callable[[tuple[ModelTurn, ...]], SessionModelProvider],
 ) -> None:
     turn = ModelTurn(decision=FinishAction(output="done"))

@@ -23,6 +23,7 @@ from weavria.core import (
     RunEnded,
     RunReport,
     SessionContextPrepared,
+    SessionControlDecided,
     SessionEvent,
     SessionInput,
     SessionInterrupted,
@@ -30,10 +31,14 @@ from weavria.core import (
     SessionResult,
     SessionRunEvent,
     SessionSourceRead,
+    SessionTaskUpdated,
     SourceUse,
+    TaskRevised,
+    TaskUpdate,
     ToolBatch,
     ToolFailedObservation,
     ToolRecorded,
+    TurnResolution,
 )
 from weavria.runtime import Clock, Phase, RunState, SystemClock, reduce_event, settle_mutation
 from weavria.tools import ToolExecutionError
@@ -136,7 +141,7 @@ class SQLiteSessionStore:
         conn = sqlite3.connect(self.path, timeout=2.0)
         self._connection = conn
         version = conn.execute("PRAGMA user_version").fetchone()[0]
-        if version not in (0, 1):
+        if version not in (0, 1, 2):
             raise SessionConflictError("unsupported session database schema")
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA journal_mode=WAL")
@@ -175,10 +180,38 @@ class SQLiteSessionStore:
                 PRAGMA user_version=1;
                 COMMIT;
             """)
+        if version < 2:
+            self._migrate_v2()
         # Only the exclusive DB owner can classify an old live run as interrupted.
         active = conn.execute("SELECT id FROM runs WHERE status='running'").fetchall()
         for row in active:
             self._interrupt(row[0], "process_exit")
+
+    def _migrate_v2(self) -> None:
+        # Raw run/session events and v4 request snapshots are immutable. Only
+        # rebuildable views are upcast; the migration commits in one transaction.
+        with self._transaction() as conn:
+            conn.execute("""CREATE TABLE directives(
+                session_id TEXT NOT NULL REFERENCES sessions, input_id TEXT NOT NULL,
+                run_id TEXT NOT NULL REFERENCES runs, revision INTEGER NOT NULL,
+                data TEXT NOT NULL, PRIMARY KEY(session_id,input_id), UNIQUE(run_id,revision))""")
+            conn.execute("""CREATE TABLE control_decisions(
+                run_id TEXT NOT NULL REFERENCES runs, sequence INTEGER NOT NULL,
+                data TEXT NOT NULL, PRIMARY KEY(run_id,sequence))""")
+            for run_id, encoded in conn.execute(
+                "SELECT id,view FROM runs WHERE view IS NOT NULL"
+            ).fetchall():
+                value = json.loads(encoded)
+                if value.get("schema_version") != 1:
+                    raise SessionConflictError(
+                        "unexpected conversation projection during migration"
+                    )
+                value["schema_version"], value["updates"] = 2, []
+                upgraded = ConversationTurn.model_validate_json(json.dumps(value))
+                conn.execute(
+                    "UPDATE runs SET view=? WHERE id=?", (upgraded.model_dump_json(), run_id)
+                )
+            conn.execute("PRAGMA user_version=2")
 
     def _session_event(
         self,
@@ -188,7 +221,10 @@ class SQLiteSessionStore:
         | SessionRunEvent
         | SessionSourceRead
         | SessionInterrupted
-        | SessionContextPrepared,
+        | SessionContextPrepared
+        | SessionTaskUpdated
+        | SessionControlDecided,
+        # Every new fact uses the v2 envelope; old rows retain their original v1 bytes.
     ) -> None:
         head = conn.execute("SELECT head FROM sessions WHERE id=?", (session_id,)).fetchone()[0]
         event = SessionEvent(
@@ -227,6 +263,11 @@ class SQLiteSessionStore:
                 ).fetchone()
                 if session is None:
                     raise KeyError("unknown session")
+                if conn.execute(
+                    "SELECT 1 FROM directives WHERE session_id=? AND input_id=?",
+                    (session_id, input_id),
+                ).fetchone():
+                    raise SessionConflictError("input identity already belongs to steering")
                 old = conn.execute(
                     (
                         "SELECT id,input,ordinal,report,status FROM runs WHERE "
@@ -350,10 +391,28 @@ class SQLiteSessionStore:
             "source_uses": uses,
             "unfinished_call_ids": state.active_call_ids if state else (),
             "undispatched_call_ids": undispatched,
+            "updates": tuple(
+                TaskUpdate.model_validate_json(r[0])
+                for r in self._conn().execute(
+                    "SELECT data FROM directives WHERE run_id=? ORDER BY revision", (run_id,)
+                )
+            ),
         }
         return ConversationTurn.model_validate(payload)
 
     async def append(self, event: ControlEvent) -> None:
+        await self._append(event)
+
+    async def append_revision(self, event: ControlEvent, update: TaskUpdate) -> None:
+        if not isinstance(event.data, TaskRevised) or (
+            update.run_id != event.run_id or update.task != event.data.task
+        ):
+            raise SessionConflictError("task input does not bind its revision fact")
+        await self._append(event, update)
+
+    async def _append(self, event: ControlEvent, update: TaskUpdate | None = None) -> None:
+        if isinstance(event.data, TaskRevised) and update is None:
+            raise SessionConflictError("session task revisions require an authored input")
         encoded = ControlEvent.model_validate(event).model_dump_json()
 
         def append() -> None:
@@ -378,6 +437,13 @@ class SQLiteSessionStore:
                         raise SessionConflictError(
                             "event identity was reused with a different fact"
                         )
+                    if update is not None:
+                        accepted = conn.execute(
+                            "SELECT data FROM directives WHERE run_id=? AND revision=?",
+                            (update.run_id, update.task.revision),
+                        ).fetchone()
+                        if accepted is None or accepted[0] != update.model_dump_json():
+                            raise SessionConflictError("task revision has a different input")
                     return
                 if row[1] != "running" or row[2] != fact.sequence - 1:
                     raise SessionConflictError("run is no longer writable at this position")
@@ -412,6 +478,18 @@ class SQLiteSessionStore:
                     "UPDATE runs SET last_sequence=? WHERE id=?", (fact.sequence, fact.run_id)
                 )
                 self._session_event(conn, row[0], SessionRunEvent(event=fact))
+                if update is not None:
+                    conn.execute(
+                        "INSERT INTO directives VALUES(?,?,?,?,?)",
+                        (
+                            row[0],
+                            update.directive.input_id,
+                            update.run_id,
+                            update.task.revision,
+                            update.model_dump_json(),
+                        ),
+                    )
+                    self._session_event(conn, row[0], SessionTaskUpdated(update=update))
                 if isinstance(fact.data, RunEnded):
                     report = RunReport.from_execution(fact.data.result, next_state.assessment)
                     view = self._view(
@@ -439,6 +517,78 @@ class SQLiteSessionStore:
                 self._states[fact.run_id] = next_state
 
         await self._submit(append)
+
+    async def directive(self, session_id: str, input_id: str, text: str) -> TaskUpdate | None:
+        def read() -> TaskUpdate | None:
+            if (
+                self._conn()
+                .execute(
+                    "SELECT 1 FROM runs WHERE session_id=? AND input_id=?", (session_id, input_id)
+                )
+                .fetchone()
+            ):
+                raise SessionConflictError("input identity already belongs to a Run")
+            row = (
+                self._conn()
+                .execute(
+                    "SELECT data FROM directives WHERE session_id=? AND input_id=?",
+                    (session_id, input_id),
+                )
+                .fetchone()
+            )
+            if row is None:
+                return None
+            update = TaskUpdate.model_validate_json(row[0])
+            if update.directive.text != text:
+                raise SessionConflictError("directive identity was reused with different text")
+            return update
+
+        return await self._submit(read)
+
+    async def record_resolution(self, resolution: TurnResolution) -> None:
+        encoded = resolution.model_dump_json()
+
+        def record() -> None:
+            with self._transaction() as conn:
+                row = conn.execute(
+                    "SELECT session_id,status FROM runs WHERE id=?", (resolution.run_id,)
+                ).fetchone()
+                old = conn.execute(
+                    "SELECT data FROM control_decisions WHERE run_id=? AND sequence=?",
+                    (resolution.run_id, resolution.sequence),
+                ).fetchone()
+                if old:
+                    if old[0] != encoded:
+                        raise SessionConflictError("control decision identity changed")
+                    return
+                state = self._state(resolution.run_id)
+                previous = conn.execute(
+                    "SELECT COALESCE(MAX(sequence),0) FROM control_decisions WHERE run_id=?",
+                    (resolution.run_id,),
+                ).fetchone()[0]
+                if (
+                    row is None
+                    or row[1] != "running"
+                    or state is None
+                    or state.sequence != resolution.observed_sequence
+                    or state.task.revision != resolution.task_revision
+                    or state.model_revision != resolution.proposal_revision
+                    or resolution.sequence != previous + 1
+                ):
+                    raise SessionConflictError(
+                        "control decision has no matching execution snapshot"
+                    )
+                conn.execute(
+                    "INSERT INTO control_decisions VALUES(?,?,?)",
+                    (
+                        resolution.run_id,
+                        resolution.sequence,
+                        encoded,
+                    ),
+                )
+                self._session_event(conn, row[0], SessionControlDecided(resolution=resolution))
+
+        await self._submit(record)
 
     async def interrupt(self, run_id: str, reason: str = "owner_exit") -> None:
         await self._submit(lambda: self._interrupt(run_id, reason))

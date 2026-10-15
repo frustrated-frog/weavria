@@ -416,7 +416,13 @@ def _reduce_turn(
         )
         return replace(next_state, skipped_call_ids=(*state.skipped_call_ids, data.call_id))
     _require(
-        state.journal_version != 3 or state.admission is not None, "settlement requires admission"
+        state.journal_version != 3
+        or state.admission is not None
+        or (
+            state.task.revision != state.model_revision
+            and set(state.skipped_call_ids) == calls.keys()
+        ),
+        "settlement requires admission or a wholly skipped obsolete proposal",
     )
     _require(
         not state.active_call_ids and settled == calls.keys(),

@@ -26,8 +26,10 @@ from .conversation import (
     ConversationItem,
     ConversationTurn,
     ConversationView,
+    DirectiveView,
     PastCall,
     SessionContextPrepared,
+    SessionControlDecided,
     SessionEvent,
     SessionInput,
     SessionInterrupted,
@@ -35,6 +37,7 @@ from .conversation import (
     SessionResult,
     SessionRunEvent,
     SessionSourceRead,
+    SessionTaskUpdated,
     SourceUse,
     TextExcerpt,
 )
@@ -57,6 +60,7 @@ from .execution import (
     ToolStarted,
 )
 from .feedback import maximum_exchange_bytes, minimum_exchange
+from .intervention import TaskDirective, TaskUpdate, TurnResolution
 from .journal import JournalEvent, decode_event
 from .lifecycle import InvalidStateTransitionError, RunStatus, transition_status
 from .messages import AgentRequest, Message, MessageRole
@@ -109,6 +113,7 @@ __all__ = [
     "ConversationTurn",
     "ConversationView",
     "DecisionDiscarded",
+    "DirectiveView",
     "ErrorCategory",
     "ExecutionData",
     "ExecutionEvent",
@@ -137,6 +142,7 @@ __all__ = [
     "RunStarted",
     "RunStatus",
     "SessionContextPrepared",
+    "SessionControlDecided",
     "SessionEvent",
     "SessionInput",
     "SessionInterrupted",
@@ -144,9 +150,12 @@ __all__ = [
     "SessionResult",
     "SessionRunEvent",
     "SessionSourceRead",
+    "SessionTaskUpdated",
     "SourceUse",
+    "TaskDirective",
     "TaskInput",
     "TaskRevised",
+    "TaskUpdate",
     "TextExcerpt",
     "ToolAuthorization",
     "ToolBatch",
@@ -160,6 +169,7 @@ __all__ = [
     "TurnDecided",
     "TurnFeedback",
     "TurnRequest",
+    "TurnResolution",
     "TurnSettled",
     "VerificationStarted",
     "decode_event",

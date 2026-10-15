@@ -4,7 +4,7 @@ Weavria 是一套实验性的 Python Agent Harness 与 Runtime，重点是让模
 
 当前已实现类型化核心契约、单动作与批量轮次 Agent 循环、有界只读工具调度、完整反馈汇合、执行前反馈预算准入、可替换成果验收与纠正、成果快照及按需读取、任务相关的片段选择、任务修订、预算和取消，以及事件驱动的状态投影。仍处于内核验证阶段，尚未接入真实模型供应商，未实现未完成执行的自动恢复。开发规范见 [AGENTS.md](AGENTS.md)。
 
-当前新增本地单用户持久多轮会话：`SessionEngine` 将独立 Run 连接为持续对话，保存接受事件、正式回答及原始成果；重启后可追问并通过受控工具读取历史来源。上下文按完整交互选择，过长文本有精确片段和原文回读；进程中断会明确保留未知调用状态。第一阶段尚未实现运行中追加指令或自动执行 Resume。使用、冻结实验和限制见 [持久会话](docs/persistent-sessions.md) 与 [ADR 0007](docs/decisions/0007-persistent-conversations.md)。
+当前支持本地单用户持久多轮会话与运行中 steering：`SessionEngine` 连接独立 Run，用户中途改变要求时修订当前任务、停止旧调用继续派发、保留已启动工作的结果，并逐轮重建历史上下文和重新验收。Harness 用独立 `TurnResolution` 表达重规划、继续、修正与完成；模型 Finish 仍需经过验收。重启后可追问、查看补充要求及重读历史成果，尚未实现自动执行 Resume。使用与限制见 [持久会话](docs/persistent-sessions.md)，机制和设计取舍见 [ADR 0008](docs/decisions/0008-interactive-turn-harness.md)。
 
 ## 开发环境
 
@@ -28,11 +28,12 @@ uv run python examples/agent_loop.py --json
 uv run python examples/control_loop.py
 uv run python examples/control_loop.py --json
 uv run python examples/session_experiment.py
+uv run python examples/steering_experiment.py
 ```
 
 示例实际读取本地资料、保存成果、调用读取工具，并从模型可见内容计算答案。相同任务与预算下比较完整历史、近期窗口和相关片段策略，检查答案来源、调用成本、依赖闭包与状态回放。这是确定性的信息交付实验，不是真实 LLM 能力评测。
 
-当前设计、源码流程、实验结果和局限见 [执行驱动的模型上下文](docs/model-context-selection.md) 与 [ADR 0003](docs/decisions/0003-execution-backed-context.md)。公开端口分别位于 `weavria.core`、`models`、`tools`、`artifacts`、`context` 与 `runtime`。
+当前设计、源码流程、实验结果和局限见 [执行驱动的模型上下文](docs/model-context-selection.md) 与 [ADR 0003](docs/decisions/0003-execution-backed-context.md)。公开端口分别位于 `weavria.core`、`models`、`tools`、`artifacts`、`context`、`runtime` 与 `sessions`。
 
 轮次实验从实际目录内容发现多个资料源，批量读取并依据失败反馈寻找替代资料；在串行与有界并发下核验结果、来源、成本和回放。原有 v2 机制与源码调研见 [轮次与反馈](docs/agent-loop.md)，现在通过 `LegacyAgentLoop` 显式保留。`AgentRun` 和 v1 日志保持兼容。
 

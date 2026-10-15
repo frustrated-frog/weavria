@@ -118,7 +118,7 @@ class FakeControlProvider:
 
 
 class FakeSessionProvider:
-    """Scripted v4 provider with isolated request copies, not a conversation-quality model."""
+    """Scripted v5 provider with isolated request copies, not a conversation-quality model."""
 
     capabilities = ModelCapabilities(tool_calls=True, multi_tool_calls=True)
 

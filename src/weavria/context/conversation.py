@@ -8,6 +8,7 @@ from weavria.core import (
     ConversationItem,
     ConversationTurn,
     ConversationView,
+    DirectiveView,
     TextExcerpt,
 )
 
@@ -49,6 +50,14 @@ def project_turn(turn: ConversationTurn, *, full: bool) -> ConversationItem:
         source_uses=turn.source_uses,
         unfinished_call_ids=turn.unfinished_call_ids,
         undispatched_call_ids=turn.undispatched_call_ids,
+        updates=tuple(
+            DirectiveView(
+                input_id=u.directive.input_id,
+                revision=u.task.revision,
+                text=_excerpt(u.directive.text, full),
+            )
+            for u in turn.updates
+        ),
     )
 
 
@@ -95,7 +104,16 @@ def select_conversation(
     if size(selected) > budget_bytes:
         raise ContextBudgetError(size(selected), budget_bytes)
     if mode is not EvidenceMode.FULL:
-        documents = [terms(t.user + " " + (t.assistant or "")) for t in turns]
+        documents = [
+            terms(
+                t.user
+                + " "
+                + (t.assistant or "")
+                + " "
+                + " ".join(u.directive.text for u in t.updates)
+            )
+            for t in turns
+        ]
         query_terms = set(terms(query))
         average = sum(map(len, documents)) / max(1, len(documents))
         scores: list[float] = []

@@ -4,7 +4,7 @@ import asyncio
 import json
 import uuid
 from collections.abc import Callable
-from dataclasses import asdict, replace
+from dataclasses import asdict
 from pathlib import Path
 from typing import Self
 
@@ -14,33 +14,34 @@ from weavria.artifacts import ArtifactSnapshot
 from weavria.context import ContextBudgetError, EvidenceMode, select_conversation
 from weavria.core import (
     CONTROL_FEEDBACK_BYTES,
-    AgentResult,
     ControlEvent,
     ControlRequest,
     ConversationView,
     ModelTurn,
-    RunEnded,
-    RunReport,
-    RunStatus,
     SessionRequest,
     SessionResult,
+    TaskDirective,
     TaskInput,
+    TaskUpdate,
+    TurnResolution,
 )
 from weavria.models import ModelCapabilities, SessionModelProvider
 from weavria.runtime import (
     AgentLoop,
     Clock,
     CompletionPolicy,
+    EventAcceptanceError,
     JournalCommitError,
     RunLimits,
     SystemClock,
     ToolScheduling,
+    TurnPreparation,
     settle_mutation,
 )
 from weavria.tools import ToolPolicy, ToolRegistry, artifact_read_tool
 
 from .evidence import session_history_tool, session_source_tool
-from .store import SQLiteSessionStore
+from .store import SessionBusyError, SessionConflictError, SQLiteSessionStore
 
 
 class _RunArtifacts:
@@ -66,20 +67,29 @@ class _SessionAdapter:
     def __init__(
         self,
         provider: SessionModelProvider,
-        view: ConversationView,
         budget: int,
         store: SQLiteSessionStore,
         run_id: str,
+        session_id: str,
+        ordinal: int,
+        history_budget: int,
+        history_mode: EvidenceMode,
+        instructions: str,
+        tools: ToolRegistry,
     ) -> None:
-        self._provider, self._view, self._budget = provider, view, budget
+        self._provider, self._budget = provider, budget
         self._store, self._run_id = store, run_id
+        self._session_id, self._ordinal = session_id, ordinal
+        self._history_budget, self._history_mode = history_budget, history_mode
+        self._instructions, self._tools = instructions, tools
+        self._prepared: dict[int, ConversationView] = {}
 
     @property
     def capabilities(self) -> ModelCapabilities:
         return self._provider.capabilities
 
     async def generate_turn(self, request: ControlRequest) -> ModelTurn:
-        outer = SessionRequest(conversation=self._view, current=request)
+        outer = SessionRequest(conversation=self._prepared[request.task.revision], current=request)
         if len(outer.model_dump_json().encode()) > self._budget:
             raise ContextBudgetError(len(outer.model_dump_json().encode()), self._budget)
         return await self._provider.generate_session(
@@ -90,8 +100,44 @@ class _SessionAdapter:
         await self._store.append(event)
 
     async def record_request(self, request: ControlRequest) -> None:
-        outer = SessionRequest(conversation=self._view, current=request)
-        await self._store.prepare_request(self._view.session_id, self._run_id, outer, self._budget)
+        outer = SessionRequest(conversation=self._prepared[request.task.revision], current=request)
+        await self._store.prepare_request(self._session_id, self._run_id, outer, self._budget)
+
+    async def append_revision(self, event: ControlEvent, update: TaskUpdate) -> None:
+        await self._store.append_revision(event, update)
+
+    async def record_resolution(self, resolution: TurnResolution) -> None:
+        await self._store.record_resolution(resolution)
+
+    async def prepare_turn(self, task: TaskInput) -> TurnPreparation:
+        sequence, count = await self._store.head(self._session_id)
+        history = await self._store.history(self._session_id, before_ordinal=self._ordinal)
+        template = AgentLoop.request_template_for(task, self._instructions, self._tools)
+        empty = ConversationView(session_id=self._session_id, through_sequence=sequence)
+        wire_fixed = len(
+            SessionRequest(conversation=empty, current=template).model_dump_json().encode()
+        ) - len(empty.model_dump_json().encode())
+        control_growth = CONTROL_FEEDBACK_BYTES - len(b"null")
+        budget = min(self._history_budget, self._budget - wire_fixed - control_growth)
+        if budget <= 0:
+            raise ContextBudgetError(wire_fixed + control_growth, self._budget)
+        plan = select_conversation(
+            session_id=self._session_id,
+            sequence=sequence,
+            turns=history,
+            total_turns=count,
+            query=task.goal + " " + " ".join(task.constraints),
+            budget_bytes=budget,
+            mode=self._history_mode,
+        )
+        view = plan.view
+        overhead = len(
+            SessionRequest(conversation=view, current=template).model_dump_json().encode()
+        ) - len(template.model_dump_json().encode())
+        # Only one attempt is active; discard obsolete prepared views after the
+        # previous model call/verification has joined, retaining bounded state.
+        self._prepared = {task.revision: view}
+        return TurnPreparation(task.revision, self._budget - overhead)
 
 
 class SessionEngine:
@@ -137,6 +183,10 @@ class SessionEngine:
         self._clock = clock or SystemClock()
         self._ids = id_generator or (lambda: uuid.uuid4().hex)
         self._tasks: set[asyncio.Task[object]] = set()
+        self._loops: dict[str, AgentLoop] = {}
+        self._run_tasks: dict[str, asyncio.Task[object]] = {}
+        self._storage_failed_runs: set[str] = set()
+        self._interventions = asyncio.Lock()
         self._closing = False
         self._close_task: asyncio.Task[None] | None = None
 
@@ -176,7 +226,7 @@ class SessionEngine:
                     + "."
                     + type(self._model).__qualname__,
                     "model_capabilities": asdict(self._model.capabilities),
-                    "session_tools_version": "1",
+                    "session_tools_version": "2",
                     "limits": asdict(self._limits),
                     "history_budget_bytes": self._history_budget,
                     "history_mode": self._history_mode.value,
@@ -207,43 +257,17 @@ class SessionEngine:
                 registered = (*registered, artifact_read_tool())
             registry = ToolRegistry((*registered, *extra))
             task = TaskInput(goal=text)
-            template = AgentLoop.request_template_for(task, self._instructions, registry)
-            sequence, count = await self.store.head(session_id)
-            history = await self.store.history(session_id, before_ordinal=claim.ordinal)
-            # Reserve the unchanged current-run control channel before allocating history.
-            empty = ConversationView(session_id=session_id, through_sequence=sequence)
-            wire_fixed = len(
-                SessionRequest(conversation=empty, current=template).model_dump_json().encode()
-            ) - len(empty.model_dump_json().encode())
-            control_growth = CONTROL_FEEDBACK_BYTES - len(b"null")
-            history_budget = min(
-                self._history_budget, self._limits.max_request_bytes - wire_fixed - control_growth
-            )
-            try:
-                if history_budget <= 0:
-                    raise ContextBudgetError(
-                        wire_fixed + control_growth, self._limits.max_request_bytes
-                    )
-                plan = select_conversation(
-                    session_id=session_id,
-                    sequence=sequence,
-                    turns=history,
-                    total_turns=count,
-                    query=text,
-                    budget_bytes=history_budget,
-                    mode=self._history_mode,
-                )
-            except ContextBudgetError:
-                return await self._reject_context(session_id, claim.input_id, run_id, task)
-            view = plan.view
-            overhead = len(
-                SessionRequest(conversation=view, current=template).model_dump_json().encode()
-            ) - len(template.model_dump_json().encode())
-            effective = replace(
-                self._limits, max_request_bytes=self._limits.max_request_bytes - overhead
-            )
             adapter = _SessionAdapter(
-                self._model, view, self._limits.max_request_bytes, self.store, run_id
+                self._model,
+                self._limits.max_request_bytes,
+                self.store,
+                run_id,
+                session_id,
+                claim.ordinal,
+                self._history_budget,
+                self._history_mode,
+                self._instructions,
+                registry,
             )
             loop = AgentLoop(
                 run_id=run_id,
@@ -252,14 +276,17 @@ class SessionEngine:
                 model=adapter,
                 tools=registry,
                 artifacts=_RunArtifacts(self.store, run_id),
-                limits=effective,
+                limits=self._limits,
                 scheduling=self._scheduling,
                 completion=self._completion,
                 policy=self._policy,
                 mode=self._mode,
                 clock=self._clock,
                 journal=adapter,
+                preparation=adapter,
             )
+            self._loops[session_id] = loop
+            self._run_tasks[run_id] = owner
             report = await loop.execute()
             return SessionResult(
                 session_id=session_id, input_id=claim.input_id, run_id=run_id, report=report
@@ -272,43 +299,72 @@ class SessionEngine:
                 if claimed_run is not None:
                     # A committed terminal report wins; interrupt only an actually open Run.
                     _, cancelled = await settle_mutation(
-                        self.store.interrupt(claimed_run, interruption_reason)
+                        self.store.interrupt(
+                            claimed_run,
+                            "storage_failure"
+                            if claimed_run in self._storage_failed_runs
+                            else interruption_reason,
+                        )
                     )
                     if cancelled:
                         raise asyncio.CancelledError
             finally:
+                active_loop = self._loops.get(session_id)
+                if active_loop is not None and active_loop.state.run_id == claimed_run:
+                    self._loops.pop(session_id)
+                if claimed_run is not None:
+                    self._run_tasks.pop(claimed_run, None)
+                    self._storage_failed_runs.discard(claimed_run)
                 self._tasks.discard(owner)
 
-    async def _reject_context(
-        self, session_id: str, input_id: str, run_id: str, task: TaskInput
-    ) -> SessionResult:
-        from weavria.core import RunStarted
+    async def steer(
+        self,
+        session_id: str,
+        text: str,
+        *,
+        input_id: str | None = None,
+        expected_run_id: str | None = None,
+    ) -> TaskUpdate:
+        """Apply an authored update to an active Run; an acknowledgment means durable application.
 
-        execution = AgentResult(run_id=run_id, status=RunStatus.BUDGET_EXHAUSTED)
-        events = (
-            ControlEvent(
-                run_id=run_id, sequence=1, occurred_at=self._clock.now(), data=RunStarted(task=task)
-            ),
-            ControlEvent(
-                run_id=run_id,
-                sequence=2,
-                occurred_at=self._clock.now(),
-                data=RunEnded(
-                    result=AgentResult(run_id=run_id, status=RunStatus.BUDGET_EXHAUSTED),
-                    reason="conversation_bytes",
-                ),
-            ),
+        Input IDs are idempotent across restart. No active Run means rejection,
+        not an implicit queue or a detached task.
+        """
+        if self._closing:
+            raise RuntimeError("session engine is closing")
+        owner = asyncio.current_task()
+        if owner is None or owner in self._tasks:
+            raise RuntimeError("steering requires a separate owned user-input task")
+        directive = TaskDirective(
+            input_id=input_id if input_id is not None else self._ids(), text=text
         )
-        for event in events:
-            _, cancelled = await settle_mutation(self.store.append(event))
-            if cancelled:
-                raise asyncio.CancelledError
-        return SessionResult(
-            session_id=session_id,
-            input_id=input_id,
-            run_id=run_id,
-            report=RunReport.from_execution(execution, None),
-        )
+        target = self._loops.get(session_id)
+        self._tasks.add(owner)
+        try:
+            async with self._interventions:
+                prior = await self.store.directive(session_id, directive.input_id, text)
+                if prior is not None:
+                    if expected_run_id is not None and prior.run_id != expected_run_id:
+                        raise SessionConflictError("directive belongs to a different Run")
+                    return prior
+                if (
+                    target is None
+                    or self._loops.get(session_id) is not target
+                    or (expected_run_id is not None and target.state.run_id != expected_run_id)
+                ):
+                    raise SessionBusyError("session has no active Run accepting steering")
+                try:
+                    return await target.apply_directive(directive)
+                except JournalCommitError:
+                    run_id = target.state.run_id
+                    self._storage_failed_runs.add(run_id)
+                    if run_owner := self._run_tasks.get(run_id):
+                        run_owner.cancel()
+                    raise
+                except EventAcceptanceError as exc:
+                    raise SessionBusyError("the active Run already settled") from exc
+        finally:
+            self._tasks.discard(owner)
 
     async def close(self) -> None:
         current = asyncio.current_task()

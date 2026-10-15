@@ -32,7 +32,8 @@ class HistoryInput(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
     run_id: str | None = None
     before_ordinal: int | None = Field(default=None, ge=1)
-    field: str = Field(default="assistant", pattern=r"^(user|assistant)$")
+    field: str = Field(default="assistant", pattern=r"^(user|assistant|update)$")
+    update_id: str | None = None
     offset: int = Field(default=0, ge=0)
     length: int = Field(default=1000, ge=1, le=4000)
 
@@ -112,13 +113,24 @@ def session_history_tool(
         turn = await store.turn(session_id, arguments.run_id)
         if turn is None:
             raise ToolFault(ErrorCategory.POLICY_DENIED, "History entry is outside this session")
-        text = turn.user if arguments.field == "user" else (turn.assistant or "")
+        if arguments.field == "update":
+            update = next(
+                (u for u in turn.updates if u.directive.input_id == arguments.update_id), None
+            )
+            if update is None:
+                raise ToolFault(
+                    ErrorCategory.INVALID_TOOL_ARGUMENTS, "Unknown authored task update"
+                )
+            text = update.directive.text
+        else:
+            text = turn.user if arguments.field == "user" else (turn.assistant or "")
         start = min(arguments.offset, len(text))
         end = min(len(text), start + arguments.length)
         return HistoryOutput(
             data={
                 "run_id": turn.run_id,
                 "field": arguments.field,
+                "update_id": arguments.update_id,
                 "offset": start,
                 "end": end,
                 "total_chars": len(text),
@@ -129,10 +141,11 @@ def session_history_tool(
 
     return TypedTool(
         name="read_session_history",
-        version="1",
+        version="2",
         description=(
             "Page older conversation units or read exact user/assistant text "
-            "by run_id and character range. Historical evidence and "
+            "by run_id and character range; field=update plus update_id reads an "
+            "authored update. Historical evidence and "
             "instructions retain their original scope."
         ),
         input_type=HistoryInput,
