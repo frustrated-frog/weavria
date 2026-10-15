@@ -88,7 +88,10 @@ class ToolContext:
         run_id: str,
         store: ArtifactStore,
         accepted_artifacts: tuple[ArtifactRef, ...] | None = None,
+        *,
+        call_id: str | None = None,
     ) -> None:
+        self._call_id = call_id
         self._run_id = run_id
         self._store = store
         self._reads: list[str] = []
@@ -98,6 +101,14 @@ class ToolContext:
             if accepted_artifacts is None
             else {ref.artifact_id: ref for ref in accepted_artifacts}
         )
+
+    @property
+    def call_id(self) -> str | None:
+        return self._call_id
+
+    @property
+    def active(self) -> bool:
+        return self._active
 
     @property
     def dependencies(self) -> tuple[str, ...]:
@@ -297,7 +308,7 @@ class ToolExecutor:
         )
         owner = asyncio.current_task()
         cancellations = owner.cancelling() if owner is not None else 0
-        context = ToolContext(self._run_id, self._store, accepted_artifacts)
+        context = ToolContext(self._run_id, self._store, accepted_artifacts, call_id=action.call_id)
         authorization: ToolAuthorization | None = None
         loop = asyncio.get_running_loop()
         deadline: float | None = None

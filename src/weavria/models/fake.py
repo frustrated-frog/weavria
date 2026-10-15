@@ -2,7 +2,14 @@
 
 import asyncio
 
-from weavria.core import ControlRequest, ModelRequest, ModelResponse, ModelTurn, TurnRequest
+from weavria.core import (
+    ControlRequest,
+    ModelRequest,
+    ModelResponse,
+    ModelTurn,
+    SessionRequest,
+    TurnRequest,
+)
 
 from .provider import ModelCapabilities
 
@@ -105,6 +112,37 @@ class FakeControlProvider:
             await asyncio.sleep(0)
             if index >= len(self._turns):
                 raise RuntimeError("Fake control script exhausted")
+            return ModelTurn.model_validate_json(self._turns[index])
+        finally:
+            self._active = False
+
+
+class FakeSessionProvider:
+    """Scripted v4 provider with isolated request copies, not a conversation-quality model."""
+
+    capabilities = ModelCapabilities(tool_calls=True, multi_tool_calls=True)
+
+    def __init__(self, turns: tuple[ModelTurn, ...]) -> None:
+        self._turns = tuple(ModelTurn.model_validate(t).model_dump_json() for t in turns)
+        self._requests: list[str] = []
+        self._cursor = 0
+        self._active = False
+
+    @property
+    def requests(self) -> tuple[SessionRequest, ...]:
+        return tuple(SessionRequest.model_validate_json(r) for r in self._requests)
+
+    async def generate_session(self, request: SessionRequest) -> ModelTurn:
+        if self._active:
+            raise RuntimeError("Fake session provider supports one active call")
+        self._active = True
+        try:
+            self._requests.append(SessionRequest.model_validate(request).model_dump_json())
+            index = self._cursor
+            self._cursor += 1
+            await asyncio.sleep(0)
+            if index >= len(self._turns):
+                raise RuntimeError("Fake session script exhausted")
             return ModelTurn.model_validate_json(self._turns[index])
         finally:
             self._active = False

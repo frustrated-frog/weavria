@@ -1,6 +1,7 @@
 """Host-authorized bounded dispatch; no task escapes its parent turn."""
 
 import asyncio
+import inspect
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
@@ -28,7 +29,7 @@ async def dispatch_batch(
     scheduling: ToolScheduling,
     execute: Callable[[ToolCallAction], Awaitable[None]],
     obsolete: Callable[[], bool],
-    skip: Callable[[ToolCallAction], None],
+    skip: Callable[[ToolCallAction], Awaitable[None] | None],
 ) -> None:
     """Drain contiguous parallel groups around exclusive calls, joining on every exit."""
     index = 0
@@ -50,7 +51,9 @@ async def dispatch_batch(
                     call = calls[index]
                     index += 1
                     if obsolete():
-                        skip(call)
+                        skipped = skip(call)
+                        if inspect.isawaitable(skipped):
+                            await skipped
                     else:
                         active.add(owner.create_task(invoke(call)))
                 if active:

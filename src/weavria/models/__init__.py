@@ -1,29 +1,34 @@
 """Public model port, checked invocation and deterministic provider."""
 
-from .fake import FakeControlProvider, FakeModelProvider, FakeTurnProvider
+from .fake import FakeControlProvider, FakeModelProvider, FakeSessionProvider, FakeTurnProvider
 from .provider import (
     ControlModelProvider,
     ModelCallError,
     ModelCapabilities,
     ModelProvider,
     ModelTimeoutOrigin,
+    SessionModelProvider,
     TurnModelProvider,
     call_controlled_model,
     call_model,
     call_model_turn,
+    call_session_model,
 )
 
 __all__ = [
     "ControlModelProvider",
     "FakeControlProvider",
     "FakeModelProvider",
+    "FakeSessionProvider",
     "FakeTurnProvider",
     "ModelCallError",
     "ModelCapabilities",
     "ModelProvider",
     "ModelTimeoutOrigin",
+    "SessionModelProvider",
     "TurnModelProvider",
     "call_controlled_model",
     "call_model",
     "call_model_turn",
+    "call_session_model",
 ]

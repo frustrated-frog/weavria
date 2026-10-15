@@ -13,6 +13,7 @@ LAYERS = {
     "tools": ("core", "artifacts"),
     "context": ("core", "artifacts"),
     "runtime": ("core", "models", "artifacts", "tools", "context"),
+    "sessions": ("core", "models", "artifacts", "tools", "context", "runtime"),
 }
 
 

@@ -16,6 +16,7 @@ from weavria.core import (
     ModelResponse,
     ModelTurn,
     RunError,
+    SessionRequest,
     ToolBatch,
     ToolCallAction,
     TurnRequest,
@@ -82,6 +83,30 @@ class ControlModelProvider(Protocol):
     def capabilities(self) -> ModelCapabilities: ...
 
     async def generate_turn(self, request: ControlRequest) -> ModelTurn: ...
+
+
+class SessionModelProvider(Protocol):
+    """Encode both conversation provenance and current control observations."""
+
+    @property
+    def capabilities(self) -> ModelCapabilities: ...
+
+    async def generate_session(self, request: SessionRequest) -> ModelTurn: ...
+
+
+async def call_session_model(
+    provider: SessionModelProvider, request: SessionRequest, *, max_duration: float = 30.0
+) -> ModelTurn:
+    result, capabilities = await _invoke_model(
+        provider.generate_session,
+        lambda: provider.capabilities,
+        request,
+        SessionRequest,
+        ModelTurn,
+        max_duration,
+    )
+    _validate_batch_capabilities(result, capabilities)
+    return result
 
 
 async def call_controlled_model(
@@ -151,7 +176,7 @@ def _validate_batch_capabilities(result: ModelTurn, capabilities: ModelCapabilit
         )
 
 
-async def _invoke_model[Input: ModelRequest | TurnRequest | ControlRequest, Response: BaseModel](
+async def _invoke_model[Input: BaseModel, Response: BaseModel](
     generate: Callable[[Input], Awaitable[Response]],
     get_capabilities: Callable[[], ModelCapabilities],
     request: Input,

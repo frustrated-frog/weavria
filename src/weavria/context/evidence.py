@@ -482,6 +482,10 @@ class EvidenceContextBuilder:
                 selected = dict(enumerate(full))
                 reasons = dict.fromkeys(selected, "full_history")
             else:
+                for index in mandatory:
+                    candidate = proposal(index, full[index])
+                    if total(candidate) <= max_request_bytes:
+                        selected = candidate
                 # A successful admission promises the minimum feedback, not full
                 # raw payloads. Keep that promise and expose the fallback in metadata.
                 reasons.update(dict.fromkeys(selected, "full_budget_fallback"))

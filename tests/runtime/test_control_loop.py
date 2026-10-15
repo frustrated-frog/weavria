@@ -993,3 +993,27 @@ async def test_noncompleted_report_cannot_publish_an_accepted_verification() -> 
             execution=AgentResult(run_id="run", status=RunStatus.CANCELLED),
             assessment=result.assessment,
         )
+
+
+async def test_full_fallback_keeps_latest_complete_feedback_when_it_fits_individually() -> None:
+    async def medium(arguments: Input, context: ToolContext) -> Output:
+        return Output(value="x" * 2500)
+
+    probe = make_loop(
+        FakeControlProvider((batch(call("a")), finish())), execute=medium, mode=EvidenceMode.FULL
+    )
+    await probe.execute()
+    budget = probe.plans[-1].request_bytes + probe.plans[-1].control_padding_bytes + 100
+    provider = FakeControlProvider((batch(call("a")), batch(call("b")), finish()))
+    agent = make_loop(provider, execute=medium, mode=EvidenceMode.FULL, budget=budget)
+    assert (await agent.execute()).status is RunStatus.COMPLETED
+    last = provider.requests[-1]
+    latest = next(
+        e for e in last.history if isinstance(e, ToolExchange) and e.action.call_id == "b"
+    )
+    observation = latest.observation
+    assert not isinstance(observation, ToolFailedObservation)
+    assert isinstance(observation.output, dict)
+    assert observation.output["representation"] == "full"
+    assert observation.output["data"] == {"value": "x" * 2500}
+    assert agent.plans[-1].request_bytes + agent.plans[-1].control_padding_bytes <= budget

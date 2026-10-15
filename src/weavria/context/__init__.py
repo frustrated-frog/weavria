@@ -1,6 +1,7 @@
 """Public deterministic context policies and inspected model input plans."""
 
 from .admission import FeedbackReservation, reserve_feedback
+from .conversation import ConversationPlan, project_turn, select_conversation
 from .evidence import (
     ControlEvidencePlan,
     EvidenceContextBuilder,
@@ -30,6 +31,7 @@ __all__ = [
     "ContextBuildError",
     "ContextPlan",
     "ControlEvidencePlan",
+    "ConversationPlan",
     "EvidenceContextBuilder",
     "EvidenceDecision",
     "EvidenceMode",
@@ -44,5 +46,7 @@ __all__ = [
     "SelectionReason",
     "TurnEvidencePlan",
     "build_context",
+    "project_turn",
     "reserve_feedback",
+    "select_conversation",
 ]
