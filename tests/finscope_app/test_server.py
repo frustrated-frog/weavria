@@ -126,8 +126,13 @@ async def test_widget_has_parent_and_script_restrictions(tmp_path: Path) -> None
             transport=httpx.ASGITransport(app=app), base_url="http://sidecar.test"
         ) as client:
             response = await client.get("/widget")
+            script = await client.get("/widget-assets/widget.js")
 
     assert response.status_code == 200
     assert "frame-ancestors http://localhost:5173" in response.headers["content-security-policy"]
     assert '<script src="/widget-assets/widget.js" defer></script>' in response.text
+    assert '<button type="button" id="send">发送</button>' in response.text
+    assert script.status_code == 200
+    assert "send.addEventListener('click'" in script.text
+    assert "void submitQuestion();" in script.text
     await market_http.aclose()

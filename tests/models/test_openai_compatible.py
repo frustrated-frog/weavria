@@ -8,6 +8,7 @@ from weavria.core import (
     FinishAction,
     SessionRequest,
     TaskInput,
+    ToolBatch,
 )
 from weavria.models.openai_compatible import (
     OpenAICompatibleConfig,
@@ -107,6 +108,66 @@ async def test_session_provider_joins_text_content_parts() -> None:
     turn = await provider.generate_session(request)
 
     assert turn.decision == FinishAction(output="完成")
+
+
+async def test_session_provider_assigns_deterministic_request_scoped_call_ids() -> None:
+    transport = StubTransport(
+        {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "decision": {
+                                    "kind": "tool_batch",
+                                    "calls": [
+                                        {
+                                            "kind": "tool_call",
+                                            "call_id": "reused-label",
+                                            "tool_name": "read",
+                                            "arguments": {"part": 1},
+                                        },
+                                        {
+                                            "kind": "tool_call",
+                                            "call_id": "reused-label",
+                                            "tool_name": "read",
+                                            "arguments": {"part": 2},
+                                        },
+                                    ],
+                                }
+                            }
+                        )
+                    }
+                }
+            ]
+        }
+    )
+    provider = OpenAICompatibleSessionProvider(
+        OpenAICompatibleConfig(model="model"),
+        transport=transport,
+    )
+    request = SessionRequest(
+        conversation=ConversationView(session_id="session", through_sequence=4),
+        current=ControlRequest(instructions="rules", task=TaskInput(goal="question")),
+    )
+
+    first = await provider.generate_session(request)
+    repeated = await provider.generate_session(request)
+    advanced = await provider.generate_session(
+        request.model_copy(
+            update={"conversation": ConversationView(session_id="session", through_sequence=5)}
+        )
+    )
+
+    assert isinstance(first.decision, ToolBatch)
+    assert isinstance(repeated.decision, ToolBatch)
+    assert isinstance(advanced.decision, ToolBatch)
+    first_ids = tuple(call.call_id for call in first.decision.calls)
+    assert len(set(first_ids)) == 2
+    assert all(identity.startswith("wvr-") for identity in first_ids)
+    assert first_ids == tuple(call.call_id for call in repeated.decision.calls)
+    assert first_ids != tuple(call.call_id for call in advanced.decision.calls)
+    assert [call.arguments for call in first.decision.calls] == [{"part": 1}, {"part": 2}]
 
 
 class StubTransport:

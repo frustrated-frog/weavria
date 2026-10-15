@@ -30,12 +30,20 @@ document.querySelectorAll('.suggestions button').forEach((button) => {
 question.addEventListener('keydown', (event) => {
   if (event.key === 'Enter' && !event.shiftKey) {
     event.preventDefault();
-    form.requestSubmit();
+    void submitQuestion();
   }
 });
 
-form.addEventListener('submit', async (event) => {
+send.addEventListener('click', () => {
+  void submitQuestion();
+});
+
+form.addEventListener('submit', (event) => {
   event.preventDefault();
+  void submitQuestion();
+});
+
+async function submitQuestion() {
   const text = question.value.trim();
   if (!text || state.busy) return;
   if (!state.context) {
@@ -55,7 +63,7 @@ form.addEventListener('submit', async (event) => {
   } finally {
     setBusy(false, false);
   }
-});
+}
 
 async function sendMessage(text, retried) {
   if (!state.sessionId) {

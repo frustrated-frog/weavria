@@ -15,7 +15,9 @@ Java Research Runtime，不能通过替换或共享数据库把两个 Runtime �
 
 1. 通用 `OpenAICompatibleSessionProvider` 放在模型适配层，只负责编码请求和归一化响应；
    HTTP 地址、认证、超时与客户端生命周期由应用层注入的 Transport 负责，模型子系统不引入
-   网络依赖，也不理解 FinScope。
+   网络依赖，也不理解 FinScope。供应商 JSON 中的 `call_id` 只视为不可信占位符；适配器用
+   完整 `SessionRequest` 的 SHA-256 与批次序号分配确定性身份。Runtime 仍会拒绝已消费身份，
+   不把模型是否擅长生成全局唯一 ID 变成执行正确性的前提。
 2. FinScope 的 HTTP 映射、类型化工具、提示词、验收规则和 Widget 全部放在
    `apps/finscope`；`weavria` 包不得导入该目录。
 3. Widget 由 sidecar 自己提供，通过 iframe 隔离样式、脚本和会话状态。宿主只发送受限的
@@ -53,3 +55,5 @@ Java Research Runtime，不能通过替换或共享数据库把两个 Runtime �
 - iframe 的视觉与状态不会污染 FinScope，但需要单独处理响应式布局和父子消息协议。
 - 同步首版不能展示逐步事件；只有真实试用证明过程可视化有价值后，才考虑通用流式 Host。
 - 验收策略只能证明回答使用了实际市场快照、标明质量和来源，不能证明金融判断正确。
+- 调用身份在同一模型请求重放时保持稳定；会话进度变化后会得到新身份。这保留了可复现性，
+  但不替供应商重试或 Runtime 执行声明 exactly-once。
