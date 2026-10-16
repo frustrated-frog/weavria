@@ -45,8 +45,9 @@ async def test_market_client_classifies_timeout_without_swallowing_cancellation(
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(timeout)) as http:
         client = MarketPulseClient("http://finscope.test", client=http)
-        with pytest.raises(ToolFault, match="market data is unavailable"):
+        with pytest.raises(ToolFault, match="market data is unavailable") as raised:
             await client.read(None, "overview")
+        assert raised.value.retryable is True
 
     def cancel(_request: httpx.Request) -> httpx.Response:
         raise asyncio.CancelledError

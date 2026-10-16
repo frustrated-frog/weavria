@@ -7,14 +7,19 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 
 from weavria.artifacts import InMemoryArtifactStore
 from weavria.core import (
+    CompletionAccept,
+    CompletionNotice,
+    CompletionRepair,
     ErrorCategory,
     FinishAction,
     Message,
     MessageRole,
     ModelRequest,
     ModelResponse,
+    ModelTurn,
     RunStatus,
     TaskInput,
+    ToolBatch,
     ToolCallAction,
 )
 from weavria.harness import (
@@ -30,7 +35,7 @@ from weavria.harness import (
     TaskUnderstandingError,
     TaskUnderstandingInput,
 )
-from weavria.models import FakeModelProvider, ModelCapabilities
+from weavria.models import FakeControlProvider, FakeModelProvider, ModelCapabilities
 from weavria.tools import ToolContext, ToolRegistry, TypedTool
 
 
@@ -471,8 +476,8 @@ async def test_valid_but_oversized_specification_fails_at_the_typed_boundary() -
 
 async def test_direct_task_hides_all_tools_and_executes_without_a_tool_call() -> None:
     understanding_model = FakeModelProvider((_declaration(_direct()),))
-    action_model = FakeModelProvider(
-        (ModelResponse(action=FinishAction(output="I am a bounded task agent.")),)
+    action_model = FakeControlProvider(
+        (ModelTurn(decision=FinishAction(output="I am a bounded task agent.")),)
     )
     agent = TaskAwareAgent(
         understanding=TaskUnderstandingEngine(ModelTaskInterpreter(understanding_model)),
@@ -498,16 +503,20 @@ async def test_direct_task_hides_all_tools_and_executes_without_a_tool_call() ->
 
 async def test_execute_task_exposes_only_selected_capability_and_preserves_evidence() -> None:
     understanding_model = FakeModelProvider((_declaration(_execute()),))
-    action_model = FakeModelProvider(
+    action_model = FakeControlProvider(
         (
-            ModelResponse(
-                action=ToolCallAction(
-                    call_id="read-1",
-                    tool_name="read_document",
-                    arguments={"document": "report.txt"},
+            ModelTurn(
+                decision=ToolBatch(
+                    calls=(
+                        ToolCallAction(
+                            call_id="read-1",
+                            tool_name="read_document",
+                            arguments={"document": "report.txt"},
+                        ),
+                    )
                 )
             ),
-            ModelResponse(action=FinishAction(output="The report was read.")),
+            ModelTurn(decision=FinishAction(output="The report was read.")),
         )
     )
     agent = TaskAwareAgent(
@@ -524,14 +533,15 @@ async def test_execute_task_exposes_only_selected_capability_and_preserves_evide
     assert execution.preparation.record.selected_capabilities == ("read_document",)
     assert tuple(d.name for d in execution.preparation.tools.descriptors) == ("read_document",)
     assert "content:report.txt" in action_model.requests[1].model_dump_json()
+    assert action_model.requests[1].feedback is not None
     first_request = action_model.requests[0].model_dump_json()
     assert "read_document" in first_request and "send_message" not in first_request
 
 
 async def test_clarification_route_hides_capabilities_and_keeps_raw_goal() -> None:
     understanding_model = FakeModelProvider((_declaration(_clarify()),))
-    action_model = FakeModelProvider(
-        (ModelResponse(action=FinishAction(output="Which document should I read?")),)
+    action_model = FakeControlProvider(
+        (ModelTurn(decision=FinishAction(output="Which document should I read?")),)
     )
     agent = TaskAwareAgent(
         understanding=TaskUnderstandingEngine(ModelTaskInterpreter(understanding_model)),
@@ -557,6 +567,48 @@ async def test_clarification_route_hides_capabilities_and_keeps_raw_goal() -> No
         TaskFrame.model_validate_json(json.dumps(observation.payload)).specification.goal
         == "Ask which document the user means"
     )
+
+
+async def test_task_aware_agent_preserves_completion_control_for_the_next_decision() -> None:
+    class RepairOnce:
+        version = "repair-once/1"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def verify(self, context: object) -> CompletionAccept | CompletionRepair:
+            self.calls += 1
+            if self.calls == 1:
+                return CompletionRepair(
+                    issue_codes=("answer_too_early",),
+                    guidance="Answer again after considering the completion feedback",
+                )
+            return CompletionAccept(outcome="unverified")
+
+    understanding_model = FakeModelProvider((_declaration(_direct()),))
+    action_model = FakeControlProvider(
+        (
+            ModelTurn(decision=FinishAction(output="first candidate")),
+            ModelTurn(decision=FinishAction(output="repaired candidate")),
+        )
+    )
+    policy = RepairOnce()
+    agent = TaskAwareAgent(
+        understanding=TaskUnderstandingEngine(ModelTaskInterpreter(understanding_model)),
+        model=action_model,
+        tools=_tools(),
+        artifacts=InMemoryArtifactStore(),
+        instructions="Complete the typed task.",
+        completion=policy,
+    )
+
+    execution = await agent.execute(run_id="repair-run", task=TaskInput(goal="Who are you?"))
+
+    assert execution.result.output == "repaired candidate"
+    assert policy.calls == 2
+    notice = action_model.requests[1].control
+    assert isinstance(notice, CompletionNotice)
+    assert notice.decision.issue_codes == ("answer_too_early",)
 
 
 def test_tool_registry_selection_is_ordered_and_fails_closed() -> None:

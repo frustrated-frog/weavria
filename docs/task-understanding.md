@@ -65,6 +65,11 @@ AgentLoop v3
 direct、clarify 与 execute 的验收义务，但它仍是模型推断而非事实证据；是否接受及如何验证
 仍由可信的 CompletionPolicy 决定。
 
+独立 `TaskAwareAgent` 的执行模型必须实现 v3 `ControlModelProvider`。它会原样收到工具批次
+的完整 `feedback` 和准入/完成验收产生的 `control`；旧的单动作 `ModelProvider` 只用于旧
+入口和任务解释器，不再通过有损适配器接入 v3。工具失败中的 `retryable` 事实也会保留到
+反馈，但是否重试仍由幂等、Policy、预算和模型决策共同约束。
+
 ## 如何观察
 
 冻结结构实验：
@@ -101,6 +106,10 @@ uv run python examples/live_task_understanding.py --repeats 3
 - OpenAI-compatible 解释器仍用 JSON tool-call 协议，不等于供应商原生 Structured Output；
 - 结构纠错只有一次，不做多候选投票，也不保证修复语义上错误但结构合法的解释；
 - 没有任何 FinScope 类型、金融术语或页面流程进入 Core、Runtime 或 Harness。
+
+Stage 0 已封住三条既有失败链：v3 控制信息不再在 TaskAwareAgent 丢失；应用完成策略可以在
+数据源已经失败后以 unverifiable 有界结束；供应商明确标记截断的 JSON 不会经补括号后形成
+动作。它们只恢复已有协议的完整性，不代表已经实现持续 Task Frame 或 Need Grounding。
 
 下一小步应深化“信息需求与证据 grounding”：让 Frame 中的事实依赖在执行过程中拥有可验证
 的满足状态，并把它与完成义务连接起来，而不是继续增加新的意图标签。设计依据和取舍见

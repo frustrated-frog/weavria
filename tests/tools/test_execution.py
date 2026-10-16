@@ -12,6 +12,7 @@ from weavria.tools import (
     ToolContext,
     ToolDescriptor,
     ToolExecutor,
+    ToolFault,
     ToolRegistry,
     TypedTool,
     artifact_read_tool,
@@ -95,6 +96,31 @@ async def test_dispatch_rejection_is_safe_feedback(
     assert record.artifact is None
 
 
+async def test_backend_retryability_is_preserved_in_model_feedback() -> None:
+    async def unavailable(arguments: Input, context: ToolContext) -> Output:
+        raise ToolFault(
+            ErrorCategory.TOOL_FAILURE,
+            "Temporary source failure",
+            retryable=True,
+        )
+
+    backend = TypedTool(
+        name="temporary",
+        version="1",
+        description="Read a temporarily unavailable source",
+        input_type=Input,
+        output_type=Output,
+        execute=unavailable,
+    )
+    record = await ToolExecutor(
+        "run", ToolRegistry((backend,)), InMemoryArtifactStore(), ReadOnlyPolicy()
+    ).execute(action({"value": 1}, "temporary"), max_duration=1)
+
+    observation = record.exchange.observation
+    assert isinstance(observation, ToolFailedObservation)
+    assert observation.error.retryable is True
+
+
 async def test_even_custom_policy_cannot_enable_unsupported_side_effects() -> None:
     class Allow:
         async def authorize(
@@ -165,6 +191,7 @@ async def test_timeout_and_external_cancellation_cleanup_the_backend(external: b
         record = await task
         assert isinstance(record.exchange.observation, ToolFailedObservation)
         assert record.exchange.observation.error.category is ErrorCategory.TIMEOUT
+        assert record.exchange.observation.error.retryable is True
     assert cleaned.is_set()
     with pytest.raises(RuntimeError, match="closed"):
         await saved[0].read_artifact("missing")

@@ -15,3 +15,4 @@
 - [0009 任务理解与最小能力暴露](0009-task-understanding-capability-resolution.md)
 - [0009 以外置 Sidecar 验证领域应用接入](0009-external-application-sidecar.md)
 - [0010 有界恢复不完整 JSON 信封](0010-bounded-json-envelope-recovery.md)
+- [0011 任务理解 Stage 0 的控制完整性与失败降级](0011-task-understanding-stage-zero-control-integrity.md)

@@ -62,8 +62,8 @@ class OpenAICompatibleProvider:
         body = self._request_body(validated)
         try:
             payload = await self._transport.complete(body)
-            content = _message_content(payload)
-            decoded = _JSON_OBJECT.validate_json(_unwrap_json(content))
+            content, finish_reason = _message_generation(payload)
+            decoded = _JSON_OBJECT.validate_json(_unwrap_json(content, finish_reason))
             normalized = _assign_call_id(decoded, validated)
             return ModelResponse.model_validate_json(
                 json.dumps(normalized, ensure_ascii=False, separators=(",", ":"))
@@ -150,8 +150,8 @@ class OpenAICompatibleSessionProvider:
             body["response_format"] = {"type": "json_object"}
         try:
             payload = await self._transport.complete(body)
-            content = _message_content(payload)
-            decoded = _JSON_OBJECT.validate_json(_unwrap_json(content))
+            content, finish_reason = _message_generation(payload)
+            decoded = _JSON_OBJECT.validate_json(_unwrap_json(content, finish_reason))
             normalized = _assign_call_ids(decoded, validated)
             return ModelTurn.model_validate_json(
                 json.dumps(normalized, ensure_ascii=False, separators=(",", ":"))
@@ -173,6 +173,7 @@ class _Message(BaseModel):
 class _Choice(BaseModel):
     model_config = ConfigDict(extra="ignore")
     message: _Message
+    finish_reason: str | None = None
 
 
 class _CompletionResponse(BaseModel):
@@ -180,13 +181,17 @@ class _CompletionResponse(BaseModel):
     choices: tuple[_Choice, ...]
 
 
-def _message_content(payload: object) -> str:
+def _message_generation(payload: object) -> tuple[str, str | None]:
     parsed = _CompletionResponse.model_validate(payload)
     if not parsed.choices:
         raise ValueError("model response has no choices")
-    content = parsed.choices[0].message.content
+    choice = parsed.choices[0]
+    finish_reason = choice.finish_reason
+    if finish_reason in {"length", "content_filter"}:
+        raise ValueError(f"model response ended with {finish_reason}")
+    content = choice.message.content
     if isinstance(content, str) and content.strip():
-        return content
+        return content, finish_reason
     if isinstance(content, tuple):
         parts: list[str] = []
         for item in content:
@@ -196,17 +201,19 @@ def _message_content(payload: object) -> str:
                 parts.append(item.text)
         joined = "".join(parts)
         if joined.strip():
-            return joined
+            return joined, finish_reason
     raise ValueError("model response has no final message content")
 
 
-def _unwrap_json(content: str) -> str:
+def _unwrap_json(content: str, finish_reason: str | None) -> str:
     stripped = content.strip()
     if stripped.startswith("```json") and stripped.endswith("```"):
         stripped = stripped[7:-3].strip()
     elif stripped.startswith("```") and stripped.endswith("```"):
         stripped = stripped[3:-3].strip()
-    completed, recovered = _complete_missing_delimiters(stripped)
+    completed, recovered = (
+        _complete_missing_delimiters(stripped) if finish_reason == "stop" else (stripped, 0)
+    )
     if recovered:
         _LOGGER.warning(
             "Recovered incomplete model JSON envelope by appending %d delimiter(s)",

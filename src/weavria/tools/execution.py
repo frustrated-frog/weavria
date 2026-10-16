@@ -71,8 +71,11 @@ class ToolDescriptor(BaseModel):
 class ToolFault(Exception):
     """A stable dispatch failure; raw backend errors remain exception causes."""
 
-    def __init__(self, category: ErrorCategory, message: str) -> None:
+    def __init__(self, category: ErrorCategory, message: str, *, retryable: bool = False) -> None:
+        if type(retryable) is not bool:
+            raise TypeError("tool fault retryable flag must be a boolean")
         self.category = category
+        self.retryable = retryable
         super().__init__(message)
 
 
@@ -319,6 +322,7 @@ class ToolExecutor:
         cancellations = owner.cancelling() if owner is not None else 0
         context = ToolContext(self._run_id, self._store, accepted_artifacts, call_id=action.call_id)
         authorization: ToolAuthorization | None = None
+        retryable = False
         loop = asyncio.get_running_loop()
         deadline: float | None = None
         limit: asyncio.Timeout | None = None
@@ -406,12 +410,15 @@ class ToolExecutor:
         except ToolFault as exc:
             if attempt_expired():
                 category, message, cause = ErrorCategory.TIMEOUT, "Tool call timed out", exc
+                retryable = True
             else:
                 category, message, cause = exc.category, str(exc), exc.__cause__
+                retryable = exc.retryable
         except TimeoutError as exc:
             if owner is not None and owner.cancelling() > cancellations:
                 raise asyncio.CancelledError from exc
             category, message, cause = ErrorCategory.TIMEOUT, "Tool call timed out", exc
+            retryable = True
         except Exception as exc:
             if owner is not None and owner.cancelling() > cancellations:
                 raise asyncio.CancelledError from exc
@@ -434,6 +441,7 @@ class ToolExecutor:
                     error=RunError(
                         category=category,
                         message=message,
+                        retryable=retryable,
                         cause_type=type(cause).__name__ if cause else None,
                     ),
                 ),

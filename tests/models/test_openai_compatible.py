@@ -33,8 +33,8 @@ class Transport:
         return self.response
 
 
-def _response(content: object) -> dict[str, object]:
-    return {"choices": [{"message": {"content": content}}]}
+def _response(content: object, *, finish_reason: str | None = "stop") -> dict[str, object]:
+    return {"choices": [{"message": {"content": content}, "finish_reason": finish_reason}]}
 
 
 def _request() -> ModelRequest:
@@ -103,6 +103,32 @@ async def test_adapter_completes_a_bounded_missing_json_suffix(
 
     assert result.action == FinishAction(output="done")
     assert "appending 1 delimiter(s)" in caplog.text
+
+
+async def test_adapter_rejects_truncated_output_before_json_recovery() -> None:
+    provider = OpenAICompatibleProvider(
+        OpenAICompatibleConfig(model="test"),
+        transport=Transport(
+            _response(
+                '{"action":{"kind":"tool_call","tool_name":"read_document",'
+                '"arguments":{"name":"a.txt"}}',
+                finish_reason="length",
+            )
+        ),
+    )
+
+    with pytest.raises(ValueError, match="valid JSON action"):
+        await provider.generate(_request())
+
+
+async def test_adapter_does_not_recover_without_a_normal_finish_signal() -> None:
+    payload = {"choices": [{"message": {"content": '{"action":{"kind":"finish","output":"done"}'}}]}
+    provider = OpenAICompatibleProvider(
+        OpenAICompatibleConfig(model="test"), transport=Transport(payload)
+    )
+
+    with pytest.raises(ValueError, match="valid JSON action"):
+        await provider.generate(_request())
 
 
 @pytest.mark.parametrize(
@@ -197,6 +223,21 @@ async def test_session_provider_completes_a_missing_outer_delimiter() -> None:
     turn = await provider.generate_session(_session_request())
 
     assert turn.decision == FinishAction(output="完成")
+
+
+async def test_session_provider_rejects_complete_json_when_supplier_reports_truncation() -> None:
+    provider = OpenAICompatibleSessionProvider(
+        OpenAICompatibleConfig(model="model"),
+        transport=Transport(
+            _response(
+                '{"decision":{"kind":"finish","output":"不完整"}}',
+                finish_reason="length",
+            )
+        ),
+    )
+
+    with pytest.raises(ValueError, match="valid JSON turn"):
+        await provider.generate_session(_session_request())
 
 
 async def test_session_provider_assigns_deterministic_request_scoped_call_ids() -> None:

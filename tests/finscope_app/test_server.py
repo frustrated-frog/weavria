@@ -5,7 +5,15 @@ import httpx
 from apps.finscope.config import FinScopeSettings
 from apps.finscope.market import MarketPulseClient
 from apps.finscope.server import MessageOutput, SessionCreated, create_app
-from weavria.core import FinishAction, ModelResponse, ModelTurn, ToolBatch, ToolCallAction
+from weavria.core import (
+    FinishAction,
+    ModelResponse,
+    ModelTurn,
+    ToolBatch,
+    ToolCallAction,
+    ToolExchange,
+    ToolFailedObservation,
+)
 from weavria.harness import (
     CapabilityNeed,
     CompletionCriterion,
@@ -224,6 +232,89 @@ async def test_direct_question_uses_task_frame_without_market_tool(tmp_path: Pat
     assert payload.answer == "我是只读的市场研究助手。"
     assert payload.tools == ()
     assert market_calls == 0
+    await market_http.aclose()
+
+
+async def test_market_source_failure_finishes_unverifiable_without_completion_loop(
+    tmp_path: Path,
+) -> None:
+    market_calls = 0
+
+    def market_response(_request: httpx.Request) -> httpx.Response:
+        nonlocal market_calls
+        market_calls += 1
+        return httpx.Response(503, json={"success": False})
+
+    market_http = httpx.AsyncClient(transport=httpx.MockTransport(market_response))
+    provider = FakeSessionProvider(
+        (
+            ModelTurn(
+                decision=ToolBatch(
+                    calls=(
+                        ToolCallAction(
+                            call_id="market-read-failed",
+                            tool_name="read_market_pulse",
+                            arguments={"business_date": "2026-10-15", "focus": "overview"},
+                        ),
+                    )
+                )
+            ),
+            ModelTurn(decision=FinishAction(output="市场数据源暂时不可用, 本次无法判断市场阶段。")),
+        )
+    )
+    app = create_app(
+        FinScopeSettings(
+            model_base_url="http://model.test",
+            model_name="fake",
+            model_api_key="",
+            state_path=tmp_path / "sessions.sqlite3",
+        ),
+        provider=provider,
+        interpreter_provider=FakeModelProvider((_declaration(_market_execution()),)),
+        market_client=MarketPulseClient("http://finscope.test", client=market_http),
+    )
+
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://sidecar.test"
+        ) as client:
+            created = SessionCreated.model_validate((await client.post("/api/sessions")).json())
+            response = await client.post(
+                f"/api/sessions/{created.session_id}/messages",
+                json={
+                    "input_id": "unavailable-market-1",
+                    "text": "今天是什么市场阶段?",
+                    "context": {
+                        "schema_version": 1,
+                        "surface": "market_pulse",
+                        "business_date": "2026-10-15",
+                        "current_view": "panorama",
+                        "quality_status": "UNAVAILABLE",
+                        "generated_at": None,
+                    },
+                },
+            )
+
+    assert response.status_code == 200
+    payload = MessageOutput.model_validate(response.json())
+    assert payload.status == "completed"
+    assert payload.task_outcome == "unverifiable"
+    assert payload.answer == "市场数据源暂时不可用, 本次无法判断市场阶段。"
+    assert [tool.model_dump() for tool in payload.tools] == [
+        {
+            "call_id": "market-read-failed",
+            "tool_name": "read_market_pulse",
+            "status": "failed",
+        }
+    ]
+    assert market_calls == 1
+    assert len(provider.requests) == 2
+    failure = provider.requests[1].current.feedback
+    assert failure is not None and failure.calls[0].status == "failed"
+    exchange = provider.requests[1].current.history[0]
+    assert isinstance(exchange, ToolExchange)
+    assert isinstance(exchange.observation, ToolFailedObservation)
+    assert exchange.observation.error.retryable is True
     await market_http.aclose()
 
 

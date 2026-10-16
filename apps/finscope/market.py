@@ -53,9 +53,23 @@ class MarketPulseClient:
             response = await self._client.get(self._base_url + path, timeout=self._timeout)
             response.raise_for_status()
             envelope = TypeAdapter(dict[str, JsonValue]).validate_python(response.json())
-        except (httpx.HTTPError, ValueError) as exc:
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
             raise ToolFault(
-                ErrorCategory.TOOL_FAILURE, "FinScope market data is unavailable"
+                ErrorCategory.TOOL_FAILURE,
+                "FinScope market data is unavailable",
+                retryable=status == 429 or status >= 500,
+            ) from exc
+        except (httpx.TimeoutException, httpx.TransportError) as exc:
+            raise ToolFault(
+                ErrorCategory.TOOL_FAILURE,
+                "FinScope market data is unavailable",
+                retryable=True,
+            ) from exc
+        except ValueError as exc:
+            raise ToolFault(
+                ErrorCategory.INVALID_TOOL_OUTPUT,
+                "FinScope returned invalid market data",
             ) from exc
         if envelope.get("success") is not True:
             raise ToolFault(ErrorCategory.TOOL_FAILURE, "FinScope rejected the market query")
