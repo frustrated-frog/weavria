@@ -18,7 +18,14 @@ from .execution import (
     ToolRecorded,
     ToolStarted,
 )
-from .model_io import HistoryEntry, TaskInput, ToolExchange, validate_history
+from .model_io import (
+    HistoryEntry,
+    TaskInput,
+    TaskObservation,
+    ToolExchange,
+    validate_history,
+    validate_task_observation,
+)
 from .outcomes import ToolFailedObservation
 
 
@@ -95,6 +102,7 @@ class TurnRequest(BaseModel):
     schema_version: Literal[2] = 2
     instructions: str
     task: TaskInput
+    task_observation: TaskObservation | None = None
     history: tuple[HistoryEntry, ...] = ()
     feedback: TurnFeedback | None = None
 
@@ -106,6 +114,7 @@ class TurnRequest(BaseModel):
     @model_validator(mode="after")
     def validate_feedback(self) -> Self:
         validate_turn_feedback(self.task, self.history, self.feedback)
+        validate_task_observation(self.task, self.task_observation)
         return self
 
 

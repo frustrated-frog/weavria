@@ -1,4 +1,5 @@
 import asyncio
+import json
 from typing import Literal
 
 import pytest
@@ -22,6 +23,7 @@ from weavria.harness import (
     InformationNeed,
     ModelTaskInterpreter,
     TaskAwareAgent,
+    TaskFrame,
     TaskSpecification,
     TaskUnderstandingEngine,
     TaskUnderstandingError,
@@ -243,7 +245,12 @@ async def test_unavailable_capability_is_rejected_before_runtime() -> None:
         ModelTaskInterpreter(FakeModelProvider((_declaration(specification),)))
     )
     with pytest.raises(TaskUnderstandingError) as raised:
-        await engine.prepare(task=TaskInput(goal="Escalate"), history=(), tools=_tools())
+        await engine.prepare(
+            input_id="escalate-input",
+            task=TaskInput(goal="Escalate"),
+            history=(),
+            tools=_tools(),
+        )
     assert raised.value.error.category is ErrorCategory.INVALID_MODEL_RESPONSE
     assert raised.value.__cause__ is None
 
@@ -267,7 +274,12 @@ async def test_understanding_timeout_cleans_up_and_is_classified() -> None:
     provider = Waiting()
     engine = TaskUnderstandingEngine(ModelTaskInterpreter(provider), max_duration=0.01)
     with pytest.raises(TaskUnderstandingError) as raised:
-        await engine.prepare(task=TaskInput(goal="Wait"), history=(), tools=_tools())
+        await engine.prepare(
+            input_id="wait-input",
+            task=TaskInput(goal="Wait"),
+            history=(),
+            tools=_tools(),
+        )
     assert raised.value.error.category is ErrorCategory.TIMEOUT
     assert provider.started.is_set() and provider.cleaned.is_set()
 
@@ -291,7 +303,12 @@ async def test_external_cancellation_propagates_through_understanding() -> None:
     provider = Waiting()
     engine = TaskUnderstandingEngine(ModelTaskInterpreter(provider))
     preparing = asyncio.create_task(
-        engine.prepare(task=TaskInput(goal="Wait"), history=(), tools=_tools())
+        engine.prepare(
+            input_id="wait-input",
+            task=TaskInput(goal="Wait"),
+            history=(),
+            tools=_tools(),
+        )
     )
     async with asyncio.timeout(1):
         await provider.started.wait()
@@ -299,6 +316,93 @@ async def test_external_cancellation_propagates_through_understanding() -> None:
     with pytest.raises(asyncio.CancelledError):
         await preparing
     assert provider.cleaned.is_set()
+
+
+async def test_capability_catalogue_carries_schema_without_artificial_size_limits() -> None:
+    provider = FakeModelProvider((_declaration(_direct()),))
+    tools = ToolRegistry(
+        tuple(
+            TypedTool(
+                name=f"read_document_{index}",
+                version="1",
+                description="x" * 700,
+                input_type=_Input,
+                output_type=_Output,
+                execute=_read_document,
+            )
+            for index in range(65)
+        )
+    )
+    engine = TaskUnderstandingEngine(ModelTaskInterpreter(provider))
+
+    preparation = await engine.prepare(
+        input_id="large-catalogue",
+        task=TaskInput(goal="Explain your role"),
+        history=(),
+        tools=tools,
+    )
+
+    catalogue = provider.requests[0].task.constraints[-1]
+    assert len(preparation.record.available_capabilities) == 65
+    assert '"input_schema"' in catalogue
+    assert '"document"' in catalogue
+    assert "x" * 700 in catalogue
+
+
+async def test_valid_but_oversized_specification_fails_at_the_typed_boundary() -> None:
+    long_text = "界" * 512
+    names = tuple(f"read_{index}" for index in range(8))
+    specification = TaskSpecification(
+        route="execute",
+        intent=long_text,
+        goal=long_text,
+        information_needs=tuple(
+            InformationNeed(
+                description=long_text,
+                source="external",
+                freshness="stable",
+            )
+            for _ in range(8)
+        ),
+        capability_needs=tuple(
+            CapabilityNeed(name=name, purpose=long_text, necessity="required") for name in names
+        ),
+        completion_criteria=tuple(
+            CompletionCriterion(
+                kind="capability_result",
+                description=long_text,
+                capability=name,
+            )
+            for name in names
+        ),
+    )
+    tools = ToolRegistry(
+        tuple(
+            TypedTool(
+                name=name,
+                version="1",
+                description="Read one value",
+                input_type=_Input,
+                output_type=_Output,
+                execute=_read_document,
+            )
+            for name in names
+        )
+    )
+    engine = TaskUnderstandingEngine(
+        ModelTaskInterpreter(FakeModelProvider((_declaration(specification),)))
+    )
+
+    with pytest.raises(TaskUnderstandingError) as raised:
+        await engine.prepare(
+            input_id="oversized-frame",
+            task=TaskInput(goal="Read values"),
+            history=(),
+            tools=tools,
+        )
+
+    assert raised.value.error.category is ErrorCategory.INVALID_MODEL_RESPONSE
+    assert "bounded task frame" in raised.value.error.message
 
 
 async def test_direct_task_hides_all_tools_and_executes_without_a_tool_call() -> None:
@@ -319,10 +423,13 @@ async def test_direct_task_hides_all_tools_and_executes_without_a_tool_call() ->
     assert execution.result.status is RunStatus.COMPLETED
     assert execution.preparation.record.selected_capabilities == ()
     assert execution.preparation.tools.descriptors == ()
-    assert execution.preparation.task.goal == "Explain your role and limits"
+    assert execution.preparation.task.goal == "Who are you?"
+    assert execution.preparation.record.frame.request_anchor.input_id == "direct-run"
+    assert execution.preparation.record.frame.specification.goal == "Explain your role and limits"
     assert execution.events[-1].data.kind == "run_ended"
     request_json = action_model.requests[0].model_dump_json()
     assert "read_document" not in request_json and "send_message" not in request_json
+    assert action_model.requests[0].task_observation == execution.preparation.observation
 
 
 async def test_execute_task_exposes_only_selected_capability_and_preserves_evidence() -> None:
@@ -357,7 +464,7 @@ async def test_execute_task_exposes_only_selected_capability_and_preserves_evide
     assert "read_document" in first_request and "send_message" not in first_request
 
 
-async def test_clarification_route_hides_capabilities_and_uses_resolved_goal() -> None:
+async def test_clarification_route_hides_capabilities_and_keeps_raw_goal() -> None:
     understanding_model = FakeModelProvider((_declaration(_clarify()),))
     action_model = FakeModelProvider(
         (ModelResponse(action=FinishAction(output="Which document should I read?")),)
@@ -379,7 +486,13 @@ async def test_clarification_route_hides_capabilities_and_uses_resolved_goal() -
     assert execution.result.output == "Which document should I read?"
     assert execution.preparation.record.specification.route == "clarify"
     assert execution.preparation.tools.descriptors == ()
-    assert action_model.requests[0].task.goal == "Ask which document the user means"
+    assert action_model.requests[0].task.goal == "Read it"
+    observation = action_model.requests[0].task_observation
+    assert observation is not None
+    assert (
+        TaskFrame.model_validate_json(json.dumps(observation.payload)).specification.goal
+        == "Ask which document the user means"
+    )
 
 
 def test_tool_registry_selection_is_ordered_and_fails_closed() -> None:

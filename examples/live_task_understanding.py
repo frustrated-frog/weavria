@@ -141,7 +141,10 @@ async def evaluate(*, repeats: int) -> dict[str, object]:
                 started = time.perf_counter()
                 try:
                     prepared = await engine.prepare(
-                        task=TaskInput(goal=case["request"]), history=(), tools=tools
+                        input_id=str(case["id"]),
+                        task=TaskInput(goal=case["request"]),
+                        history=(),
+                        tools=tools,
                     )
                     actual = prepared.record.specification
                     expected_structure = _structure(expected)

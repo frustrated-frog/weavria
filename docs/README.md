@@ -7,8 +7,8 @@
 - [执行驱动的模型上下文](model-context-selection.md)：讲解实际模型—工具循环、成果回取、任务检索、依赖闭包、状态归约与冻结对照实验。
 - [ADR 0002](decisions/0002-model-context-selection.md)：记录模型输入与上下文选择的协议、预算和设计取舍。
 - [ADR 0003](decisions/0003-execution-backed-context.md)：记录从实际执行事实重建模型视图的当前决策。
-- [通用任务理解与能力解析](task-understanding.md)：说明多维任务规格、最小能力暴露、执行流程与当前证据边界。
-- [ADR 0009](decisions/0009-task-understanding-capability-resolution.md)：记录任务理解与能力解析的契约、信任边界和取舍。
+- [通用任务理解与能力解析](task-understanding.md)：说明版本化 Task Frame、会话接入、最小能力视图与当前证据边界。
+- [ADR 0009](decisions/0009-task-understanding-capability-resolution.md)：记录原始请求、模型推断、能力解析和 AgentLoop v3 接入的契约与取舍。
 - [AgentLoop 决策、调度与反馈](agent-loop.md)：模型轮次、有界调度、部分成功、修订与完整反馈，包含源码调研和冻结实验。
 - [ADR 0004](decisions/0004-model-turn-feedback.md)：轮次协议、v1/v2 兼容和反馈汇合边界。
 - [ADR 0005](decisions/0005-timeout-feedback-outcome.md)：超时来源、结构化反馈，以及执行结束与任务质量的区别。

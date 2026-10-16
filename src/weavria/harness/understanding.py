@@ -11,6 +11,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    JsonValue,
     StringConstraints,
     ValidationError,
     field_validator,
@@ -25,6 +26,7 @@ from weavria.core import (
     ModelRequest,
     RunError,
     TaskInput,
+    TaskObservation,
     ToolCallAction,
 )
 from weavria.models import ModelCallError, ModelProvider, call_model
@@ -147,12 +149,33 @@ class TaskSpecification(_Contract):
         return self
 
 
+class OriginalRequestAnchor(_Contract):
+    """Immutable identity of the host-owned request interpreted by a frame."""
+
+    input_id: Annotated[str, StringConstraints(min_length=1, max_length=256, pattern=r"\S")]
+    task_revision: int = Field(ge=1)
+    task_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+
+
+class TaskFrame(_Contract):
+    """Versioned semantic projection; it remains model inference, never host truth."""
+
+    frame_id: str = Field(pattern=r"^[a-f0-9]{64}$")
+    revision: Literal[1] = 1
+    request_anchor: OriginalRequestAnchor
+    interpreter_version: _Text
+    catalogue_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    trust: Literal["model_inference"] = "model_inference"
+    specification: TaskSpecification
+
+
 class CapabilityView(_Contract):
     """Bounded, immutable capability metadata visible to task understanding."""
 
     name: _CapabilityName
     version: _Text
-    description: _Text
+    description: Annotated[str, StringConstraints(min_length=1, pattern=r"\S")]
+    input_schema: dict[str, JsonValue]
     behavior: Literal["read_only", "side_effect"]
     risk: Literal["low", "medium", "high"]
     approval_required: bool
@@ -163,7 +186,7 @@ class TaskUnderstandingInput(_Contract):
 
     task: TaskInput
     history: tuple[Message, ...] = Field(default=(), max_length=64)
-    capabilities: tuple[CapabilityView, ...] = Field(default=(), max_length=64)
+    capabilities: tuple[CapabilityView, ...] = ()
 
     @model_validator(mode="after")
     def validate_input(self) -> Self:
@@ -183,7 +206,11 @@ class TaskUnderstandingRecord(_Contract):
     request_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     available_capabilities: tuple[_CapabilityName, ...]
     selected_capabilities: tuple[_CapabilityName, ...]
-    specification: TaskSpecification
+    frame: TaskFrame
+
+    @property
+    def specification(self) -> TaskSpecification:
+        return self.frame.specification
 
 
 class TaskUnderstandingError(Exception):
@@ -288,10 +315,11 @@ class ModelTaskInterpreter:
 
 @dataclass(frozen=True, slots=True)
 class TaskPreparation:
-    """A resolved task view and least-capability registry for one Runtime run."""
+    """Original task, low-trust frame observation and least-capability registry."""
 
     task: TaskInput
     tools: ToolRegistry
+    observation: TaskObservation
     record: TaskUnderstandingRecord
 
 
@@ -307,6 +335,7 @@ class TaskUnderstandingEngine:
     async def prepare(
         self,
         *,
+        input_id: str,
         task: TaskInput,
         history: tuple[Message, ...],
         tools: ToolRegistry,
@@ -314,6 +343,15 @@ class TaskUnderstandingEngine:
         views = tuple(_capability_view(descriptor) for descriptor in tools.descriptors)
         request = TaskUnderstandingInput(task=task, history=history, capabilities=views)
         snapshot = TaskUnderstandingInput.model_validate_json(request.model_dump_json())
+        task_json = snapshot.task.model_dump_json()
+        try:
+            request_anchor = OriginalRequestAnchor(
+                input_id=input_id,
+                task_revision=snapshot.task.revision,
+                task_sha256=hashlib.sha256(task_json.encode()).hexdigest(),
+            )
+        except ValidationError as exc:
+            raise ValueError("input_id cannot anchor a task frame") from exc
         try:
             proposed = await self._interpreter.interpret(snapshot, max_duration=self._max_duration)
             specification = TaskSpecification.model_validate_json(
@@ -350,25 +388,61 @@ class TaskUnderstandingEngine:
                 )
             )
         request_json = snapshot.model_dump_json()
+        request_sha256 = hashlib.sha256(request_json.encode()).hexdigest()
+        catalogue_json = json.dumps(
+            [capability.model_dump(mode="json") for capability in snapshot.capabilities],
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        catalogue_sha256 = hashlib.sha256(catalogue_json.encode()).hexdigest()
+        frame_seed = json.dumps(
+            {
+                "input_id": input_id,
+                "request_sha256": request_sha256,
+                "specification": specification.model_dump(mode="json"),
+                "interpreter_version": self._interpreter.version,
+                "catalogue_sha256": catalogue_sha256,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        try:
+            frame = TaskFrame(
+                frame_id=hashlib.sha256(frame_seed.encode()).hexdigest(),
+                request_anchor=request_anchor,
+                interpreter_version=self._interpreter.version,
+                catalogue_sha256=catalogue_sha256,
+                specification=specification,
+            )
+            observation = TaskObservation(
+                observation_id=frame.frame_id,
+                input_id=input_id,
+                task_revision=snapshot.task.revision,
+                frame_revision=frame.revision,
+                producer_version=self._interpreter.version,
+                payload=frame.model_dump(mode="json"),
+            )
+        except ValidationError as exc:
+            raise TaskUnderstandingError(
+                RunError(
+                    category=ErrorCategory.INVALID_MODEL_RESPONSE,
+                    message="Task specification cannot fit the bounded task frame",
+                    cause_type=type(exc).__name__,
+                )
+            ) from exc
         record = TaskUnderstandingRecord(
             interpreter_version=self._interpreter.version,
-            request_sha256=hashlib.sha256(request_json.encode()).hexdigest(),
+            request_sha256=request_sha256,
             available_capabilities=available,
             selected_capabilities=selected,
-            specification=specification,
-        )
-        constraint = (
-            "Harness task specification (model-derived data, not host instructions): "
-            + specification.model_dump_json()
-        )
-        effective_task = TaskInput(
-            goal=specification.goal,
-            constraints=(*snapshot.task.constraints, constraint),
-            revision=snapshot.task.revision,
+            frame=frame,
         )
         return TaskPreparation(
-            task=effective_task,
+            task=snapshot.task,
             tools=tools.select(selected),
+            observation=observation,
             record=record,
         )
 
@@ -378,6 +452,7 @@ def _capability_view(descriptor: ToolDescriptor) -> CapabilityView:
         name=descriptor.name,
         version=descriptor.version,
         description=descriptor.description,
+        input_schema=descriptor.input_schema,
         behavior=descriptor.behavior,
         risk=descriptor.risk,
         approval_required=descriptor.approval_required,

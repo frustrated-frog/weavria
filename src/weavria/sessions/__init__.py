@@ -1,6 +1,7 @@
 """Persistent single-user conversations, accepted evidence and explicit interruption."""
 
 from .engine import SessionEngine
+from .preparation import SessionTaskContext, SessionTaskPreparation, SessionTaskPreparer
 from .store import (
     SessionBusyError,
     SessionConflictError,
@@ -14,4 +15,7 @@ __all__ = [
     "SessionConflictError",
     "SessionEngine",
     "SessionInterruptedError",
+    "SessionTaskContext",
+    "SessionTaskPreparation",
+    "SessionTaskPreparer",
 ]

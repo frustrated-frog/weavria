@@ -56,6 +56,7 @@ from weavria.core import (
     RunStatus,
     TaskDirective,
     TaskInput,
+    TaskObservation,
     TaskRevised,
     TaskUpdate,
     ToolBatch,
@@ -210,9 +211,15 @@ class _AgentKernel:
         feedback_bounds: FeedbackBounds | None = None,
         journal: RunJournal | None = None,
         preparation: TurnPreparer | None = None,
+        task_observation: TaskObservation | None = None,
     ) -> None:
         self._journal = journal
         self._preparation = preparation
+        self._task_observation = (
+            TaskObservation.model_validate_json(task_observation.model_dump_json())
+            if task_observation is not None
+            else None
+        )
         self._journal_failed = False
         self._commit_lock = asyncio.Lock()
         self._clock = clock if clock is not None else SystemClock()
@@ -512,12 +519,19 @@ class _AgentKernel:
     async def _build_context(
         self, task: TaskInput
     ) -> EvidencePlan | TurnEvidencePlan | ControlEvidencePlan:
+        task_observation = (
+            self._task_observation
+            if self._task_observation is not None
+            and self._task_observation.task_revision == task.revision
+            else None
+        )
         try:
             if self._journal_version == 1:
                 return await self._builder.build(
                     run_id=self._run_id,
                     instructions=self._instructions,
                     task=task,
+                    task_observation=task_observation,
                     records=self.state.records,
                     max_request_bytes=self._request_budget,
                 )
@@ -526,6 +540,7 @@ class _AgentKernel:
                     run_id=self._run_id,
                     instructions=self._instructions,
                     task=task,
+                    task_observation=task_observation,
                     records=self.state.records,
                     max_request_bytes=self._request_budget,
                     feedback=self.state.feedback,
@@ -536,6 +551,7 @@ class _AgentKernel:
                 run_id=self._run_id,
                 instructions=self._instructions,
                 task=task,
+                task_observation=task_observation,
                 records=self.state.records,
                 max_request_bytes=self._request_budget,
                 feedback=self.state.feedback,
@@ -548,6 +564,12 @@ class _AgentKernel:
         reservation = reserve_feedback(
             instructions=self._instructions,
             task=self.state.task,
+            task_observation=(
+                self._task_observation
+                if self._task_observation is not None
+                and self._task_observation.task_revision == self.state.task.revision
+                else None
+            ),
             records=self.state.records,
             batch=batch,
             bounds=self._bounds,
@@ -1025,6 +1047,7 @@ class AgentLoop(_AgentKernel):
         clock: Clock | None = None,
         journal: RunJournal | None = None,
         preparation: TurnPreparer | None = None,
+        task_observation: TaskObservation | None = None,
         # 构造函数只建立依赖、初始状态和首个事件,不在初始化阶段执行模型或工具。
     ) -> None:
         # 把基类的通用“决策”回调适配为 v3 模型调用,同时保留统一的超时边界。
@@ -1064,6 +1087,7 @@ class AgentLoop(_AgentKernel):
             journal_version=3,
             journal=journal,
             preparation=preparation,
+            task_observation=task_observation,
             # 传递已补全默认值且通过并行安全校验的调度配置。
             scheduling=scheduling,
             # 传递工具注册表,用于工具发现、参数校验和具体执行。
@@ -1109,7 +1133,14 @@ class AgentLoop(_AgentKernel):
 
     @staticmethod
     def request_template_for(
-        task: TaskInput, instructions: str, tools: ToolRegistry
+        task: TaskInput,
+        instructions: str,
+        tools: ToolRegistry,
+        task_observation: TaskObservation | None = None,
     ) -> ControlRequest:
         """Compute the initial envelope without creating execution facts or doing I/O."""
-        return ControlRequest(instructions=_instructions_for(instructions, tools, 3), task=task)
+        return ControlRequest(
+            instructions=_instructions_for(instructions, tools, 3),
+            task=task,
+            task_observation=task_observation,
+        )

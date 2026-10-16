@@ -13,7 +13,15 @@ LAYERS = {
     "tools": ("core", "artifacts"),
     "context": ("core", "artifacts"),
     "runtime": ("core", "models", "artifacts", "tools", "context"),
-    "harness": ("core", "models", "artifacts", "tools", "context", "runtime"),
+    "harness": (
+        "core",
+        "models",
+        "artifacts",
+        "tools",
+        "context",
+        "runtime",
+        "sessions",
+    ),
     "sessions": ("core", "models", "artifacts", "tools", "context", "runtime"),
 }
 

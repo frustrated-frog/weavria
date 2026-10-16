@@ -21,7 +21,7 @@ from .execution import (
     ToolStarted,
 )
 from .lifecycle import RunStatus
-from .model_io import HistoryEntry, TaskInput
+from .model_io import HistoryEntry, TaskInput, TaskObservation, validate_task_observation
 from .outcomes import AgentResult
 from .turns import CallSkipped, TurnDecided, TurnFeedback, TurnSettled, validate_turn_feedback
 
@@ -97,6 +97,7 @@ class ControlRequest(BaseModel):
     schema_version: Literal[3] = 3
     instructions: str
     task: TaskInput
+    task_observation: TaskObservation | None = None
     history: tuple[HistoryEntry, ...] = ()
     feedback: TurnFeedback | None = None
     control: ControlFeedback | None = None
@@ -109,6 +110,7 @@ class ControlRequest(BaseModel):
     @model_validator(mode="after")
     def validate_observations(self) -> Self:
         validate_turn_feedback(self.task, self.history, self.feedback)
+        validate_task_observation(self.task, self.task_observation)
         if (
             self.control is not None
             and len(self.control.model_dump_json().encode()) > CONTROL_FEEDBACK_BYTES

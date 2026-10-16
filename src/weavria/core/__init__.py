@@ -64,7 +64,14 @@ from .intervention import TaskDirective, TaskUpdate, TurnResolution
 from .journal import JournalEvent, decode_event
 from .lifecycle import InvalidStateTransitionError, RunStatus, transition_status
 from .messages import AgentRequest, Message, MessageRole
-from .model_io import HistoryEntry, ModelRequest, ModelResponse, TaskInput, ToolExchange
+from .model_io import (
+    HistoryEntry,
+    ModelRequest,
+    ModelResponse,
+    TaskInput,
+    TaskObservation,
+    ToolExchange,
+)
 from .outcomes import (
     AgentResult,
     LoopResult,
@@ -154,6 +161,7 @@ __all__ = [
     "SourceUse",
     "TaskDirective",
     "TaskInput",
+    "TaskObservation",
     "TaskRevised",
     "TaskUpdate",
     "TextExcerpt",

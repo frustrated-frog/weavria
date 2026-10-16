@@ -18,6 +18,7 @@ from weavria.core import (
     ControlRequest,
     ModelRequest,
     TaskInput,
+    TaskObservation,
     ToolExchange,
     ToolRecord,
     ToolSucceededObservation,
@@ -226,12 +227,17 @@ class EvidenceContextBuilder:
         run_id: str,
         instructions: str,
         task: TaskInput,
+        task_observation: TaskObservation | None = None,
         records: tuple[ToolRecord, ...],
         max_request_bytes: int,
         feedback_call_ids: tuple[str, ...] | None = None,
     ) -> EvidencePlan:
         """Build a v1 view; fail on invalid provenance or insufficient feedback budget."""
-        base = ModelRequest(instructions=instructions, task=task)
+        base = ModelRequest(
+            instructions=instructions,
+            task=task,
+            task_observation=task_observation,
+        )
         plan = await self._select(run_id, base, records, max_request_bytes, feedback_call_ids)
         return EvidencePlan(plan.request_json, plan.mode, plan.budget_bytes, plan.decisions)
 
@@ -241,6 +247,7 @@ class EvidenceContextBuilder:
         run_id: str,
         instructions: str,
         task: TaskInput,
+        task_observation: TaskObservation | None = None,
         records: tuple[ToolRecord, ...],
         max_request_bytes: int,
         feedback: TurnFeedback | None = None,
@@ -255,9 +262,11 @@ class EvidenceContextBuilder:
         )
         # Empty history is only a sizing template. The final request is fully
         # revalidated, including every feedback status and its paired exchange.
-        base = TurnRequest(instructions=instructions, task=task).model_copy(
-            update={"feedback": feedback}
-        )
+        base = TurnRequest(
+            instructions=instructions,
+            task=task,
+            task_observation=task_observation,
+        ).model_copy(update={"feedback": feedback})
         mandatory = (
             tuple(c.call_id for c in feedback.calls if c.status != "skipped") if feedback else ()
         )
@@ -270,6 +279,7 @@ class EvidenceContextBuilder:
         run_id: str,
         instructions: str,
         task: TaskInput,
+        task_observation: TaskObservation | None = None,
         records: tuple[ToolRecord, ...],
         max_request_bytes: int,
         feedback: TurnFeedback | None = None,
@@ -283,9 +293,12 @@ class EvidenceContextBuilder:
             if feedback is not None
             else None
         )
-        base = ControlRequest(instructions=instructions, task=task, control=control).model_copy(
-            update={"feedback": feedback}
-        )
+        base = ControlRequest(
+            instructions=instructions,
+            task=task,
+            task_observation=task_observation,
+            control=control,
+        ).model_copy(update={"feedback": feedback})
         mandatory = (
             tuple(c.call_id for c in feedback.calls if c.status != "skipped") if feedback else ()
         )

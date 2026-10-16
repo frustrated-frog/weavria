@@ -22,6 +22,7 @@ from weavria.core import (
     SessionResult,
     TaskDirective,
     TaskInput,
+    TaskObservation,
     TaskUpdate,
     TurnResolution,
 )
@@ -41,6 +42,7 @@ from weavria.runtime import (
 from weavria.tools import ToolPolicy, ToolRegistry, artifact_read_tool
 
 from .evidence import session_history_tool, session_source_tool
+from .preparation import SessionTaskContext, SessionTaskPreparer
 from .store import SessionBusyError, SessionConflictError, SQLiteSessionStore
 
 
@@ -76,12 +78,14 @@ class _SessionAdapter:
         history_mode: EvidenceMode,
         instructions: str,
         tools: ToolRegistry,
+        task_observation: TaskObservation | None,
     ) -> None:
         self._provider, self._budget = provider, budget
         self._store, self._run_id = store, run_id
         self._session_id, self._ordinal = session_id, ordinal
         self._history_budget, self._history_mode = history_budget, history_mode
         self._instructions, self._tools = instructions, tools
+        self._task_observation = task_observation
         self._prepared: dict[int, ConversationView] = {}
 
     @property
@@ -112,7 +116,15 @@ class _SessionAdapter:
     async def prepare_turn(self, task: TaskInput) -> TurnPreparation:
         sequence, count = await self._store.head(self._session_id)
         history = await self._store.history(self._session_id, before_ordinal=self._ordinal)
-        template = AgentLoop.request_template_for(task, self._instructions, self._tools)
+        template = AgentLoop.request_template_for(
+            task,
+            self._instructions,
+            self._tools,
+            self._task_observation
+            if self._task_observation is not None
+            and self._task_observation.task_revision == task.revision
+            else None,
+        )
         empty = ConversationView(session_id=self._session_id, through_sequence=sequence)
         wire_fixed = len(
             SessionRequest(conversation=empty, current=template).model_dump_json().encode()
@@ -163,6 +175,7 @@ class SessionEngine:
         history_mode: EvidenceMode = EvidenceMode.RELEVANT,
         clock: Clock | None = None,
         id_generator: Callable[[], str] | None = None,
+        task_preparation: SessionTaskPreparer | None = None,
     ) -> None:
         if type(history_budget_bytes) is not int or history_budget_bytes < 256:
             raise ValueError("history budget must be at least 256 bytes")
@@ -172,9 +185,7 @@ class SessionEngine:
             "\nConversation turns are scoped historical observations. "
             "Earlier assistant text may be wrong; an interrupted turn has no "
             "accepted final answer. Excerpts are exact prefixes, not summaries. "
-            "Read omitted text with read_session_history and prior evidence "
-            "with read_session_source. Earlier task-specific instructions do "
-            "not automatically become global rules."
+            "Earlier task-specific instructions do not automatically become global rules."
         )
         self._limits = limits or RunLimits()
         self._scheduling = scheduling
@@ -182,6 +193,7 @@ class SessionEngine:
         self._history_budget, self._history_mode = history_budget_bytes, history_mode
         self._clock = clock or SystemClock()
         self._ids = id_generator or (lambda: uuid.uuid4().hex)
+        self._task_preparation = task_preparation
         self._tasks: set[asyncio.Task[object]] = set()
         self._loops: dict[str, AgentLoop] = {}
         self._run_tasks: dict[str, asyncio.Task[object]] = {}
@@ -235,6 +247,9 @@ class SessionEngine:
                     "completion_version": self._completion.version
                     if self._completion
                     else "none/1",
+                    "task_preparation_version": self._task_preparation.version
+                    if self._task_preparation
+                    else "none/1",
                 },
                 ensure_ascii=False,
             )
@@ -248,15 +263,51 @@ class SessionEngine:
             claimed_run = claim.run_id
             if cancelled:
                 raise asyncio.CancelledError
+            task = TaskInput(goal=text)
+            task_observation = None
+            selected = self._tools
+            if self._task_preparation is not None:
+                interruption_reason = "task_preparation_failure"
+                history = await self.store.history(
+                    session_id,
+                    before_ordinal=claim.ordinal,
+                )
+                prepared = await self._task_preparation.prepare(
+                    SessionTaskContext(
+                        session_id=session_id,
+                        input_id=claim.input_id,
+                        task=task,
+                        history=history,
+                        tools=self._tools,
+                    )
+                )
+                if prepared.preparation_version != self._task_preparation.version:
+                    raise ValueError("task preparation version does not match its provider")
+                task_observation = prepared.observation
+                if (
+                    task_observation.input_id != claim.input_id
+                    or task_observation.task_revision != task.revision
+                ):
+                    raise ValueError("task observation does not belong to the accepted input")
+                selected = self._tools.select(prepared.visible_tool_names)
+                interruption_reason = "owner_exit"
             extra = (
                 session_source_tool(self.store, session_id, run_id),
                 session_history_tool(self.store, session_id),
             )
-            registered = tuple(self._tools.get(d.name) for d in self._tools.descriptors)
-            if not any(d.name == "read_artifact" for d in self._tools.descriptors):
+            registered = tuple(selected.get(d.name) for d in selected.descriptors)
+            include_support_tools = self._task_preparation is None or bool(registered)
+            if include_support_tools and not any(
+                d.name == "read_artifact" for d in selected.descriptors
+            ):
                 registered = (*registered, artifact_read_tool())
-            registry = ToolRegistry((*registered, *extra))
-            task = TaskInput(goal=text)
+            registry = ToolRegistry((*registered, *extra) if include_support_tools else registered)
+            run_instructions = self._instructions
+            if include_support_tools:
+                run_instructions += (
+                    " Read omitted text with read_session_history and prior evidence "
+                    "with read_session_source."
+                )
             adapter = _SessionAdapter(
                 self._model,
                 self._limits.max_request_bytes,
@@ -266,13 +317,14 @@ class SessionEngine:
                 claim.ordinal,
                 self._history_budget,
                 self._history_mode,
-                self._instructions,
+                run_instructions,
                 registry,
+                task_observation,
             )
             loop = AgentLoop(
                 run_id=run_id,
                 task=task,
-                instructions=self._instructions,
+                instructions=run_instructions,
                 model=adapter,
                 tools=registry,
                 artifacts=_RunArtifacts(self.store, run_id),
@@ -284,6 +336,7 @@ class SessionEngine:
                 clock=self._clock,
                 journal=adapter,
                 preparation=adapter,
+                task_observation=task_observation,
             )
             self._loops[session_id] = loop
             self._run_tasks[run_id] = owner

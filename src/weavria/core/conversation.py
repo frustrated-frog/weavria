@@ -193,7 +193,12 @@ class SessionSourceRead(ContractModel):
 class SessionInterrupted(ContractModel):
     kind: Literal["interrupted"] = "interrupted"
     run_id: NonBlankString
-    reason: Literal["process_exit", "storage_failure", "owner_exit"]
+    reason: Literal[
+        "process_exit",
+        "storage_failure",
+        "owner_exit",
+        "task_preparation_failure",
+    ]
 
 
 class SessionContextPrepared(ContractModel):

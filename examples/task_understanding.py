@@ -100,7 +100,7 @@ async def build_report() -> dict[str, Any]:
     for case in cases:
         expected = tuple(case["expected_capabilities"])
         prepared = await engine.prepare(
-            task=TaskInput(goal=case["request"]), history=(), tools=tools
+            input_id=str(case["id"]), task=TaskInput(goal=case["request"]), history=(), tools=tools
         )
         selected = prepared.record.selected_capabilities
         for policy, exposed in (("all", all_names), ("task_aware", selected)):

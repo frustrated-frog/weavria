@@ -7,6 +7,7 @@ from weavria.core import (
     ControlRequest,
     FeedbackBounds,
     TaskInput,
+    TaskObservation,
     ToolBatch,
     ToolRecord,
     maximum_exchange_bytes,
@@ -33,6 +34,7 @@ def reserve_feedback(
     *,
     instructions: str,
     task: TaskInput,
+    task_observation: TaskObservation | None = None,
     records: tuple[ToolRecord, ...],
     batch: ToolBatch,
     bounds: FeedbackBounds,
@@ -55,7 +57,11 @@ def reserve_feedback(
         if identity in known or not set(record.dependencies) <= known:
             raise ContextBuildError("reservation history is not an ordered dependency graph")
         known.add(identity)
-    base = ControlRequest(instructions=instructions, task=task)
+    base = ControlRequest(
+        instructions=instructions,
+        task=task,
+        task_observation=task_observation,
+    )
     size = len(base.model_dump_json().encode())
     parent_sizes = [len(minimum_exchange(r).model_dump_json().encode()) for r in records]
     new_sizes = [maximum_exchange_bytes(c, bounds) for c in batch.calls]
