@@ -309,4 +309,5 @@ async def test_widget_has_parent_and_script_restrictions(tmp_path: Path) -> None
     assert script.status_code == 200
     assert "send.addEventListener('click'" in script.text
     assert "void submitQuestion();" in script.text
+    assert "result.task_outcome === 'verified' ? '已核验' : '已完成'" in script.text
     await market_http.aclose()

@@ -56,7 +56,8 @@ async function submitQuestion() {
   try {
     const result = await sendMessage(text, false);
     appendMessage('agent', result.answer || result.error || '本次运行没有生成可交付答案。', result.tools);
-    setStatus(result.status === 'completed' ? '已核验' : result.status, result.status === 'completed' ? '' : 'error');
+    const completedLabel = result.task_outcome === 'verified' ? '已核验' : '已完成';
+    setStatus(result.status === 'completed' ? completedLabel : result.status, result.status === 'completed' ? '' : 'error');
   } catch (error) {
     appendMessage('agent', error instanceof Error ? error.message : 'Agent 暂时不可用。');
     setStatus('连接失败', 'error');
