@@ -58,6 +58,10 @@ AgentLoop v3
 任务理解失败发生在 Runtime 启动前，但原始用户输入已经被持久化，并以
 `task_preparation_failure` 记录中断原因。取消继续传播，不会被伪装成普通理解失败。
 
+同一份 revision-bound `TaskObservation` 也会进入 `CompletionContext`。验收策略可以据此区分
+direct、clarify 与 execute 的验收义务，但它仍是模型推断而非事实证据；是否接受及如何验证
+仍由可信的 CompletionPolicy 决定。
+
 ## 如何观察
 
 冻结结构实验：

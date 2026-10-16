@@ -50,6 +50,10 @@ AgentLoop v3 已经能校验模型动作、限制预算、管理 Tool Batch、�
 Task Frame 进入 AgentLoop v3 的初始请求。若 steering 修改任务修订号，旧 Observation 不再
 发送，防止过期语义静默控制新任务。当前阶段不自动重新解释，保持行为诚实可见。
 
+相同的 revision-bound Observation 会提供给 `CompletionContext`，使可信验收策略能够按任务
+路由选择不同义务。该能力不把 Frame 提升为事实或自动验收器；Policy 仍须独立决定哪些模型
+推断可以影响验收，并只能把实际 Tool Record 与 Artifact 当作外部事实证据。
+
 ## 关键不变量
 
 - 原始 `TaskInput` 的 goal、constraints 和 revision 不被模型推断改写；

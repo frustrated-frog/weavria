@@ -27,6 +27,9 @@ Java Research Runtime，不能通过替换或共享数据库把两个 Runtime �
 5. 首版消息接口同步返回最终报告及安全的工具状态摘要；会话由 `SessionEngine` 独立持久化。
 6. Sidecar 只面向绑定回环地址的单用户实验。允许嵌入的父 Origin 必须显式配置，并通过
    CSP 限制。
+7. Sidecar 使用通用 `TaskAwareSessionPreparer`。direct 与 clarify 不暴露市场工具；execute
+   才能看到 `read_market_pulse`。应用验收策略读取同一 Task Frame：非 execute 回答明确标为
+   unverifiable，execute 仍必须满足市场证据、数据质量和来源标记，不把任务路由当成行情证据。
 
 ## 备选方案
 

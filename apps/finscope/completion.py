@@ -1,6 +1,9 @@
 """FinScope-local acceptance rule; no financial concept enters the runtime."""
 
-from weavria.core import CompletionAccept, CompletionRepair
+import json
+
+from weavria.core import CompletionAccept, CompletionRepair, CompletionUnverifiable
+from weavria.harness import TaskFrame
 from weavria.runtime import CompletionContext
 
 from .market import MarketPulseOutput
@@ -11,7 +14,21 @@ class MarketAnswerPolicy:
 
     version = "finscope-market-answer/1"
 
-    async def verify(self, context: CompletionContext) -> CompletionAccept | CompletionRepair:
+    async def verify(
+        self, context: CompletionContext
+    ) -> CompletionAccept | CompletionRepair | CompletionUnverifiable:
+        observation = context.task_observation
+        if observation is not None:
+            frame = TaskFrame.model_validate_json(
+                json.dumps(observation.payload, ensure_ascii=False, separators=(",", ":"))
+            )
+            if frame.specification.route != "execute":
+                return CompletionUnverifiable(
+                    reason=(
+                        f"Task Frame route {frame.specification.route} has no market-evidence "
+                        "obligation"
+                    )
+                )
         sources: list[MarketPulseOutput] = []
         for record in context.records:
             if record.exchange.action.tool_name != "read_market_pulse" or record.artifact is None:

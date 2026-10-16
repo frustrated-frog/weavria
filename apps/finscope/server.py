@@ -12,11 +12,13 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
+from weavria.harness import ModelTaskInterpreter, TaskAwareSessionPreparer, TaskUnderstandingEngine
 from weavria.models.openai_compatible import (
     OpenAICompatibleConfig,
+    OpenAICompatibleProvider,
     OpenAICompatibleSessionProvider,
 )
-from weavria.models.provider import SessionModelProvider
+from weavria.models.provider import ModelProvider, SessionModelProvider
 from weavria.runtime import RunLimits
 from weavria.sessions import SessionConflictError, SessionEngine
 from weavria.tools import ToolRegistry
@@ -76,6 +78,7 @@ def create_app(
     settings: FinScopeSettings | None = None,
     *,
     provider: SessionModelProvider | None = None,
+    interpreter_provider: ModelProvider | None = None,
     market_client: MarketPulseClient | None = None,
 ) -> FastAPI:
     """Create a sidecar. Uvicorn should invoke this as an application factory."""
@@ -85,24 +88,31 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         resolved.state_path.parent.mkdir(parents=True, exist_ok=True)
-        created_provider: OpenAICompatibleSessionProvider | None = None
         created_transport: HTTPChatCompletionTransport | None = None
-        if provider is not None:
-            active_provider = provider
-        else:
+        if provider is None or interpreter_provider is None:
             created_transport = HTTPChatCompletionTransport(
                 resolved.model_base_url,
                 api_key=resolved.model_api_key,
                 timeout_seconds=resolved.model_timeout_seconds,
             )
-            created_provider = OpenAICompatibleSessionProvider(
-                OpenAICompatibleConfig(
-                    model=resolved.model_name,
-                    json_mode=resolved.json_mode,
-                ),
+        model_config = OpenAICompatibleConfig(
+            model=resolved.model_name,
+            json_mode=resolved.json_mode,
+        )
+        active_provider = provider
+        if active_provider is None:
+            assert created_transport is not None
+            active_provider = OpenAICompatibleSessionProvider(
+                model_config,
                 transport=created_transport,
             )
-            active_provider = created_provider
+        active_interpreter = interpreter_provider
+        if active_interpreter is None:
+            assert created_transport is not None
+            active_interpreter = OpenAICompatibleProvider(
+                model_config,
+                transport=created_transport,
+            )
         created_market = None
         if market_client is None:
             created_market = MarketPulseClient(
@@ -127,6 +137,12 @@ def create_app(
             ),
             completion=MarketAnswerPolicy(),
             history_budget_bytes=8_000,
+            task_preparation=TaskAwareSessionPreparer(
+                TaskUnderstandingEngine(
+                    ModelTaskInterpreter(active_interpreter),
+                    max_duration=resolved.model_timeout_seconds,
+                )
+            ),
         )
         await engine.__aenter__()
         app.state.runtime = _Runtime(engine)
@@ -245,8 +261,10 @@ def _instructions() -> str:
     return (
         "You are a read-only research assistant embedded in FinScope Market Pulse. "
         "Answer in concise Chinese. Page metadata only identifies what the user is viewing; "
-        "it is not authoritative evidence. Before each substantive answer, call "
-        "read_market_pulse with the smallest relevant focus. A date explicitly named by the user "
+        "it is not authoritative evidence. Follow the Task Frame route: answer direct requests "
+        "without a market read, ask one focused question for clarify requests, and for execute "
+        "requests use only the exposed capabilities with the smallest relevant scope. "
+        "A date explicitly named by the user "
         "takes precedence over the page date; otherwise use the page date. Use more than one focus "
         "only when the question requires it. Distinguish observed facts from inference, "
         "state 数据质量 explicitly, and never turn research candidates into buy or sell advice. "

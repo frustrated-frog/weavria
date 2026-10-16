@@ -31,6 +31,7 @@ from weavria.core import (
     RunReport,
     RunStatus,
     TaskInput,
+    TaskObservation,
     ToolBatch,
     ToolCallAction,
     ToolExchange,
@@ -96,6 +97,7 @@ def make_loop(
     limits: RunLimits | None = None,
     mode: EvidenceMode = EvidenceMode.RELEVANT,
     bounds: FeedbackBounds | None = None,
+    task_observation: TaskObservation | None = None,
 ) -> AgentLoop:
     return AgentLoop(
         run_id="run",
@@ -120,6 +122,7 @@ def make_loop(
         mode=mode,
         feedback_bounds=bounds,
         scheduling=ToolScheduling(2, frozenset({"echo"})),
+        task_observation=task_observation,
     )
 
 
@@ -335,6 +338,39 @@ class ValueVerifier:
                 guidance="Report the value from the accepted source",
             )
         return CompletionAccept(outcome="verified")
+
+
+class ObservationVerifier:
+    version = "task_observation/1"
+
+    def __init__(self, expected: TaskObservation) -> None:
+        self.expected = expected
+
+    async def verify(self, context: CompletionContext) -> CompletionDecision:
+        assert context.task_observation == self.expected
+        return CompletionAccept(outcome="unverified")
+
+
+async def test_completion_policy_receives_revision_bound_task_observation() -> None:
+    observation = TaskObservation(
+        observation_id="frame",
+        input_id="input",
+        task_revision=1,
+        frame_revision=1,
+        producer_version="test/1",
+        payload={"route": "direct"},
+    )
+    agent = make_loop(
+        FakeControlProvider((finish("direct"),)),
+        completion=ObservationVerifier(observation),
+        task_observation=observation,
+    )
+
+    result = await agent.execute()
+
+    assert result.status is RunStatus.COMPLETED
+    assert result.output == "direct"
+    assert result.task_outcome == "unverified"
 
 
 async def test_actual_evidence_rejects_candidate_and_corrected_finish_is_verified() -> None:

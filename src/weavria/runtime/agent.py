@@ -620,7 +620,15 @@ class _AgentKernel:
         ):
             return None
         context = CompletionContext(
-            self._run_id, task, candidate, self.state.records, self._artifacts
+            self._run_id,
+            task,
+            candidate,
+            self.state.records,
+            self._artifacts,
+            self._task_observation
+            if self._task_observation is not None
+            and self._task_observation.task_revision == task.revision
+            else None,
         )
         assessment = await check_completion(
             self._completion,

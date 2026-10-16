@@ -5,8 +5,65 @@ import httpx
 from apps.finscope.config import FinScopeSettings
 from apps.finscope.market import MarketPulseClient
 from apps.finscope.server import MessageOutput, SessionCreated, create_app
-from weavria.core import FinishAction, ModelTurn, ToolBatch, ToolCallAction
-from weavria.models import FakeSessionProvider
+from weavria.core import FinishAction, ModelResponse, ModelTurn, ToolBatch, ToolCallAction
+from weavria.harness import (
+    CapabilityNeed,
+    CompletionCriterion,
+    InformationNeed,
+    TaskSpecification,
+)
+from weavria.models import FakeModelProvider, FakeSessionProvider
+
+
+def _declaration(specification: TaskSpecification) -> ModelResponse:
+    return ModelResponse(
+        action=ToolCallAction(
+            call_id="understand",
+            tool_name="declare_task_specification",
+            arguments=specification.model_dump(mode="json"),
+        )
+    )
+
+
+def _market_execution() -> TaskSpecification:
+    return TaskSpecification(
+        route="execute",
+        intent="Read the current market stage",
+        goal="Read authoritative market evidence and explain the current stage",
+        information_needs=(
+            InformationNeed(
+                description="Current market stage",
+                source="external",
+                freshness="current",
+            ),
+        ),
+        capability_needs=(
+            CapabilityNeed(
+                name="read_market_pulse",
+                purpose="Read the authoritative market snapshot",
+                necessity="required",
+            ),
+        ),
+        completion_criteria=(
+            CompletionCriterion(
+                kind="capability_result",
+                description="Read the market snapshot",
+                capability="read_market_pulse",
+            ),
+            CompletionCriterion(kind="response", description="Explain the market stage"),
+        ),
+    )
+
+
+def _direct() -> TaskSpecification:
+    return TaskSpecification(
+        route="direct",
+        intent="Explain the assistant identity",
+        goal="Explain the configured assistant role",
+        completion_criteria=(
+            CompletionCriterion(kind="response", description="Answer the identity question"),
+        ),
+    )
 
 
 async def test_widget_session_executes_real_runtime_and_reports_tool_trace(
@@ -57,6 +114,7 @@ async def test_widget_session_executes_real_runtime_and_reports_tool_trace(
             ),
         )
     )
+    interpreter = FakeModelProvider((_declaration(_market_execution()),))
     settings = FinScopeSettings(
         model_base_url="http://model.test",
         model_name="fake",
@@ -65,7 +123,12 @@ async def test_widget_session_executes_real_runtime_and_reports_tool_trace(
         allowed_parent_origin="http://localhost:5173",
         state_path=tmp_path / "sessions.sqlite3",
     )
-    app = create_app(settings, provider=provider, market_client=market)
+    app = create_app(
+        settings,
+        provider=provider,
+        interpreter_provider=interpreter,
+        market_client=market,
+    )
 
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(
@@ -103,6 +166,64 @@ async def test_widget_session_executes_real_runtime_and_reports_tool_trace(
             "status": "succeeded",
         }
     ]
+    interpreted = interpreter.requests[0].task
+    assert interpreted.goal.endswith("User question: 今天是什么市场阶段?")
+    assert "Page navigation metadata" in interpreted.goal
+    await market_http.aclose()
+
+
+async def test_direct_question_uses_task_frame_without_market_tool(tmp_path: Path) -> None:
+    market_calls = 0
+
+    def market_response(_request: httpx.Request) -> httpx.Response:
+        nonlocal market_calls
+        market_calls += 1
+        return httpx.Response(500)
+
+    market_http = httpx.AsyncClient(transport=httpx.MockTransport(market_response))
+    interpreter = FakeModelProvider((_declaration(_direct()),))
+    app = create_app(
+        FinScopeSettings(
+            model_base_url="http://model.test",
+            model_name="fake",
+            model_api_key="",
+            state_path=tmp_path / "sessions.sqlite3",
+        ),
+        provider=FakeSessionProvider(
+            (ModelTurn(decision=FinishAction(output="我是只读的市场研究助手。")),)
+        ),
+        interpreter_provider=interpreter,
+        market_client=MarketPulseClient("http://finscope.test", client=market_http),
+    )
+
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://sidecar.test"
+        ) as client:
+            created = SessionCreated.model_validate((await client.post("/api/sessions")).json())
+            response = await client.post(
+                f"/api/sessions/{created.session_id}/messages",
+                json={
+                    "input_id": "identity-1",
+                    "text": "你是谁?",
+                    "context": {
+                        "schema_version": 1,
+                        "surface": "market_pulse",
+                        "business_date": "2026-10-15",
+                        "current_view": "panorama",
+                        "quality_status": "READY",
+                        "generated_at": "2026-10-15T15:40:00",
+                    },
+                },
+            )
+
+    assert response.status_code == 200
+    payload = MessageOutput.model_validate(response.json())
+    assert payload.status == "completed"
+    assert payload.task_outcome == "unverifiable"
+    assert payload.answer == "我是只读的市场研究助手。"
+    assert payload.tools == ()
+    assert market_calls == 0
     await market_http.aclose()
 
 

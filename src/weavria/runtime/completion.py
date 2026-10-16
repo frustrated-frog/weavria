@@ -16,6 +16,7 @@ from weavria.core import (
     FinishAction,
     RunError,
     TaskInput,
+    TaskObservation,
     ToolRecord,
     VerificationStarted,
 )
@@ -31,10 +32,16 @@ class CompletionContext:
         candidate: FinishAction,
         records: tuple[ToolRecord, ...],
         store: ArtifactStore,
+        task_observation: TaskObservation | None = None,
     ) -> None:
         self._run_id = run_id
         self._task = TaskInput.model_validate(task).model_dump_json()
         self._candidate = FinishAction.model_validate(candidate).model_dump_json()
+        self._task_observation = (
+            TaskObservation.model_validate(task_observation).model_dump_json()
+            if task_observation is not None
+            else None
+        )
         self._records = tuple(ToolRecord.model_validate(r).model_dump_json() for r in records)
         self._references = {
             r.artifact.artifact_id: r.artifact for r in self.records if r.artifact is not None
@@ -54,6 +61,15 @@ class CompletionContext:
     @property
     def candidate(self) -> FinishAction:
         return FinishAction.model_validate_json(self._candidate)
+
+    @property
+    def task_observation(self) -> TaskObservation | None:
+        """Return the revision-bound low-trust semantic projection, when supplied."""
+        return (
+            TaskObservation.model_validate_json(self._task_observation)
+            if self._task_observation is not None
+            else None
+        )
 
     @property
     def records(self) -> tuple[ToolRecord, ...]:
