@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>市场状态 Agent</title>
+    <link rel="stylesheet" href="/widget-assets/widget.css" />
+  </head>
+  <body>
+    <main class="agent-shell">
+      <header class="agent-header">
+        <div class="agent-mark" aria-hidden="true"><i></i><i></i><i></i></div>
+        <div><strong>市场状态 Agent</strong><span id="context-label">等待页面上下文</span></div>
+        <span class="agent-status" id="agent-status">就绪</span>
+      </header>
+      <section class="conversation" id="conversation" aria-live="polite">
+        <div class="intro">
+          <span>READ-ONLY RESEARCH</span>
+          <h1>从页面判断，追到真实证据。</h1>
+          <p>我会按需读取市场状态、机会、宽度或历史快照，并标明数据日期与质量。</p>
+          <div class="suggestions">
+            <button type="button">今天为什么是这个市场阶段？</button>
+            <button type="button">当前机会最缺什么确认？</button>
+            <button type="button">和上一交易日相比有什么变化？</button>
+          </div>
+        </div>
+      </section>
+      <form class="composer" id="composer">
+        <label for="question">追问当前市场状态</label>
+        <div><textarea id="question" rows="2" maxlength="4000" placeholder="例如：哪些行业只是短期反弹？"></textarea><button type="button" id="send">发送</button></div>
+        <small>只读分析 · 不执行交易或修改 FinScope 数据</small>
+      </form>
+    </main>
+    <script src="/widget-assets/widget.js" defer></script>
+  </body>
+</html>

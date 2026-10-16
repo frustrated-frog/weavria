@@ -2,17 +2,25 @@ import json
 from typing import Any
 
 import pytest
-from pydantic import TypeAdapter
+from pydantic import JsonValue, TypeAdapter
 
 from weavria.core import (
+    ControlRequest,
+    ConversationView,
     FinishAction,
     Message,
     MessageRole,
     ModelRequest,
+    SessionRequest,
     TaskInput,
+    ToolBatch,
     ToolCallAction,
 )
-from weavria.models import OpenAICompatibleConfig, OpenAICompatibleProvider
+from weavria.models import (
+    OpenAICompatibleConfig,
+    OpenAICompatibleProvider,
+    OpenAICompatibleSessionProvider,
+)
 
 
 class Transport:
@@ -99,3 +107,107 @@ async def test_adapter_rejects_missing_or_invalid_actions(payload: object) -> No
     )
     with pytest.raises(ValueError, match="valid JSON action"):
         await provider.generate(_request())
+
+
+def _session_request(*, sequence: int = 0) -> SessionRequest:
+    return SessionRequest(
+        conversation=ConversationView(session_id="session", through_sequence=sequence),
+        current=ControlRequest(
+            instructions="trusted instructions",
+            task=TaskInput(goal="question"),
+        ),
+    )
+
+
+async def test_session_provider_encodes_observations_and_parses_json_turn() -> None:
+    transport = Transport(_response('```json\n{"decision":{"kind":"finish","output":"完成"}}\n```'))
+    provider = OpenAICompatibleSessionProvider(
+        OpenAICompatibleConfig(model="model"),
+        transport=transport,
+    )
+
+    turn = await provider.generate_session(_session_request())
+
+    assert turn.decision == FinishAction(output="完成")
+    messages = TypeAdapter(list[dict[str, object]]).validate_python(
+        transport.requests[0]["messages"]
+    )
+    system = messages[0]["content"]
+    user = messages[1]["content"]
+    assert isinstance(system, str) and "trusted instructions" in system
+    assert isinstance(user, str)
+    observations = TypeAdapter(dict[str, JsonValue]).validate_python(json.loads(user))
+    assert isinstance(observations["current"], dict)
+    current = observations["current"]
+    assert isinstance(current["task"], dict) and current["task"]["goal"] == "question"
+    assert "instructions" not in current
+
+
+async def test_session_provider_rejects_non_json_final_content() -> None:
+    provider = OpenAICompatibleSessionProvider(
+        OpenAICompatibleConfig(model="model"),
+        transport=Transport(_response("not json")),
+    )
+
+    with pytest.raises(ValueError, match="valid JSON turn"):
+        await provider.generate_session(_session_request())
+
+
+async def test_session_provider_joins_text_content_parts() -> None:
+    transport = Transport(
+        _response(
+            [
+                {"type": "text", "text": '{"decision":'},
+                {"type": "text", "text": '{"kind":"finish","output":"完成"}}'},
+            ]
+        )
+    )
+    provider = OpenAICompatibleSessionProvider(
+        OpenAICompatibleConfig(model="model"),
+        transport=transport,
+    )
+
+    turn = await provider.generate_session(_session_request())
+
+    assert turn.decision == FinishAction(output="完成")
+
+
+async def test_session_provider_assigns_deterministic_request_scoped_call_ids() -> None:
+    payload = {
+        "decision": {
+            "kind": "tool_batch",
+            "calls": [
+                {
+                    "kind": "tool_call",
+                    "call_id": "reused-label",
+                    "tool_name": "read",
+                    "arguments": {"part": 1},
+                },
+                {
+                    "kind": "tool_call",
+                    "call_id": "reused-label",
+                    "tool_name": "read",
+                    "arguments": {"part": 2},
+                },
+            ],
+        }
+    }
+    provider = OpenAICompatibleSessionProvider(
+        OpenAICompatibleConfig(model="model"),
+        transport=Transport(_response(json.dumps(payload))),
+    )
+    request = _session_request(sequence=4)
+
+    first = await provider.generate_session(request)
+    repeated = await provider.generate_session(request)
+    advanced = await provider.generate_session(_session_request(sequence=5))
+
+    assert isinstance(first.decision, ToolBatch)
+    assert isinstance(repeated.decision, ToolBatch)
+    assert isinstance(advanced.decision, ToolBatch)
+    first_ids = tuple(call.call_id for call in first.decision.calls)
+    assert len(set(first_ids)) == 2
+    assert all(identity.startswith("wvr-") for identity in first_ids)
+    assert first_ids == tuple(call.call_id for call in repeated.decision.calls)
+    assert first_ids != tuple(call.call_id for call in advanced.decision.calls)
+    assert [call.arguments for call in first.decision.calls] == [{"part": 1}, {"part": 2}]

@@ -5,6 +5,7 @@ from .openai_compatible import (
     ChatCompletionTransport,
     OpenAICompatibleConfig,
     OpenAICompatibleProvider,
+    OpenAICompatibleSessionProvider,
 )
 from .provider import (
     ControlModelProvider,
@@ -33,6 +34,7 @@ __all__ = [
     "ModelTimeoutOrigin",
     "OpenAICompatibleConfig",
     "OpenAICompatibleProvider",
+    "OpenAICompatibleSessionProvider",
     "SessionModelProvider",
     "TurnModelProvider",
     "call_controlled_model",
