@@ -239,6 +239,10 @@ async def test_model_interpreter_keeps_capability_data_out_of_host_instructions(
     assert "declare_task_specification" in sent.instructions
     assert "Available capability catalogue" not in sent.instructions
     assert "Available capability catalogue" in sent.task.constraints[-1]
+    assert "freshness=current requires source=external" in sent.instructions
+    assert "execute has at least one selected capability and no blocking ambiguities" in (
+        sent.instructions
+    )
     assert sent.history == request.history
 
 

@@ -271,7 +271,12 @@ class ModelTaskInterpreter:
             "because context or the catalogue mentions its domain. Select only capabilities "
             "in the catalogue. Use direct when no external capability is needed, clarify when "
             "missing user intent blocks safe progress, and execute only when at least one "
-            "listed capability is useful."
+            "listed capability is useful. Cross-field invariants not fully expressed by the "
+            "JSON Schema: freshness=current requires source=external; direct has no selected "
+            "capabilities, required external information or ambiguities; clarify has at least "
+            "one blocking ambiguity and no selected capabilities; execute has at least one "
+            "selected capability and no blocking ambiguities. Record only ambiguities that "
+            "prevent safe progress, not harmless context limitations or optional detail."
         )
         model_request = ModelRequest(
             instructions=instructions,
