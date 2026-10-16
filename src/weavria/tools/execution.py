@@ -20,7 +20,9 @@ from pydantic_core import PydanticSerializationError
 
 from weavria.artifacts import ArtifactSnapshot, ArtifactStore
 from weavria.core import (
+    ArtifactRef,
     ErrorCategory,
+    FeedbackBounds,
     JsonPointer,
     RunError,
     ToolAuthorization,
@@ -81,11 +83,32 @@ class ToolExecutionError(RuntimeError):
 class ToolContext:
     """Invocation-scoped read capability; captures dependencies and closes on exit."""
 
-    def __init__(self, run_id: str, store: ArtifactStore) -> None:
+    def __init__(
+        self,
+        run_id: str,
+        store: ArtifactStore,
+        accepted_artifacts: tuple[ArtifactRef, ...] | None = None,
+        *,
+        call_id: str | None = None,
+    ) -> None:
+        self._call_id = call_id
         self._run_id = run_id
         self._store = store
         self._reads: list[str] = []
         self._active = True
+        self._accepted = (
+            None
+            if accepted_artifacts is None
+            else {ref.artifact_id: ref for ref in accepted_artifacts}
+        )
+
+    @property
+    def call_id(self) -> str | None:
+        return self._call_id
+
+    @property
+    def active(self) -> bool:
+        return self._active
 
     @property
     def dependencies(self) -> tuple[str, ...]:
@@ -95,11 +118,17 @@ class ToolContext:
         """Read within the owning run and record the producing call."""
         if not self._active:
             raise RuntimeError("tool invocation context is closed")
+        if self._accepted is not None and artifact_id not in self._accepted:
+            raise ToolFault(
+                ErrorCategory.POLICY_DENIED, "Artifact is outside the accepted turn view"
+            )
         snapshot = await self._store.get(self._run_id, artifact_id)
         if not self._active:
             raise RuntimeError("tool invocation context is closed")
         if snapshot.reference.run_id != self._run_id:
             raise ToolExecutionError("artifact store returned another run's result")
+        if self._accepted is not None and snapshot.reference != self._accepted[artifact_id]:
+            raise ToolExecutionError("artifact store changed an accepted source identity")
         self._reads.append(snapshot.reference.call_id)
         return snapshot
 
@@ -242,6 +271,15 @@ class ToolRegistry:
         except KeyError as exc:
             raise ToolFault(ErrorCategory.UNKNOWN_TOOL, "Unknown tool") from exc
 
+    def select(self, names: tuple[str, ...]) -> "ToolRegistry":
+        """Return an ordered least-capability view; unknown or duplicate names fail closed."""
+        if len(names) != len(set(names)):
+            raise ValueError("selected tool names must be unique")
+        try:
+            return ToolRegistry(tuple(self._tools[name] for name in names))
+        except KeyError as exc:
+            raise ValueError("selected tool is not registered") from exc
+
 
 class ToolExecutor:
     """Dispatch one attempt; publish a result receipt, never raw oversized data."""
@@ -252,15 +290,25 @@ class ToolExecutor:
         registry: ToolRegistry,
         store: ArtifactStore,
         policy: ToolPolicy,
+        feedback_bounds: FeedbackBounds | None = None,
     ) -> None:
         self._run_id, self._registry, self._store, self._policy = run_id, registry, store, policy
         self._failures: dict[str, BaseException] = {}
+        self._bounds = (
+            FeedbackBounds.model_validate(feedback_bounds) if feedback_bounds is not None else None
+        )
 
     def failure_cause(self, call_id: str) -> BaseException | None:
         """Owner-only diagnostics, including exception chains; never serialize to model or trace."""
         return self._failures.get(call_id)
 
-    async def execute(self, action: ToolCallAction, *, max_duration: float) -> ToolRecord:
+    async def execute(
+        self,
+        action: ToolCallAction,
+        *,
+        max_duration: float,
+        accepted_artifacts: tuple[ArtifactRef, ...] | None = None,
+    ) -> ToolRecord:
         """Return a classified exchange; external cancellation always propagates."""
         if isinstance(max_duration, bool) or not math.isfinite(max_duration) or max_duration <= 0:
             raise ValueError("tool duration must be positive and finite")
@@ -269,8 +317,17 @@ class ToolExecutor:
         )
         owner = asyncio.current_task()
         cancellations = owner.cancelling() if owner is not None else 0
-        context = ToolContext(self._run_id, self._store)
+        context = ToolContext(self._run_id, self._store, accepted_artifacts, call_id=action.call_id)
         authorization: ToolAuthorization | None = None
+        loop = asyncio.get_running_loop()
+        deadline: float | None = None
+        limit: asyncio.Timeout | None = None
+
+        def attempt_expired() -> bool:
+            return deadline is not None and (
+                loop.time() >= deadline or (limit is not None and limit.expired())
+            )
+
         try:
             tool = self._registry.get(action.tool_name)
             descriptor = tool.descriptor
@@ -283,7 +340,9 @@ class ToolExecutor:
                     ErrorCategory.POLICY_DENIED,
                     "This executor supports replay-safe reads without approval only",
                 )
-            async with asyncio.timeout(min(max_duration, descriptor.timeout_seconds)) as limit:
+            deadline = loop.time() + min(max_duration, descriptor.timeout_seconds)
+            limit = asyncio.timeout_at(deadline)
+            async with limit:
                 arguments = tool.validate_arguments(action.arguments)
                 normalized = TypeAdapter[JsonValue](JsonValue).validate_json(
                     arguments.model_dump_json()
@@ -306,14 +365,22 @@ class ToolExecutor:
                 value = await tool.invoke(arguments, context)
                 if owner is not None and owner.cancelling() > cancellations:
                     raise asyncio.CancelledError
+                if attempt_expired():
+                    raise TimeoutError("tool backend returned after its deadline")
                 snapshot = await self._store.put(self._run_id, action.call_id, value)
-            if limit.expired():
+            if attempt_expired():
                 raise TimeoutError("tool returned after its deadline")
             if owner is not None and owner.cancelling() > cancellations:
                 raise asyncio.CancelledError
             reference = snapshot.reference
             if reference.run_id != self._run_id or reference.call_id != action.call_id:
                 raise ToolExecutionError("artifact store violated execution identity")
+            if self._bounds is not None and (
+                len(TypeAdapter(str).dump_json(reference.artifact_id))
+                > self._bounds.max_artifact_id_json_bytes
+                or reference.size_bytes > self._bounds.max_result_bytes
+            ):
+                raise ToolExecutionError("artifact store violated admitted feedback bounds")
             receipt: dict[str, JsonValue] = {
                 "artifact_id": reference.artifact_id,
                 "sha256": reference.sha256,
@@ -337,7 +404,10 @@ class ToolExecutor:
         except ToolExecutionError:
             raise
         except ToolFault as exc:
-            category, message, cause = exc.category, str(exc), exc.__cause__
+            if attempt_expired():
+                category, message, cause = ErrorCategory.TIMEOUT, "Tool call timed out", exc
+            else:
+                category, message, cause = exc.category, str(exc), exc.__cause__
         except TimeoutError as exc:
             if owner is not None and owner.cancelling() > cancellations:
                 raise asyncio.CancelledError from exc
@@ -345,7 +415,10 @@ class ToolExecutor:
         except Exception as exc:
             if owner is not None and owner.cancelling() > cancellations:
                 raise asyncio.CancelledError from exc
-            category, message, cause = ErrorCategory.TOOL_FAILURE, "Tool backend failed", exc
+            if attempt_expired():
+                category, message, cause = ErrorCategory.TIMEOUT, "Tool call timed out", exc
+            else:
+                category, message, cause = ErrorCategory.TOOL_FAILURE, "Tool backend failed", exc
         finally:
             context.close()
         if owner is not None and owner.cancelling() > cancellations:

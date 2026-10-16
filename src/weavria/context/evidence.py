@@ -13,11 +13,18 @@ from pydantic import JsonValue, TypeAdapter
 
 from weavria.artifacts import ArtifactSnapshot, ArtifactStore
 from weavria.core import (
+    CONTROL_FEEDBACK_BYTES,
+    ControlFeedback,
+    ControlRequest,
     ModelRequest,
     TaskInput,
+    TaskObservation,
     ToolExchange,
     ToolRecord,
     ToolSucceededObservation,
+    TurnFeedback,
+    TurnRequest,
+    minimum_exchange,
 )
 
 from .selection import ContextBudgetError, ContextBuildError
@@ -112,17 +119,13 @@ class EvidenceDecision:
 
 
 @dataclass(frozen=True, slots=True)
-class EvidencePlan:
+class _EvidencePlan:
     """Independent model view; the execution journal and artifacts remain authoritative."""
 
     request_json: str = field(repr=False)
     mode: EvidenceMode
     budget_bytes: int
     decisions: tuple[EvidenceDecision, ...]
-
-    @property
-    def request(self) -> ModelRequest:
-        return ModelRequest.model_validate_json(self.request_json)
 
     @property
     def request_bytes(self) -> int:
@@ -148,6 +151,51 @@ class EvidencePlan:
                 for d in self.decisions
             ],
         }
+
+
+@dataclass(frozen=True, slots=True)
+class EvidencePlan(_EvidencePlan):
+    """Unchanged v1 request snapshot for single-action providers."""
+
+    @property
+    def request(self) -> ModelRequest:
+        return ModelRequest.model_validate_json(self.request_json)
+
+
+@dataclass(frozen=True, slots=True)
+class TurnEvidencePlan(_EvidencePlan):
+    """v2 request snapshot; structured feedback is included in the measured bytes."""
+
+    @property
+    def request(self) -> TurnRequest:
+        return TurnRequest.model_validate_json(self.request_json)
+
+    def metadata(self) -> dict[str, JsonValue]:
+        return {**_EvidencePlan.metadata(self), "schema_version": 2, "request_schema_version": 2}
+
+
+@dataclass(frozen=True, slots=True)
+class ControlEvidencePlan(_EvidencePlan):
+    """v3 request; minimum feedback remains available even when full views cannot fit."""
+
+    @property
+    def request(self) -> ControlRequest:
+        return ControlRequest.model_validate_json(self.request_json)
+
+    def metadata(self) -> dict[str, JsonValue]:
+        return {
+            **_EvidencePlan.metadata(self),
+            "schema_version": 3,
+            "request_schema_version": 3,
+            "control_padding_bytes": self.control_padding_bytes,
+        }
+
+    @property
+    def control_padding_bytes(self) -> int:
+        control = self.request.control
+        return CONTROL_FEEDBACK_BYTES - len(
+            control.model_dump_json().encode() if control else b"null"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,13 +227,107 @@ class EvidenceContextBuilder:
         run_id: str,
         instructions: str,
         task: TaskInput,
+        task_observation: TaskObservation | None = None,
         records: tuple[ToolRecord, ...],
         max_request_bytes: int,
+        feedback_call_ids: tuple[str, ...] | None = None,
     ) -> EvidencePlan:
-        """Fail on invalid provenance or insufficient minimum feedback budget."""
+        """Build a v1 view; fail on invalid provenance or insufficient feedback budget."""
+        base = ModelRequest(
+            instructions=instructions,
+            task=task,
+            task_observation=task_observation,
+        )
+        plan = await self._select(run_id, base, records, max_request_bytes, feedback_call_ids)
+        return EvidencePlan(plan.request_json, plan.mode, plan.budget_bytes, plan.decisions)
+
+    async def build_turn(
+        self,
+        *,
+        run_id: str,
+        instructions: str,
+        task: TaskInput,
+        task_observation: TaskObservation | None = None,
+        records: tuple[ToolRecord, ...],
+        max_request_bytes: int,
+        feedback: TurnFeedback | None = None,
+    ) -> TurnEvidencePlan:
+        """Keep paired feedback indivisible while allocating remaining evidence bytes."""
+        feedback = (
+            TurnFeedback.model_validate_json(
+                TurnFeedback.model_validate(feedback).model_dump_json()
+            )
+            if feedback is not None
+            else None
+        )
+        # Empty history is only a sizing template. The final request is fully
+        # revalidated, including every feedback status and its paired exchange.
+        base = TurnRequest(
+            instructions=instructions,
+            task=task,
+            task_observation=task_observation,
+        ).model_copy(update={"feedback": feedback})
+        mandatory = (
+            tuple(c.call_id for c in feedback.calls if c.status != "skipped") if feedback else ()
+        )
+        plan = await self._select(run_id, base, records, max_request_bytes, mandatory)
+        return TurnEvidencePlan(plan.request_json, plan.mode, plan.budget_bytes, plan.decisions)
+
+    async def build_control(
+        self,
+        *,
+        run_id: str,
+        instructions: str,
+        task: TaskInput,
+        task_observation: TaskObservation | None = None,
+        records: tuple[ToolRecord, ...],
+        max_request_bytes: int,
+        feedback: TurnFeedback | None = None,
+        control: ControlFeedback | None = None,
+        required_call_ids: tuple[str, ...] = (),
+    ) -> ControlEvidencePlan:
+        feedback = (
+            TurnFeedback.model_validate_json(
+                TurnFeedback.model_validate(feedback).model_dump_json()
+            )
+            if feedback is not None
+            else None
+        )
+        base = ControlRequest(
+            instructions=instructions,
+            task=task,
+            task_observation=task_observation,
+            control=control,
+        ).model_copy(update={"feedback": feedback})
+        mandatory = (
+            tuple(c.call_id for c in feedback.calls if c.status != "skipped") if feedback else ()
+        )
+        mandatory = tuple(dict.fromkeys((*mandatory, *required_call_ids)))
+        control_bytes = (
+            len(base.control.model_dump_json().encode()) if base.control else len(b"null")
+        )
+        plan = await self._select(
+            run_id,
+            base,
+            records,
+            max_request_bytes,
+            mandatory,
+            CONTROL_FEEDBACK_BYTES - control_bytes,
+        )
+        return ControlEvidencePlan(plan.request_json, plan.mode, plan.budget_bytes, plan.decisions)
+
+    async def _select(
+        self,
+        run_id: str,
+        base: ModelRequest | TurnRequest | ControlRequest,
+        records: tuple[ToolRecord, ...],
+        max_request_bytes: int,
+        feedback_call_ids: tuple[str, ...] | None,
+        reserved_bytes: int = 0,
+    ) -> _EvidencePlan:
         if type(max_request_bytes) is not int or max_request_bytes <= 0:
             raise ValueError("max_request_bytes must be a positive integer")
-        task = TaskInput.model_validate_json(TaskInput.model_validate(task).model_dump_json())
+        task = base.task
         records = tuple(ToolRecord.model_validate_json(r.model_dump_json()) for r in records)
         identities: dict[str, int] = {}
         indexed: dict[int, _IndexedResult] = {}
@@ -223,8 +365,7 @@ class EvidenceContextBuilder:
                         ),
                     )
 
-        base = ModelRequest(instructions=instructions, task=task)
-        base_bytes = len(base.model_dump_json().encode("utf-8"))
+        base_bytes = len(base.model_dump_json().encode("utf-8")) + reserved_bytes
         query = set(terms(" ".join((task.goal, *task.constraints))))
         all_passages = [p for item in indexed.values() for p in item.passages]
         frequencies: Counter[str] = Counter()
@@ -250,9 +391,15 @@ class EvidenceContextBuilder:
         scores: list[float] = []
         for index, record in enumerate(records):
             exchange = record.exchange
-            references.append(exchange)
+            references.append(
+                minimum_exchange(record) if isinstance(base, ControlRequest) else exchange
+            )
             if index not in indexed:
-                alternatives.append(((exchange, 0.0),))
+                alternatives.append(
+                    ((references[-1], 0.0), (exchange, 0.0))
+                    if isinstance(base, ControlRequest)
+                    else ((exchange, 0.0),)
+                )
                 full.append(exchange)
                 scores.append(0.0)
                 continue
@@ -319,24 +466,42 @@ class EvidenceContextBuilder:
             return result
 
         last = len(records) - 1
-        if records:
-            selected = proposal(last, references[last])
-            reasons = {i: "dependency" for i in selected}
-            reasons[last] = "latest_feedback"
+        mandatory = (last,) if records and not isinstance(base, ControlRequest) else ()
+        if feedback_call_ids:
+            if len(set(feedback_call_ids)) != len(feedback_call_ids) or any(
+                c not in identities for c in feedback_call_ids
+            ):
+                raise ContextBuildError("feedback references unaccepted or duplicate calls")
+            mandatory = tuple(identities[c] for c in feedback_call_ids)
+        for index in mandatory:
+            selected = proposal(index, references[index])
+        reasons = dict.fromkeys(selected, "dependency")
+        reasons.update(dict.fromkeys(mandatory, "latest_feedback"))
         if total(selected) > max_request_bytes:
             raise ContextBudgetError(total(selected), max_request_bytes)
-        initial_level = -1
-        if records:
-            # Give the latest feedback a useful view before optimizing older evidence.
-            # A receipt remains the fallback when even one source passage cannot fit.
-            candidate = proposal(last, alternatives[last][0][0])
+        initial_levels: dict[int, int] = {}
+        for index in mandatory:
+            # Each sibling keeps a receipt; offer one useful view before older evidence.
+            candidate = proposal(index, alternatives[index][0][0])
             if total(candidate) <= max_request_bytes:
                 selected = candidate
-                initial_level = 0
+                initial_levels[index] = 0
 
         if self._mode is EvidenceMode.FULL:
-            selected = dict(enumerate(full))
-            reasons = dict.fromkeys(selected, "full_history")
+            if (
+                not isinstance(base, ControlRequest)
+                or total(dict(enumerate(full))) <= max_request_bytes
+            ):
+                selected = dict(enumerate(full))
+                reasons = dict.fromkeys(selected, "full_history")
+            else:
+                for index in mandatory:
+                    candidate = proposal(index, full[index])
+                    if total(candidate) <= max_request_bytes:
+                        selected = candidate
+                # A successful admission promises the minimum feedback, not full
+                # raw payloads. Keep that promise and expose the fallback in metadata.
+                reasons.update(dict.fromkeys(selected, "full_budget_fallback"))
         elif self._mode is EvidenceMode.RECENT:
             for index in reversed(range(len(records))):
                 fitting = [
@@ -352,9 +517,9 @@ class EvidenceContextBuilder:
         else:
             levels = dict.fromkeys(range(len(records)), -1)
             utilities = dict.fromkeys(range(len(records)), 0.0)
-            if records and initial_level >= 0:
-                levels[last] = initial_level
-                utilities[last] = alternatives[last][initial_level][1]
+            for index, level in initial_levels.items():
+                levels[index] = level
+                utilities[index] = alternatives[index][level][1]
             while True:
                 feasible: list[tuple[float, float, int, int, dict[int, ToolExchange]]] = []
                 for index in range(len(records)):
@@ -388,13 +553,11 @@ class EvidenceContextBuilder:
         needed = total(selected)
         if needed > max_request_bytes:
             raise ContextBudgetError(needed, max_request_bytes)
-        request = ModelRequest(
-            instructions=instructions,
-            task=task,
-            history=tuple(selected[i] for i in sorted(selected)),
+        request = type(base).model_validate(
+            base.model_copy(update={"history": tuple(selected[i] for i in sorted(selected))})
         )
         encoded = request.model_dump_json()
-        if len(encoded.encode("utf-8")) != needed:
+        if len(encoded.encode("utf-8")) + reserved_bytes != needed:
             raise ContextBuildError("projection size disagrees with final request")
         decisions = tuple(
             EvidenceDecision(
@@ -407,7 +570,7 @@ class EvidenceContextBuilder:
             )
             for i, r in enumerate(records)
         )
-        return EvidencePlan(encoded, self._mode, max_request_bytes, decisions)
+        return _EvidencePlan(encoded, self._mode, max_request_bytes, decisions)
 
     @staticmethod
     def _view(exchange: ToolExchange, output: dict[str, JsonValue]) -> ToolExchange:

@@ -9,6 +9,7 @@ from weavria.core import (
     ModelResponse,
     RunError,
     TaskInput,
+    TaskObservation,
     ToolExchange,
     ToolFailedObservation,
 )
@@ -63,6 +64,40 @@ def test_history_rejects_duplicate_call_ids(exchange: ToolExchange) -> None:
 def test_task_revision_is_a_positive_strict_integer(revision: object) -> None:
     with pytest.raises(ValidationError):
         TaskInput.model_validate({"goal": "Read", "revision": revision})
+
+
+def test_task_observation_is_bounded_and_revision_bound() -> None:
+    observation = TaskObservation(
+        observation_id="frame-1",
+        input_id="input-1",
+        task_revision=1,
+        frame_revision=1,
+        producer_version="test/1",
+        payload={"goal": "derived goal"},
+    )
+    request = ModelRequest(
+        instructions="",
+        task=TaskInput(goal="raw request"),
+        task_observation=observation,
+    )
+    assert request.task.goal == "raw request"
+    assert request.task_observation == observation
+    for revision in (1, 3):
+        with pytest.raises(ValidationError, match="current task revision"):
+            ModelRequest(
+                instructions="",
+                task=TaskInput(goal="raw request", revision=2),
+                task_observation=observation.model_copy(update={"task_revision": revision}),
+            )
+    with pytest.raises(ValidationError, match="exceeds 16384"):
+        TaskObservation(
+            observation_id="large",
+            input_id="input-1",
+            task_revision=1,
+            frame_revision=1,
+            producer_version="test/1",
+            payload={"value": "x" * 17_000},
+        )
 
 
 def test_current_constraints_are_separate_from_historical_text() -> None:

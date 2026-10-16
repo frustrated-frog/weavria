@@ -1,0 +1,507 @@
+import asyncio
+import json
+from typing import Literal
+
+import pytest
+from pydantic import BaseModel, ConfigDict, ValidationError
+
+from weavria.artifacts import InMemoryArtifactStore
+from weavria.core import (
+    ErrorCategory,
+    FinishAction,
+    Message,
+    MessageRole,
+    ModelRequest,
+    ModelResponse,
+    RunStatus,
+    TaskInput,
+    ToolCallAction,
+)
+from weavria.harness import (
+    CapabilityNeed,
+    CompletionCriterion,
+    InformationNeed,
+    ModelTaskInterpreter,
+    TaskAwareAgent,
+    TaskFrame,
+    TaskSpecification,
+    TaskUnderstandingEngine,
+    TaskUnderstandingError,
+    TaskUnderstandingInput,
+)
+from weavria.models import FakeModelProvider, ModelCapabilities
+from weavria.tools import ToolContext, ToolRegistry, TypedTool
+
+
+class _Input(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid")
+    document: str
+
+
+class _Output(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid")
+    text: str
+
+
+async def _read_document(arguments: _Input, context: ToolContext) -> _Output:
+    return _Output(text=f"content:{arguments.document}")
+
+
+async def _send_message(arguments: _Input, context: ToolContext) -> _Output:
+    return _Output(text=f"sent:{arguments.document}")
+
+
+def _tools() -> ToolRegistry:
+    return ToolRegistry(
+        (
+            TypedTool(
+                name="read_document",
+                version="1",
+                description="Read a named local document",
+                input_type=_Input,
+                output_type=_Output,
+                execute=_read_document,
+            ),
+            TypedTool(
+                name="send_message",
+                version="1",
+                description="Send a message to an external recipient",
+                input_type=_Input,
+                output_type=_Output,
+                execute=_send_message,
+                behavior="side_effect",
+                idempotency="unknown",
+                risk="high",
+                approval_required=True,
+            ),
+        )
+    )
+
+
+def _criterion(
+    kind: Literal["response", "clarification", "capability_result"] = "response",
+    capability: str | None = None,
+) -> CompletionCriterion:
+    return CompletionCriterion(
+        kind=kind,
+        description="Produce the requested result",
+        capability=capability,
+    )
+
+
+def _direct() -> TaskSpecification:
+    return TaskSpecification(
+        route="direct",
+        intent="Explain the assistant role",
+        goal="Explain your role and limits",
+        completion_criteria=(_criterion(),),
+    )
+
+
+def _execute() -> TaskSpecification:
+    return TaskSpecification(
+        route="execute",
+        intent="Retrieve a document fact",
+        goal="Read report.txt and answer from its contents",
+        information_needs=(
+            InformationNeed(
+                description="Contents of report.txt",
+                source="external",
+                freshness="stable",
+            ),
+        ),
+        capability_needs=(
+            CapabilityNeed(
+                name="read_document",
+                purpose="Retrieve the requested source",
+                necessity="required",
+            ),
+        ),
+        completion_criteria=(
+            _criterion("capability_result", "read_document"),
+            _criterion(),
+        ),
+    )
+
+
+def _clarify() -> TaskSpecification:
+    return TaskSpecification(
+        route="clarify",
+        intent="Resolve missing input before acting",
+        goal="Ask which document the user means",
+        ambiguities=("The target document is unknown",),
+        completion_criteria=(
+            CompletionCriterion(
+                kind="clarification",
+                description="Ask one focused question about the target document",
+            ),
+        ),
+    )
+
+
+def _declaration(specification: TaskSpecification) -> ModelResponse:
+    return ModelResponse(
+        action=ToolCallAction(
+            call_id="understanding-1",
+            tool_name="declare_task_specification",
+            arguments=specification.model_dump(mode="json"),
+        )
+    )
+
+
+def test_task_specification_rejects_inert_or_contradictory_routes() -> None:
+    with pytest.raises(ValidationError, match="direct tasks cannot require"):
+        TaskSpecification(
+            route="direct",
+            intent="Look something up",
+            goal="Find a fact",
+            information_needs=(
+                InformationNeed(
+                    description="A current fact",
+                    source="external",
+                    freshness="current",
+                ),
+            ),
+            completion_criteria=(_criterion(),),
+        )
+    with pytest.raises(ValidationError, match="every required capability"):
+        TaskSpecification(
+            route="execute",
+            intent="Read a file",
+            goal="Read report.txt",
+            capability_needs=(
+                CapabilityNeed(
+                    name="read_document",
+                    purpose="Read the source",
+                    necessity="required",
+                ),
+            ),
+            completion_criteria=(_criterion(),),
+        )
+    with pytest.raises(ValidationError, match="clarification requires ambiguity"):
+        TaskSpecification(
+            route="clarify",
+            intent="Resolve an unclear request",
+            goal="Ask what should be processed",
+            completion_criteria=(
+                CompletionCriterion(
+                    kind="clarification",
+                    description="Ask one focused question",
+                ),
+            ),
+        )
+    with pytest.raises(ValidationError, match="required external information"):
+        TaskSpecification(
+            route="execute",
+            intent="Optionally look up a required fact",
+            goal="Find a required fact",
+            information_needs=(
+                InformationNeed(
+                    description="A required fact",
+                    source="external",
+                    freshness="stable",
+                ),
+            ),
+            capability_needs=(
+                CapabilityNeed(
+                    name="read_document",
+                    purpose="Maybe read the source",
+                    necessity="optional",
+                ),
+            ),
+            completion_criteria=(_criterion(),),
+        )
+
+
+async def test_model_interpreter_keeps_capability_data_out_of_host_instructions() -> None:
+    provider = FakeModelProvider((_declaration(_execute()),))
+    interpreter = ModelTaskInterpreter(provider)
+    request = TaskUnderstandingInput(
+        task=TaskInput(goal="Read the report"),
+        history=(Message(role=MessageRole.USER, content="The report is report.txt"),),
+        capabilities=(),
+    )
+    specification = await interpreter.interpret(request, max_duration=1)
+
+    assert specification.route == "execute"
+    sent = provider.requests[0]
+    assert "declare_task_specification" in sent.instructions
+    assert "Available capability catalogue" not in sent.instructions
+    assert "Available capability catalogue" in sent.task.constraints[-1]
+    assert sent.history == request.history
+
+
+async def test_unavailable_capability_is_rejected_before_runtime() -> None:
+    specification = TaskSpecification(
+        route="execute",
+        intent="Use an invented capability",
+        goal="Use a capability the host did not grant",
+        capability_needs=(
+            CapabilityNeed(name="invented", purpose="Escalate", necessity="required"),
+        ),
+        completion_criteria=(_criterion("capability_result", "invented"),),
+    )
+    engine = TaskUnderstandingEngine(
+        ModelTaskInterpreter(FakeModelProvider((_declaration(specification),)))
+    )
+    with pytest.raises(TaskUnderstandingError) as raised:
+        await engine.prepare(
+            input_id="escalate-input",
+            task=TaskInput(goal="Escalate"),
+            history=(),
+            tools=_tools(),
+        )
+    assert raised.value.error.category is ErrorCategory.INVALID_MODEL_RESPONSE
+    assert raised.value.__cause__ is None
+
+
+async def test_understanding_timeout_cleans_up_and_is_classified() -> None:
+    class Waiting:
+        capabilities = ModelCapabilities(tool_calls=True)
+
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.cleaned = asyncio.Event()
+
+        async def generate(self, request: ModelRequest) -> ModelResponse:
+            self.started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                self.cleaned.set()
+            raise AssertionError("unreachable")
+
+    provider = Waiting()
+    engine = TaskUnderstandingEngine(ModelTaskInterpreter(provider), max_duration=0.01)
+    with pytest.raises(TaskUnderstandingError) as raised:
+        await engine.prepare(
+            input_id="wait-input",
+            task=TaskInput(goal="Wait"),
+            history=(),
+            tools=_tools(),
+        )
+    assert raised.value.error.category is ErrorCategory.TIMEOUT
+    assert provider.started.is_set() and provider.cleaned.is_set()
+
+
+async def test_external_cancellation_propagates_through_understanding() -> None:
+    class Waiting:
+        capabilities = ModelCapabilities(tool_calls=True)
+
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.cleaned = asyncio.Event()
+
+        async def generate(self, request: ModelRequest) -> ModelResponse:
+            self.started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                self.cleaned.set()
+            raise AssertionError("unreachable")
+
+    provider = Waiting()
+    engine = TaskUnderstandingEngine(ModelTaskInterpreter(provider))
+    preparing = asyncio.create_task(
+        engine.prepare(
+            input_id="wait-input",
+            task=TaskInput(goal="Wait"),
+            history=(),
+            tools=_tools(),
+        )
+    )
+    async with asyncio.timeout(1):
+        await provider.started.wait()
+    preparing.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await preparing
+    assert provider.cleaned.is_set()
+
+
+async def test_capability_catalogue_carries_schema_without_artificial_size_limits() -> None:
+    provider = FakeModelProvider((_declaration(_direct()),))
+    tools = ToolRegistry(
+        tuple(
+            TypedTool(
+                name=f"read_document_{index}",
+                version="1",
+                description="x" * 700,
+                input_type=_Input,
+                output_type=_Output,
+                execute=_read_document,
+            )
+            for index in range(65)
+        )
+    )
+    engine = TaskUnderstandingEngine(ModelTaskInterpreter(provider))
+
+    preparation = await engine.prepare(
+        input_id="large-catalogue",
+        task=TaskInput(goal="Explain your role"),
+        history=(),
+        tools=tools,
+    )
+
+    catalogue = provider.requests[0].task.constraints[-1]
+    assert len(preparation.record.available_capabilities) == 65
+    assert '"input_schema"' in catalogue
+    assert '"document"' in catalogue
+    assert "x" * 700 in catalogue
+
+
+async def test_valid_but_oversized_specification_fails_at_the_typed_boundary() -> None:
+    long_text = "界" * 512
+    names = tuple(f"read_{index}" for index in range(8))
+    specification = TaskSpecification(
+        route="execute",
+        intent=long_text,
+        goal=long_text,
+        information_needs=tuple(
+            InformationNeed(
+                description=long_text,
+                source="external",
+                freshness="stable",
+            )
+            for _ in range(8)
+        ),
+        capability_needs=tuple(
+            CapabilityNeed(name=name, purpose=long_text, necessity="required") for name in names
+        ),
+        completion_criteria=tuple(
+            CompletionCriterion(
+                kind="capability_result",
+                description=long_text,
+                capability=name,
+            )
+            for name in names
+        ),
+    )
+    tools = ToolRegistry(
+        tuple(
+            TypedTool(
+                name=name,
+                version="1",
+                description="Read one value",
+                input_type=_Input,
+                output_type=_Output,
+                execute=_read_document,
+            )
+            for name in names
+        )
+    )
+    engine = TaskUnderstandingEngine(
+        ModelTaskInterpreter(FakeModelProvider((_declaration(specification),)))
+    )
+
+    with pytest.raises(TaskUnderstandingError) as raised:
+        await engine.prepare(
+            input_id="oversized-frame",
+            task=TaskInput(goal="Read values"),
+            history=(),
+            tools=tools,
+        )
+
+    assert raised.value.error.category is ErrorCategory.INVALID_MODEL_RESPONSE
+    assert "bounded task frame" in raised.value.error.message
+
+
+async def test_direct_task_hides_all_tools_and_executes_without_a_tool_call() -> None:
+    understanding_model = FakeModelProvider((_declaration(_direct()),))
+    action_model = FakeModelProvider(
+        (ModelResponse(action=FinishAction(output="I am a bounded task agent.")),)
+    )
+    agent = TaskAwareAgent(
+        understanding=TaskUnderstandingEngine(ModelTaskInterpreter(understanding_model)),
+        model=action_model,
+        tools=_tools(),
+        artifacts=InMemoryArtifactStore(),
+        instructions="Complete the typed task.",
+    )
+
+    execution = await agent.execute(run_id="direct-run", task=TaskInput(goal="Who are you?"))
+
+    assert execution.result.status is RunStatus.COMPLETED
+    assert execution.preparation.record.selected_capabilities == ()
+    assert execution.preparation.tools.descriptors == ()
+    assert execution.preparation.task.goal == "Who are you?"
+    assert execution.preparation.record.frame.request_anchor.input_id == "direct-run"
+    assert execution.preparation.record.frame.specification.goal == "Explain your role and limits"
+    assert execution.events[-1].data.kind == "run_ended"
+    request_json = action_model.requests[0].model_dump_json()
+    assert "read_document" not in request_json and "send_message" not in request_json
+    assert action_model.requests[0].task_observation == execution.preparation.observation
+
+
+async def test_execute_task_exposes_only_selected_capability_and_preserves_evidence() -> None:
+    understanding_model = FakeModelProvider((_declaration(_execute()),))
+    action_model = FakeModelProvider(
+        (
+            ModelResponse(
+                action=ToolCallAction(
+                    call_id="read-1",
+                    tool_name="read_document",
+                    arguments={"document": "report.txt"},
+                )
+            ),
+            ModelResponse(action=FinishAction(output="The report was read.")),
+        )
+    )
+    agent = TaskAwareAgent(
+        understanding=TaskUnderstandingEngine(ModelTaskInterpreter(understanding_model)),
+        model=action_model,
+        tools=_tools(),
+        artifacts=InMemoryArtifactStore(),
+        instructions="Complete the typed task.",
+    )
+
+    execution = await agent.execute(run_id="execute-run", task=TaskInput(goal="Read the report"))
+
+    assert execution.result.status is RunStatus.COMPLETED
+    assert execution.preparation.record.selected_capabilities == ("read_document",)
+    assert tuple(d.name for d in execution.preparation.tools.descriptors) == ("read_document",)
+    assert "content:report.txt" in action_model.requests[1].model_dump_json()
+    first_request = action_model.requests[0].model_dump_json()
+    assert "read_document" in first_request and "send_message" not in first_request
+
+
+async def test_clarification_route_hides_capabilities_and_keeps_raw_goal() -> None:
+    understanding_model = FakeModelProvider((_declaration(_clarify()),))
+    action_model = FakeModelProvider(
+        (ModelResponse(action=FinishAction(output="Which document should I read?")),)
+    )
+    agent = TaskAwareAgent(
+        understanding=TaskUnderstandingEngine(ModelTaskInterpreter(understanding_model)),
+        model=action_model,
+        tools=_tools(),
+        artifacts=InMemoryArtifactStore(),
+        instructions="Complete the typed task.",
+    )
+
+    execution = await agent.execute(
+        run_id="clarify-run",
+        task=TaskInput(goal="Read it"),
+        history=(Message(role=MessageRole.USER, content="I need a summary"),),
+    )
+
+    assert execution.result.output == "Which document should I read?"
+    assert execution.preparation.record.specification.route == "clarify"
+    assert execution.preparation.tools.descriptors == ()
+    assert action_model.requests[0].task.goal == "Read it"
+    observation = action_model.requests[0].task_observation
+    assert observation is not None
+    assert (
+        TaskFrame.model_validate_json(json.dumps(observation.payload)).specification.goal
+        == "Ask which document the user means"
+    )
+
+
+def test_tool_registry_selection_is_ordered_and_fails_closed() -> None:
+    tools = _tools()
+    assert tuple(d.name for d in tools.select(("send_message", "read_document")).descriptors) == (
+        "send_message",
+        "read_document",
+    )
+    with pytest.raises(ValueError, match="unique"):
+        tools.select(("read_document", "read_document"))
+    with pytest.raises(ValueError, match="not registered"):
+        tools.select(("unknown",))
