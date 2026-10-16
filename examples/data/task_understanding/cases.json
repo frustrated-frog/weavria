@@ -1,0 +1,135 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "id": "direct_identity",
+      "request": "Explain what kind of assistant you are and what you cannot do.",
+      "specification": {
+        "schema_version": 1,
+        "route": "direct",
+        "intent": "Explain the assistant role and limits",
+        "goal": "Explain the assistant role and its operational limits",
+        "information_needs": [],
+        "capability_needs": [],
+        "ambiguities": [],
+        "completion_criteria": [
+          {
+            "schema_version": 1,
+            "kind": "response",
+            "description": "Return a clear role and boundary explanation",
+            "capability": null
+          }
+        ]
+      },
+      "expected_capabilities": []
+    },
+    {
+      "id": "document_lookup",
+      "request": "Read report.txt and summarize its conclusion.",
+      "specification": {
+        "schema_version": 1,
+        "route": "execute",
+        "intent": "Retrieve and summarize a named document",
+        "goal": "Read report.txt and summarize its conclusion",
+        "information_needs": [
+          {
+            "schema_version": 1,
+            "description": "The contents of report.txt",
+            "source": "external",
+            "freshness": "stable",
+            "required": true
+          }
+        ],
+        "capability_needs": [
+          {
+            "schema_version": 1,
+            "name": "read_document",
+            "purpose": "Retrieve the named source",
+            "necessity": "required"
+          }
+        ],
+        "ambiguities": [],
+        "completion_criteria": [
+          {
+            "schema_version": 1,
+            "kind": "capability_result",
+            "description": "Use a successful document read",
+            "capability": "read_document"
+          },
+          {
+            "schema_version": 1,
+            "kind": "response",
+            "description": "Return a concise summary",
+            "capability": null
+          }
+        ]
+      },
+      "expected_capabilities": ["read_document"]
+    },
+    {
+      "id": "current_time",
+      "request": "What time is it now?",
+      "specification": {
+        "schema_version": 1,
+        "route": "execute",
+        "intent": "Retrieve a current time value",
+        "goal": "Report the current time from an external clock",
+        "information_needs": [
+          {
+            "schema_version": 1,
+            "description": "The current time",
+            "source": "external",
+            "freshness": "current",
+            "required": true
+          }
+        ],
+        "capability_needs": [
+          {
+            "schema_version": 1,
+            "name": "read_clock",
+            "purpose": "Retrieve current time",
+            "necessity": "required"
+          }
+        ],
+        "ambiguities": [],
+        "completion_criteria": [
+          {
+            "schema_version": 1,
+            "kind": "capability_result",
+            "description": "Use a successful current clock read",
+            "capability": "read_clock"
+          },
+          {
+            "schema_version": 1,
+            "kind": "response",
+            "description": "Return the time and its timezone",
+            "capability": null
+          }
+        ]
+      },
+      "expected_capabilities": ["read_clock"]
+    },
+    {
+      "id": "ambiguous_action",
+      "request": "Send it to them.",
+      "specification": {
+        "schema_version": 1,
+        "route": "clarify",
+        "intent": "Resolve missing action arguments before a side effect",
+        "goal": "Ask which content and recipient the user means",
+        "information_needs": [],
+        "capability_needs": [],
+        "ambiguities": ["The content is unknown", "The recipient is unknown"],
+        "completion_criteria": [
+          {
+            "schema_version": 1,
+            "kind": "clarification",
+            "description": "Ask for both the content and recipient",
+            "capability": null
+          }
+        ]
+      },
+      "expected_capabilities": []
+    }
+  ]
+}

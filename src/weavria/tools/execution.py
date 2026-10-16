@@ -242,6 +242,15 @@ class ToolRegistry:
         except KeyError as exc:
             raise ToolFault(ErrorCategory.UNKNOWN_TOOL, "Unknown tool") from exc
 
+    def select(self, names: tuple[str, ...]) -> "ToolRegistry":
+        """Return an ordered least-capability view; unknown or duplicate names fail closed."""
+        if len(names) != len(set(names)):
+            raise ValueError("selected tool names must be unique")
+        try:
+            return ToolRegistry(tuple(self._tools[name] for name in names))
+        except KeyError as exc:
+            raise ValueError("selected tool is not registered") from exc
+
 
 class ToolExecutor:
     """Dispatch one attempt; publish a result receipt, never raw oversized data."""
