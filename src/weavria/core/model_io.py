@@ -18,6 +18,24 @@ class TaskInput(ContractModel):
     revision: int = Field(default=1, ge=1)
 
 
+class ApplicationObservation(ContractModel):
+    """Bounded navigation/UI context that is not authoritative task evidence."""
+
+    kind: Literal["application_context"] = "application_context"
+    observation_id: NonBlankString
+    input_id: NonBlankString
+    provider: NonBlankString
+    payload_schema: NonBlankString
+    trust: Literal["navigation_context"] = "navigation_context"
+    payload: dict[str, JsonValue]
+
+    @model_validator(mode="after")
+    def validate_size(self) -> Self:
+        if len(self.model_dump_json().encode()) > 16_384:
+            raise ValueError("application observation exceeds 16384 encoded bytes")
+        return self
+
+
 class TaskObservation(ContractModel):
     """A bounded, low-trust semantic projection tied to one accepted user input.
 
@@ -32,7 +50,7 @@ class TaskObservation(ContractModel):
     task_revision: int = Field(ge=1)
     frame_revision: int = Field(ge=1)
     producer_version: NonBlankString
-    payload_schema: Literal["weavria.task-frame/1"] = "weavria.task-frame/1"
+    payload_schema: Literal["weavria.task-frame/1", "weavria.task-frame/2"] = "weavria.task-frame/1"
     trust: Literal["model_inference"] = "model_inference"
     payload: dict[str, JsonValue]
 

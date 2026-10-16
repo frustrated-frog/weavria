@@ -1,5 +1,9 @@
 # 通用任务理解与能力解析
 
+> 本文保留第一阶段设计背景。持续 Frame、Need Ledger、动态能力视图与澄清恢复的当前实现见
+> [持续任务语义 v2](task-semantics-v2.md)、[ADR 0012](decisions/0012-semantic-ledger-frame-revision.md)
+> 和 [ADR 0013](decisions/0013-dynamic-capability-completion-progress.md)。
+
 Weavria 的任务理解位于 Harness 层。它不是业务意图分类器，而是把原始请求、会话证据和
 宿主能力目录编译成一份版本化、低信任的 `TaskFrame`。Runtime 仍只接受宿主拥有的原始
 `TaskInput`；模型推导出的目标、信息需求、歧义和完成条件不能改写用户输入。
@@ -97,7 +101,7 @@ uv run python examples/live_task_understanding.py --repeats 3
 输入 Schema 传输、直接回答零业务工具、执行路径最小能力视图、隐藏高风险工具无法执行，
 以及准备失败不会启动执行模型。
 
-## 当前刻意没有实现
+## 第一阶段当时刻意没有实现（现状见 v2 文档）
 
 - 当前只生成 revision 1 的 Frame；steering 后旧 Frame 会被移除，但尚未增量重理解；
 - `clarify` 已具有结构语义，但尚未实现等待用户补充后恢复的状态机；

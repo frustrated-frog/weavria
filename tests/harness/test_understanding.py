@@ -34,6 +34,7 @@ from weavria.harness import (
     TaskUnderstandingEngine,
     TaskUnderstandingError,
     TaskUnderstandingInput,
+    apply_frame_patch,
 )
 from weavria.models import FakeControlProvider, FakeModelProvider, ModelCapabilities
 from weavria.tools import ToolContext, ToolRegistry, TypedTool
@@ -243,7 +244,7 @@ async def test_model_interpreter_keeps_capability_data_out_of_host_instructions(
     sent = provider.requests[0]
     assert "declare_task_specification" in sent.instructions
     assert "Available capability catalogue" not in sent.instructions
-    assert "Available capability catalogue" in sent.task.constraints[-1]
+    assert any(item.startswith("Available capability catalogue") for item in sent.task.constraints)
     assert "freshness=current requires source=external" in sent.instructions
     assert "execute has at least one selected capability and no blocking ambiguities" in (
         sent.instructions
@@ -411,11 +412,45 @@ async def test_capability_catalogue_carries_schema_without_artificial_size_limit
         tools=tools,
     )
 
-    catalogue = provider.requests[0].task.constraints[-1]
+    catalogue = next(
+        item
+        for item in provider.requests[0].task.constraints
+        if item.startswith("Available capability catalogue")
+    )
     assert len(preparation.record.available_capabilities) == 65
     assert '"input_schema"' in catalogue
     assert '"document"' in catalogue
     assert "x" * 700 in catalogue
+
+
+async def test_capability_catalogue_has_an_explicit_input_budget() -> None:
+    tools = ToolRegistry(
+        tuple(
+            TypedTool(
+                name=f"read_document_{index}",
+                version="1",
+                description="x" * 700,
+                input_type=_Input,
+                output_type=_Output,
+                execute=_read_document,
+            )
+            for index in range(8)
+        )
+    )
+    engine = TaskUnderstandingEngine(
+        ModelTaskInterpreter(FakeModelProvider((_declaration(_direct()),))),
+        max_catalogue_bytes=1024,
+    )
+
+    with pytest.raises(TaskUnderstandingError) as raised:
+        await engine.prepare(
+            input_id="catalogue-budget",
+            task=TaskInput(goal="Explain your role"),
+            history=(),
+            tools=tools,
+        )
+
+    assert raised.value.error.category is ErrorCategory.CONTEXT_BUDGET_EXCEEDED
 
 
 async def test_valid_but_oversized_specification_fails_at_the_typed_boundary() -> None:
@@ -536,6 +571,39 @@ async def test_execute_task_exposes_only_selected_capability_and_preserves_evide
     assert action_model.requests[1].feedback is not None
     first_request = action_model.requests[0].model_dump_json()
     assert "read_document" in first_request and "send_message" not in first_request
+
+
+async def test_frame_revision_preserves_need_identity_and_rejects_stale_patch() -> None:
+    model = FakeModelProvider((_declaration(_execute()), _declaration(_execute())))
+    engine = TaskUnderstandingEngine(ModelTaskInterpreter(model))
+    first = await engine.prepare(
+        input_id="input with host punctuation/1",
+        task=TaskInput(goal="Read the report"),
+        history=(),
+        tools=_tools(),
+    )
+    second = await engine.prepare(
+        input_id="follow-up/2",
+        task=TaskInput(goal="Read the report", revision=2),
+        history=(),
+        tools=_tools(),
+        work_id=first.record.frame.work_id,
+        base_frame=first.record.frame,
+        cause="steering",
+    )
+
+    assert first.record.frame.schema_version == 2
+    assert first.observation.payload_schema == "weavria.task-frame/2"
+    assert second.record.frame.revision == 2
+    assert second.record.frame.capability_epoch == first.record.frame.capability_epoch
+    assert second.record.frame.requirements[0].need_id == first.record.frame.requirements[0].need_id
+    assert second.patch is not None and second.patch.cause == "steering"
+    assert (
+        apply_frame_patch(first.record.frame, second.patch, second.record.frame)
+        == second.record.frame
+    )
+    with pytest.raises(ValueError, match="stale_frame"):
+        apply_frame_patch(second.record.frame, second.patch, second.record.frame)
 
 
 async def test_clarification_route_hides_capabilities_and_keeps_raw_goal() -> None:

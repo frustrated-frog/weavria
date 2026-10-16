@@ -37,15 +37,23 @@ class FeedbackBounds(ContractModel):
 
 class AdmissionNotice(ContractModel):
     kind: Literal["admission_rejected"] = "admission_rejected"
-    reason: Literal["feedback_budget", "tool_budget"]
+    reason: Literal["feedback_budget", "tool_budget", "capability_view", "no_progress"]
     proposal_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     proposed_calls: int = Field(ge=1, le=32)
     required_bytes: int = Field(ge=0)
     budget_bytes: int = Field(gt=0)
     remaining_tool_calls: int = Field(ge=0)
+    progress_fingerprint_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    canonical_tool_key_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
 
     @model_validator(mode="after")
     def bound_notice(self) -> Self:
+        progress = self.reason == "no_progress"
+        if progress != (
+            self.progress_fingerprint_sha256 is not None
+            and self.canonical_tool_key_sha256 is not None
+        ):
+            raise ValueError("no-progress rejection requires both diagnostic digests")
         if len(self.model_dump_json().encode()) > CONTROL_FEEDBACK_BYTES:
             raise ValueError("admission notice exceeds its reserved channel")
         return self

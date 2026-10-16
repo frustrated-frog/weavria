@@ -15,6 +15,7 @@ from typing import Self
 
 from weavria.artifacts import ArtifactAccessError, ArtifactSnapshot
 from weavria.core import (
+    ApplicationObservation,
     ArtifactRef,
     ContextSelected,
     ControlEvent,
@@ -22,6 +23,10 @@ from weavria.core import (
     PastCall,
     RunEnded,
     RunReport,
+    SemanticSnapshot,
+    SemanticVersion,
+    SessionApplicationObserved,
+    SessionClarificationChanged,
     SessionContextPrepared,
     SessionControlDecided,
     SessionEvent,
@@ -30,6 +35,7 @@ from weavria.core import (
     SessionRequest,
     SessionResult,
     SessionRunEvent,
+    SessionSemanticCommitted,
     SessionSourceRead,
     SessionTaskUpdated,
     SourceUse,
@@ -37,6 +43,7 @@ from weavria.core import (
     TaskUpdate,
     ToolBatch,
     ToolFailedObservation,
+    ToolRecord,
     ToolRecorded,
     TurnResolution,
 )
@@ -141,7 +148,7 @@ class SQLiteSessionStore:
         conn = sqlite3.connect(self.path, timeout=2.0)
         self._connection = conn
         version = conn.execute("PRAGMA user_version").fetchone()[0]
-        if version not in (0, 1, 2):
+        if version not in (0, 1, 2, 3, 4):
             raise SessionConflictError("unsupported session database schema")
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA journal_mode=WAL")
@@ -182,6 +189,10 @@ class SQLiteSessionStore:
             """)
         if version < 2:
             self._migrate_v2()
+        if version < 3:
+            self._migrate_v3()
+        if version < 4:
+            self._migrate_v4()
         # Only the exclusive DB owner can classify an old live run as interrupted.
         active = conn.execute("SELECT id FROM runs WHERE status='running'").fetchall()
         for row in active:
@@ -213,18 +224,52 @@ class SQLiteSessionStore:
                 )
             conn.execute("PRAGMA user_version=2")
 
+    def _migrate_v3(self) -> None:
+        """Add append-only semantic facts and rebuildable Work projections."""
+        with self._transaction() as conn:
+            conn.execute("""CREATE TABLE semantic_commits(
+                session_id TEXT NOT NULL REFERENCES sessions, work_id TEXT NOT NULL,
+                semantic_sequence INTEGER NOT NULL, data TEXT NOT NULL,
+                PRIMARY KEY(session_id,work_id,semantic_sequence))""")
+            conn.execute("""CREATE TABLE semantic_heads(
+                session_id TEXT NOT NULL REFERENCES sessions, work_id TEXT NOT NULL,
+                semantic_sequence INTEGER NOT NULL, data TEXT NOT NULL,
+                PRIMARY KEY(session_id,work_id))""")
+            conn.execute("""CREATE TABLE work_heads(
+                session_id TEXT NOT NULL REFERENCES sessions, work_id TEXT NOT NULL,
+                status TEXT NOT NULL, input_id TEXT NOT NULL, run_id TEXT NOT NULL,
+                updated_sequence INTEGER NOT NULL, PRIMARY KEY(session_id,work_id))""")
+            conn.execute("""CREATE TABLE pending_clarifications(
+                session_id TEXT NOT NULL REFERENCES sessions, clarification_id TEXT NOT NULL,
+                work_id TEXT NOT NULL, status TEXT NOT NULL, data TEXT NOT NULL,
+                PRIMARY KEY(session_id,clarification_id))""")
+            conn.execute(
+                "CREATE INDEX work_session_status ON work_heads(session_id,status,updated_sequence)"
+            )
+            conn.execute("PRAGMA user_version=3")
+
+    def _migrate_v4(self) -> None:
+        with self._transaction() as conn:
+            conn.execute(
+                "ALTER TABLE runs ADD COLUMN application_context TEXT NOT NULL DEFAULT '[]'"
+            )
+            conn.execute("PRAGMA user_version=4")
+
     def _session_event(
         self,
         conn: sqlite3.Connection,
         session_id: str,
         data: SessionInput
+        | SessionApplicationObserved
         | SessionRunEvent
         | SessionSourceRead
         | SessionInterrupted
         | SessionContextPrepared
         | SessionTaskUpdated
-        | SessionControlDecided,
-        # Every new fact uses the v2 envelope; old rows retain their original v1 bytes.
+        | SessionControlDecided
+        | SessionSemanticCommitted
+        | SessionClarificationChanged,
+        # Every new fact uses the latest envelope; old rows retain their original bytes.
     ) -> None:
         head = conn.execute("SELECT head FROM sessions WHERE id=?", (session_id,)).fetchone()[0]
         event = SessionEvent(
@@ -240,6 +285,174 @@ class SQLiteSessionStore:
         if updated.rowcount != 1:
             raise SessionConflictError("session revision changed")
 
+    async def commit_semantic(
+        self,
+        snapshot: SemanticSnapshot,
+        *,
+        expected: SemanticVersion | None,
+    ) -> SemanticSnapshot:
+        """CAS one Work head and its session event in the same SQLite transaction."""
+        encoded = SemanticSnapshot.model_validate(snapshot).model_dump_json()
+
+        def commit() -> SemanticSnapshot:
+            accepted = SemanticSnapshot.model_validate_json(encoded)
+            with self._transaction() as conn:
+                run = conn.execute(
+                    "SELECT session_id,input_id FROM runs WHERE id=?", (accepted.run_id,)
+                ).fetchone()
+                if run is None or run != (accepted.session_id, accepted.input_id):
+                    raise SessionConflictError("semantic snapshot is outside its accepted input")
+                row = conn.execute(
+                    "SELECT data FROM semantic_heads WHERE session_id=? AND work_id=?",
+                    (accepted.session_id, accepted.work_id),
+                ).fetchone()
+                current = SemanticSnapshot.model_validate_json(row[0]) if row else None
+                if current is None:
+                    if expected is not None or accepted.version.semantic_sequence != 1:
+                        raise SessionConflictError("semantic head does not match initial CAS")
+                else:
+                    if expected is None or current.version != expected:
+                        raise SessionConflictError("semantic head changed")
+                    before, after = current.version, accepted.version
+                    if (
+                        after.semantic_sequence != before.semantic_sequence + 1
+                        or after.task_revision < before.task_revision
+                        or after.frame_revision < before.frame_revision
+                        or after.capability_epoch < before.capability_epoch
+                        or after.evidence_revision < before.evidence_revision
+                    ):
+                        raise SessionConflictError("semantic version is not monotonic")
+                conn.execute(
+                    "INSERT INTO semantic_commits VALUES(?,?,?,?)",
+                    (
+                        accepted.session_id,
+                        accepted.work_id,
+                        accepted.version.semantic_sequence,
+                        encoded,
+                    ),
+                )
+                conn.execute(
+                    """INSERT INTO semantic_heads VALUES(?,?,?,?)
+                    ON CONFLICT(session_id,work_id) DO UPDATE SET
+                    semantic_sequence=excluded.semantic_sequence,data=excluded.data""",
+                    (
+                        accepted.session_id,
+                        accepted.work_id,
+                        accepted.version.semantic_sequence,
+                        encoded,
+                    ),
+                )
+                conn.execute(
+                    """INSERT INTO work_heads VALUES(?,?,?,?,?,?)
+                    ON CONFLICT(session_id,work_id) DO UPDATE SET status=excluded.status,
+                    input_id=excluded.input_id,run_id=excluded.run_id,
+                    updated_sequence=excluded.updated_sequence""",
+                    (
+                        accepted.session_id,
+                        accepted.work_id,
+                        accepted.work_status,
+                        accepted.input_id,
+                        accepted.run_id,
+                        accepted.version.semantic_sequence,
+                    ),
+                )
+                if (
+                    current is not None
+                    and current.pending_clarification is not None
+                    and (
+                        accepted.pending_clarification is None
+                        or accepted.pending_clarification.clarification_id
+                        != current.pending_clarification.clarification_id
+                    )
+                ):
+                    if current.input_id != accepted.input_id:
+                        resolution = "answered"
+                    elif accepted.work_status == "abandoned":
+                        expires_at = current.pending_clarification.expires_at
+                        resolution = (
+                            "expired"
+                            if expires_at is not None and expires_at <= self._clock.now()
+                            else "cancelled"
+                        )
+                    else:
+                        resolution = "superseded"
+                    answered = current.pending_clarification.model_copy(
+                        update={
+                            "status": resolution,
+                            "answer_input_id": (
+                                accepted.input_id if resolution == "answered" else None
+                            ),
+                        }
+                    )
+                    conn.execute(
+                        """UPDATE pending_clarifications SET status=?,data=?
+                        WHERE session_id=? AND clarification_id=? AND status='pending'""",
+                        (
+                            answered.status,
+                            answered.model_dump_json(),
+                            accepted.session_id,
+                            answered.clarification_id,
+                        ),
+                    )
+                    self._session_event(
+                        conn,
+                        accepted.session_id,
+                        SessionClarificationChanged(clarification=answered),
+                    )
+                clarification = accepted.pending_clarification
+                if clarification is not None:
+                    conn.execute(
+                        "INSERT INTO pending_clarifications VALUES(?,?,?,?,?)",
+                        (
+                            accepted.session_id,
+                            clarification.clarification_id,
+                            accepted.work_id,
+                            clarification.status,
+                            clarification.model_dump_json(),
+                        ),
+                    )
+                self._session_event(
+                    conn,
+                    accepted.session_id,
+                    SessionSemanticCommitted(snapshot=accepted),
+                )
+            return accepted
+
+        return await self._submit(commit)
+
+    async def semantic_head(self, session_id: str, work_id: str) -> SemanticSnapshot | None:
+        def read() -> SemanticSnapshot | None:
+            row = (
+                self._conn()
+                .execute(
+                    "SELECT data FROM semantic_heads WHERE session_id=? AND work_id=?",
+                    (session_id, work_id),
+                )
+                .fetchone()
+            )
+            return SemanticSnapshot.model_validate_json(row[0]) if row else None
+
+        return await self._submit(read)
+
+    async def pending_clarifications(self, session_id: str) -> tuple[SemanticSnapshot, ...]:
+        """Return current heads for pending Work, oldest first."""
+
+        def read() -> tuple[SemanticSnapshot, ...]:
+            rows = (
+                self._conn()
+                .execute(
+                    """SELECT s.data FROM semantic_heads s JOIN work_heads w
+                ON s.session_id=w.session_id AND s.work_id=w.work_id
+                WHERE s.session_id=? AND w.status='waiting_input'
+                ORDER BY w.rowid""",
+                    (session_id,),
+                )
+                .fetchall()
+            )
+            return tuple(SemanticSnapshot.model_validate_json(row[0]) for row in rows)
+
+        return await self._submit(read)
+
     async def create(self, session_id: str) -> None:
         if not session_id.strip() or len(session_id.encode()) > 128:
             raise ValueError("session identity must contain 1 to 128 bytes")
@@ -251,10 +464,24 @@ class SQLiteSessionStore:
         await self._submit(create)
 
     async def begin(
-        self, session_id: str, input_id: str, run_id: str, text: str, config: str
+        self,
+        session_id: str,
+        input_id: str,
+        run_id: str,
+        text: str,
+        config: str,
+        application_context: tuple[ApplicationObservation, ...] = (),
     ) -> TurnClaim:
         if not text.strip() or not input_id.strip():
             raise ValueError("input identity and text must not be blank")
+        if any(item.input_id != input_id for item in application_context):
+            raise ValueError("application context belongs to another input")
+        encoded_context = json.dumps(
+            [item.model_dump(mode="json") for item in application_context],
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
 
         def begin() -> TurnClaim:
             with self._transaction() as conn:
@@ -270,7 +497,7 @@ class SQLiteSessionStore:
                     raise SessionConflictError("input identity already belongs to steering")
                 old = conn.execute(
                     (
-                        "SELECT id,input,ordinal,report,status FROM runs WHERE "
+                        "SELECT id,input,ordinal,report,status,application_context FROM runs WHERE "
                         "session_id=? AND input_id=?"
                     ),
                     (session_id, input_id),
@@ -279,6 +506,10 @@ class SQLiteSessionStore:
                     if old[1] != text:
                         raise SessionConflictError(
                             "input identity was reused with different content"
+                        )
+                    if old[5] != encoded_context:
+                        raise SessionConflictError(
+                            "input identity was reused with different application context"
                         )
                     if old[3]:
                         return TurnClaim(
@@ -305,15 +536,22 @@ class SQLiteSessionStore:
                 conn.execute(
                     (
                         "INSERT INTO "
-                        "runs(id,session_id,input_id,ordinal,input,config,status) "
-                        "VALUES(?,?,?,?,?,?,'running')"
+                        "runs(id,session_id,input_id,ordinal,input,config,status,"
+                        "application_context) "
+                        "VALUES(?,?,?,?,?,?,'running',?)"
                     ),
-                    (run_id, session_id, input_id, ordinal, text, config),
+                    (run_id, session_id, input_id, ordinal, text, config, encoded_context),
                 )
                 conn.execute("UPDATE sessions SET active_run=? WHERE id=?", (run_id, session_id))
                 self._session_event(
                     conn, session_id, SessionInput(input_id=input_id, run_id=run_id, text=text)
                 )
+                for observation in application_context:
+                    self._session_event(
+                        conn,
+                        session_id,
+                        SessionApplicationObserved(observation=observation),
+                    )
                 return TurnClaim(run_id, input_id, ordinal)
 
         return await self._submit(begin)
@@ -650,6 +888,22 @@ class SQLiteSessionStore:
                 .fetchone()
             )
             return ConversationTurn.model_validate_json(row[0]) if row else None
+
+        return await self._submit(read)
+
+    async def run_records(self, session_id: str, run_id: str) -> tuple[ToolRecord, ...]:
+        """Return accepted current-run records as immutable contract snapshots."""
+
+        def read() -> tuple[ToolRecord, ...]:
+            row = (
+                self._conn()
+                .execute("SELECT 1 FROM runs WHERE session_id=? AND id=?", (session_id, run_id))
+                .fetchone()
+            )
+            if row is None:
+                raise KeyError("unknown session run")
+            state = self._state(run_id)
+            return state.records if state is not None else ()
 
         return await self._submit(read)
 

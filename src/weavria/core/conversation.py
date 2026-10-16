@@ -10,6 +10,8 @@ from .control import ControlEvent, ControlRequest, RunReport
 from .errors import ErrorCategory
 from .execution import ArtifactRef, ExecutionEvent
 from .intervention import TaskUpdate, TurnResolution
+from .model_io import ApplicationObservation
+from .semantics import SessionClarificationChanged, SessionSemanticCommitted
 
 
 class PastCall(ContractModel):
@@ -180,6 +182,11 @@ class SessionInput(ContractModel):
     text: NonBlankString
 
 
+class SessionApplicationObserved(ContractModel):
+    kind: Literal["application_observed"] = "application_observed"
+    observation: ApplicationObservation
+
+
 class SessionRunEvent(ContractModel):
     kind: Literal["run_event"] = "run_event"
     event: ControlEvent
@@ -229,7 +236,7 @@ class SessionControlDecided(ContractModel):
 
 class SessionEvent(BaseModel):
     model_config = ContractModel.model_config
-    schema_version: Literal[1, 2] = 2
+    schema_version: Literal[1, 2, 3] = 3
 
     @field_validator("schema_version", mode="before")
     @classmethod
@@ -247,12 +254,15 @@ class SessionEvent(BaseModel):
     sequence: int = Field(ge=1)
     data: (
         SessionInput
+        | SessionApplicationObserved
         | SessionRunEvent
         | SessionSourceRead
         | SessionInterrupted
         | SessionContextPrepared
         | SessionTaskUpdated
         | SessionControlDecided
+        | SessionSemanticCommitted
+        | SessionClarificationChanged
     ) = Field(discriminator="kind")
 
     @model_validator(mode="after")
@@ -261,4 +271,13 @@ class SessionEvent(BaseModel):
             self.data, (SessionTaskUpdated, SessionControlDecided)
         ):
             raise ValueError("new Harness facts require session event v2")
+        if self.schema_version in (1, 2) and isinstance(
+            self.data,
+            (
+                SessionSemanticCommitted,
+                SessionClarificationChanged,
+                SessionApplicationObserved,
+            ),
+        ):
+            raise ValueError("semantic Harness facts require session event v3")
         return self

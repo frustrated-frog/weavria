@@ -11,6 +11,7 @@ from weavria.core import (
     ModelTurn,
     TaskDirective,
     TaskInput,
+    TaskObservation,
     ToolBatch,
     TurnResolution,
 )
@@ -20,13 +21,16 @@ from weavria.core import (
 class TurnPreparation:
     task_revision: int
     request_budget_bytes: int
+    visible_tool_names: tuple[str, ...] | None = None
+    capability_epoch: int | None = None
+    task_observation: TaskObservation | None = None
 
 
 class TurnPreparer(Protocol):
     """Rebuild outer context and return its remaining current-run budget.
 
-    Cannot modify Runtime facts, tools, limits or task identity. The model input
-    recorder must persist the same prepared outer context before transport.
+    Capability names are a view over the Runtime's immutable host ceiling. The
+    model input recorder must persist the same prepared outer context before transport.
     """
 
     async def prepare_turn(self, task: TaskInput) -> TurnPreparation: ...

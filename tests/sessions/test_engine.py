@@ -5,9 +5,11 @@ import pytest
 from pydantic import BaseModel, JsonValue
 
 from weavria.core import (
+    ApplicationObservation,
     FinishAction,
     ModelTurn,
     RunStatus,
+    SessionApplicationObserved,
     SessionRequest,
     SessionRunEvent,
     ToolBatch,
@@ -144,6 +146,37 @@ async def test_input_identity_deduplicates_even_after_restart_and_rejects_change
             await engine.send(session, "changed", input_id="stable")
     async with SessionEngine(path, model=Reader(), tools=tools()) as engine:
         assert await engine.send("s", "remember", input_id="stable") == original
+
+
+async def test_application_context_is_separate_persisted_data_and_part_of_idempotency(
+    tmp_path: Path,
+) -> None:
+    context = ApplicationObservation(
+        observation_id="page-1",
+        input_id="stable",
+        provider="example_app",
+        payload_schema="example.page/1",
+        payload={"view": "overview"},
+    )
+    changed = context.model_copy(update={"payload": {"view": "detail"}})
+    async with SessionEngine(tmp_path / "session.db", model=Reader(), tools=tools()) as engine:
+        await engine.create("s")
+        original = await engine.send(
+            "s", "remember", input_id="stable", application_context=(context,)
+        )
+        assert (
+            await engine.send("s", "remember", input_id="stable", application_context=(context,))
+            == original
+        )
+        with pytest.raises(SessionConflictError, match="application context"):
+            await engine.send("s", "remember", input_id="stable", application_context=(changed,))
+        events = await engine.store.events("s")
+    observed = [
+        event.data.observation
+        for event in events
+        if isinstance(event.data, SessionApplicationObserved)
+    ]
+    assert observed == [context]
 
 
 async def test_second_engine_cannot_steal_database_owner(tmp_path: Path) -> None:

@@ -207,6 +207,45 @@ async def test_rejected_ids_are_consumed_and_repeated_rejection_is_bounded() -> 
     )
 
 
+async def test_no_progress_rejects_repeated_canonical_call_after_unchanged_feedback() -> None:
+    provider = FakeControlProvider(
+        (
+            batch(call("missing-1", name="missing")),
+            batch(call("missing-2", name="missing")),
+            batch(call("missing-3", name="missing")),
+            finish(),
+        )
+    )
+    agent = make_loop(provider)
+
+    result = await agent.execute()
+
+    assert result.status is RunStatus.COMPLETED
+    assert agent.state.tool_calls == 2
+    rejected = [item.data for item in agent.events if isinstance(item.data, BatchRejected)]
+    assert len(rejected) == 1
+    notice = rejected[0].notice
+    assert notice.reason == "no_progress"
+    assert notice.progress_fingerprint_sha256 is not None
+    assert notice.canonical_tool_key_sha256 is not None
+    assert provider.requests[-1].control == notice
+
+
+async def test_persistent_no_progress_stops_as_explicit_failure_not_budget_exhaustion() -> None:
+    provider = FakeControlProvider(
+        tuple(batch(call(f"missing-{index}", name="missing")) for index in range(5))
+    )
+    agent = make_loop(provider)
+
+    result = await agent.execute()
+
+    assert result.status is RunStatus.FAILED
+    assert result.error is not None and result.error.category is ErrorCategory.NO_PROGRESS
+    assert agent.state.tool_calls == 2
+    assert isinstance(agent.events[-1].data, RunEnded)
+    assert agent.events[-1].data.reason == "no_progress"
+
+
 async def test_full_mode_downgrades_to_real_receipt_without_losing_failure() -> None:
     provider = FakeControlProvider((batch(call("ok"), call("bad", name="missing")), finish()))
 

@@ -12,6 +12,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
+from weavria.core import ApplicationObservation
 from weavria.harness import (
     ModelTaskInterpreter,
     TaskAwareSessionPreparer,
@@ -221,8 +222,17 @@ def create_app(
         try:
             result = await runtime.engine.send(
                 session_id,
-                _task_text(payload),
+                payload.text.strip(),
                 input_id=payload.input_id,
+                application_context=(
+                    ApplicationObservation(
+                        observation_id=f"page-{payload.input_id}",
+                        input_id=payload.input_id,
+                        provider="finscope",
+                        payload_schema="finscope.page-context/1",
+                        payload=payload.context.model_dump(mode="json"),
+                    ),
+                ),
             )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="session not found") from exc
@@ -254,18 +264,6 @@ def _runtime(request: Request) -> _Runtime:
     if not isinstance(runtime, _Runtime):
         raise HTTPException(status_code=503, detail="sidecar is starting")
     return runtime
-
-
-def _task_text(payload: MessageInput) -> str:
-    context = payload.context
-    date = context.business_date or "latest"
-    quality = context.quality_status or "unknown"
-    return (
-        "[Page navigation metadata; not market evidence] "
-        f"surface={context.surface}; business_date={date}; current_view={context.current_view}; "
-        f"page_quality={quality}; generated_at={context.generated_at or 'unknown'}\n"
-        f"User question: {payload.text.strip()}"
-    )
 
 
 def _instructions() -> str:

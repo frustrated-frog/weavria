@@ -16,3 +16,5 @@
 - [0009 以外置 Sidecar 验证领域应用接入](0009-external-application-sidecar.md)
 - [0010 有界恢复不完整 JSON 信封](0010-bounded-json-envelope-recovery.md)
 - [0011 任务理解 Stage 0 的控制完整性与失败降级](0011-task-understanding-stage-zero-control-integrity.md)
+- [0012 Need Ledger、Frame Revision 与持久语义账本](0012-semantic-ledger-frame-revision.md)
+- [0013 动态能力视图、任务义务验收与无进展恢复](0013-dynamic-capability-completion-progress.md)

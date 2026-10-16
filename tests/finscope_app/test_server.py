@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import httpx
@@ -18,6 +19,7 @@ from weavria.harness import (
     CapabilityNeed,
     CompletionCriterion,
     InformationNeed,
+    TaskFrame,
     TaskSpecification,
 )
 from weavria.models import FakeModelProvider, FakeSessionProvider
@@ -175,8 +177,13 @@ async def test_widget_session_executes_real_runtime_and_reports_tool_trace(
         }
     ]
     interpreted = interpreter.requests[0].task
-    assert interpreted.goal.endswith("User question: 今天是什么市场阶段?")
-    assert "Page navigation metadata" in interpreted.goal
+    assert interpreted.goal == "今天是什么市场阶段?"
+    assert "2026-10-15" in interpreter.requests[0].task.constraints[-1]
+    runtime_observation = provider.requests[0].current.task_observation
+    assert runtime_observation is not None
+    runtime_frame = TaskFrame.model_validate_json(json.dumps(runtime_observation.payload))
+    assert provider.requests[0].current.task.goal == "今天是什么市场阶段?"
+    assert runtime_frame.application_context[0].payload["business_date"] == "2026-10-15"
     await market_http.aclose()
 
 

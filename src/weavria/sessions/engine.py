@@ -2,11 +2,13 @@
 
 import asyncio
 import json
+import math
 import uuid
 from collections.abc import Callable
-from dataclasses import asdict
+from dataclasses import asdict, replace
+from datetime import timedelta
 from pathlib import Path
-from typing import Self
+from typing import Self, cast
 
 from pydantic import JsonValue, TypeAdapter
 
@@ -14,10 +16,14 @@ from weavria.artifacts import ArtifactSnapshot
 from weavria.context import ContextBudgetError, EvidenceMode, select_conversation
 from weavria.core import (
     CONTROL_FEEDBACK_BYTES,
+    ApplicationObservation,
     ControlEvent,
     ControlRequest,
     ConversationView,
     ModelTurn,
+    PendingClarification,
+    SemanticSnapshot,
+    SemanticVersion,
     SessionRequest,
     SessionResult,
     TaskDirective,
@@ -33,6 +39,7 @@ from weavria.runtime import (
     CompletionPolicy,
     EventAcceptanceError,
     JournalCommitError,
+    RootBudget,
     RunLimits,
     SystemClock,
     ToolScheduling,
@@ -42,7 +49,7 @@ from weavria.runtime import (
 from weavria.tools import ToolPolicy, ToolRegistry, artifact_read_tool
 
 from .evidence import session_history_tool, session_source_tool
-from .preparation import SessionTaskContext, SessionTaskPreparer
+from .preparation import SessionSemanticContext, SessionTaskContext, SessionTaskPreparer
 from .store import SessionBusyError, SessionConflictError, SQLiteSessionStore
 
 
@@ -79,6 +86,13 @@ class _SessionAdapter:
         instructions: str,
         tools: ToolRegistry,
         task_observation: TaskObservation | None,
+        visible_tool_names: tuple[str, ...],
+        capability_epoch: int,
+        task_preparer: SessionTaskPreparer | None,
+        semantic: SemanticSnapshot | None,
+        capability_ceiling: ToolRegistry,
+        clock: Clock,
+        clarification_timeout_seconds: float | None,
     ) -> None:
         self._provider, self._budget = provider, budget
         self._store, self._run_id = store, run_id
@@ -86,6 +100,14 @@ class _SessionAdapter:
         self._history_budget, self._history_mode = history_budget, history_mode
         self._instructions, self._tools = instructions, tools
         self._task_observation = task_observation
+        self._visible_tool_names = visible_tool_names
+        self._capability_epoch = capability_epoch
+        self._task_preparer = task_preparer
+        self._semantic = semantic
+        self._capability_ceiling = capability_ceiling
+        self._clock = clock
+        self._clarification_timeout = clarification_timeout_seconds
+        self._semantic_record_count = 0
         self._prepared: dict[int, ConversationView] = {}
 
     @property
@@ -114,12 +136,14 @@ class _SessionAdapter:
         await self._store.record_resolution(resolution)
 
     async def prepare_turn(self, task: TaskInput) -> TurnPreparation:
+        await self._refresh_semantics(task)
         sequence, count = await self._store.head(self._session_id)
         history = await self._store.history(self._session_id, before_ordinal=self._ordinal)
+        visible = self._tools.select(self._visible_tool_names)
         template = AgentLoop.request_template_for(
             task,
             self._instructions,
-            self._tools,
+            visible,
             self._task_observation
             if self._task_observation is not None
             and self._task_observation.task_revision == task.revision
@@ -149,7 +173,116 @@ class _SessionAdapter:
         # Only one attempt is active; discard obsolete prepared views after the
         # previous model call/verification has joined, retaining bounded state.
         self._prepared = {task.revision: view}
-        return TurnPreparation(task.revision, self._budget - overhead)
+        return TurnPreparation(
+            task.revision,
+            self._budget - overhead,
+            visible_tool_names=self._visible_tool_names,
+            capability_epoch=self._capability_epoch,
+            task_observation=(
+                self._task_observation
+                if self._task_observation is not None
+                and self._task_observation.task_revision == task.revision
+                else None
+            ),
+        )
+
+    async def _refresh_semantics(self, task: TaskInput) -> None:
+        if self._task_preparer is None or self._semantic is None:
+            return
+        records = await self._store.run_records(self._session_id, self._run_id)
+        if (
+            task.revision == self._semantic.version.task_revision
+            and len(records) == self._semantic_record_count
+        ):
+            return
+        history = await self._store.history(self._session_id, before_ordinal=self._ordinal)
+        prepared = await self._task_preparer.refresh(
+            SessionSemanticContext(
+                session_id=self._session_id,
+                input_id=self._semantic.input_id,
+                task=task,
+                history=history,
+                tools=self._capability_ceiling,
+                base_semantic=self._semantic,
+                records=records,
+                read_artifact=lambda artifact_id: self._store.get(self._run_id, artifact_id),
+                trigger=(
+                    "steering"
+                    if task.revision != self._semantic.version.task_revision
+                    else "tool_feedback"
+                ),
+            )
+        )
+        if prepared.preparation_version != self._task_preparer.version:
+            raise ValueError("semantic refresh version does not match its provider")
+        pending = prepared.pending_clarification
+        if pending is not None:
+            pending = _bind_clarification(
+                pending,
+                run_id=self._run_id,
+                observation=prepared.observation,
+                clock=self._clock,
+                timeout_seconds=self._clarification_timeout,
+            )
+        snapshot = SemanticSnapshot(
+            session_id=self._session_id,
+            work_id=prepared.work_id,
+            input_id=self._semantic.input_id,
+            run_id=self._run_id,
+            version=SemanticVersion(
+                task_revision=task.revision,
+                frame_revision=prepared.observation.frame_revision,
+                capability_epoch=prepared.capability_epoch,
+                evidence_revision=prepared.evidence_revision,
+                semantic_sequence=self._semantic.version.semantic_sequence + 1,
+            ),
+            observation=prepared.observation,
+            visible_tool_names=prepared.visible_tool_names,
+            need_ledger=prepared.need_ledger,
+            work_status=prepared.work_status,
+            pending_clarification=pending,
+        )
+        snapshot = await self._store.commit_semantic(snapshot, expected=self._semantic.version)
+        support_names = tuple(
+            descriptor.name
+            for descriptor in self._tools.descriptors
+            if descriptor.name not in {item.name for item in self._capability_ceiling.descriptors}
+        )
+        self._visible_tool_names = (
+            *snapshot.visible_tool_names,
+            *(support_names if snapshot.visible_tool_names else ()),
+        )
+        self._capability_epoch = snapshot.version.capability_epoch
+        self._task_observation = snapshot.observation
+        self._semantic = snapshot
+        self._semantic_record_count = len(records)
+
+    @property
+    def semantic(self) -> SemanticSnapshot | None:
+        return self._semantic
+
+
+def _bind_clarification(
+    clarification: PendingClarification,
+    *,
+    run_id: str,
+    observation: TaskObservation,
+    clock: Clock,
+    timeout_seconds: float | None,
+) -> PendingClarification:
+    created_at = clock.now()
+    expires_at = (
+        created_at + timedelta(seconds=timeout_seconds) if timeout_seconds is not None else None
+    )
+    return clarification.model_copy(
+        update={
+            "triggering_run_id": run_id,
+            "parent_frame_id": observation.observation_id,
+            "parent_task_revision": observation.task_revision,
+            "created_at": created_at,
+            "expires_at": expires_at,
+        }
+    )
 
 
 class SessionEngine:
@@ -176,9 +309,16 @@ class SessionEngine:
         clock: Clock | None = None,
         id_generator: Callable[[], str] | None = None,
         task_preparation: SessionTaskPreparer | None = None,
+        clarification_timeout_seconds: float | None = 86_400.0,
     ) -> None:
         if type(history_budget_bytes) is not int or history_budget_bytes < 256:
             raise ValueError("history budget must be at least 256 bytes")
+        if clarification_timeout_seconds is not None and (
+            isinstance(clarification_timeout_seconds, bool)
+            or not math.isfinite(clarification_timeout_seconds)
+            or clarification_timeout_seconds <= 0
+        ):
+            raise ValueError("clarification timeout must be positive and finite")
         self.store = SQLiteSessionStore(path, clock=clock)
         self._model, self._tools = model, tools
         self._instructions = instructions + (
@@ -189,11 +329,17 @@ class SessionEngine:
         )
         self._limits = limits or RunLimits()
         self._scheduling = scheduling
-        self._completion, self._policy, self._mode = completion, policy, mode
+        prepared_completion = cast(
+            CompletionPolicy | None,
+            getattr(task_preparation, "completion_policy", None),
+        )
+        self._completion = completion if completion is not None else prepared_completion
+        self._policy, self._mode = policy, mode
         self._history_budget, self._history_mode = history_budget_bytes, history_mode
         self._clock = clock or SystemClock()
         self._ids = id_generator or (lambda: uuid.uuid4().hex)
         self._task_preparation = task_preparation
+        self._clarification_timeout = clarification_timeout_seconds
         self._tasks: set[asyncio.Task[object]] = set()
         self._loops: dict[str, AgentLoop] = {}
         self._run_tasks: dict[str, asyncio.Task[object]] = {}
@@ -215,7 +361,12 @@ class SessionEngine:
         return identity
 
     async def send(
-        self, session_id: str, text: str, *, input_id: str | None = None
+        self,
+        session_id: str,
+        text: str,
+        *,
+        input_id: str | None = None,
+        application_context: tuple[ApplicationObservation, ...] = (),
     ) -> SessionResult:
         """Persist input before work; retrying an input ID returns its original terminal report."""
         if self._closing:
@@ -229,6 +380,7 @@ class SessionEngine:
         claimed_run: str | None = None
         interruption_reason = "owner_exit"
         try:
+            root_budget = RootBudget.start(self._clock.monotonic(), self._limits.max_duration)
             run_id = self._ids()
             identity = input_id if input_id is not None else self._ids()
             config = json.dumps(
@@ -254,7 +406,14 @@ class SessionEngine:
                 ensure_ascii=False,
             )
             claim, cancelled = await settle_mutation(
-                self.store.begin(session_id, identity, run_id, text, config)
+                self.store.begin(
+                    session_id,
+                    identity,
+                    run_id,
+                    text,
+                    config,
+                    application_context,
+                )
             )
             if claim.duplicate is not None:
                 if cancelled:
@@ -266,21 +425,40 @@ class SessionEngine:
             task = TaskInput(goal=text)
             task_observation = None
             selected = self._tools
+            capability_epoch = 1
+            semantic: SemanticSnapshot | None = None
+            semantic_base = None
             if self._task_preparation is not None:
                 interruption_reason = "task_preparation_failure"
                 history = await self.store.history(
                     session_id,
                     before_ordinal=claim.ordinal,
                 )
-                prepared = await self._task_preparation.prepare(
-                    SessionTaskContext(
-                        session_id=session_id,
-                        input_id=claim.input_id,
-                        task=task,
-                        history=history,
-                        tools=self._tools,
+                await self._expire_clarifications(session_id)
+                pending = await self.store.pending_clarifications(session_id)
+                semantic_base = pending[0] if len(pending) == 1 else None
+                if semantic_base is not None:
+                    task = TaskInput(
+                        goal=text,
+                        revision=semantic_base.version.task_revision + 1,
                     )
-                )
+                async with asyncio.timeout(root_budget.remaining(self._clock.monotonic())):
+                    prepared = await self._task_preparation.prepare(
+                        SessionTaskContext(
+                            session_id=session_id,
+                            input_id=claim.input_id,
+                            task=task,
+                            history=history,
+                            tools=self._tools,
+                            base_semantic=semantic_base,
+                            cause=(
+                                "clarification_answer"
+                                if semantic_base is not None
+                                else "new_user_input"
+                            ),
+                            application_context=application_context,
+                        )
+                    )
                 if prepared.preparation_version != self._task_preparation.version:
                     raise ValueError("task preparation version does not match its provider")
                 task_observation = prepared.observation
@@ -290,18 +468,60 @@ class SessionEngine:
                 ):
                     raise ValueError("task observation does not belong to the accepted input")
                 selected = self._tools.select(prepared.visible_tool_names)
+                capability_epoch = prepared.capability_epoch
+                pending_clarification = prepared.pending_clarification
+                if pending_clarification is not None:
+                    pending_clarification = _bind_clarification(
+                        pending_clarification,
+                        run_id=run_id,
+                        observation=prepared.observation,
+                        clock=self._clock,
+                        timeout_seconds=self._clarification_timeout,
+                    )
+                semantic_sequence = (
+                    1 if semantic_base is None else semantic_base.version.semantic_sequence + 1
+                )
+                semantic = SemanticSnapshot(
+                    session_id=session_id,
+                    work_id=prepared.work_id,
+                    input_id=claim.input_id,
+                    run_id=run_id,
+                    version=SemanticVersion(
+                        task_revision=task.revision,
+                        frame_revision=prepared.observation.frame_revision,
+                        capability_epoch=prepared.capability_epoch,
+                        evidence_revision=prepared.evidence_revision,
+                        semantic_sequence=semantic_sequence,
+                    ),
+                    observation=prepared.observation,
+                    visible_tool_names=prepared.visible_tool_names,
+                    need_ledger=prepared.need_ledger,
+                    work_status=prepared.work_status,
+                    pending_clarification=pending_clarification,
+                )
+                await self.store.commit_semantic(
+                    semantic,
+                    expected=semantic_base.version if semantic_base is not None else None,
+                )
                 interruption_reason = "owner_exit"
             extra = (
                 session_source_tool(self.store, session_id, run_id),
                 session_history_tool(self.store, session_id),
             )
-            registered = tuple(selected.get(d.name) for d in selected.descriptors)
-            include_support_tools = self._task_preparation is None or bool(registered)
-            if include_support_tools and not any(
-                d.name == "read_artifact" for d in selected.descriptors
-            ):
-                registered = (*registered, artifact_read_tool())
-            registry = ToolRegistry((*registered, *extra) if include_support_tools else registered)
+            registered = tuple(self._tools.get(d.name) for d in self._tools.descriptors)
+            include_support_tools = self._task_preparation is None or bool(selected.descriptors)
+            support = (
+                (artifact_read_tool(), *extra)
+                if not any(d.name == "read_artifact" for d in self._tools.descriptors)
+                else extra
+            )
+            registry = ToolRegistry((*registered, *support))
+            visible_tool_names = tuple(d.name for d in selected.descriptors)
+            if include_support_tools:
+                visible_tool_names = (
+                    *visible_tool_names,
+                    *(tool.descriptor.name for tool in support),
+                )
             run_instructions = self._instructions
             if include_support_tools:
                 run_instructions += (
@@ -320,6 +540,22 @@ class SessionEngine:
                 run_instructions,
                 registry,
                 task_observation,
+                visible_tool_names,
+                capability_epoch,
+                self._task_preparation,
+                semantic if self._task_preparation is not None else None,
+                self._tools,
+                self._clock,
+                self._clarification_timeout,
+            )
+            remaining = root_budget.remaining(self._clock.monotonic())
+            run_limits = replace(
+                self._limits,
+                max_duration=max(remaining, 0.000_001),
+                max_model_duration=min(self._limits.max_model_duration, max(remaining, 0.000_001)),
+                max_completion_duration=min(
+                    self._limits.max_completion_duration, max(remaining, 0.000_001)
+                ),
             )
             loop = AgentLoop(
                 run_id=run_id,
@@ -328,7 +564,7 @@ class SessionEngine:
                 model=adapter,
                 tools=registry,
                 artifacts=_RunArtifacts(self.store, run_id),
-                limits=self._limits,
+                limits=run_limits,
                 scheduling=self._scheduling,
                 completion=self._completion,
                 policy=self._policy,
@@ -341,6 +577,18 @@ class SessionEngine:
             self._loops[session_id] = loop
             self._run_tasks[run_id] = owner
             report = await loop.execute()
+            latest = adapter.semantic
+            if latest is not None and latest.work_status == "active":
+                terminal_status = "succeeded" if report.status.value == "completed" else "blocked"
+                terminal = latest.model_copy(
+                    update={
+                        "version": latest.version.model_copy(
+                            update={"semantic_sequence": latest.version.semantic_sequence + 1}
+                        ),
+                        "work_status": terminal_status,
+                    }
+                )
+                await self.store.commit_semantic(terminal, expected=latest.version)
             return SessionResult(
                 session_id=session_id, input_id=claim.input_id, run_id=run_id, report=report
             )
@@ -418,6 +666,42 @@ class SessionEngine:
                     raise SessionBusyError("the active Run already settled") from exc
         finally:
             self._tasks.discard(owner)
+
+    async def abandon_work(self, session_id: str, work_id: str) -> SemanticSnapshot:
+        """Cancel one waiting Work without deleting its frame, evidence or history."""
+        current = await self.store.semantic_head(session_id, work_id)
+        if current is None:
+            raise KeyError("unknown work")
+        if current.work_status != "waiting_input":
+            raise SessionConflictError("work is not waiting for clarification")
+        abandoned = current.model_copy(
+            update={
+                "version": current.version.model_copy(
+                    update={"semantic_sequence": current.version.semantic_sequence + 1}
+                ),
+                "work_status": "abandoned",
+                "pending_clarification": None,
+            }
+        )
+        return await self.store.commit_semantic(abandoned, expected=current.version)
+
+    async def _expire_clarifications(self, session_id: str) -> None:
+        """Persist lazily observed expiry before matching a new input to waiting Work."""
+        now = self._clock.now()
+        for current in await self.store.pending_clarifications(session_id):
+            pending = current.pending_clarification
+            if pending is None or pending.expires_at is None or pending.expires_at > now:
+                continue
+            expired = current.model_copy(
+                update={
+                    "version": current.version.model_copy(
+                        update={"semantic_sequence": current.version.semantic_sequence + 1}
+                    ),
+                    "work_status": "abandoned",
+                    "pending_clarification": None,
+                }
+            )
+            await self.store.commit_semantic(expired, expected=current.version)
 
     async def close(self) -> None:
         current = asyncio.current_task()

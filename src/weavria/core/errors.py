@@ -21,6 +21,8 @@ class ErrorCategory(StrEnum):
     POLICY_DENIED = "policy_denied"
     RUNTIME_INVARIANT_VIOLATION = "runtime_invariant_violation"
     EVENT_SINK_FAILURE = "event_sink_failure"
+    CONTEXT_BUDGET_EXCEEDED = "context_budget_exceeded"
+    NO_PROGRESS = "no_progress"
 
 
 class RunError(ContractModel):

@@ -89,7 +89,7 @@ from .completion import (
     NoVerification,
     check_completion,
 )
-from .controller import TurnPreparer, prepare_task, resolve_turn
+from .controller import TurnPreparation, TurnPreparer, prepare_task, resolve_turn
 from .journal import (
     InterventionJournal,
     JournalCommitError,
@@ -98,6 +98,7 @@ from .journal import (
     RunJournal,
     settle_mutation,
 )
+from .progress import ProgressPolicy, SemanticProgressPolicy
 from .scheduling import ToolScheduling, dispatch_batch
 from .state import EventAcceptanceError, Phase, RunState, reduce_event
 
@@ -128,6 +129,10 @@ class _DispatchDeadlineExpired(TimeoutError):
     """Run budget expired before a worker started, distinct from tool feedback."""
 
 
+class _NoProgressExhausted(RuntimeError):
+    """The model repeated a semantically unchanged action after bounded feedback."""
+
+
 @dataclass(frozen=True, slots=True)
 class RunLimits:
     """Independent counters and deadline; limits are checked before dispatch."""
@@ -139,6 +144,7 @@ class RunLimits:
     max_model_duration: float = 30.0
     max_completion_duration: float = 10.0
     max_completion_repairs: int = 3
+    max_no_progress_rejections: int = 2
 
     def __post_init__(self) -> None:
         for value in (self.max_model_calls, self.max_tool_calls, self.max_request_bytes):
@@ -146,6 +152,8 @@ class RunLimits:
                 raise ValueError("run counter and input limits must be positive integers")
         if type(self.max_completion_repairs) is not int or self.max_completion_repairs < 0:
             raise ValueError("completion repair limit must be a nonnegative integer")
+        if type(self.max_no_progress_rejections) is not int or self.max_no_progress_rejections < 1:
+            raise ValueError("no-progress rejection limit must be a positive integer")
         for duration in (self.max_duration, self.max_model_duration, self.max_completion_duration):
             if isinstance(duration, bool) or not math.isfinite(duration) or duration <= 0:
                 raise ValueError("run and model attempt durations must be positive and finite")
@@ -212,6 +220,7 @@ class _AgentKernel:
         journal: RunJournal | None = None,
         preparation: TurnPreparer | None = None,
         task_observation: TaskObservation | None = None,
+        progress: ProgressPolicy | None = None,
     ) -> None:
         self._journal = journal
         self._preparation = preparation
@@ -236,6 +245,10 @@ class _AgentKernel:
             if feedback_bounds is not None
             else FeedbackBounds()
         )
+        self._tool_ceiling = tools
+        self._visible_tools = tools
+        self._capability_epoch = 0
+        self._instruction_source = instructions
         self._executor = ToolExecutor(
             run_id,
             tools,
@@ -244,6 +257,8 @@ class _AgentKernel:
             feedback_bounds=self._bounds if journal_version == 3 else None,
         )
         self._instructions = _instructions_for(instructions, tools, journal_version)
+        self._progress = progress or SemanticProgressPolicy(tools)
+        self._no_progress_rejections = 0
         self._events_json: list[str] = []
         self._plans: list[EvidencePlan | TurnEvidencePlan | ControlEvidencePlan] = []
         self._state: RunState | None = None
@@ -349,6 +364,7 @@ class _AgentKernel:
                             ):
                                 raise ValueError("invalid turn preparation budget or revision")
                             self._request_budget = prepared.request_budget_bytes
+                            self._apply_turn_preparation(prepared, task)
                         plan = await self._build_context(task)
                     except ContextBudgetError:
                         if task.revision != self.state.task.revision:
@@ -435,7 +451,7 @@ class _AgentKernel:
                         if self.state.model_calls >= self._limits.max_model_calls:
                             return await self._end(RunStatus.BUDGET_EXHAUSTED, "model_calls")
                         assert isinstance(decision, ToolBatch)
-                        if not await self._admit_batch(decision):
+                        if not await self._admit_batch(decision, self._capability_epoch):
                             if self.state.phase is Phase.ACTION:
                                 await self._execute_turn(calls, deadline)
                             continue
@@ -479,6 +495,15 @@ class _AgentKernel:
                     if exc.error.category is ErrorCategory.TIMEOUT
                     else "completion_failure",
                     error=exc.error,
+                )
+            if isinstance(exc, _NoProgressExhausted):
+                return await self._end(
+                    RunStatus.FAILED,
+                    "no_progress",
+                    error=RunError(
+                        category=ErrorCategory.NO_PROGRESS,
+                        message="Repeated actions did not improve accepted task state",
+                    ),
                 )
             if isinstance(exc, ModelCallError):
                 if exc.error.category is ErrorCategory.TIMEOUT:
@@ -559,7 +584,31 @@ class _AgentKernel:
         except TimeoutError as exc:
             raise _ContextDependencyTimeout("Context dependency timed out") from exc
 
-    async def _admit_batch(self, batch: ToolBatch) -> bool:
+    def _apply_turn_preparation(self, prepared: TurnPreparation, task: TaskInput) -> None:
+        if prepared.task_observation is not None:
+            if prepared.task_observation.task_revision != task.revision:
+                raise ValueError("turn observation belongs to another task revision")
+            self._task_observation = TaskObservation.model_validate_json(
+                prepared.task_observation.model_dump_json()
+            )
+        if prepared.visible_tool_names is None:
+            if prepared.capability_epoch is not None:
+                raise ValueError("capability epoch requires a visible tool view")
+            return
+        if prepared.capability_epoch is None or prepared.capability_epoch < self._capability_epoch:
+            raise ValueError("capability view epoch is absent or stale")
+        visible = self._tool_ceiling.select(prepared.visible_tool_names)
+        if prepared.capability_epoch == self._capability_epoch and tuple(
+            item.name for item in visible.descriptors
+        ) != tuple(item.name for item in self._visible_tools.descriptors):
+            raise ValueError("one capability epoch cannot name different views")
+        self._visible_tools = visible
+        self._capability_epoch = prepared.capability_epoch
+        self._instructions = _instructions_for(
+            self._instruction_source, visible, self._journal_version
+        )
+
+    async def _admit_batch(self, batch: ToolBatch, capability_epoch: int) -> bool:
         revision = self.state.model_revision
         reservation = reserve_feedback(
             instructions=self._instructions,
@@ -576,13 +625,39 @@ class _AgentKernel:
             budget_bytes=self._request_budget,
         )
         remaining = max(0, self._limits.max_tool_calls - self.state.tool_calls)
+        visible = {descriptor.name for descriptor in self._visible_tools.descriptors}
         reason = (
-            "tool_budget"
+            "capability_view"
+            if capability_epoch > 0
+            and (
+                capability_epoch != self._capability_epoch
+                or any(call.tool_name not in visible for call in batch.calls)
+            )
+            else "tool_budget"
             if len(batch.calls) > remaining
             else "feedback_budget"
             if not reservation.fits
             else None
         )
+        progress = None
+        if reason is None:
+            progress = self._progress.inspect(
+                task=self.state.task,
+                observation=(
+                    self._task_observation
+                    if self._task_observation is not None
+                    and self._task_observation.task_revision == self.state.task.revision
+                    else None
+                ),
+                records=self.state.records,
+                batch=batch,
+                capability_epoch=self._capability_epoch,
+            )
+            if progress.repeated:
+                self._no_progress_rejections += 1
+                if self._no_progress_rejections > self._limits.max_no_progress_rejections:
+                    raise _NoProgressExhausted
+                reason = "no_progress"
         if reason is not None:
             await self._accept(
                 BatchRejected(
@@ -595,6 +670,16 @@ class _AgentKernel:
                         required_bytes=reservation.required_bytes,
                         budget_bytes=reservation.budget_bytes,
                         remaining_tool_calls=remaining,
+                        progress_fingerprint_sha256=(
+                            progress.fingerprint_sha256
+                            if reason == "no_progress" and progress is not None
+                            else None
+                        ),
+                        canonical_tool_key_sha256=(
+                            progress.canonical_tool_key_sha256
+                            if reason == "no_progress" and progress is not None
+                            else None
+                        ),
                     )
                 ),
                 expected_revision=revision,
@@ -1056,6 +1141,7 @@ class AgentLoop(_AgentKernel):
         journal: RunJournal | None = None,
         preparation: TurnPreparer | None = None,
         task_observation: TaskObservation | None = None,
+        progress: ProgressPolicy | None = None,
         # 构造函数只建立依赖、初始状态和首个事件,不在初始化阶段执行模型或工具。
     ) -> None:
         # 把基类的通用“决策”回调适配为 v3 模型调用,同时保留统一的超时边界。
@@ -1114,6 +1200,7 @@ class AgentLoop(_AgentKernel):
             completion=completion,
             # 传递反馈大小边界,使 v3 在工具执行前完成反馈预算准入判断。
             feedback_bounds=feedback_bounds,
+            progress=progress,
             # 完成共享内核初始化;此时实例已拥有初始状态,但尚未进入异步执行循环。
         )
 

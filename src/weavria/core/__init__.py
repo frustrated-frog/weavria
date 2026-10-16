@@ -28,6 +28,7 @@ from .conversation import (
     ConversationView,
     DirectiveView,
     PastCall,
+    SessionApplicationObserved,
     SessionContextPrepared,
     SessionControlDecided,
     SessionEvent,
@@ -65,6 +66,7 @@ from .journal import JournalEvent, decode_event
 from .lifecycle import InvalidStateTransitionError, RunStatus, transition_status
 from .messages import AgentRequest, Message, MessageRole
 from .model_io import (
+    ApplicationObservation,
     HistoryEntry,
     ModelRequest,
     ModelResponse,
@@ -78,6 +80,14 @@ from .outcomes import (
     Observation,
     ToolFailedObservation,
     ToolSucceededObservation,
+)
+from .semantics import (
+    PendingClarification,
+    SemanticSnapshot,
+    SemanticVersion,
+    SessionClarificationChanged,
+    SessionSemanticCommitted,
+    WorkStatus,
 )
 from .turns import (
     CallFeedback,
@@ -98,6 +108,7 @@ __all__ = [
     "AgentAction",
     "AgentRequest",
     "AgentResult",
+    "ApplicationObservation",
     "ArtifactRef",
     "BatchAdmitted",
     "BatchRejected",
@@ -143,11 +154,16 @@ __all__ = [
     "ModelTurn",
     "Observation",
     "PastCall",
+    "PendingClarification",
     "RunEnded",
     "RunError",
     "RunReport",
     "RunStarted",
     "RunStatus",
+    "SemanticSnapshot",
+    "SemanticVersion",
+    "SessionApplicationObserved",
+    "SessionClarificationChanged",
     "SessionContextPrepared",
     "SessionControlDecided",
     "SessionEvent",
@@ -156,6 +172,7 @@ __all__ = [
     "SessionRequest",
     "SessionResult",
     "SessionRunEvent",
+    "SessionSemanticCommitted",
     "SessionSourceRead",
     "SessionTaskUpdated",
     "SourceUse",
@@ -180,6 +197,7 @@ __all__ = [
     "TurnResolution",
     "TurnSettled",
     "VerificationStarted",
+    "WorkStatus",
     "decode_event",
     "maximum_exchange_bytes",
     "minimum_exchange",

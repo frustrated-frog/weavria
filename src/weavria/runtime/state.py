@@ -506,7 +506,8 @@ def _reduce_control(
             or (
                 notice.reason == "tool_budget"
                 and notice.proposed_calls > notice.remaining_tool_calls
-            ),
+            )
+            or notice.reason in ("capability_view", "no_progress"),
             "rejection contradicts its budget",
         )
         # Denial is a new observation, not a reason to remove prior mandatory

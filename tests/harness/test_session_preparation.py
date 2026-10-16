@@ -1,4 +1,5 @@
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal
 
@@ -6,11 +7,13 @@ import pytest
 from pydantic import BaseModel, ConfigDict
 
 from weavria.core import (
+    AdmissionNotice,
     FinishAction,
     Message,
     ModelResponse,
     ModelTurn,
     RunStatus,
+    SessionClarificationChanged,
     SessionInterrupted,
     SessionRequest,
     TaskInput,
@@ -24,6 +27,8 @@ from weavria.harness import (
     CompletionCriterion,
     InformationNeed,
     ModelTaskInterpreter,
+    NeedLedger,
+    NeedStatus,
     TaskAwareSessionPreparer,
     TaskFrame,
     TaskSpecification,
@@ -110,7 +115,7 @@ def _execute() -> TaskSpecification:
             InformationNeed(
                 description="The current value of alpha",
                 source="external",
-                freshness="current",
+                freshness="stable",
             ),
         ),
         capability_needs=(
@@ -123,6 +128,21 @@ def _execute() -> TaskSpecification:
         completion_criteria=(
             _criterion("capability_result", "read_value"),
             _criterion(),
+        ),
+    )
+
+
+def _clarify() -> TaskSpecification:
+    return TaskSpecification(
+        route="clarify",
+        intent="Resolve the value target",
+        goal="Ask which value should be read from the trusted source",
+        ambiguities=("The requested value key is missing",),
+        completion_criteria=(
+            CompletionCriterion(
+                kind="clarification",
+                description="Ask for the missing value key",
+            ),
         ),
     )
 
@@ -224,8 +244,17 @@ async def test_execute_frame_exposes_only_selected_business_capability(
     ) as engine:
         await engine.create("s")
         result = await engine.send("s", "Read alpha.", input_id="input-1")
+        events = await engine.store.events("s")
+        initial_observation = model.requests[0].current.task_observation
+        assert initial_observation is not None
+        frame = TaskFrame.model_validate_json(json.dumps(initial_observation.payload))
+        semantic = await engine.store.semantic_head("s", frame.work_id)
 
     assert result.report.status is RunStatus.COMPLETED
+    assert semantic is not None and semantic.work_status == "succeeded"
+    ledger = NeedLedger.model_validate_json(json.dumps(semantic.need_ledger))
+    assert ledger.state_for(frame.requirements[0].need_id).status is NeedStatus.SATISFIED
+    assert any(event.data.kind == "semantic_committed" for event in events)
     first = model.requests[0].current
     assert first.task.goal == "Read alpha."
     assert "read_value" in first.instructions
@@ -233,6 +262,143 @@ async def test_execute_frame_exposes_only_selected_business_capability(
     assert first.task_observation is not None
     frame = TaskFrame.model_validate_json(json.dumps(first.task_observation.payload))
     assert frame.specification.capability_needs[0].name == "read_value"
+
+
+class _ClarifyThenExecuteModel:
+    capabilities = ModelCapabilities(tool_calls=True, multi_tool_calls=True)
+
+    async def generate_session(self, request: SessionRequest) -> ModelTurn:
+        observation = request.current.task_observation
+        assert observation is not None
+        frame = TaskFrame.model_validate_json(json.dumps(observation.payload))
+        if frame.specification.route == "clarify":
+            return ModelTurn(decision=FinishAction(output="Which value should I read?"))
+        exchanges = [entry for entry in request.current.history if isinstance(entry, ToolExchange)]
+        if exchanges:
+            return ModelTurn(decision=FinishAction(output="The requested value was read."))
+        return ModelTurn(
+            decision=ToolBatch(
+                calls=(
+                    ToolCallAction(
+                        call_id="resumed-read",
+                        tool_name="read_value",
+                        arguments={"value": "alpha"},
+                    ),
+                )
+            )
+        )
+
+
+async def test_pending_clarification_resumes_the_same_work_across_runs(
+    tmp_path: Path,
+) -> None:
+    interpreter = FakeModelProvider((_declaration(_clarify()), _declaration(_execute())))
+    preparer = TaskAwareSessionPreparer(TaskUnderstandingEngine(ModelTaskInterpreter(interpreter)))
+    async with SessionEngine(
+        tmp_path / "clarification.db",
+        model=_ClarifyThenExecuteModel(),
+        tools=_registry(),
+        task_preparation=preparer,
+    ) as engine:
+        await engine.create("s")
+        first = await engine.send("s", "Read it.", input_id="input-1")
+        pending = await engine.store.pending_clarifications("s")
+        assert len(pending) == 1 and pending[0].work_status == "waiting_input"
+        work_id = pending[0].work_id
+
+        second = await engine.send("s", "Read alpha from the trusted source.", input_id="input-2")
+        head = await engine.store.semantic_head("s", work_id)
+        events = await engine.store.events("s")
+
+    assert first.report.output == "Which value should I read?"
+    assert second.report.status is RunStatus.COMPLETED
+    assert head is not None and head.work_id == work_id and head.work_status == "succeeded"
+    assert head.version.task_revision == 2
+    assert head.version.frame_revision == 3
+    clarification_events = [
+        event.data for event in events if isinstance(event.data, SessionClarificationChanged)
+    ]
+    assert len(clarification_events) == 1
+    assert clarification_events[0].clarification.status == "answered"
+    assert clarification_events[0].clarification.answer_input_id == "input-2"
+
+
+async def test_waiting_work_can_be_abandoned_without_deleting_semantic_history(
+    tmp_path: Path,
+) -> None:
+    preparer = TaskAwareSessionPreparer(
+        TaskUnderstandingEngine(
+            ModelTaskInterpreter(FakeModelProvider((_declaration(_clarify()),)))
+        )
+    )
+    async with SessionEngine(
+        tmp_path / "abandon.db",
+        model=_ClarifyThenExecuteModel(),
+        tools=_registry(),
+        task_preparation=preparer,
+    ) as engine:
+        await engine.create("s")
+        await engine.send("s", "Read it.", input_id="input-1")
+        pending = (await engine.store.pending_clarifications("s"))[0]
+        abandoned = await engine.abandon_work("s", pending.work_id)
+        events = await engine.store.events("s")
+
+    assert abandoned.work_status == "abandoned"
+    assert abandoned.pending_clarification is None
+    changed = [
+        item.data.clarification
+        for item in events
+        if isinstance(item.data, SessionClarificationChanged)
+    ]
+    assert changed[-1].status == "cancelled"
+
+
+async def test_expired_clarification_is_persisted_and_not_matched_to_new_input(
+    tmp_path: Path,
+) -> None:
+    class Clock:
+        def __init__(self) -> None:
+            self.value = datetime(2026, 10, 17, tzinfo=UTC)
+
+        def monotonic(self) -> float:
+            return 0.0
+
+        def now(self) -> datetime:
+            return self.value
+
+    clock = Clock()
+    interpreter = FakeModelProvider((_declaration(_clarify()), _declaration(_direct())))
+    preparer = TaskAwareSessionPreparer(TaskUnderstandingEngine(ModelTaskInterpreter(interpreter)))
+    async with SessionEngine(
+        tmp_path / "expiry.db",
+        model=_DirectSessionModel(),
+        tools=_registry(),
+        task_preparation=preparer,
+        clock=clock,
+        clarification_timeout_seconds=60,
+    ) as engine:
+        await engine.create("s")
+        await engine.send("s", "Read it.", input_id="input-1")
+        waiting = (await engine.store.pending_clarifications("s"))[0]
+        clarification = waiting.pending_clarification
+        assert clarification is not None
+        assert clarification.parent_frame_id == waiting.observation.observation_id
+        assert clarification.parent_task_revision == 1
+        assert clarification.created_at == clock.value
+        assert clarification.expires_at == clock.value + timedelta(seconds=60)
+
+        clock.value += timedelta(seconds=61)
+        await engine.send("s", "Who are you?", input_id="input-2")
+        expired = await engine.store.semantic_head("s", waiting.work_id)
+        events = await engine.store.events("s")
+
+    assert expired is not None and expired.work_status == "abandoned"
+    changes = [
+        item.data.clarification
+        for item in events
+        if isinstance(item.data, SessionClarificationChanged)
+    ]
+    assert changes[-1].status == "expired"
 
 
 class _GuessHiddenToolModel:
@@ -243,6 +409,9 @@ class _GuessHiddenToolModel:
 
     async def generate_session(self, request: SessionRequest) -> ModelTurn:
         self.calls += 1
+        if isinstance(request.current.control, AdmissionNotice):
+            assert request.current.control.reason == "capability_view"
+            return ModelTurn(decision=FinishAction(output="The hidden action was not executed."))
         exchanges = [entry for entry in request.current.history if isinstance(entry, ToolExchange)]
         if exchanges:
             observation = exchanges[-1].observation

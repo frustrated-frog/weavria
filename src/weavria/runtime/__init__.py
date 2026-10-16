@@ -1,6 +1,7 @@
 """Execution backed by accepted facts, bounded resources and task-aware views."""
 
 from .agent import AgentLoop, AgentRun, Clock, LegacyAgentLoop, RunLimits, SystemClock
+from .budget import RootBudget
 from .completion import CompletionContext, CompletionPolicy, NoVerification
 from .controller import TurnPreparation, TurnPreparer, prepare_task, resolve_turn
 from .journal import (
@@ -11,6 +12,7 @@ from .journal import (
     RunJournal,
     settle_mutation,
 )
+from .progress import ProgressCheck, ProgressPolicy, SemanticProgressPolicy
 from .scheduling import ToolScheduling
 from .state import EventAcceptanceError, Phase, RunState, reduce_event
 
@@ -26,11 +28,15 @@ __all__ = [
     "LegacyAgentLoop",
     "NoVerification",
     "Phase",
+    "ProgressCheck",
+    "ProgressPolicy",
     "RequestJournal",
     "ResolutionJournal",
+    "RootBudget",
     "RunJournal",
     "RunLimits",
     "RunState",
+    "SemanticProgressPolicy",
     "SystemClock",
     "ToolScheduling",
     "TurnPreparation",
