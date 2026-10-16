@@ -113,3 +113,19 @@ def test_error_preserves_step_and_attempt_identity() -> None:
 def test_error_rejects_attempt_without_a_step() -> None:
     with pytest.raises(ValidationError, match="attempt_id requires step_id"):
         RunError(category=ErrorCategory.TIMEOUT, message="Timeout", attempt_id="attempt-1")
+
+
+def test_loop_report_cannot_claim_verified_task_success_without_a_verifier() -> None:
+    from weavria.core import LoopResult
+
+    execution = AgentResult(run_id="run", status=RunStatus.COMPLETED, output="done")
+    with pytest.raises(ValidationError):
+        LoopResult.model_validate({"execution": execution, "task_outcome": "succeeded"})
+    with pytest.raises(ValidationError):
+        LoopResult.model_validate_json(execution.model_dump_json())
+    report = LoopResult(execution=execution)
+    with pytest.raises(ValidationError):
+        AgentResult.model_validate_json(report.model_dump_json())
+    for version in (True, 2.0, 3):
+        with pytest.raises(ValidationError):
+            LoopResult.model_validate({**report.model_dump(), "schema_version": version})

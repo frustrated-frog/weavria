@@ -342,3 +342,56 @@ async def test_invalid_artifact_pointer_has_actionable_feedback_and_preserves_re
         max_duration=1,
     )
     assert valid.artifact and (await store.get("run", valid.artifact.artifact_id)).value
+
+
+@pytest.mark.parametrize("blocking", [False, True])
+async def test_late_backend_result_or_exception_cannot_escape_tool_timeout(blocking: bool) -> None:
+    import time
+
+    def blocking_backend() -> Output:
+        time.sleep(0.005)
+        return Output(doubled=6)
+
+    async def nonconforming(arguments: Input, context: ToolContext) -> Output:
+        if blocking:
+            return blocking_backend()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            raise ValueError("private error during cleanup") from None
+        return Output(doubled=6)
+
+    backend = TypedTool(
+        name="late",
+        version="1",
+        description="Late backend",
+        input_type=Input,
+        output_type=Output,
+        execute=nonconforming,
+        timeout_seconds=0.001 if blocking else 0.02,
+    )
+    from pydantic import JsonValue
+
+    from weavria.artifacts import ArtifactSnapshot
+
+    class CountingStore(InMemoryArtifactStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.puts = 0
+
+        async def put(self, run_id: str, call_id: str, value: JsonValue) -> ArtifactSnapshot:
+            self.puts += 1
+            return await super().put(run_id, call_id, value)
+
+    store = CountingStore()
+    executor = ToolExecutor("run", ToolRegistry((backend,)), store, ReadOnlyPolicy())
+    record = await executor.execute(
+        ToolCallAction(call_id="late", tool_name="late", arguments={"value": 3}),
+        max_duration=1,
+    )
+    assert isinstance(record.exchange.observation, ToolFailedObservation)
+    assert record.exchange.observation.error.category is ErrorCategory.TIMEOUT
+    assert "private" not in record.exchange.observation.error.message
+    assert record.artifact is None
+    assert executor.failure_cause("late") is not None
+    assert store.puts == 0

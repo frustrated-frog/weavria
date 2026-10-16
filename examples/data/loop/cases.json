@@ -1,0 +1,5 @@
+[
+  {"name":"clean","expected":{"alpha":"AMBER","beta":"VIOLET"},"recoverable":true},
+  {"name":"missing","expected":{"alpha":"AMBER","beta":"VIOLET"},"recoverable":true},
+  {"name":"unrecoverable","expected":{"alpha":"AMBER"},"recoverable":false}
+]

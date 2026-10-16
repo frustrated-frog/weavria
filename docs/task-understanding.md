@@ -68,4 +68,4 @@ uv run python examples/live_task_understanding.py --repeats 3
 证明完成。解释失败会安全终止准备阶段，但尚不会把结构化问题反馈给解释模型重试。当前
 会话历史只参与本次理解，尚无持久会话层。OpenAI-compatible 适配器使用可替换 Transport，
 HTTP 仅是评测脚本的可选依赖。设计依据和取舍见
-[ADR 0004](decisions/0004-task-understanding-capability-resolution.md)。
+[ADR 0009](decisions/0009-task-understanding-capability-resolution.md)。
