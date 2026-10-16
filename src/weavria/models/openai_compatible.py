@@ -1,6 +1,7 @@
 """OpenAI-compatible JSON providers with no supplier-specific SDK."""
 
 import json
+import logging
 import math
 from dataclasses import dataclass
 from hashlib import sha256
@@ -13,6 +14,8 @@ from weavria.core import ModelRequest, ModelResponse, ModelTurn, SessionRequest
 from .provider import ModelCapabilities
 
 _JSON_OBJECT = TypeAdapter(dict[str, JsonValue])
+_LOGGER = logging.getLogger(__name__)
+_MAX_RECOVERED_DELIMITERS = 8
 
 
 @dataclass(frozen=True, slots=True)
@@ -200,10 +203,49 @@ def _message_content(payload: object) -> str:
 def _unwrap_json(content: str) -> str:
     stripped = content.strip()
     if stripped.startswith("```json") and stripped.endswith("```"):
-        return stripped[7:-3].strip()
-    if stripped.startswith("```") and stripped.endswith("```"):
-        return stripped[3:-3].strip()
-    return stripped
+        stripped = stripped[7:-3].strip()
+    elif stripped.startswith("```") and stripped.endswith("```"):
+        stripped = stripped[3:-3].strip()
+    completed, recovered = _complete_missing_delimiters(stripped)
+    if recovered:
+        _LOGGER.warning(
+            "Recovered incomplete model JSON envelope by appending %d delimiter(s)",
+            recovered,
+        )
+    return completed
+
+
+def _complete_missing_delimiters(value: str) -> tuple[str, int]:
+    """Close only a bounded, structurally unambiguous JSON object or array suffix."""
+    if not value or value[0] not in "{[":
+        return value, 0
+
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+    pairs = {"}": "{", "]": "["}
+    for character in value:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if character == '"':
+            in_string = True
+        elif character in "{[":
+            stack.append(character)
+        elif character in "}]":
+            if not stack or stack[-1] != pairs[character]:
+                return value, 0
+            stack.pop()
+
+    if in_string or not stack or len(stack) > _MAX_RECOVERED_DELIMITERS:
+        return value, 0
+    suffix = "".join("}" if opener == "{" else "]" for opener in reversed(stack))
+    return value + suffix, len(stack)
 
 
 def _assign_call_id(payload: dict[str, JsonValue], request: ModelRequest) -> dict[str, JsonValue]:

@@ -91,6 +91,20 @@ async def test_adapter_normalizes_tool_identity_from_request_snapshot() -> None:
     assert repeated.action == first.action
 
 
+async def test_adapter_completes_a_bounded_missing_json_suffix(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    provider = OpenAICompatibleProvider(
+        OpenAICompatibleConfig(model="test"),
+        transport=Transport(_response('{"action":{"kind":"finish","output":"done"}')),
+    )
+
+    result = await provider.generate(_request())
+
+    assert result.action == FinishAction(output="done")
+    assert "appending 1 delimiter(s)" in caplog.text
+
+
 @pytest.mark.parametrize(
     "payload",
     [
@@ -98,6 +112,8 @@ async def test_adapter_normalizes_tool_identity_from_request_snapshot() -> None:
         {"choices": []},
         _response(None),
         _response("not-json"),
+        _response('{"action":{"kind":"finish","output":"done"]}'),
+        _response('{"action":{"kind":"finish","output":"done}'),
         _response('{"action":{"kind":"unknown"}}'),
     ],
 )
@@ -165,6 +181,17 @@ async def test_session_provider_joins_text_content_parts() -> None:
     provider = OpenAICompatibleSessionProvider(
         OpenAICompatibleConfig(model="model"),
         transport=transport,
+    )
+
+    turn = await provider.generate_session(_session_request())
+
+    assert turn.decision == FinishAction(output="完成")
+
+
+async def test_session_provider_completes_a_missing_outer_delimiter() -> None:
+    provider = OpenAICompatibleSessionProvider(
+        OpenAICompatibleConfig(model="model"),
+        transport=Transport(_response('{"decision":{"kind":"finish","output":"完成"}')),
     )
 
     turn = await provider.generate_session(_session_request())

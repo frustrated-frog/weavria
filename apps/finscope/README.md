@@ -22,10 +22,15 @@ uv sync --extra finscope
 export WEAVRIA_MODEL_BASE_URL="https://api.deepseek.com"
 export WEAVRIA_MODEL_NAME="deepseek-flash"
 export WEAVRIA_MODEL_API_KEY="..."
+export WEAVRIA_MODEL_JSON_MODE="true"
 export WEAVRIA_FINSCOPE_BASE_URL="http://127.0.0.1:8080"
 export WEAVRIA_ALLOWED_PARENT_ORIGIN="http://localhost:5173"
 uv run --extra finscope python -m apps.finscope
 ```
+
+示例中的 DeepSeek 模型启用 JSON 模式，以减少协议输出截断或混入说明文本的概率；适配器仍
+会对最终结构进行独立校验。若模型只遗漏了可无歧义推导、且不超过 8 个的末尾 `}`/`]`，
+OpenAI-compatible 边界会补齐后再校验；错配括号、未闭合字符串和其他损坏仍会失败。
 
 Sidecar 监听 `127.0.0.1:8765`。健康检查和 Widget 地址分别为：
 
