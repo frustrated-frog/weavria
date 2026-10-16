@@ -57,6 +57,9 @@ AgentLoop v3
 
 任务理解失败发生在 Runtime 启动前，但原始用户输入已经被持久化，并以
 `task_preparation_failure` 记录中断原因。取消继续传播，不会被伪装成普通理解失败。
+如果第一次解释违反 Schema、跨字段不变量、合成工具协议或能力目录边界，解释器会在原有
+总时限内追加一次经过裁剪的主机校验反馈并重新生成；反馈不包含原始模型参数。第二次仍不
+合法就按 `INVALID_MODEL_RESPONSE` 终止，不启动执行模型或业务工具。
 
 同一份 revision-bound `TaskObservation` 也会进入 `CompletionContext`。验收策略可以据此区分
 direct、clarify 与 execute 的验收义务，但它仍是模型推断而非事实证据；是否接受及如何验证
@@ -96,6 +99,7 @@ uv run python examples/live_task_understanding.py --repeats 3
 - 完成条件仍是低信任声明，尚未编译成 `CompletionPolicy` 或独立验收证据；
 - 当前解释器读取完整能力目录；没有用 BM25、Embedding 或分层索引伪装大目录检索；
 - OpenAI-compatible 解释器仍用 JSON tool-call 协议，不等于供应商原生 Structured Output；
+- 结构纠错只有一次，不做多候选投票，也不保证修复语义上错误但结构合法的解释；
 - 没有任何 FinScope 类型、金融术语或页面流程进入 Core、Runtime 或 Harness。
 
 下一小步应深化“信息需求与证据 grounding”：让 Frame 中的事实依赖在执行过程中拥有可验证

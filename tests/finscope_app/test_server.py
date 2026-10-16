@@ -227,6 +227,59 @@ async def test_direct_question_uses_task_frame_without_market_tool(tmp_path: Pat
     await market_http.aclose()
 
 
+async def test_invalid_task_understanding_returns_safe_gateway_error(tmp_path: Path) -> None:
+    provider = FakeSessionProvider(())
+    interpreter = FakeModelProvider(
+        (
+            ModelResponse(action=FinishAction(output="not a specification")),
+            ModelResponse(action=FinishAction(output="still not a specification")),
+        )
+    )
+    market_http = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(500))
+    )
+    app = create_app(
+        FinScopeSettings(
+            model_base_url="http://model.test",
+            model_name="fake",
+            model_api_key="",
+            state_path=tmp_path / "sessions.sqlite3",
+        ),
+        provider=provider,
+        interpreter_provider=interpreter,
+        market_client=MarketPulseClient("http://finscope.test", client=market_http),
+    )
+
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://sidecar.test"
+        ) as client:
+            created = SessionCreated.model_validate((await client.post("/api/sessions")).json())
+            response = await client.post(
+                f"/api/sessions/{created.session_id}/messages",
+                json={
+                    "input_id": "invalid-understanding-1",
+                    "text": "你是谁?",
+                    "context": {
+                        "schema_version": 1,
+                        "surface": "market_pulse",
+                        "business_date": "2026-10-15",
+                        "current_view": "panorama",
+                        "quality_status": "READY",
+                        "generated_at": "2026-10-15T15:40:00",
+                    },
+                },
+            )
+
+    assert response.status_code == 502
+    assert response.json() == {
+        "detail": "Task interpreter returned finish instead of a specification"
+    }
+    assert len(interpreter.requests) == 2
+    assert provider.requests == ()
+    await market_http.aclose()
+
+
 async def test_widget_has_parent_and_script_restrictions(tmp_path: Path) -> None:
     provider = FakeSessionProvider(())
     market_http = httpx.AsyncClient(

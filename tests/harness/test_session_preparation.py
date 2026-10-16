@@ -285,7 +285,12 @@ async def test_hidden_capability_name_cannot_bypass_runtime_registry(tmp_path: P
 async def test_preparation_failure_is_persisted_without_starting_runtime_model(
     tmp_path: Path,
 ) -> None:
-    interpreter = FakeModelProvider((ModelResponse(action=FinishAction(output="not a frame")),))
+    interpreter = FakeModelProvider(
+        (
+            ModelResponse(action=FinishAction(output="not a frame")),
+            ModelResponse(action=FinishAction(output="still not a frame")),
+        )
+    )
     model = _DirectSessionModel()
     preparer = TaskAwareSessionPreparer(TaskUnderstandingEngine(ModelTaskInterpreter(interpreter)))
     async with SessionEngine(

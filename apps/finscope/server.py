@@ -12,7 +12,12 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
-from weavria.harness import ModelTaskInterpreter, TaskAwareSessionPreparer, TaskUnderstandingEngine
+from weavria.harness import (
+    ModelTaskInterpreter,
+    TaskAwareSessionPreparer,
+    TaskUnderstandingEngine,
+    TaskUnderstandingError,
+)
 from weavria.models.openai_compatible import (
     OpenAICompatibleConfig,
     OpenAICompatibleProvider,
@@ -186,6 +191,12 @@ def create_app(
     @app.exception_handler(SessionConflictError)
     async def session_conflict(_request: Request, _error: SessionConflictError) -> JSONResponse:
         return JSONResponse(status_code=409, content={"detail": "session request conflicts"})
+
+    @app.exception_handler(TaskUnderstandingError)
+    async def task_understanding_failure(
+        _request: Request, error: TaskUnderstandingError
+    ) -> JSONResponse:
+        return JSONResponse(status_code=502, content={"detail": error.error.message})
 
     @app.get("/health")
     async def health() -> dict[str, str]:

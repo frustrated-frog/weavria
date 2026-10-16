@@ -19,6 +19,7 @@ from weavria.core import (
 )
 from weavria.harness import (
     CapabilityNeed,
+    CapabilityView,
     CompletionCriterion,
     InformationNeed,
     ModelTaskInterpreter,
@@ -219,7 +220,17 @@ async def test_model_interpreter_keeps_capability_data_out_of_host_instructions(
     request = TaskUnderstandingInput(
         task=TaskInput(goal="Read the report"),
         history=(Message(role=MessageRole.USER, content="The report is report.txt"),),
-        capabilities=(),
+        capabilities=(
+            CapabilityView(
+                name="read_document",
+                version="1",
+                description="Read a named document",
+                input_schema={"type": "object"},
+                behavior="read_only",
+                risk="low",
+                approval_required=False,
+            ),
+        ),
     )
     specification = await interpreter.interpret(request, max_duration=1)
 
@@ -229,6 +240,54 @@ async def test_model_interpreter_keeps_capability_data_out_of_host_instructions(
     assert "Available capability catalogue" not in sent.instructions
     assert "Available capability catalogue" in sent.task.constraints[-1]
     assert sent.history == request.history
+
+
+async def test_model_interpreter_repairs_one_invalid_specification_with_bounded_feedback() -> None:
+    invalid = ModelResponse(
+        action=ToolCallAction(
+            call_id="invalid-understanding",
+            tool_name="declare_task_specification",
+            arguments={
+                "schema_version": 1,
+                "route": "direct",
+                "intent": "Explain the assistant role",
+                "goal": "Explain the assistant role",
+                "information_needs": [
+                    {
+                        "schema_version": 1,
+                        "description": "SENSITIVE-RAW-MODEL-VALUE",
+                        "source": "external",
+                        "freshness": "current",
+                        "required": True,
+                    }
+                ],
+                "capability_needs": [],
+                "ambiguities": [],
+                "completion_criteria": [
+                    {
+                        "schema_version": 1,
+                        "kind": "response",
+                        "description": "Answer the identity question",
+                        "capability": None,
+                    }
+                ],
+            },
+        )
+    )
+    provider = FakeModelProvider((invalid, _declaration(_direct())))
+    interpreter = ModelTaskInterpreter(provider)
+
+    specification = await interpreter.interpret(
+        TaskUnderstandingInput(task=TaskInput(goal="Who are you?")),
+        max_duration=1,
+    )
+
+    assert specification == _direct()
+    assert len(provider.requests) == 2
+    repair = provider.requests[1].instructions
+    assert "rejected by trusted host validation" in repair
+    assert "direct tasks cannot require capabilities" in repair
+    assert "SENSITIVE-RAW-MODEL-VALUE" not in repair
 
 
 async def test_unavailable_capability_is_rejected_before_runtime() -> None:
@@ -241,9 +300,8 @@ async def test_unavailable_capability_is_rejected_before_runtime() -> None:
         ),
         completion_criteria=(_criterion("capability_result", "invented"),),
     )
-    engine = TaskUnderstandingEngine(
-        ModelTaskInterpreter(FakeModelProvider((_declaration(specification),)))
-    )
+    provider = FakeModelProvider((_declaration(specification), _declaration(specification)))
+    engine = TaskUnderstandingEngine(ModelTaskInterpreter(provider))
     with pytest.raises(TaskUnderstandingError) as raised:
         await engine.prepare(
             input_id="escalate-input",
@@ -253,6 +311,8 @@ async def test_unavailable_capability_is_rejected_before_runtime() -> None:
         )
     assert raised.value.error.category is ErrorCategory.INVALID_MODEL_RESPONSE
     assert raised.value.__cause__ is None
+    assert len(provider.requests) == 2
+    assert "invented" not in provider.requests[1].instructions
 
 
 async def test_understanding_timeout_cleans_up_and_is_classified() -> None:
