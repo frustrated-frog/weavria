@@ -60,6 +60,11 @@ def _requirement(
 
 
 async def _success_record() -> tuple[InMemoryArtifactStore, ToolRecord]:
+    store, records = await _success_records()
+    return store, records[0]
+
+
+async def _success_records() -> tuple[InMemoryArtifactStore, tuple[ToolRecord, ...]]:
     store = InMemoryArtifactStore()
     tool = TypedTool(
         name="fetch",
@@ -69,11 +74,51 @@ async def _success_record() -> tuple[InMemoryArtifactStore, ToolRecord]:
         output_type=_Output,
         execute=_fetch,
     )
-    record = await ToolExecutor("run-1", ToolRegistry((tool,)), store, ReadOnlyPolicy()).execute(
-        ToolCallAction(call_id="call-1", tool_name="fetch", arguments={"key": "a"}),
-        max_duration=1,
+    executor = ToolExecutor("run-1", ToolRegistry((tool,)), store, ReadOnlyPolicy())
+    records = tuple(
+        [
+            await executor.execute(
+                ToolCallAction(
+                    call_id=f"call-{index}",
+                    tool_name="fetch",
+                    arguments={"key": key},
+                ),
+                max_duration=1,
+            )
+            for index, key in enumerate(("a", "b"), start=1)
+        ]
     )
-    return store, record
+    return store, records
+
+
+class _ProgressiveExtractor:
+    key = "progressive"
+    version = "1"
+
+    def __init__(self, *, complete_second: bool) -> None:
+        self._complete_second = complete_second
+
+    def supports(self, requirement: InformationRequirement, record: ToolRecord) -> bool:
+        return True
+
+    async def evaluate(
+        self,
+        requirement: InformationRequirement,
+        record: ToolRecord,
+        snapshot: ArtifactSnapshot,
+    ) -> EvidenceEvaluation:
+        second = record.exchange.action.call_id == "call-2"
+        relation: Literal["supports", "partially_supports"] = (
+            "supports" if second and self._complete_second else "partially_supports"
+        )
+        pointer = "/source_time" if second else "/value"
+        missing = () if relation == "supports" else (("/value",) if second else ("/source_time",))
+        return EvidenceEvaluation(
+            relation=relation,
+            pointers=(pointer,),
+            missing_fields=missing,
+            freshness="valid",
+        )
 
 
 async def test_resolver_binds_accepted_artifact_and_satisfies_structural_need() -> None:
@@ -97,6 +142,30 @@ async def test_resolver_binds_accepted_artifact_and_satisfies_structural_need() 
     assert address.producer_call_id == "call-1"
     assert record.artifact is not None
     assert address.artifact_sha256 == record.artifact.sha256
+
+
+@pytest.mark.parametrize("complete_second", [True, False])
+async def test_resolver_reduces_progressive_evidence_from_effective_coverage(
+    complete_second: bool,
+) -> None:
+    store, records = await _success_records()
+    requirement = _requirement(required_fields=("/value", "/source_time"))
+
+    ledger = await EvidenceResolver(
+        (_ProgressiveExtractor(complete_second=complete_second),)
+    ).resolve(
+        work_id="work-a",
+        task_revision=1,
+        frame_revision=1,
+        requirements=(requirement,),
+        records=records,
+        read_artifact=lambda artifact_id: store.get("run-1", artifact_id),
+    )
+
+    state = ledger.state_for(requirement.need_id)
+    assert state.status is NeedStatus.SATISFIED
+    assert state.missing_fields == ()
+    assert len(state.evidence_binding_ids) == 2
 
 
 async def test_resolver_preserves_partial_fields_and_retryable_failures() -> None:

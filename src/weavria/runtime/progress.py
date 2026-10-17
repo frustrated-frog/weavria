@@ -34,7 +34,7 @@ class ProgressPolicy(Protocol):
 class SemanticProgressPolicy:
     """Detect repeated canonical actions when effective facts and Need state are unchanged."""
 
-    version = "semantic-progress/1"
+    version = "semantic-progress/2"
 
     def __init__(self, tools: ToolRegistry) -> None:
         self._versions = {item.name: item.version for item in tools.descriptors}
@@ -66,7 +66,7 @@ class SemanticProgressPolicy:
         fingerprint = _digest(
             {
                 "task_revision": task.revision,
-                "frame_revision": observation.frame_revision if observation else 0,
+                "frame_semantics_sha256": _frame_semantics_sha256(observation),
                 "need_state_sha256": need_state if isinstance(need_state, str) else "",
                 "evidence": evidence,
                 "failures": failures,
@@ -87,6 +87,32 @@ class SemanticProgressPolicy:
         repeated = key in self._seen
         self._seen.add(key)
         return ProgressCheck(repeated, fingerprint, canonical)
+
+
+def _frame_semantics_sha256(observation: TaskObservation | None) -> str:
+    if observation is None:
+        return ""
+    payload = observation.payload
+    if observation.payload_schema == "weavria.task-frame/2":
+        payload = {
+            key: value
+            for key, value in payload.items()
+            if key
+            not in {
+                "frame_id",
+                "revision",
+                "evidence_revision",
+                "need_state_sha256",
+                "capability_epoch",
+            }
+        }
+    return _digest(
+        {
+            "payload_schema": observation.payload_schema,
+            "producer_version": observation.producer_version,
+            "payload": payload,
+        }
+    )
 
 
 def _digest(value: object) -> str:

@@ -28,6 +28,7 @@ from weavria.core import (
     FinishAction,
     ModelTurn,
     RunEnded,
+    RunError,
     RunReport,
     RunStatus,
     TaskInput,
@@ -36,6 +37,7 @@ from weavria.core import (
     ToolCallAction,
     ToolExchange,
     ToolFailedObservation,
+    ToolRecord,
     ToolStarted,
     VerificationStarted,
     decode_event,
@@ -49,6 +51,7 @@ from weavria.runtime import (
     CompletionPolicy,
     EventAcceptanceError,
     RunLimits,
+    SemanticProgressPolicy,
     ToolScheduling,
     reduce_event,
 )
@@ -244,6 +247,85 @@ async def test_persistent_no_progress_stops_as_explicit_failure_not_budget_exhau
     assert agent.state.tool_calls == 2
     assert isinstance(agent.events[-1].data, RunEnded)
     assert agent.events[-1].data.reason == "no_progress"
+
+
+def test_progress_ignores_projection_revisions_but_keeps_effective_frame_semantics() -> None:
+    tools = ToolRegistry(
+        (
+            TypedTool(
+                name="echo",
+                version="1",
+                description="Read a value",
+                input_type=Input,
+                output_type=Output,
+                execute=echo,
+            ),
+        )
+    )
+    policy = SemanticProgressPolicy(tools)
+    task = TaskInput(goal="Read and report the value")
+
+    def observation(revision: int, *, goal: str = "Read the value") -> TaskObservation:
+        return TaskObservation(
+            observation_id=f"frame-{revision}",
+            input_id="input-1",
+            task_revision=1,
+            frame_revision=revision,
+            producer_version="test",
+            payload_schema="weavria.task-frame/2",
+            payload={
+                "frame_id": str(revision) * 64,
+                "revision": revision,
+                "evidence_revision": revision,
+                "capability_epoch": 1,
+                "need_state_sha256": "a" * 64,
+                "specification": {"goal": goal},
+            },
+        )
+
+    def failure(call_id: str) -> ToolRecord:
+        return ToolRecord(
+            exchange=ToolExchange(
+                action=call(call_id),
+                observation=ToolFailedObservation(
+                    call_id=call_id,
+                    tool_name="echo",
+                    error=RunError(
+                        category=ErrorCategory.TOOL_FAILURE,
+                        message="same source failure",
+                        retryable=True,
+                    ),
+                ),
+            )
+        )
+
+    first = policy.inspect(
+        task=task,
+        observation=observation(2),
+        records=(failure("failed-1"),),
+        batch=ToolBatch(calls=(call("next-1"),)),
+        capability_epoch=1,
+    )
+    repeated = policy.inspect(
+        task=task,
+        observation=observation(3),
+        records=(failure("failed-1"), failure("failed-2")),
+        batch=ToolBatch(calls=(call("next-2"),)),
+        capability_epoch=1,
+    )
+    changed = policy.inspect(
+        task=task,
+        observation=observation(4, goal="Read another value"),
+        records=(failure("failed-1"), failure("failed-2"), failure("failed-3")),
+        batch=ToolBatch(calls=(call("next-3"),)),
+        capability_epoch=1,
+    )
+
+    assert not first.repeated
+    assert repeated.repeated
+    assert repeated.fingerprint_sha256 == first.fingerprint_sha256
+    assert not changed.repeated
+    assert changed.fingerprint_sha256 != repeated.fingerprint_sha256
 
 
 async def test_full_mode_downgrades_to_real_receipt_without_losing_failure() -> None:

@@ -51,3 +51,13 @@
 工具反馈后的 Frame/Need 修订、澄清跨 Run 恢复与取消、Semantic CAS/迁移、义务完成分叉、
 重复失败的 no-progress 反馈和显式停止。`weavria.evaluation` 还提供 all-tools 基线下的召回与
 平均暴露工具数对照；该实验只证明发现策略行为，不证明真实模型任务完成率。
+
+## 2026-10-18 修订：有效覆盖与有效进展
+
+- Need 状态先合并所有未过期支持证据的 JSON Pointer 覆盖，再计算仍未解决的字段。后到的
+  完整证据或多份互补的部分证据可以消除早期缺口；`SATISFIED` 投影不会携带已经解决的
+  `missing_fields` 或失败记录。
+- `semantic-progress/2` 不再把单调递增的 Frame/Evidence Revision 当作进展。指纹保留任务
+  修订、去除投影标识后的有效 Frame 语义、Need 摘要、Artifact 内容、失败类别及能力 epoch。
+  因重复失败而产生的新 call ID 和新投影版本不会掩盖无进展；目标、需求或能力真正改变时
+  仍会形成新的指纹。

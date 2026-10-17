@@ -414,26 +414,38 @@ def _reduce_need(
     bindings: list[EvidenceBinding],
     failures: list[NeedFailure],
 ) -> NeedState:
-    supporting = [binding for binding in bindings if binding.relation == "supports"]
-    partial = [binding for binding in bindings if binding.relation == "partially_supports"]
     contradictory = [binding for binding in bindings if binding.relation == "contradicts"]
     stale = [binding for binding in bindings if binding.freshness == "stale"]
+    usable = [
+        binding
+        for binding in bindings
+        if binding.relation in {"supports", "partially_supports"} and binding.freshness != "stale"
+    ]
+    supporting = [binding for binding in usable if binding.relation == "supports"]
+    covered_fields = {address.json_pointer for binding in usable for address in binding.addresses}
+    declared_gaps = (field for binding in usable for field in binding.missing_fields)
+    missing = tuple(
+        field
+        for field in dict.fromkeys((*requirement.required_fields, *declared_gaps))
+        if field not in covered_fields
+    )
+    coverage_complete = bool(supporting) or (
+        bool(requirement.required_fields) and bool(usable) and not missing
+    )
     if contradictory:
         status = NeedStatus.CONTRADICTED
-    elif supporting and not stale:
+    elif coverage_complete:
         status = NeedStatus.SATISFIED
         failures = []
-    elif stale and not supporting:
+        missing = ()
+    elif stale and not usable:
         status = NeedStatus.STALE
-    elif partial or bindings:
+    elif usable or bindings:
         status = NeedStatus.PARTIAL
     elif failures:
         status = NeedStatus.UNAVAILABLE
     else:
         status = NeedStatus.PENDING
-    missing = tuple(
-        dict.fromkeys(field for binding in (*partial, *stale) for field in binding.missing_fields)
-    )
     return NeedState(
         need_id=requirement.need_id,
         status=status,
