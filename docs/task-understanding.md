@@ -2,7 +2,8 @@
 
 > 本文保留第一阶段设计背景。持续 Frame、Need Ledger、动态能力视图与澄清恢复的当前实现见
 > [持续任务语义 v2](task-semantics-v2.md)、[ADR 0012](decisions/0012-semantic-ledger-frame-revision.md)
-> 和 [ADR 0013](decisions/0013-dynamic-capability-completion-progress.md)。
+> 和 [ADR 0013](decisions/0013-dynamic-capability-completion-progress.md)。从首次提交到 P0/P1 修复的
+> 逐提交代码说明见[意图理解到持续任务语义：完整代码演进](intent-understanding-evolution/README.md)。
 
 Weavria 的任务理解位于 Harness 层。它不是业务意图分类器，而是把原始请求、会话证据和
 宿主能力目录编译成一份版本化、低信任的 `TaskFrame`。Runtime 仍只接受宿主拥有的原始

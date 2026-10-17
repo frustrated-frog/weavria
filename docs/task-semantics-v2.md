@@ -1,5 +1,8 @@
 # 持续任务语义：从一次解释到可恢复 Work
 
+> 本文聚焦当前机制概览。首次任务理解、真实模型加固、持续语义实现和两轮评审修复的历史链路见
+> [意图理解到持续任务语义：完整代码演进](intent-understanding-evolution/README.md)。
+
 ## 1. 本次新增了什么能力
 
 Task Frame 不再是 Run 开始时的一次性附言。Weavria 现在维护版本化 Frame、Need Ledger、
