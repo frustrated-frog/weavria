@@ -1,6 +1,7 @@
 const state = {
   context: null,
   busy: false,
+  clarificationId: null,
   sessionId: window.localStorage.getItem('weavria.marketPulse.sessionId')
 };
 
@@ -55,7 +56,8 @@ async function submitQuestion() {
   setBusy(true);
   try {
     const result = await sendMessage(text, false);
-    appendMessage('agent', result.answer || result.error || '本次运行没有生成可交付答案。', result.tools);
+    state.clarificationId = null;
+    appendMessage('agent', result.answer || result.error || '本次运行没有生成可交付答案。', result.tools, result.clarification_id);
     const completedLabel = result.task_outcome === 'verified' ? '已核验' : '已完成';
     setStatus(result.status === 'completed' ? completedLabel : result.status, result.status === 'completed' ? '' : 'error');
   } catch (error) {
@@ -78,6 +80,7 @@ async function sendMessage(text, retried) {
       body: JSON.stringify({
         input_id: crypto.randomUUID(),
         text,
+        clarification_id: state.clarificationId,
         context: state.context
       })
     });
@@ -102,7 +105,7 @@ async function request(path, options) {
   return body;
 }
 
-function appendMessage(role, text, tools = []) {
+function appendMessage(role, text, tools = [], clarificationId = null) {
   const item = document.createElement('article');
   item.className = `message ${role}`;
   const label = document.createElement('span');
@@ -120,6 +123,18 @@ function appendMessage(role, text, tools = []) {
       trace.append(chip);
     });
     item.append(trace);
+  }
+  if (clarificationId) {
+    const reply = document.createElement('button');
+    reply.type = 'button';
+    reply.textContent = '回答这个追问';
+    reply.addEventListener('click', () => {
+      state.clarificationId = clarificationId;
+      question.placeholder = '输入对这个追问的回答…';
+      question.focus();
+      setStatus('正在回答追问', '');
+    });
+    item.append(reply);
   }
   conversation.append(item);
   conversation.scrollTop = conversation.scrollHeight;

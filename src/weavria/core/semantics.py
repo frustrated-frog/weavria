@@ -1,5 +1,7 @@
 """Persistent, domain-independent semantic state between bounded Runs."""
 
+import hashlib
+import json
 from datetime import datetime
 from typing import Literal, Self
 
@@ -20,6 +22,45 @@ class SemanticVersion(ContractModel):
 
 
 type WorkStatus = Literal["active", "waiting_input", "blocked", "succeeded", "abandoned"]
+
+
+class SemanticTransition(ContractModel):
+    """Auditable reason and revision binding for one semantic-head replacement."""
+
+    kind: Literal["initial", "frame_patch", "evidence_refresh", "work_status"]
+    work_id: NonBlankString
+    expected_semantic_sequence: int = Field(ge=0)
+    base_frame_id: NonBlankString | None = None
+    target_frame_id: NonBlankString
+    cause: NonBlankString
+    patch: dict[str, JsonValue] | None = None
+    patch_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+
+    @model_validator(mode="after")
+    def validate_transition(self) -> Self:
+        initial = self.kind == "initial"
+        if initial != (self.expected_semantic_sequence == 0):
+            raise ValueError("only an initial transition starts without a semantic head")
+        if initial != (self.base_frame_id is None):
+            raise ValueError("non-initial transitions must bind a base frame")
+        has_patch = self.patch is not None
+        if (self.kind == "frame_patch") != has_patch:
+            raise ValueError("only a frame-patch transition carries a patch")
+        expected_digest = (
+            hashlib.sha256(
+                json.dumps(
+                    self.patch,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+            ).hexdigest()
+            if self.patch is not None
+            else None
+        )
+        if self.patch_sha256 != expected_digest:
+            raise ValueError("semantic transition patch digest does not match its payload")
+        return self
 
 
 class PendingClarification(ContractModel):
@@ -99,6 +140,7 @@ class SemanticSnapshot(ContractModel):
 class SessionSemanticCommitted(ContractModel):
     kind: Literal["semantic_committed"] = "semantic_committed"
     snapshot: SemanticSnapshot
+    transition: SemanticTransition | None = None
 
 
 class SessionClarificationChanged(ContractModel):

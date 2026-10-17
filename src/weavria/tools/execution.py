@@ -45,10 +45,11 @@ class ToolDescriptor(BaseModel):
         validate_default=True,
         revalidate_instances="always",
     )
-    schema_version: Literal[1] = 1
+    schema_version: Literal[2] = 2
     name: str = Field(min_length=1, pattern=r"^[a-zA-Z][a-zA-Z0-9_]*$")
     version: str = Field(min_length=1)
     description: str = Field(min_length=1)
+    intent_signals: tuple[str, ...] = Field(default=(), max_length=32)
     input_schema: dict[str, JsonValue]
     output_schema: dict[str, JsonValue]
     behavior: Literal["read_only", "side_effect"] = "read_only"
@@ -159,6 +160,7 @@ class TypedTool[Input: BaseModel, Output: BaseModel]:
         name: str,
         version: str,
         description: str,
+        intent_signals: tuple[str, ...] = (),
         input_type: type[Input],
         output_type: type[Output],
         execute: Callable[[Input, ToolContext], Awaitable[Output]],
@@ -177,6 +179,7 @@ class TypedTool[Input: BaseModel, Output: BaseModel]:
             name=name,
             version=version,
             description=description,
+            intent_signals=intent_signals,
             input_schema=adapter.validate_python(input_type.model_json_schema()),
             output_schema=adapter.validate_python(output_type.model_json_schema()),
             behavior=behavior,

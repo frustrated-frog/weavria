@@ -17,11 +17,11 @@ Progress Fingerprint。它们通过 Session Semantic Ledger 跨 Run 持久化。
 ```text
 raw user input + ApplicationObservation
         ↓ 持久化
-BM25 recall → schema-aware choices → initial capability candidates
+BM25 + intent signals + bounded Need fallback → schema-aware choices
         ↓
 TaskInterpreter → validated TaskFrame v2 → Need/Obligation compilation
         ↓ CAS
-SemanticSnapshot(work/frame/capability/evidence versions)
+SemanticSnapshot + SemanticTransition(work/frame/capability/evidence versions)
         ↓
 AgentLoop(model sees epoch view; executor retains host ceiling)
         ↓
@@ -29,7 +29,7 @@ ToolRecord + Artifact → EvidenceResolver → NeedLedger
         ↓ CAS / next decision boundary
 Frame evidence revision + optional capability expansion
         ↓
-Obligation completion / clarification wait / bounded degradation
+Persistent-Ledger obligation completion / explicit clarification wait / bounded degradation
 ```
 
 Steering 先提交 Runtime TaskRevision；旧模型响应会被丢弃。下一合法决策边界重新解释并用
@@ -63,6 +63,8 @@ expected recall 和 visible count。它是机制诊断，不是自然语言任�
 - 不实现向量检索、学习式澄清或自主修改策略；这些应先在 labs 中有冻结对照。
 - Pending Clarification 支持回答、替换语义、显式取消和期限；为保持无后台任务所有权，超时在
   下一个 Session 请求边界惰性结算并持久化，而非由脱离调度器唤醒。
+- 未标注的新输入不会自动绑定唯一 Pending Clarification；宿主必须传 `clarification_id` 或显式
+  注入可评测的关联策略。
 
 ## 7. 下一小步
 

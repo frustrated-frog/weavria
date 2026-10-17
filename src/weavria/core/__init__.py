@@ -84,6 +84,7 @@ from .outcomes import (
 from .semantics import (
     PendingClarification,
     SemanticSnapshot,
+    SemanticTransition,
     SemanticVersion,
     SessionClarificationChanged,
     SessionSemanticCommitted,
@@ -161,6 +162,7 @@ __all__ = [
     "RunStarted",
     "RunStatus",
     "SemanticSnapshot",
+    "SemanticTransition",
     "SemanticVersion",
     "SessionApplicationObserved",
     "SessionClarificationChanged",

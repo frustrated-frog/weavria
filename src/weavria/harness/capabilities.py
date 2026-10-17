@@ -287,9 +287,9 @@ class SchemaAwareSelector:
 
 
 class CapabilityResolver:
-    """Compose policy filtering, BM25 recall and schema-aware selection."""
+    """Compose policy filtering, bounded recall fallbacks and schema-aware selection."""
 
-    version = "capability-resolver/1"
+    version = "capability-resolver/2"
 
     def __init__(
         self,
@@ -321,6 +321,12 @@ class CapabilityResolver:
             safe,
             limit=min(len(safe), self._limit * 3) or self._limit,
         )
+        recalled = _merge_declared_and_schema_candidates(
+            query,
+            safe,
+            recalled,
+            limit=min(len(safe), self._limit * 3) or self._limit,
+        )
         choices = self._selector.select(query, catalogue, recalled, limit=self._limit)
         selected = tuple(item for item in choices if item.decision == "select")
         by_id = {item.capability_id: item for item in catalogue.capabilities}
@@ -342,6 +348,7 @@ def _descriptor(descriptor: ToolDescriptor) -> CapabilityDescriptor:
         name=descriptor.name,
         version=descriptor.version,
         description=descriptor.description,
+        intent_signals=descriptor.intent_signals,
         input_schema_digest=_digest(descriptor.input_schema),
         input_schema=descriptor.input_schema,
         output_schema_digest=_digest(descriptor.output_schema),
@@ -405,6 +412,8 @@ def _query_terms(query: CapabilityQuery) -> Counter[str]:
 
 
 def _covers(descriptor: CapabilityDescriptor, requirement: InformationRequirement) -> bool:
+    if descriptor.name in requirement.capability_names:
+        return True
     if not requirement.required_fields:
         return bool(set(_tokens(requirement.description)) & set(_document_terms(descriptor)))
     output = set(_schema_terms(descriptor.output_schema))
@@ -417,3 +426,36 @@ def _required_parameters(descriptor: CapabilityDescriptor) -> tuple[str, ...]:
     schema = descriptor.input_schema or {}
     value = schema.get("required", [])
     return tuple(str(item) for item in value) if isinstance(value, list) else ()
+
+
+def _merge_declared_and_schema_candidates(
+    query: CapabilityQuery,
+    descriptors: tuple[CapabilityDescriptor, ...],
+    lexical: tuple[CapabilityCandidate, ...],
+    *,
+    limit: int,
+) -> tuple[CapabilityCandidate, ...]:
+    """Recall declared capabilities first, then schema matches only for uncovered Needs."""
+    by_name = {item.name: item for item in descriptors}
+    ordered = list(lexical)
+    included = {item.capability_id for item in lexical}
+    for requirement in query.requirements:
+        declared = tuple(by_name[name] for name in requirement.capability_names if name in by_name)
+        fallback = declared or tuple(
+            descriptor for descriptor in descriptors if _covers(descriptor, requirement)
+        )
+        for descriptor in fallback:
+            if descriptor.capability_id in included:
+                continue
+            ordered.append(
+                CapabilityCandidate(
+                    capability_id=descriptor.capability_id,
+                    name=descriptor.name,
+                    lexical_score=0,
+                    matched_terms=("declared_need" if declared else "schema_coverage",),
+                )
+            )
+            included.add(descriptor.capability_id)
+            if len(ordered) >= limit:
+                return tuple(ordered)
+    return tuple(ordered[:limit])

@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict
 
 from weavria.core import (
     AdmissionNotice,
+    ErrorCategory,
     FinishAction,
     Message,
     ModelResponse,
@@ -16,6 +17,7 @@ from weavria.core import (
     SessionClarificationChanged,
     SessionInterrupted,
     SessionRequest,
+    SessionSemanticCommitted,
     TaskInput,
     ToolBatch,
     ToolCallAction,
@@ -37,7 +39,7 @@ from weavria.harness import (
 )
 from weavria.models import FakeModelProvider, ModelCapabilities
 from weavria.sessions import SessionEngine
-from weavria.tools import ToolContext, ToolRegistry, TypedTool
+from weavria.tools import ToolContext, ToolFault, ToolRegistry, TypedTool
 
 
 class _Input(BaseModel):
@@ -264,6 +266,49 @@ async def test_execute_frame_exposes_only_selected_business_capability(
     assert frame.specification.capability_needs[0].name == "read_value"
 
 
+async def test_unverifiable_completion_blocks_work_even_when_execution_finishes(
+    tmp_path: Path,
+) -> None:
+    async def unavailable(arguments: _Input, context: ToolContext) -> _Output:
+        raise ToolFault(ErrorCategory.TOOL_FAILURE, "source unavailable")
+
+    registry = ToolRegistry(
+        (
+            TypedTool(
+                name="read_value",
+                version="1",
+                description="Read a value from a trusted source",
+                input_type=_Input,
+                output_type=_Output,
+                execute=unavailable,
+            ),
+        )
+    )
+    preparer = TaskAwareSessionPreparer(
+        TaskUnderstandingEngine(
+            ModelTaskInterpreter(FakeModelProvider((_declaration(_execute()),)))
+        )
+    )
+    async with SessionEngine(
+        tmp_path / "unverifiable.db",
+        model=_ExecuteSessionModel(),
+        tools=registry,
+        task_preparation=preparer,
+    ) as engine:
+        await engine.create("s")
+        result = await engine.send("s", "Read alpha.", input_id="input-1")
+        events = await engine.store.events("s")
+        semantic = [
+            event.data.snapshot
+            for event in events
+            if isinstance(event.data, SessionSemanticCommitted)
+        ]
+
+    assert result.report.status is RunStatus.COMPLETED
+    assert result.report.task_outcome == "unverifiable"
+    assert semantic[-1].work_status == "blocked"
+
+
 class _ClarifyThenExecuteModel:
     capabilities = ModelCapabilities(tool_calls=True, multi_tool_calls=True)
 
@@ -305,8 +350,15 @@ async def test_pending_clarification_resumes_the_same_work_across_runs(
         pending = await engine.store.pending_clarifications("s")
         assert len(pending) == 1 and pending[0].work_status == "waiting_input"
         work_id = pending[0].work_id
+        clarification = pending[0].pending_clarification
+        assert clarification is not None
 
-        second = await engine.send("s", "Read alpha from the trusted source.", input_id="input-2")
+        second = await engine.send(
+            "s",
+            "Read alpha from the trusted source.",
+            input_id="input-2",
+            clarification_id=clarification.clarification_id,
+        )
         head = await engine.store.semantic_head("s", work_id)
         events = await engine.store.events("s")
 
@@ -321,6 +373,30 @@ async def test_pending_clarification_resumes_the_same_work_across_runs(
     assert len(clarification_events) == 1
     assert clarification_events[0].clarification.status == "answered"
     assert clarification_events[0].clarification.answer_input_id == "input-2"
+
+
+async def test_unlabelled_input_does_not_capture_the_only_pending_clarification(
+    tmp_path: Path,
+) -> None:
+    interpreter = FakeModelProvider((_declaration(_clarify()), _declaration(_direct())))
+    preparer = TaskAwareSessionPreparer(TaskUnderstandingEngine(ModelTaskInterpreter(interpreter)))
+    async with SessionEngine(
+        tmp_path / "clarification-association.db",
+        model=_DirectSessionModel(),
+        tools=_registry(),
+        task_preparation=preparer,
+    ) as engine:
+        await engine.create("s")
+        await engine.send("s", "Read it.", input_id="input-1")
+        waiting = (await engine.store.pending_clarifications("s"))[0]
+
+        independent = await engine.send("s", "Who are you?", input_id="input-2")
+        pending = await engine.store.pending_clarifications("s")
+        original = await engine.store.semantic_head("s", waiting.work_id)
+
+    assert independent.report.status is RunStatus.COMPLETED
+    assert original is not None and original.work_status == "waiting_input"
+    assert [item.work_id for item in pending] == [waiting.work_id]
 
 
 async def test_waiting_work_can_be_abandoned_without_deleting_semantic_history(

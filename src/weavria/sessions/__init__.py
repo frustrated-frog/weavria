@@ -2,6 +2,8 @@
 
 from .engine import SessionEngine
 from .preparation import (
+    ClarificationAssociationPolicy,
+    ExplicitClarificationOnly,
     SessionSemanticContext,
     SessionTaskContext,
     SessionTaskPreparation,
@@ -15,6 +17,8 @@ from .store import (
 )
 
 __all__ = [
+    "ClarificationAssociationPolicy",
+    "ExplicitClarificationOnly",
     "SQLiteSessionStore",
     "SessionBusyError",
     "SessionConflictError",

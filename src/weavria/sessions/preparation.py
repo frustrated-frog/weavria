@@ -12,6 +12,7 @@ from weavria.core import (
     ConversationTurn,
     PendingClarification,
     SemanticSnapshot,
+    SemanticTransition,
     TaskInput,
     TaskObservation,
     ToolRecord,
@@ -45,6 +46,7 @@ class SessionTaskPreparation:
     capability_epoch: int
     evidence_revision: int
     need_ledger: dict[str, JsonValue]
+    transition: SemanticTransition
     work_status: WorkStatus = "active"
     pending_clarification: PendingClarification | None = None
 
@@ -73,3 +75,30 @@ class SessionTaskPreparer(Protocol):
     async def prepare(self, context: SessionTaskContext) -> SessionTaskPreparation: ...
 
     async def refresh(self, context: SessionSemanticContext) -> SessionTaskPreparation: ...
+
+
+class ClarificationAssociationPolicy(Protocol):
+    """Optionally associate unlabelled input with one pending clarification."""
+
+    @property
+    def version(self) -> str: ...
+
+    async def associate(
+        self,
+        text: str,
+        pending: tuple[SemanticSnapshot, ...],
+    ) -> str | None: ...
+
+
+class ExplicitClarificationOnly:
+    """Safe default: unlabelled input always starts independent Work."""
+
+    version = "explicit-clarification-only/1"
+
+    async def associate(
+        self,
+        text: str,
+        pending: tuple[SemanticSnapshot, ...],
+    ) -> str | None:
+        del text, pending
+        return None

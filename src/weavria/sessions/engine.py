@@ -23,6 +23,7 @@ from weavria.core import (
     ModelTurn,
     PendingClarification,
     SemanticSnapshot,
+    SemanticTransition,
     SemanticVersion,
     SessionRequest,
     SessionResult,
@@ -49,8 +50,25 @@ from weavria.runtime import (
 from weavria.tools import ToolPolicy, ToolRegistry, artifact_read_tool
 
 from .evidence import session_history_tool, session_source_tool
-from .preparation import SessionSemanticContext, SessionTaskContext, SessionTaskPreparer
+from .preparation import (
+    ClarificationAssociationPolicy,
+    ExplicitClarificationOnly,
+    SessionSemanticContext,
+    SessionTaskContext,
+    SessionTaskPreparer,
+)
 from .store import SessionBusyError, SessionConflictError, SQLiteSessionStore
+
+
+def _status_transition(snapshot: SemanticSnapshot, *, cause: str) -> SemanticTransition:
+    return SemanticTransition(
+        kind="work_status",
+        work_id=snapshot.work_id,
+        expected_semantic_sequence=snapshot.version.semantic_sequence,
+        base_frame_id=snapshot.observation.observation_id,
+        target_frame_id=snapshot.observation.observation_id,
+        cause=cause,
+    )
 
 
 class _RunArtifacts:
@@ -184,6 +202,7 @@ class _SessionAdapter:
                 and self._task_observation.task_revision == task.revision
                 else None
             ),
+            semantic_state=(self._semantic.need_ledger if self._semantic is not None else None),
         )
 
     async def _refresh_semantics(self, task: TaskInput) -> None:
@@ -242,7 +261,11 @@ class _SessionAdapter:
             work_status=prepared.work_status,
             pending_clarification=pending,
         )
-        snapshot = await self._store.commit_semantic(snapshot, expected=self._semantic.version)
+        snapshot = await self._store.commit_semantic(
+            snapshot,
+            expected=self._semantic.version,
+            transition=prepared.transition,
+        )
         support_names = tuple(
             descriptor.name
             for descriptor in self._tools.descriptors
@@ -309,6 +332,7 @@ class SessionEngine:
         clock: Clock | None = None,
         id_generator: Callable[[], str] | None = None,
         task_preparation: SessionTaskPreparer | None = None,
+        clarification_association: ClarificationAssociationPolicy | None = None,
         clarification_timeout_seconds: float | None = 86_400.0,
     ) -> None:
         if type(history_budget_bytes) is not int or history_budget_bytes < 256:
@@ -339,6 +363,7 @@ class SessionEngine:
         self._clock = clock or SystemClock()
         self._ids = id_generator or (lambda: uuid.uuid4().hex)
         self._task_preparation = task_preparation
+        self._clarification_association = clarification_association or ExplicitClarificationOnly()
         self._clarification_timeout = clarification_timeout_seconds
         self._tasks: set[asyncio.Task[object]] = set()
         self._loops: dict[str, AgentLoop] = {}
@@ -367,6 +392,7 @@ class SessionEngine:
         *,
         input_id: str | None = None,
         application_context: tuple[ApplicationObservation, ...] = (),
+        clarification_id: str | None = None,
     ) -> SessionResult:
         """Persist input before work; retrying an input ID returns its original terminal report."""
         if self._closing:
@@ -402,6 +428,8 @@ class SessionEngine:
                     "task_preparation_version": self._task_preparation.version
                     if self._task_preparation
                     else "none/1",
+                    "clarification_association_version": self._clarification_association.version,
+                    "clarification_id": clarification_id,
                 },
                 ensure_ascii=False,
             )
@@ -436,7 +464,22 @@ class SessionEngine:
                 )
                 await self._expire_clarifications(session_id)
                 pending = await self.store.pending_clarifications(session_id)
-                semantic_base = pending[0] if len(pending) == 1 else None
+                associated_id = clarification_id
+                if associated_id is None:
+                    associated_id = await self._clarification_association.associate(text, pending)
+                semantic_base = next(
+                    (
+                        item
+                        for item in pending
+                        if item.pending_clarification is not None
+                        and item.pending_clarification.clarification_id == associated_id
+                    ),
+                    None,
+                )
+                if associated_id is not None and semantic_base is None:
+                    raise SessionConflictError(
+                        "clarification is not pending in the current session"
+                    )
                 if semantic_base is not None:
                     task = TaskInput(
                         goal=text,
@@ -502,6 +545,7 @@ class SessionEngine:
                 await self.store.commit_semantic(
                     semantic,
                     expected=semantic_base.version if semantic_base is not None else None,
+                    transition=prepared.transition,
                 )
                 interruption_reason = "owner_exit"
             extra = (
@@ -579,7 +623,12 @@ class SessionEngine:
             report = await loop.execute()
             latest = adapter.semantic
             if latest is not None and latest.work_status == "active":
-                terminal_status = "succeeded" if report.status.value == "completed" else "blocked"
+                terminal_status = (
+                    "succeeded"
+                    if report.status.value == "completed"
+                    and report.task_outcome in {"verified", "unverified"}
+                    else "blocked"
+                )
                 terminal = latest.model_copy(
                     update={
                         "version": latest.version.model_copy(
@@ -588,7 +637,11 @@ class SessionEngine:
                         "work_status": terminal_status,
                     }
                 )
-                await self.store.commit_semantic(terminal, expected=latest.version)
+                await self.store.commit_semantic(
+                    terminal,
+                    expected=latest.version,
+                    transition=_status_transition(latest, cause="run_terminal"),
+                )
             return SessionResult(
                 session_id=session_id, input_id=claim.input_id, run_id=run_id, report=report
             )
@@ -683,7 +736,11 @@ class SessionEngine:
                 "pending_clarification": None,
             }
         )
-        return await self.store.commit_semantic(abandoned, expected=current.version)
+        return await self.store.commit_semantic(
+            abandoned,
+            expected=current.version,
+            transition=_status_transition(current, cause="user_abandoned"),
+        )
 
     async def _expire_clarifications(self, session_id: str) -> None:
         """Persist lazily observed expiry before matching a new input to waiting Work."""
@@ -701,7 +758,11 @@ class SessionEngine:
                     "pending_clarification": None,
                 }
             )
-            await self.store.commit_semantic(expired, expected=current.version)
+            await self.store.commit_semantic(
+                expired,
+                expected=current.version,
+                transition=_status_transition(current, cause="clarification_expired"),
+            )
 
     async def close(self) -> None:
         current = asyncio.current_task()

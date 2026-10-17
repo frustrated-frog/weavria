@@ -208,6 +208,48 @@ async def test_resolver_preserves_partial_fields_and_retryable_failures() -> Non
     assert failed.can_retry and failed.failures[0].retryable
 
 
+async def test_resolver_keeps_satisfied_prior_evidence_when_a_later_attempt_fails() -> None:
+    store, record = await _success_record()
+    resolver = EvidenceResolver()
+    first = await resolver.resolve(
+        work_id="work-a",
+        task_revision=1,
+        frame_revision=1,
+        requirements=(_requirement(),),
+        records=(record,),
+        read_artifact=lambda artifact_id: store.get("run-1", artifact_id),
+    )
+    failure = ToolRecord(
+        exchange=ToolExchange(
+            action=ToolCallAction(call_id="call-later", tool_name="fetch", arguments={"key": "a"}),
+            observation=ToolFailedObservation(
+                call_id="call-later",
+                tool_name="fetch",
+                error=RunError(
+                    category=ErrorCategory.TOOL_FAILURE,
+                    message="later source failure",
+                    retryable=True,
+                ),
+            ),
+        )
+    )
+
+    merged = await resolver.resolve(
+        work_id="work-a",
+        task_revision=1,
+        frame_revision=1,
+        requirements=(_requirement(),),
+        records=(failure,),
+        read_artifact=lambda artifact_id: store.get("run-1", artifact_id),
+        previous=first,
+    )
+
+    state = merged.state_for("need-a")
+    assert state.status is NeedStatus.SATISFIED
+    assert state.evidence_binding_ids == first.state_for("need-a").evidence_binding_ids
+    assert state.failures == ()
+
+
 async def test_current_data_is_not_claimed_fresh_by_structural_coverage() -> None:
     store, record = await _success_record()
     ledger = await EvidenceResolver().resolve(

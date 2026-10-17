@@ -5,7 +5,7 @@ import hashlib
 import math
 from typing import Protocol
 
-from pydantic import TypeAdapter
+from pydantic import JsonValue, TypeAdapter
 
 from weavria.artifacts import ArtifactAccessError, ArtifactSnapshot, ArtifactStore
 from weavria.core import (
@@ -33,6 +33,7 @@ class CompletionContext:
         records: tuple[ToolRecord, ...],
         store: ArtifactStore,
         task_observation: TaskObservation | None = None,
+        semantic_state: dict[str, JsonValue] | None = None,
     ) -> None:
         self._run_id = run_id
         self._task = TaskInput.model_validate(task).model_dump_json()
@@ -40,6 +41,11 @@ class CompletionContext:
         self._task_observation = (
             TaskObservation.model_validate(task_observation).model_dump_json()
             if task_observation is not None
+            else None
+        )
+        self._semantic_state = (
+            TypeAdapter(dict[str, JsonValue]).validate_python(semantic_state, strict=True)
+            if semantic_state is not None
             else None
         )
         self._records = tuple(ToolRecord.model_validate(r).model_dump_json() for r in records)
@@ -74,6 +80,13 @@ class CompletionContext:
     @property
     def records(self) -> tuple[ToolRecord, ...]:
         return tuple(ToolRecord.model_validate_json(r) for r in self._records)
+
+    @property
+    def semantic_state(self) -> dict[str, JsonValue] | None:
+        """Return an opaque, revision-bound semantic projection when supplied."""
+        if self._semantic_state is None:
+            return None
+        return TypeAdapter(dict[str, JsonValue]).validate_python(self._semantic_state, strict=True)
 
     @property
     def evidence_call_ids(self) -> tuple[str, ...]:

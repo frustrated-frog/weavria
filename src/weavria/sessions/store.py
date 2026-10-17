@@ -24,6 +24,7 @@ from weavria.core import (
     RunEnded,
     RunReport,
     SemanticSnapshot,
+    SemanticTransition,
     SemanticVersion,
     SessionApplicationObserved,
     SessionClarificationChanged,
@@ -69,6 +70,74 @@ class TurnClaim:
     input_id: str
     ordinal: int
     duplicate: SessionResult | None = None
+
+
+def _validate_semantic_transition(
+    current: SemanticSnapshot | None,
+    accepted: SemanticSnapshot,
+    *,
+    expected: SemanticVersion | None,
+    transition: SemanticTransition,
+) -> None:
+    """Bind an accepted projection to an explicit, auditable transition fact."""
+    expected_sequence = expected.semantic_sequence if expected is not None else 0
+    if (
+        transition.work_id != accepted.work_id
+        or transition.target_frame_id != accepted.observation.observation_id
+        or transition.expected_semantic_sequence != expected_sequence
+    ):
+        raise SessionConflictError("semantic transition does not bind the accepted snapshot")
+    if current is None:
+        if transition.kind != "initial":
+            raise SessionConflictError("initial semantic head requires an initial transition")
+        return
+    if transition.base_frame_id != current.observation.observation_id:
+        raise SessionConflictError("semantic transition does not bind the current frame")
+    before, after = current.version, accepted.version
+    if transition.kind == "frame_patch":
+        patch = transition.patch
+        if patch is None or (
+            patch.get("work_id") != current.work_id
+            or patch.get("base_frame_id") != current.observation.observation_id
+            or patch.get("expected_task_revision") != after.task_revision
+            or patch.get("expected_frame_revision") != before.frame_revision
+            or after.task_revision != before.task_revision + 1
+            or after.frame_revision != before.frame_revision + 1
+        ):
+            raise SessionConflictError("frame patch does not reproduce the revision boundary")
+        return
+    if transition.kind == "work_status":
+        if (
+            accepted.work_status == current.work_status
+            or accepted.input_id != current.input_id
+            or accepted.run_id != current.run_id
+            or accepted.observation != current.observation
+            or accepted.visible_tool_names != current.visible_tool_names
+            or accepted.need_ledger != current.need_ledger
+            or (
+                after.task_revision,
+                after.frame_revision,
+                after.capability_epoch,
+                after.evidence_revision,
+            )
+            != (
+                before.task_revision,
+                before.frame_revision,
+                before.capability_epoch,
+                before.evidence_revision,
+            )
+        ):
+            raise SessionConflictError("work-status transition changed semantic content")
+        return
+    if (
+        transition.kind != "evidence_refresh"
+        or after.task_revision != before.task_revision
+        or accepted.input_id != current.input_id
+        or accepted.run_id != current.run_id
+        or accepted.work_status != current.work_status
+        or accepted.pending_clarification != current.pending_clarification
+    ):
+        raise SessionConflictError("semantic revision requires an explicit frame patch")
 
 
 class SQLiteSessionStore:
@@ -148,7 +217,7 @@ class SQLiteSessionStore:
         conn = sqlite3.connect(self.path, timeout=2.0)
         self._connection = conn
         version = conn.execute("PRAGMA user_version").fetchone()[0]
-        if version not in (0, 1, 2, 3, 4):
+        if version not in (0, 1, 2, 3, 4, 5):
             raise SessionConflictError("unsupported session database schema")
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA journal_mode=WAL")
@@ -193,6 +262,8 @@ class SQLiteSessionStore:
             self._migrate_v3()
         if version < 4:
             self._migrate_v4()
+        if version < 5:
+            self._migrate_v5()
         # Only the exclusive DB owner can classify an old live run as interrupted.
         active = conn.execute("SELECT id FROM runs WHERE status='running'").fetchall()
         for row in active:
@@ -255,6 +326,14 @@ class SQLiteSessionStore:
             )
             conn.execute("PRAGMA user_version=4")
 
+    def _migrate_v5(self) -> None:
+        with self._transaction() as conn:
+            conn.execute("""CREATE TABLE semantic_transitions(
+                session_id TEXT NOT NULL REFERENCES sessions, work_id TEXT NOT NULL,
+                semantic_sequence INTEGER NOT NULL, data TEXT NOT NULL,
+                PRIMARY KEY(session_id,work_id,semantic_sequence))""")
+            conn.execute("PRAGMA user_version=5")
+
     def _session_event(
         self,
         conn: sqlite3.Connection,
@@ -290,12 +369,15 @@ class SQLiteSessionStore:
         snapshot: SemanticSnapshot,
         *,
         expected: SemanticVersion | None,
+        transition: SemanticTransition,
     ) -> SemanticSnapshot:
         """CAS one Work head and its session event in the same SQLite transaction."""
         encoded = SemanticSnapshot.model_validate(snapshot).model_dump_json()
+        transition_encoded = SemanticTransition.model_validate(transition).model_dump_json()
 
         def commit() -> SemanticSnapshot:
             accepted = SemanticSnapshot.model_validate_json(encoded)
+            accepted_transition = SemanticTransition.model_validate_json(transition_encoded)
             with self._transaction() as conn:
                 run = conn.execute(
                     "SELECT session_id,input_id FROM runs WHERE id=?", (accepted.run_id,)
@@ -322,6 +404,12 @@ class SQLiteSessionStore:
                         or after.evidence_revision < before.evidence_revision
                     ):
                         raise SessionConflictError("semantic version is not monotonic")
+                _validate_semantic_transition(
+                    current,
+                    accepted,
+                    expected=expected,
+                    transition=accepted_transition,
+                )
                 conn.execute(
                     "INSERT INTO semantic_commits VALUES(?,?,?,?)",
                     (
@@ -329,6 +417,15 @@ class SQLiteSessionStore:
                         accepted.work_id,
                         accepted.version.semantic_sequence,
                         encoded,
+                    ),
+                )
+                conn.execute(
+                    "INSERT INTO semantic_transitions VALUES(?,?,?,?)",
+                    (
+                        accepted.session_id,
+                        accepted.work_id,
+                        accepted.version.semantic_sequence,
+                        transition_encoded,
                     ),
                 )
                 conn.execute(
@@ -414,7 +511,10 @@ class SQLiteSessionStore:
                 self._session_event(
                     conn,
                     accepted.session_id,
-                    SessionSemanticCommitted(snapshot=accepted),
+                    SessionSemanticCommitted(
+                        snapshot=accepted,
+                        transition=accepted_transition,
+                    ),
                 )
             return accepted
 

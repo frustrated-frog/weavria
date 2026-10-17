@@ -50,6 +50,7 @@ class MessageInput(BaseModel):
     input_id: str = Field(min_length=1, max_length=128)
     text: str = Field(min_length=1, max_length=4000)
     context: PageContext
+    clarification_id: str | None = Field(default=None, min_length=1, max_length=128)
 
 
 class SessionCreated(BaseModel):
@@ -70,6 +71,7 @@ class MessageOutput(BaseModel):
     answer: str | None
     error: str | None
     tools: tuple[ToolTrace, ...]
+    clarification_id: str | None = None
 
 
 class _Runtime:
@@ -233,6 +235,7 @@ def create_app(
                         payload=payload.context.model_dump(mode="json"),
                     ),
                 ),
+                clarification_id=payload.clarification_id,
             )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="session not found") from exc
@@ -246,6 +249,14 @@ def create_app(
             for call in (turn.calls if turn else ())
         )
         error = result.report.error.message if result.report.error else None
+        pending = next(
+            (
+                item.pending_clarification
+                for item in await runtime.engine.store.pending_clarifications(session_id)
+                if item.run_id == result.run_id and item.pending_clarification is not None
+            ),
+            None,
+        )
         return MessageOutput(
             session_id=session_id,
             run_id=result.run_id,
@@ -254,6 +265,7 @@ def create_app(
             answer=result.report.output,
             error=error,
             tools=tools,
+            clarification_id=pending.clarification_id if pending is not None else None,
         )
 
     return app

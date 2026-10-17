@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Literal, Protocol
 
+from pydantic import JsonValue, TypeAdapter
+
 from weavria.artifacts import ArtifactStore
 from weavria.context import (
     ContextBudgetError,
@@ -229,6 +231,7 @@ class _AgentKernel:
             if task_observation is not None
             else None
         )
+        self._semantic_state: dict[str, JsonValue] | None = None
         self._journal_failed = False
         self._commit_lock = asyncio.Lock()
         self._clock = clock if clock is not None else SystemClock()
@@ -591,6 +594,11 @@ class _AgentKernel:
             self._task_observation = TaskObservation.model_validate_json(
                 prepared.task_observation.model_dump_json()
             )
+        self._semantic_state = (
+            TypeAdapter(dict[str, JsonValue]).validate_python(prepared.semantic_state, strict=True)
+            if prepared.semantic_state is not None
+            else None
+        )
         if prepared.visible_tool_names is None:
             if prepared.capability_epoch is not None:
                 raise ValueError("capability epoch requires a visible tool view")
@@ -714,6 +722,7 @@ class _AgentKernel:
             if self._task_observation is not None
             and self._task_observation.task_revision == task.revision
             else None,
+            self._semantic_state,
         )
         assessment = await check_completion(
             self._completion,

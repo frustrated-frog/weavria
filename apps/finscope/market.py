@@ -109,6 +109,12 @@ def market_pulse_tool(client: MarketPulseClient) -> TypedTool[MarketPulseInput, 
             "or review for the daily conclusion. Prefer a date explicitly named by the user; "
             "otherwise use the page business date when present."
         ),
+        intent_signals=(
+            "市场状态 市场阶段 市场全景",
+            "市场机会 行业机会 候选机会",
+            "市场宽度 涨跌分布",
+            "每日复盘 历史演变 行情",
+        ),
         input_type=MarketPulseInput,
         output_type=MarketPulseOutput,
         execute=execute,

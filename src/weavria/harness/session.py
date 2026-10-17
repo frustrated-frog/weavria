@@ -9,6 +9,7 @@ from weavria.core import (
     Message,
     MessageRole,
     PendingClarification,
+    SemanticTransition,
     TaskObservation,
 )
 from weavria.sessions import (
@@ -21,7 +22,7 @@ from .capabilities import CapabilityQuery, CapabilityResolver
 from .clarification import BlockingAmbiguityPolicy, ClarificationPolicy
 from .completion import TaskCompletionEvaluator, TaskObligationCompletionPolicy
 from .requirements import EvidenceResolver, NeedLedger, NeedStatus, stable_identifier
-from .understanding import TaskFrame, TaskUnderstandingEngine
+from .understanding import TaskFrame, TaskUnderstandingEngine, apply_frame_patch
 
 
 async def _no_artifact(artifact_id: str) -> NoReturn:
@@ -112,6 +113,21 @@ class TaskAwareSessionPreparer:
             previous=previous,
         )
         frame = preparation.record.frame
+        transition_patch = None
+        transition_kind = "initial"
+        transition_cause = context.cause
+        base_frame_id = None
+        expected_sequence = 0
+        if base is not None:
+            if preparation.patch is None:
+                raise ValueError("a revised task frame requires an explicit patch")
+            apply_frame_patch(base, preparation.patch, frame)
+            transition_patch = preparation.patch.model_dump(mode="json")
+            transition_kind = "frame_patch"
+            transition_cause = preparation.patch.cause
+            base_frame_id = base.frame_id
+            assert context.base_semantic is not None
+            expected_sequence = context.base_semantic.version.semantic_sequence
         observation = preparation.observation
         if (
             frame.evidence_revision != ledger.evidence_revision
@@ -159,6 +175,15 @@ class TaskAwareSessionPreparer:
             capability_epoch=frame.capability_epoch,
             evidence_revision=ledger.evidence_revision,
             need_ledger=ledger.model_dump(mode="json"),
+            transition=_transition(
+                kind=transition_kind,
+                work_id=frame.work_id,
+                expected_sequence=expected_sequence,
+                base_frame_id=base_frame_id,
+                target_frame_id=frame.frame_id,
+                cause=transition_cause,
+                patch=transition_patch,
+            ),
             work_status="waiting_input" if pending is not None else "active",
             pending_clarification=pending,
         )
@@ -255,7 +280,52 @@ class TaskAwareSessionPreparer:
             capability_epoch=capability_epoch,
             evidence_revision=ledger.evidence_revision,
             need_ledger=ledger.model_dump(mode="json"),
+            transition=_transition(
+                kind="evidence_refresh",
+                work_id=frame.work_id,
+                expected_sequence=context.base_semantic.version.semantic_sequence,
+                base_frame_id=base.frame_id,
+                target_frame_id=frame.frame_id,
+                cause=context.trigger,
+            ),
         )
+
+
+def _transition(
+    *,
+    kind: str,
+    work_id: str,
+    expected_sequence: int,
+    base_frame_id: str | None,
+    target_frame_id: str,
+    cause: str,
+    patch: dict[str, object] | None = None,
+) -> SemanticTransition:
+    normalized_patch = json.loads(json.dumps(patch)) if patch is not None else None
+    digest = (
+        hashlib.sha256(
+            json.dumps(
+                normalized_patch,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+        if normalized_patch is not None
+        else None
+    )
+    return SemanticTransition.model_validate(
+        {
+            "kind": kind,
+            "work_id": work_id,
+            "expected_semantic_sequence": expected_sequence,
+            "base_frame_id": base_frame_id,
+            "target_frame_id": target_frame_id,
+            "cause": cause,
+            "patch": normalized_patch,
+            "patch_sha256": digest,
+        }
+    )
 
 
 def _messages(turns: tuple[ConversationTurn, ...]) -> tuple[Message, ...]:

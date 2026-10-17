@@ -145,7 +145,10 @@ async def test_v1_migration_preserves_facts_and_requests_and_upcasts_only_views(
         assert provider.requests[0].schema_version == 5
         assert provider.requests[0].conversation.turns[0].assistant is not None
     with sqlite3.connect(path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert conn.execute(
+            "SELECT name FROM sqlite_master WHERE name='semantic_transitions'"
+        ).fetchone() == ("semantic_transitions",)
         events = tuple(
             row[0]
             for row in conn.execute(

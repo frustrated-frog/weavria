@@ -369,17 +369,26 @@ class EvidenceResolver:
                         freshness=evaluation.freshness,
                     )
                 )
-            if previous is not None and not requirement_bindings and not failures:
+            if previous is not None:
                 try:
                     prior_state = previous.state_for(requirement.need_id)
                 except KeyError:
                     pass
                 else:
                     prior_ids = set(prior_state.evidence_binding_ids)
+                    current_binding_ids = {binding.binding_id for binding in requirement_bindings}
                     requirement_bindings.extend(
-                        binding for binding in previous.bindings if binding.binding_id in prior_ids
+                        binding
+                        for binding in previous.bindings
+                        if binding.binding_id in prior_ids
+                        and binding.binding_id not in current_binding_ids
                     )
-                    failures.extend(prior_state.failures)
+                    current_failure_ids = {failure.call_id for failure in failures}
+                    failures.extend(
+                        failure
+                        for failure in prior_state.failures
+                        if failure.call_id not in current_failure_ids
+                    )
             bindings.extend(requirement_bindings)
             states.append(_reduce_need(requirement, requirement_bindings, failures))
 

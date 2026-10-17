@@ -4,6 +4,8 @@ import hashlib
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
+from pydantic import JsonValue
+
 from weavria.core import (
     CompletionAssessment,
     CompletionRepair,
@@ -24,6 +26,7 @@ class TurnPreparation:
     visible_tool_names: tuple[str, ...] | None = None
     capability_epoch: int | None = None
     task_observation: TaskObservation | None = None
+    semantic_state: dict[str, JsonValue] | None = None
 
 
 class TurnPreparer(Protocol):
