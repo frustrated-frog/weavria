@@ -238,16 +238,21 @@ class TaskFrame(_VersionTwoContract):
 
     frame_id: str = Field(pattern=r"^[a-f0-9]{64}$")
     work_id: Annotated[str, StringConstraints(min_length=1, max_length=128, pattern=r"\S")]
+    # frame 修订号
     revision: int = Field(ge=1)
+    # 绑定的原始用户请求
     request_anchor: OriginalRequestAnchor
     interpreter_version: _Text
     catalogue_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     capability_epoch: int = Field(ge=1)
+    # 证据状态版本
     evidence_revision: int = Field(ge=1)
     need_state_sha256: str = Field(default="0" * 64, pattern=r"^[a-f0-9]{64}$")
     trust: Literal["model_inference"] = "model_inference"
     specification: TaskSpecification
+    # 编译后的信息需求
     requirements: tuple[InformationRequirement, ...] = ()
+    # 编译后的完成义务
     obligations: tuple[CompletionObligation, ...] = ()
     application_context: tuple[ApplicationObservation, ...] = ()
 
