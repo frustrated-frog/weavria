@@ -51,6 +51,8 @@ from weavria.core import (
 from weavria.runtime import Clock, Phase, RunState, SystemClock, reduce_event, settle_mutation
 from weavria.tools import ToolExecutionError
 
+from .preparation import SemanticTransitionReducer
+
 
 class SessionBusyError(RuntimeError):
     """Another owner or active request holds this local session."""
@@ -78,6 +80,7 @@ def _validate_semantic_transition(
     *,
     expected: SemanticVersion | None,
     transition: SemanticTransition,
+    reducer: SemanticTransitionReducer | None,
 ) -> None:
     """Bind an accepted projection to an explicit, auditable transition fact."""
     expected_sequence = expected.semantic_sequence if expected is not None else 0
@@ -105,6 +108,14 @@ def _validate_semantic_transition(
             or after.frame_revision != before.frame_revision + 1
         ):
             raise SessionConflictError("frame patch does not reproduce the revision boundary")
+        if reducer is None:
+            raise SessionConflictError("frame patch requires an authoritative reducer")
+        try:
+            reduced = reducer.reduce_observation(current, transition)
+        except (TypeError, ValueError) as exc:
+            raise SessionConflictError("frame patch cannot be reduced") from exc
+        if reduced != accepted.observation:
+            raise SessionConflictError("frame patch does not reproduce semantic content")
         return
     if transition.kind == "work_status":
         if (
@@ -147,8 +158,15 @@ class SQLiteSessionStore:
     only a ToolRecorded transaction makes them readable by later requests.
     """
 
-    def __init__(self, path: Path, *, clock: Clock | None = None) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        clock: Clock | None = None,
+        semantic_reducer: SemanticTransitionReducer | None = None,
+    ) -> None:
         self._clock = clock or SystemClock()
+        self._semantic_reducer = semantic_reducer
         self.path = Path(path).expanduser().absolute()
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="weavria-session")
         self._slots = asyncio.Semaphore(64)
@@ -409,6 +427,7 @@ class SQLiteSessionStore:
                     accepted,
                     expected=expected,
                     transition=accepted_transition,
+                    reducer=self._semantic_reducer,
                 )
                 conn.execute(
                     "INSERT INTO semantic_commits VALUES(?,?,?,?)",

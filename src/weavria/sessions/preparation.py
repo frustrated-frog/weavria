@@ -112,6 +112,16 @@ class SessionTaskPreparer(Protocol):
     async def refresh(self, context: SessionSemanticContext) -> SessionTaskPreparation: ...
 
 
+class SemanticTransitionReducer(Protocol):
+    """Deterministically derive semantic content from an accepted transition."""
+
+    def reduce_observation(
+        self,
+        current: SemanticSnapshot,
+        transition: SemanticTransition,
+    ) -> TaskObservation: ...
+
+
 class ClarificationAssociationPolicy(Protocol):
     """Optionally associate unlabelled input with one pending clarification."""
 

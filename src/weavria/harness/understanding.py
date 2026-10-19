@@ -319,8 +319,12 @@ class TaskFramePatch(_VersionThreeContract):
     expected_task_revision: int = Field(ge=1)
     expected_frame_revision: int = Field(ge=1)
     cause: FramePatchCause
+    request_anchor: OriginalRequestAnchor | None = None
+    evidence_revision: int | None = Field(default=None, ge=1)
+    need_state_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
     add_requirements: tuple[InformationRequirement, ...] = ()
     supersede_need_ids: tuple[str, ...] = ()
+    requirement_order: tuple[str, ...] = ()
     obligations: tuple[CompletionObligation, ...] = ()
     specification: TaskSpecification
     clarification_decision: ClarificationDecision | None = None
@@ -338,6 +342,8 @@ class TaskFramePatch(_VersionThreeContract):
             raise ValueError("frame patch superseded needs must be unique")
         if added.intersection(self.supersede_need_ids):
             raise ValueError("frame patch cannot add and supersede the same need")
+        if len(set(self.requirement_order)) != len(self.requirement_order):
+            raise ValueError("frame patch requirement order must be unique")
         return self
 
 
@@ -873,47 +879,25 @@ class TaskUnderstandingEngine:
             + int(selected_changed or base_frame.catalogue_sha256 != catalogue_sha256)
         )
         frame_revision = 1 if base_frame is None else base_frame.revision + 1
-        frame_seed = json.dumps(
-            {
-                "input_id": input_id,
-                "request_sha256": request_sha256,
-                "work_id": accepted_work_id,
-                "frame_revision": frame_revision,
-                "specification": specification.model_dump(mode="json"),
-                "clarification_decision": (
-                    clarification_decision.model_dump(mode="json")
-                    if clarification_decision is not None
-                    else None
-                ),
-                "requirements": [item.model_dump(mode="json") for item in requirements],
-                "obligations": [item.model_dump(mode="json") for item in obligations],
-                "interpreter_version": self._interpreter.version,
-                "catalogue_sha256": catalogue_sha256,
-                "capability_epoch": capability_epoch,
-                "need_state_sha256": "0" * 64,
-                "application_context": [
-                    item.model_dump(mode="json") for item in snapshot.application_context
-                ],
-            },
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
         try:
-            frame = TaskFrame(
-                frame_id=hashlib.sha256(frame_seed.encode()).hexdigest(),
-                work_id=accepted_work_id,
-                revision=frame_revision,
-                request_anchor=request_anchor,
-                interpreter_version=self._interpreter.version,
-                catalogue_sha256=catalogue_sha256,
-                capability_epoch=capability_epoch,
-                evidence_revision=base_frame.evidence_revision if base_frame is not None else 1,
-                specification=specification,
-                clarification_decision=clarification_decision,
-                requirements=requirements,
-                obligations=obligations,
-                application_context=snapshot.application_context,
+            frame = canonicalize_task_frame(
+                TaskFrame(
+                    frame_id="0" * 64,
+                    work_id=accepted_work_id,
+                    revision=frame_revision,
+                    request_anchor=request_anchor,
+                    interpreter_version=self._interpreter.version,
+                    catalogue_sha256=catalogue_sha256,
+                    capability_epoch=capability_epoch,
+                    evidence_revision=(
+                        base_frame.evidence_revision if base_frame is not None else 1
+                    ),
+                    specification=specification,
+                    clarification_decision=clarification_decision,
+                    requirements=requirements,
+                    obligations=obligations,
+                    application_context=snapshot.application_context,
+                )
             )
             observation = TaskObservation(
                 observation_id=frame.frame_id,
@@ -939,7 +923,7 @@ class TaskUnderstandingEngine:
             selected_capabilities=selected,
             frame=frame,
         )
-        patch = _frame_patch(base_frame, frame, cause) if base_frame is not None else None
+        patch = create_frame_patch(base_frame, frame, cause) if base_frame is not None else None
         return TaskPreparation(
             task=snapshot.task,
             tools=tools.select(selected),
@@ -968,7 +952,7 @@ def _compile_requirements(
     work_id: str,
     base_frame: TaskFrame | None,
 ) -> tuple[InformationRequirement, ...]:
-    existing: dict[str, list[str]] = {}
+    existing: dict[str, list[InformationRequirement]] = {}
     if base_frame is not None:
         for requirement in base_frame.requirements:
             fingerprint = _requirement_fingerprint(
@@ -979,7 +963,7 @@ def _compile_requirements(
                 requirement.required_fields,
                 requirement.capability_names,
             )
-            existing.setdefault(fingerprint, []).append(requirement.need_id)
+            existing.setdefault(fingerprint, []).append(requirement)
     required_capabilities = tuple(
         item.name for item in specification.capability_needs if item.necessity == "required"
     )
@@ -1009,9 +993,10 @@ def _compile_requirements(
         occurrence = occurrences.get(fingerprint, 0)
         occurrences[fingerprint] = occurrence + 1
         prior = existing.get(fingerprint, ())
+        prior_requirement = prior[occurrence] if occurrence < len(prior) else None
         need_id = (
-            prior[occurrence]
-            if occurrence < len(prior)
+            prior_requirement.need_id
+            if prior_requirement is not None
             else stable_identifier(
                 "need",
                 {
@@ -1030,9 +1015,13 @@ def _compile_requirements(
                 required=need.required,
                 required_fields=need.required_fields,
                 capability_names=capabilities,
-                origin_ref=stable_identifier(
-                    "origin",
-                    {"input_id": input_id, "kind": "information_need", "ordinal": ordinal},
+                origin_ref=(
+                    prior_requirement.origin_ref
+                    if prior_requirement is not None
+                    else stable_identifier(
+                        "origin",
+                        {"input_id": input_id, "kind": "information_need", "ordinal": ordinal},
+                    )
                 ),
             )
         )
@@ -1114,7 +1103,20 @@ def _compile_obligations(
     return tuple(obligations)
 
 
-def _frame_patch(
+def canonicalize_task_frame(frame: TaskFrame) -> TaskFrame:
+    """Return a frame whose identity commits to its complete semantic payload."""
+    payload = frame.model_dump(mode="json")
+    payload["frame_id"] = "0" * 64
+    digest = hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    payload["frame_id"] = digest
+    return TaskFrame.model_validate_json(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    )
+
+
+def create_frame_patch(
     base: TaskFrame,
     target: TaskFrame,
     cause: FramePatchCause,
@@ -1127,6 +1129,9 @@ def _frame_patch(
         expected_task_revision=target.request_anchor.task_revision,
         expected_frame_revision=base.revision,
         cause=cause,
+        request_anchor=target.request_anchor,
+        evidence_revision=target.evidence_revision,
+        need_state_sha256=target.need_state_sha256,
         add_requirements=tuple(
             requirement
             for requirement in target.requirements
@@ -1137,6 +1142,7 @@ def _frame_patch(
             for requirement in base.requirements
             if requirement.need_id not in target_ids
         ),
+        requirement_order=tuple(item.need_id for item in target.requirements),
         obligations=target.obligations,
         specification=target.specification,
         clarification_decision=target.clarification_decision,
@@ -1147,18 +1153,51 @@ def _frame_patch(
     )
 
 
-def apply_frame_patch(base: TaskFrame, patch: TaskFramePatch, target: TaskFrame) -> TaskFrame:
-    """Validate the optimistic semantic commit against the exact proposed target."""
+def reduce_frame_patch(base: TaskFrame, patch: TaskFramePatch) -> TaskFrame:
+    """Deterministically derive the only Task Frame represented by an accepted patch."""
     if (
         patch.work_id != base.work_id
         or patch.base_frame_id != base.frame_id
         or patch.expected_frame_revision != base.revision
-        or patch.expected_task_revision != target.request_anchor.task_revision
-        or target.work_id != base.work_id
-        or target.revision != base.revision + 1
+        or patch.request_anchor is None
+        or patch.evidence_revision is None
+        or patch.need_state_sha256 is None
+        or patch.expected_task_revision != patch.request_anchor.task_revision
     ):
         raise ValueError("stale_frame")
-    expected = _frame_patch(base, target, patch.cause)
-    if expected != patch:
+    superseded = set(patch.supersede_need_ids)
+    requirements = {
+        item.need_id: item for item in base.requirements if item.need_id not in superseded
+    }
+    for item in patch.add_requirements:
+        if item.need_id in requirements:
+            raise ValueError("frame patch adds an existing need")
+        requirements[item.need_id] = item
+    if set(patch.requirement_order) != set(requirements):
+        raise ValueError("frame patch requirement order does not reproduce its needs")
+    return canonicalize_task_frame(
+        TaskFrame(
+            frame_id="0" * 64,
+            work_id=patch.work_id,
+            revision=base.revision + 1,
+            request_anchor=patch.request_anchor,
+            interpreter_version=patch.interpreter_version,
+            catalogue_sha256=patch.catalogue_sha256,
+            capability_epoch=patch.capability_epoch,
+            evidence_revision=patch.evidence_revision,
+            need_state_sha256=patch.need_state_sha256,
+            specification=patch.specification,
+            clarification_decision=patch.clarification_decision,
+            requirements=tuple(requirements[item] for item in patch.requirement_order),
+            obligations=patch.obligations,
+            application_context=patch.application_context,
+        )
+    )
+
+
+def apply_frame_patch(base: TaskFrame, patch: TaskFramePatch, target: TaskFrame) -> TaskFrame:
+    """Reject a proposed target unless it equals the reducer's exact output."""
+    reduced = reduce_frame_patch(base, patch)
+    if reduced != target:
         raise ValueError("frame patch does not reproduce the proposed target")
-    return TaskFrame.model_validate_json(target.model_dump_json())
+    return reduced

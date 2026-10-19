@@ -71,8 +71,11 @@ from .understanding import (
     TaskUnderstandingInput,
     TaskUnderstandingRecord,
     apply_frame_patch,
+    canonicalize_task_frame,
+    create_frame_patch,
     load_task_frame,
     load_task_frame_patch,
+    reduce_frame_patch,
 )
 
 __all__ = [
@@ -137,6 +140,9 @@ __all__ = [
     "TaskUnderstandingInput",
     "TaskUnderstandingRecord",
     "apply_frame_patch",
+    "canonicalize_task_frame",
+    "create_frame_patch",
     "load_task_frame",
     "load_task_frame_patch",
+    "reduce_frame_patch",
 ]

@@ -71,6 +71,7 @@ def _frame_patch(base: SemanticSnapshot, target: SemanticSnapshot) -> SemanticTr
         "expected_task_revision": target.version.task_revision,
         "expected_frame_revision": base.version.frame_revision,
         "cause": "clarification_answer",
+        "target_observation": target.observation.model_dump(mode="json"),
     }
     digest = hashlib.sha256(
         json.dumps(patch, sort_keys=True, separators=(",", ":")).encode()
@@ -85,6 +86,17 @@ def _frame_patch(base: SemanticSnapshot, target: SemanticSnapshot) -> SemanticTr
         patch=patch,
         patch_sha256=digest,
     )
+
+
+class _FrameReducer:
+    def reduce_observation(
+        self,
+        current: SemanticSnapshot,
+        transition: SemanticTransition,
+    ) -> TaskObservation:
+        del current
+        assert transition.patch is not None
+        return TaskObservation.model_validate(transition.patch["target_observation"])
 
 
 async def test_semantic_commit_is_cas_ordered_and_evented(tmp_path: Path) -> None:
@@ -144,7 +156,9 @@ async def test_semantic_commit_rejects_non_monotonic_versions(tmp_path: Path) ->
 
 
 async def test_task_revision_requires_a_bound_frame_patch(tmp_path: Path) -> None:
-    async with SQLiteSessionStore(tmp_path / "session.db") as store:
+    async with SQLiteSessionStore(
+        tmp_path / "session.db", semantic_reducer=_FrameReducer()
+    ) as store:
         await store.create("s")
         await store.begin("s", "input-1", "run-1", "read", "{}")
         initial = _snapshot()
@@ -156,6 +170,18 @@ async def test_task_revision_requires_a_bound_frame_patch(tmp_path: Path) -> Non
                 revised,
                 expected=first.version,
                 transition=_refresh(first, revised),
+            )
+
+        forged = revised.model_copy(
+            update={
+                "observation": revised.observation.model_copy(update={"payload": {"frame": 999}})
+            }
+        )
+        with pytest.raises(SessionConflictError, match="semantic content"):
+            await store.commit_semantic(
+                forged,
+                expected=first.version,
+                transition=_frame_patch(first, revised),
             )
 
         accepted = await store.commit_semantic(

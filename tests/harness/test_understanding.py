@@ -749,6 +749,10 @@ async def test_frame_revision_preserves_need_identity_and_rejects_stale_patch() 
     assert second.record.frame.revision == 2
     assert second.record.frame.capability_epoch == first.record.frame.capability_epoch
     assert second.record.frame.requirements[0].need_id == first.record.frame.requirements[0].need_id
+    assert (
+        second.record.frame.requirements[0].origin_ref
+        == first.record.frame.requirements[0].origin_ref
+    )
     assert second.patch is not None and second.patch.cause == "steering"
     legacy_patch = second.patch.model_dump(mode="json")
     legacy_patch["schema_version"] = 2
@@ -758,6 +762,15 @@ async def test_frame_revision_preserves_need_identity_and_rejects_stale_patch() 
         apply_frame_patch(first.record.frame, second.patch, second.record.frame)
         == second.record.frame
     )
+    forged = second.record.frame.model_copy(
+        update={
+            "specification": second.record.frame.specification.model_copy(
+                update={"goal": "A target not represented by the accepted patch"}
+            )
+        }
+    )
+    with pytest.raises(ValueError, match="does not reproduce"):
+        apply_frame_patch(first.record.frame, second.patch, forged)
     with pytest.raises(ValueError, match="stale_frame"):
         apply_frame_patch(second.record.frame, second.patch, second.record.frame)
 

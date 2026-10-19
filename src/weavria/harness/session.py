@@ -8,6 +8,7 @@ from weavria.core import (
     ConversationTurn,
     Message,
     MessageRole,
+    SemanticSnapshot,
     SemanticTransition,
     TaskObservation,
 )
@@ -26,7 +27,11 @@ from .understanding import (
     TaskFrame,
     TaskUnderstandingEngine,
     apply_frame_patch,
+    canonicalize_task_frame,
+    create_frame_patch,
     load_task_frame,
+    load_task_frame_patch,
+    reduce_frame_patch,
 )
 
 
@@ -57,6 +62,11 @@ class TaskAwareSessionPreparer:
     def completion_policy(self) -> TaskObligationCompletionPolicy:
         """Completion policy sharing this preparer's evidence semantics."""
         return self._completion
+
+    @property
+    def semantic_reducer(self) -> "TaskFrameSemanticReducer":
+        """Reducer used by the store to reproduce frame-patch observations."""
+        return TaskFrameSemanticReducer()
 
     @property
     def version(self) -> str:
@@ -133,8 +143,6 @@ class TaskAwareSessionPreparer:
         if base is not None:
             if preparation.patch is None:
                 raise ValueError("a revised task frame requires an explicit patch")
-            apply_frame_patch(base, preparation.patch, frame)
-            transition_patch = preparation.patch.model_dump(mode="json")
             transition_kind = "frame_patch"
             transition_cause = preparation.patch.cause
             base_frame_id = base.frame_id
@@ -161,6 +169,11 @@ class TaskAwareSessionPreparer:
                 payload_schema="weavria.task-frame/3",
                 payload=frame.model_dump(mode="json"),
             )
+        if base is not None:
+            assert preparation.patch is not None
+            transition_patch_model = create_frame_patch(base, frame, preparation.patch.cause)
+            apply_frame_patch(base, transition_patch_model, frame)
+            transition_patch = transition_patch_model.model_dump(mode="json")
         clarification = self._clarification.plan(frame)
         delivery_plan = None
         if clarification.disposition == "ask":
@@ -360,18 +373,38 @@ def _project_frame(
     evidence_revision: int,
     need_state_sha256: str | None = None,
 ) -> TaskFrame:
-    payload = base.model_dump(mode="json")
-    payload.update(
-        {
-            "frame_id": "0" * 64,
-            "revision": frame_revision,
-            "capability_epoch": capability_epoch,
-            "evidence_revision": evidence_revision,
-            "need_state_sha256": need_state_sha256 or base.need_state_sha256,
-        }
+    return canonicalize_task_frame(
+        base.model_copy(
+            update={
+                "frame_id": "0" * 64,
+                "revision": frame_revision,
+                "capability_epoch": capability_epoch,
+                "evidence_revision": evidence_revision,
+                "need_state_sha256": need_state_sha256 or base.need_state_sha256,
+            }
+        )
     )
-    digest = hashlib.sha256(
-        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
-    payload["frame_id"] = digest
-    return TaskFrame.model_validate_json(json.dumps(payload))
+
+
+class TaskFrameSemanticReducer:
+    """Reproduce a revised TaskObservation from its accepted semantic patch."""
+
+    def reduce_observation(
+        self,
+        current: SemanticSnapshot,
+        transition: SemanticTransition,
+    ) -> TaskObservation:
+        if transition.patch is None:
+            raise ValueError("frame-patch transition omitted its patch")
+        base = load_task_frame(current.observation.payload)
+        patch = load_task_frame_patch(transition.patch)
+        target = reduce_frame_patch(base, patch)
+        return TaskObservation(
+            observation_id=target.frame_id,
+            input_id=target.request_anchor.input_id,
+            task_revision=target.request_anchor.task_revision,
+            frame_revision=target.revision,
+            producer_version=target.interpreter_version,
+            payload_schema="weavria.task-frame/3",
+            payload=target.model_dump(mode="json"),
+        )

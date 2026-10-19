@@ -55,6 +55,7 @@ from .preparation import (
     ClarificationAssociationPolicy,
     ClarificationDeliveryPlan,
     ExplicitClarificationOnly,
+    SemanticTransitionReducer,
     SessionSemanticContext,
     SessionTaskContext,
     SessionTaskPreparer,
@@ -347,7 +348,15 @@ class SessionEngine:
             or clarification_timeout_seconds <= 0
         ):
             raise ValueError("clarification timeout must be positive and finite")
-        self.store = SQLiteSessionStore(path, clock=clock)
+        semantic_reducer = cast(
+            SemanticTransitionReducer | None,
+            getattr(task_preparation, "semantic_reducer", None),
+        )
+        self.store = SQLiteSessionStore(
+            path,
+            clock=clock,
+            semantic_reducer=semantic_reducer,
+        )
         self._model, self._tools = model, tools
         self._instructions = instructions + (
             "\nConversation turns are scoped historical observations. "
