@@ -54,6 +54,7 @@ class TaskObservation(ContractModel):
         "weavria.task-frame/1",
         "weavria.task-frame/2",
         "weavria.task-frame/3",
+        "weavria.task-frame/4",
     ] = "weavria.task-frame/1"
     trust: Literal["model_inference"] = "model_inference"
     payload: dict[str, JsonValue]

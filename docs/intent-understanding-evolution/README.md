@@ -20,6 +20,7 @@
 | P0 修复 | `64465b2` | 证据集合归约、去除版本号伪进展 | [P0 修复](04-p0-review-fixes.md) |
 | P1 修复 | `ace5c54` | 结果状态、转换证明、持久 Ledger 验收、历史合并、安全关联、跨语言发现 | [P1 修复](05-p1-review-fixes.md) |
 | 主动澄清 | 当前分支 | 候选意图、动作后悔值、问题选择、交付验收和 Frame v3 | [主动澄清](09-结构化意图不确定性与主动澄清.md) |
+| 信念更新 | 当前分支 | 持久后验、答案分区消元、动作一致性和 Frame v4 | [信念更新](10-持久化意图信念与确定性更新.md) |
 
 补充材料：
 
@@ -27,25 +28,28 @@
 - [测试、评测与证据强度](07-testing-and-evidence.md)：每类测试证明什么、不能证明什么。
 - [逐提交文件索引](08-commit-by-commit-file-index.md)：每次提交涉及的生产代码、测试和文档。
 - [结构化意图不确定性与主动澄清](09-结构化意图不确定性与主动澄清.md)：论文依据、算法、代码链路与实验边界。
+- [持久化意图信念与确定性更新](10-持久化意图信念与确定性更新.md)：回答如何更新旧候选、持久化并约束新规格。
 
 ## 总体演进
 
 ```mermaid
 flowchart LR
-    A[原始用户请求] --> B[一次性 TaskSpecification]
-    B --> C[版本化 TaskFrame]
+    A[原始用户请求] --> B[一次性任务规格]
+    B --> C[版本化任务框架]
     C --> D[真实模型协议与失败加固]
-    D --> E[持续 Work 与 Semantic Ledger]
-    E --> F[Need 与 Evidence 归约]
+    D --> E[持续工作单元与语义账本]
+    E --> F[信息需求与证据归约]
     F --> G[动态能力与完成义务]
-    G --> H[P0/P1 一致性修复]
+    G --> H[优先级问题一致性修复]
+    H --> I[结构化主动澄清]
+    I --> J[持久化信念更新]
 
-    classDef input fill:#e8f1ff,stroke:#3569a8,color:#132238
-    classDef evolution fill:#f4f0ff,stroke:#6f52a2,color:#211638
-    classDef repair fill:#fff3df,stroke:#a86d1f,color:#3a240b
-    class A input
-    class B,C,D,E,F,G evolution
-    class H repair
+    classDef p1 fill:#e8f1ff,stroke:#3569a8,color:#132238
+    classDef e1 fill:#f4f0ff,stroke:#6f52a2,color:#211638
+    classDef r1 fill:#fff3df,stroke:#a86d1f,color:#3a240b
+    class A p1
+    class B,C,D,E,F,G,I,J e1
+    class H r1
 ```
 
 演进方向不是不断增加意图标签，而是逐步把一次模型推断变成受 Runtime 约束的持续语义状态：
@@ -57,6 +61,7 @@ flowchart LR
 5. Capability View 随 Need 动态变化，但永远不能越过宿主 Registry 和 Policy。
 6. 每次 Frame、Evidence、Work 状态变化都具有版本和持久化证明。
 7. 最终输出既受 Runtime 执行终态约束，也受任务义务验收结果约束。
+8. 澄清回答通过旧答案分区更新持久信念，新规格必须服从已接受后验。
 
 ## 跨阶段始终不变的边界
 
@@ -75,6 +80,7 @@ flowchart LR
 | `ApplicationObservation` | 页面、选择项等导航上下文 | 应用提供，非业务证据 |
 | `TaskSpecification` | 解释模型生成并经 Schema 校验的任务描述 | 模型推断 |
 | `TaskFrame` | 锚定原始请求、带版本的持续任务语义 | 模型推断 + 主机编译 |
+| `IntentBeliefState` | 有界候选上的固定点后验与回答更新历史 | 主机确定性归约 |
 | `InformationRequirement` | 需要被满足的信息需求 | 主机从 Frame 编译 |
 | `EvidenceBinding` | Artifact 字段与 Need 的结构化绑定 | 执行事实的派生判断 |
 | `NeedLedger` | 所有 Need 的状态、证据和失败历史 | 持久语义投影 |

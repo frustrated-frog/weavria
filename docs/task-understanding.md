@@ -4,8 +4,10 @@
 > [持续任务语义 v2](task-semantics-v2.md)、[ADR 0012](decisions/0012-semantic-ledger-frame-revision.md)
 > 和 [ADR 0013](decisions/0013-dynamic-capability-completion-progress.md)。从首次提交到 P0/P1 修复的
 > 逐提交代码说明见[意图理解到持续任务语义：完整代码演进](intent-understanding-evolution/README.md)。
-> 当前结构化候选意图、问题价值选择与 Frame v3 见
-> [意图不确定性与主动澄清](意图不确定性与主动澄清.md)。
+> 当前结构化候选意图与问题价值选择见
+> [意图不确定性与主动澄清](意图不确定性与主动澄清.md)；回答后的持久信念、确定性更新与
+> Frame v4 见[持久化意图信念与确定性更新](intent-understanding-evolution/10-持久化意图信念与确定性更新.md)
+> 和 [ADR 0020](decisions/0020-持久化意图信念与确定性更新.md)。
 
 Weavria 的任务理解位于 Harness 层。它不是业务意图分类器，而是把原始请求、会话证据和
 宿主能力目录编译成一份版本化、低信任的 `TaskFrame`。Runtime 仍只接受宿主拥有的原始

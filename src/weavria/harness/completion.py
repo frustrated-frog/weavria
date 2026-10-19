@@ -65,7 +65,7 @@ class CandidateAnswerVerifier(Protocol):
 class TaskCompletionEvaluator:
     """Evaluate declared obligations without trusting model claims of completion."""
 
-    version = "task-obligations/3"
+    version = "task-obligations/4"
 
     def __init__(
         self,
@@ -81,6 +81,7 @@ class TaskCompletionEvaluator:
         if observation is None or observation.payload_schema not in {
             "weavria.task-frame/2",
             "weavria.task-frame/3",
+            "weavria.task-frame/4",
         }:
             return CompletionEvaluation(
                 disposition="degraded_answer",

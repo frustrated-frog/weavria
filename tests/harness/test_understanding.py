@@ -27,6 +27,7 @@ from weavria.harness import (
     CapabilityView,
     ClarificationAnswerOption,
     ClarificationQuestionCandidate,
+    ClarificationResolution,
     CompletionCriterion,
     InformationNeed,
     IntentHypothesis,
@@ -194,6 +195,18 @@ def _clarify() -> TaskSpecification:
                 description="Ask one focused question about the target document",
             ),
         ),
+    )
+
+
+def _resolved_execute(*, outcome_key: str = "document_read") -> TaskSpecification:
+    return _execute().model_copy(
+        update={
+            "clarification_resolution": ClarificationResolution(
+                question_id="document_action",
+                answer_id="read",
+            ),
+            "resolved_outcome_key": outcome_key,
+        }
     )
 
 
@@ -740,12 +753,16 @@ async def test_frame_revision_preserves_need_identity_and_rejects_stale_patch() 
         cause="steering",
     )
 
-    assert first.record.frame.schema_version == 3
-    assert first.observation.payload_schema == "weavria.task-frame/3"
-    legacy_payload = first.record.frame.model_dump(mode="json")
-    legacy_payload["schema_version"] = 2
-    legacy_payload.pop("clarification_decision")
-    assert load_task_frame(legacy_payload).schema_version == 3
+    assert first.record.frame.schema_version == 4
+    assert first.observation.payload_schema == "weavria.task-frame/4"
+    legacy_v3_payload = first.record.frame.model_dump(mode="json")
+    legacy_v3_payload["schema_version"] = 3
+    legacy_v3_payload.pop("intent_belief")
+    assert load_task_frame(legacy_v3_payload).schema_version == 4
+    legacy_v2_payload = dict(legacy_v3_payload)
+    legacy_v2_payload["schema_version"] = 2
+    legacy_v2_payload.pop("clarification_decision")
+    assert load_task_frame(legacy_v2_payload).schema_version == 4
     assert second.record.frame.revision == 2
     assert second.record.frame.capability_epoch == first.record.frame.capability_epoch
     assert second.record.frame.requirements[0].need_id == first.record.frame.requirements[0].need_id
@@ -754,10 +771,14 @@ async def test_frame_revision_preserves_need_identity_and_rejects_stale_patch() 
         == first.record.frame.requirements[0].origin_ref
     )
     assert second.patch is not None and second.patch.cause == "steering"
-    legacy_patch = second.patch.model_dump(mode="json")
-    legacy_patch["schema_version"] = 2
-    legacy_patch.pop("clarification_decision")
-    assert load_task_frame_patch(legacy_patch).schema_version == 3
+    legacy_v3_patch = second.patch.model_dump(mode="json")
+    legacy_v3_patch["schema_version"] = 3
+    legacy_v3_patch.pop("intent_belief")
+    assert load_task_frame_patch(legacy_v3_patch).schema_version == 4
+    legacy_v2_patch = dict(legacy_v3_patch)
+    legacy_v2_patch["schema_version"] = 2
+    legacy_v2_patch.pop("clarification_decision")
+    assert load_task_frame_patch(legacy_v2_patch).schema_version == 4
     assert (
         apply_frame_patch(first.record.frame, second.patch, second.record.frame)
         == second.record.frame
@@ -797,12 +818,193 @@ async def test_clarification_route_hides_capabilities_and_keeps_raw_goal() -> No
     assert execution.result.output == "Which document should I read?"
     assert execution.preparation.record.specification.route == "clarify"
     assert execution.preparation.tools.descriptors == ()
+    belief = execution.preparation.record.frame.intent_belief
+    assert belief is not None and belief.belief_revision == 1
+    assert belief.status == "uncertain"
     assert action_model.requests[0].task.goal == "Read it"
     observation = action_model.requests[0].task_observation
     assert observation is not None
     assert (
         TaskFrame.model_validate_json(json.dumps(observation.payload)).specification.goal
         == "Ask which document the user means"
+    )
+
+
+@pytest.mark.parametrize(
+    "answer_specification",
+    (_execute(), _resolved_execute(outcome_key="document_sent")),
+    ids=("missing_resolution", "mismatched_outcome"),
+)
+async def test_structured_clarification_answer_cannot_bypass_belief_update(
+    answer_specification: TaskSpecification,
+) -> None:
+    model = FakeModelProvider((_declaration(_clarify()), _declaration(answer_specification)))
+    engine = TaskUnderstandingEngine(ModelTaskInterpreter(model))
+    first = await engine.prepare(
+        input_id="input-1",
+        task=TaskInput(goal="Read it"),
+        history=(),
+        tools=_tools(),
+    )
+
+    with pytest.raises(TaskUnderstandingError) as raised:
+        await engine.prepare(
+            input_id="input-2",
+            task=TaskInput(goal="Read report.txt", revision=2),
+            history=(),
+            tools=_tools(),
+            work_id=first.record.frame.work_id,
+            base_frame=first.record.frame,
+            cause="clarification_answer",
+            prior_clarification_question="Which document should I read?",
+            prior_clarification_id="clarification-1",
+        )
+
+    assert raised.value.error.category is ErrorCategory.INVALID_MODEL_RESPONSE
+    assert "intent state" in raised.value.error.message
+
+
+async def test_unresolved_answer_uses_persisted_posterior_for_the_next_question() -> None:
+    operation_ambiguity = "Whether to answer here or act on a document is unclear"
+    action_ambiguity = "Whether the document should be read or sent is unclear"
+    initial_hypotheses = (
+        IntentHypothesis(
+            hypothesis_id="answer_here",
+            interpretation="Answer in the current conversation",
+            intended_route="direct",
+            outcome_key="conversation_answer",
+            support_weight=45,
+        ),
+        IntentHypothesis(
+            hypothesis_id="read_document_target",
+            interpretation="Read the intended document",
+            intended_route="execute",
+            capability_names=("read_document",),
+            outcome_key="document_read",
+            support_weight=35,
+        ),
+        IntentHypothesis(
+            hypothesis_id="send_document_target",
+            interpretation="Send the intended document",
+            intended_route="execute",
+            capability_names=("send_message",),
+            outcome_key="document_sent",
+            support_weight=20,
+        ),
+    )
+    initial = TaskSpecification(
+        route="clarify",
+        intent="Resolve the requested document operation",
+        goal="Ask whether the user wants an answer or an external document action",
+        ambiguities=(operation_ambiguity, action_ambiguity),
+        uncertainty=IntentUncertainty(
+            hypotheses=initial_hypotheses,
+            candidate_questions=(
+                ClarificationQuestionCandidate(
+                    question_id="operation_kind",
+                    question_text="Should I answer here or act on a document?",
+                    target_ambiguities=(operation_ambiguity,),
+                    answer_options=(
+                        ClarificationAnswerOption(
+                            answer_id="answer_here",
+                            label="Answer here",
+                            hypothesis_ids=("answer_here",),
+                        ),
+                        ClarificationAnswerOption(
+                            answer_id="external_action",
+                            label="Act on a document",
+                            hypothesis_ids=(
+                                "read_document_target",
+                                "send_document_target",
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+        completion_criteria=(
+            CompletionCriterion(
+                kind="clarification",
+                description="Ask which operation family the user wants",
+            ),
+        ),
+    )
+    follow_up_hypotheses = (
+        initial_hypotheses[1].model_copy(update={"support_weight": 1}),
+        initial_hypotheses[2].model_copy(update={"support_weight": 99}),
+    )
+    follow_up = TaskSpecification(
+        route="clarify",
+        intent="Resolve the external document action",
+        goal="Ask whether to read or send the document",
+        ambiguities=(action_ambiguity,),
+        uncertainty=IntentUncertainty(
+            hypotheses=follow_up_hypotheses,
+            candidate_questions=(
+                ClarificationQuestionCandidate(
+                    question_id="action_kind",
+                    question_text="Should I read or send the document?",
+                    target_ambiguities=(action_ambiguity,),
+                    answer_options=(
+                        ClarificationAnswerOption(
+                            answer_id="read",
+                            label="Read it",
+                            hypothesis_ids=("read_document_target",),
+                        ),
+                        ClarificationAnswerOption(
+                            answer_id="send",
+                            label="Send it",
+                            hypothesis_ids=("send_document_target",),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+        clarification_resolution=ClarificationResolution(
+            question_id="operation_kind",
+            answer_id="external_action",
+        ),
+        completion_criteria=(
+            CompletionCriterion(
+                kind="clarification",
+                description="Ask which document action the user wants",
+            ),
+        ),
+    )
+    model = FakeModelProvider((_declaration(initial), _declaration(follow_up)))
+    engine = TaskUnderstandingEngine(ModelTaskInterpreter(model))
+    first = await engine.prepare(
+        input_id="input-1",
+        task=TaskInput(goal="Handle the document"),
+        history=(),
+        tools=_tools(),
+    )
+
+    second = await engine.prepare(
+        input_id="input-2",
+        task=TaskInput(goal="Act on the document", revision=2),
+        history=(),
+        tools=_tools(),
+        work_id=first.record.frame.work_id,
+        base_frame=first.record.frame,
+        cause="clarification_answer",
+        prior_clarification_question="Should I answer here or act on a document?",
+        prior_clarification_id="clarification-1",
+    )
+
+    belief = second.record.frame.intent_belief
+    assert belief is not None and belief.status == "uncertain"
+    assert belief.belief_revision == 2
+    assert {item.hypothesis_id: item.support_micros for item in belief.viable_hypotheses} == {
+        "read_document_target": 636_364,
+        "send_document_target": 363_636,
+    }
+    assert second.record.frame.clarification_decision is not None
+    assert second.record.frame.clarification_decision.selected_question_id == "action_kind"
+    assert second.patch is not None
+    assert (
+        apply_frame_patch(first.record.frame, second.patch, second.record.frame)
+        == second.record.frame
     )
 
 

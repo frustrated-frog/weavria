@@ -93,7 +93,11 @@ def _frame_semantics_sha256(observation: TaskObservation | None) -> str:
     if observation is None:
         return ""
     payload = observation.payload
-    if observation.payload_schema in {"weavria.task-frame/2", "weavria.task-frame/3"}:
+    if observation.payload_schema in {
+        "weavria.task-frame/2",
+        "weavria.task-frame/3",
+        "weavria.task-frame/4",
+    }:
         payload = {
             key: value
             for key, value in payload.items()

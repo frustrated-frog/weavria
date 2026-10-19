@@ -71,7 +71,7 @@ class TaskAwareSessionPreparer:
     @property
     def version(self) -> str:
         return (
-            "task-aware-session/3["
+            "task-aware-session/4["
             f"{self._understanding.version};{self._evidence.version};"
             f"{self._capabilities.version};{self._clarification.version}]"
         )
@@ -116,6 +116,13 @@ class TaskAwareSessionPreparer:
             application_context=context.application_context,
             prior_clarification_question=(
                 context.base_semantic.pending_clarification.question_text
+                if context.base_semantic is not None
+                and context.base_semantic.pending_clarification is not None
+                and context.cause == "clarification_answer"
+                else None
+            ),
+            prior_clarification_id=(
+                context.base_semantic.pending_clarification.clarification_id
                 if context.base_semantic is not None
                 and context.base_semantic.pending_clarification is not None
                 and context.cause == "clarification_answer"
@@ -166,7 +173,7 @@ class TaskAwareSessionPreparer:
                 task_revision=context.task.revision,
                 frame_revision=frame.revision,
                 producer_version=frame.interpreter_version,
-                payload_schema="weavria.task-frame/3",
+                payload_schema="weavria.task-frame/4",
                 payload=frame.model_dump(mode="json"),
             )
         if base is not None:
@@ -294,7 +301,7 @@ class TaskAwareSessionPreparer:
             task_revision=context.task.revision,
             frame_revision=frame.revision,
             producer_version=frame.interpreter_version,
-            payload_schema="weavria.task-frame/3",
+            payload_schema="weavria.task-frame/4",
             payload=frame.model_dump(mode="json"),
         )
         return SessionTaskPreparation(
@@ -405,6 +412,6 @@ class TaskFrameSemanticReducer:
             task_revision=target.request_anchor.task_revision,
             frame_revision=target.revision,
             producer_version=target.interpreter_version,
-            payload_schema="weavria.task-frame/3",
+            payload_schema="weavria.task-frame/4",
             payload=target.model_dump(mode="json"),
         )

@@ -28,6 +28,7 @@ from weavria.harness import (
     CapabilityNeed,
     ClarificationAnswerOption,
     ClarificationQuestionCandidate,
+    ClarificationResolution,
     CompletionCriterion,
     InformationNeed,
     IntentHypothesis,
@@ -138,6 +139,18 @@ def _execute() -> TaskSpecification:
     )
 
 
+def _resolved_execute() -> TaskSpecification:
+    return _execute().model_copy(
+        update={
+            "clarification_resolution": ClarificationResolution(
+                question_id="target_action",
+                answer_id="read",
+            ),
+            "resolved_outcome_key": "value_read",
+        }
+    )
+
+
 def _clarify() -> TaskSpecification:
     ambiguity = "The requested value key is missing"
     return TaskSpecification(
@@ -221,7 +234,7 @@ class _DirectSessionModel:
         return ModelTurn(decision=FinishAction(output="I am the configured assistant."))
 
 
-async def test_task_frame_preserves_raw_request_and_hides_business_tools_in_v3_session(
+async def test_task_frame_preserves_raw_request_and_hides_business_tools_in_v4_session(
     tmp_path: Path,
 ) -> None:
     interpreter = FakeModelProvider((_declaration(_direct()), _declaration(_direct())))
@@ -453,10 +466,11 @@ async def test_failed_clarification_delivery_does_not_create_pending_input(
 async def test_pending_clarification_resumes_the_same_work_across_runs(
     tmp_path: Path,
 ) -> None:
-    interpreter = FakeModelProvider((_declaration(_clarify()), _declaration(_execute())))
+    interpreter = FakeModelProvider((_declaration(_clarify()), _declaration(_resolved_execute())))
     preparer = TaskAwareSessionPreparer(TaskUnderstandingEngine(ModelTaskInterpreter(interpreter)))
+    database = tmp_path / "clarification.db"
     async with SessionEngine(
-        tmp_path / "clarification.db",
+        database,
         model=_ClarifyThenExecuteModel(),
         tools=_registry(),
         task_preparation=preparer,
@@ -478,14 +492,31 @@ async def test_pending_clarification_resumes_the_same_work_across_runs(
         head = await engine.store.semantic_head("s", work_id)
         events = await engine.store.events("s")
 
+    async with SessionEngine(
+        database,
+        model=FakeSessionProvider(()),
+        tools=_registry(),
+        task_preparation=preparer,
+    ) as reopened:
+        restored = await reopened.store.semantic_head("s", work_id)
+
     assert first.report.output == "Which value should I read?"
     assert second.report.status is RunStatus.COMPLETED
     assert head is not None and head.work_id == work_id and head.work_status == "succeeded"
     assert head.version.task_revision == 2
     assert head.version.frame_revision == 3
+    persisted_frame = TaskFrame.model_validate_json(json.dumps(head.observation.payload))
+    belief = persisted_frame.intent_belief
+    assert belief is not None and belief.belief_revision == 2
+    assert belief.status == "resolved"
+    assert [item.hypothesis_id for item in belief.viable_hypotheses] == ["read_target"]
+    assert belief.updates[0].clarification_id == clarification.clarification_id
+    assert belief.updates[0].answer_input_id == "input-2"
+    assert restored == head
     resumed_constraints = interpreter.requests[1].task.constraints
     assert any("Which value should I read?" in item for item in resumed_constraints)
     assert any("Accepted prior interpretation" in item for item in resumed_constraints)
+    assert any('"question_id":"target_action"' in item for item in resumed_constraints)
     clarification_events = [
         event.data for event in events if isinstance(event.data, SessionClarificationChanged)
     ]

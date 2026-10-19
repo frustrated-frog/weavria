@@ -4,7 +4,9 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 from weavria.harness import (
     ClarificationAnswerOption,
     ClarificationQuestionCandidate,
+    ClarificationResolution,
     ConsequenceAwareQuestionSelector,
+    DeterministicBeliefUpdater,
     IntentHypothesis,
     IntentUncertainty,
 )
@@ -210,3 +212,159 @@ def test_selector_rejects_hypothesis_outside_host_capability_ceiling() -> None:
 
     with pytest.raises(ValueError, match="unavailable capability"):
         ConsequenceAwareQuestionSelector().select(uncertainty, _registry())
+
+
+def test_belief_initializer_uses_exact_deterministic_fixed_point_support() -> None:
+    uncertainty = IntentUncertainty(
+        hypotheses=_hypotheses(),
+        candidate_questions=(
+            _question(
+                "delivery_boundary",
+                "Should I answer here or send the result outside this process?",
+                (("concise_answer", "detailed_answer"), ("send_result",)),
+            ),
+        ),
+    )
+
+    belief = DeterministicBeliefUpdater().initialize(uncertainty)
+
+    assert belief.belief_revision == 1
+    assert belief.status == "uncertain"
+    assert {item.hypothesis_id: item.support_micros for item in belief.hypotheses} == {
+        "concise_answer": 450_000,
+        "detailed_answer": 350_000,
+        "send_result": 200_000,
+    }
+    assert belief.updates == ()
+
+
+def test_belief_initializer_breaks_equal_remainders_by_hypothesis_id() -> None:
+    hypotheses = tuple(item.model_copy(update={"support_weight": 1}) for item in _hypotheses())
+    uncertainty = IntentUncertainty(
+        hypotheses=hypotheses,
+        candidate_questions=(
+            _question(
+                "delivery_boundary",
+                "Should I answer here or send the result outside this process?",
+                (("concise_answer", "detailed_answer"), ("send_result",)),
+            ),
+        ),
+    )
+
+    belief = DeterministicBeliefUpdater().initialize(uncertainty)
+
+    assert {item.hypothesis_id: item.support_micros for item in belief.hypotheses} == {
+        "concise_answer": 333_334,
+        "detailed_answer": 333_333,
+        "send_result": 333_333,
+    }
+
+
+def test_belief_updater_applies_selected_answer_partition_and_keeps_eliminated_history() -> None:
+    uncertainty = IntentUncertainty(
+        hypotheses=_hypotheses(),
+        candidate_questions=(
+            _question(
+                "delivery_boundary",
+                "Should I answer here or send the result outside this process?",
+                (("concise_answer", "detailed_answer"), ("send_result",)),
+            ),
+        ),
+    )
+    updater = DeterministicBeliefUpdater()
+    prior = updater.initialize(uncertainty)
+    decision = ConsequenceAwareQuestionSelector().select(uncertainty, _registry())
+
+    updated = updater.update(
+        prior,
+        uncertainty,
+        decision,
+        ClarificationResolution(
+            question_id="delivery_boundary",
+            answer_id="answer_2",
+        ),
+        clarification_id="clarification-1",
+        answer_input_id="input-2",
+    )
+
+    assert updated.belief_revision == 2
+    assert updated.status == "resolved"
+    assert [item.hypothesis_id for item in updated.viable_hypotheses] == ["send_result"]
+    assert updated.viable_hypotheses[0].support_micros == 1_000_000
+    assert [item.hypothesis_id for item in updated.hypotheses if item.status == "eliminated"] == [
+        "concise_answer",
+        "detailed_answer",
+    ]
+    assert updated.updates[0].prior_belief_sha256 == prior.content_sha256()
+    assert updated.updates[0].retained_hypothesis_ids == ("send_result",)
+
+    forged = updated.model_copy(
+        update={
+            "updates": (updated.updates[0].model_copy(update={"prior_belief_sha256": "0" * 64}),)
+        }
+    )
+    with pytest.raises(ValidationError, match="parent digest"):
+        type(updated).model_validate_json(forged.model_dump_json())
+
+
+def test_belief_updater_retains_uncertainty_when_answer_has_multiple_actions() -> None:
+    uncertainty = IntentUncertainty(
+        hypotheses=_hypotheses(),
+        candidate_questions=(
+            _question(
+                "response_style",
+                "Should the answer be concise or not?",
+                (("concise_answer",), ("detailed_answer", "send_result")),
+            ),
+        ),
+    )
+    updater = DeterministicBeliefUpdater()
+    prior = updater.initialize(uncertainty)
+    decision = ConsequenceAwareQuestionSelector().select(uncertainty, _registry())
+
+    updated = updater.update(
+        prior,
+        uncertainty,
+        decision,
+        ClarificationResolution(
+            question_id="response_style",
+            answer_id="answer_2",
+        ),
+        clarification_id="clarification-1",
+        answer_input_id="input-2",
+    )
+
+    assert updated.status == "uncertain"
+    assert {item.hypothesis_id: item.support_micros for item in updated.viable_hypotheses} == {
+        "detailed_answer": 636_364,
+        "send_result": 363_636,
+    }
+
+
+def test_belief_updater_rejects_answer_outside_selected_question() -> None:
+    uncertainty = IntentUncertainty(
+        hypotheses=_hypotheses()[:2],
+        candidate_questions=(
+            _question(
+                "response_style",
+                "Do you want a concise or detailed response?",
+                (("concise_answer",), ("detailed_answer",)),
+            ),
+        ),
+    )
+    updater = DeterministicBeliefUpdater()
+    belief = updater.initialize(uncertainty)
+    decision = ConsequenceAwareQuestionSelector().select(uncertainty, _registry())
+
+    with pytest.raises(ValueError, match="unknown answer option"):
+        updater.update(
+            belief,
+            uncertainty,
+            decision,
+            ClarificationResolution(
+                question_id="response_style",
+                answer_id="invented",
+            ),
+            clarification_id="clarification-1",
+            answer_input_id="input-2",
+        )
