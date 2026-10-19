@@ -128,7 +128,6 @@ class CompletionCriterion(_Contract):
 
 # 定义模型对当前任务的结构化解释,并继承严格、冻结且禁止额外字段的基础契约。
 class TaskSpecification(_Contract):
-    # 强调该对象必须给出可执行的任务结构,而不是只输出一个宽泛的意图标签。
     """Actionable interpretation rather than a single intent label."""
 
     # 决定后续路径:direct 直接回答,clarify 先澄清,execute 调用能力完成任务。
