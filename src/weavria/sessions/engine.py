@@ -53,6 +53,7 @@ from weavria.tools import ToolPolicy, ToolRegistry, artifact_read_tool
 from .evidence import session_history_tool, session_source_tool
 from .preparation import (
     ClarificationAssociationPolicy,
+    ClarificationDeliveryPlan,
     ExplicitClarificationOnly,
     SessionSemanticContext,
     SessionTaskContext,
@@ -112,6 +113,7 @@ class _SessionAdapter:
         capability_ceiling: ToolRegistry,
         clock: Clock,
         clarification_timeout_seconds: float | None,
+        clarification_plan: ClarificationDeliveryPlan | None,
     ) -> None:
         self._provider, self._budget = provider, budget
         self._store, self._run_id = store, run_id
@@ -126,6 +128,7 @@ class _SessionAdapter:
         self._capability_ceiling = capability_ceiling
         self._clock = clock
         self._clarification_timeout = clarification_timeout_seconds
+        self._clarification_plan = clarification_plan
         self._semantic_record_count = 0
         self._prepared: dict[int, ConversationView] = {}
 
@@ -235,15 +238,7 @@ class _SessionAdapter:
         )
         if prepared.preparation_version != self._task_preparer.version:
             raise ValueError("semantic refresh version does not match its provider")
-        pending = prepared.pending_clarification
-        if pending is not None:
-            pending = _bind_clarification(
-                pending,
-                run_id=self._run_id,
-                observation=prepared.observation,
-                clock=self._clock,
-                timeout_seconds=self._clarification_timeout,
-            )
+        self._clarification_plan = prepared.clarification_plan
         snapshot = SemanticSnapshot(
             session_id=self._session_id,
             work_id=prepared.work_id,
@@ -260,7 +255,7 @@ class _SessionAdapter:
             visible_tool_names=prepared.visible_tool_names,
             need_ledger=prepared.need_ledger,
             work_status=prepared.work_status,
-            pending_clarification=pending,
+            pending_clarification=None,
         )
         snapshot = await self._store.commit_semantic(
             snapshot,
@@ -285,9 +280,13 @@ class _SessionAdapter:
     def semantic(self) -> SemanticSnapshot | None:
         return self._semantic
 
+    @property
+    def clarification_plan(self) -> ClarificationDeliveryPlan | None:
+        return self._clarification_plan
+
 
 def _bind_clarification(
-    clarification: PendingClarification,
+    plan: ClarificationDeliveryPlan,
     *,
     run_id: str,
     observation: TaskObservation,
@@ -298,14 +297,18 @@ def _bind_clarification(
     expires_at = (
         created_at + timedelta(seconds=timeout_seconds) if timeout_seconds is not None else None
     )
-    return clarification.model_copy(
-        update={
-            "triggering_run_id": run_id,
-            "parent_frame_id": observation.observation_id,
-            "parent_task_revision": observation.task_revision,
-            "created_at": created_at,
-            "expires_at": expires_at,
-        }
+    return PendingClarification(
+        clarification_id=plan.clarification_id,
+        work_id=plan.work_id,
+        triggering_run_id=run_id,
+        parent_frame_id=observation.observation_id,
+        parent_task_revision=observation.task_revision,
+        frame_revision=plan.frame_revision,
+        unresolved_slot_ids=plan.unresolved_slot_ids,
+        question_text=plan.question_text,
+        allowed_answer_formats=plan.allowed_answer_formats,
+        created_at=created_at,
+        expires_at=expires_at,
     )
 
 
@@ -466,6 +469,7 @@ class SessionEngine:
             semantic: SemanticSnapshot | None = None
             semantic_base = None
             planned_clarification_text: str | None = None
+            clarification_plan: ClarificationDeliveryPlan | None = None
             if self._task_preparation is not None:
                 interruption_reason = "task_preparation_failure"
                 history = await self.store.history(
@@ -522,16 +526,9 @@ class SessionEngine:
                     raise ValueError("task observation does not belong to the accepted input")
                 selected = self._tools.select(prepared.visible_tool_names)
                 capability_epoch = prepared.capability_epoch
-                pending_clarification = prepared.pending_clarification
-                if pending_clarification is not None:
-                    planned_clarification_text = pending_clarification.question_text
-                    pending_clarification = _bind_clarification(
-                        pending_clarification,
-                        run_id=run_id,
-                        observation=prepared.observation,
-                        clock=self._clock,
-                        timeout_seconds=self._clarification_timeout,
-                    )
+                clarification_plan = prepared.clarification_plan
+                if clarification_plan is not None:
+                    planned_clarification_text = clarification_plan.question_text
                 semantic_sequence = (
                     1 if semantic_base is None else semantic_base.version.semantic_sequence + 1
                 )
@@ -551,7 +548,7 @@ class SessionEngine:
                     visible_tool_names=prepared.visible_tool_names,
                     need_ledger=prepared.need_ledger,
                     work_status=prepared.work_status,
-                    pending_clarification=pending_clarification,
+                    pending_clarification=None,
                 )
                 await self.store.commit_semantic(
                     semantic,
@@ -608,6 +605,7 @@ class SessionEngine:
                 self._tools,
                 self._clock,
                 self._clarification_timeout,
+                clarification_plan,
             )
             remaining = root_budget.remaining(self._clock.monotonic())
             run_limits = replace(
@@ -639,11 +637,43 @@ class SessionEngine:
             self._run_tasks[run_id] = owner
             report = await loop.execute()
             latest = adapter.semantic
+            delivered_plan = adapter.clarification_plan
+            clarification_delivered = (
+                latest is not None
+                and delivered_plan is not None
+                and report.status.value == "completed"
+                and report.output is not None
+                and report.output.strip() == delivered_plan.question_text.strip()
+            )
+            if clarification_delivered:
+                assert latest is not None and delivered_plan is not None
+                pending_clarification = _bind_clarification(
+                    delivered_plan,
+                    run_id=run_id,
+                    observation=latest.observation,
+                    clock=self._clock,
+                    timeout_seconds=self._clarification_timeout,
+                )
+                waiting = latest.model_copy(
+                    update={
+                        "version": latest.version.model_copy(
+                            update={"semantic_sequence": latest.version.semantic_sequence + 1}
+                        ),
+                        "work_status": "waiting_input",
+                        "pending_clarification": pending_clarification,
+                    }
+                )
+                latest = await self.store.commit_semantic(
+                    waiting,
+                    expected=latest.version,
+                    transition=_status_transition(latest, cause="clarification_delivered"),
+                )
             if latest is not None and latest.work_status == "active":
                 terminal_status = (
                     "succeeded"
                     if report.status.value == "completed"
                     and report.task_outcome in {"verified", "unverified"}
+                    and delivered_plan is None
                     else "blocked"
                 )
                 terminal = latest.model_copy(

@@ -64,7 +64,7 @@ class SemanticTransition(ContractModel):
 
 
 class PendingClarification(ContractModel):
-    """A durable request for user information, separate from the delivered question."""
+    """A durable request created only after the exact question was delivered."""
 
     clarification_id: NonBlankString
     work_id: NonBlankString

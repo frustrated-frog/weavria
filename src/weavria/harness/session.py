@@ -8,11 +8,11 @@ from weavria.core import (
     ConversationTurn,
     Message,
     MessageRole,
-    PendingClarification,
     SemanticTransition,
     TaskObservation,
 )
 from weavria.sessions import (
+    ClarificationDeliveryPlan,
     SessionSemanticContext,
     SessionTaskContext,
     SessionTaskPreparation,
@@ -162,10 +162,10 @@ class TaskAwareSessionPreparer:
                 payload=frame.model_dump(mode="json"),
             )
         clarification = self._clarification.plan(frame)
-        pending = None
+        delivery_plan = None
         if clarification.disposition == "ask":
             assert clarification.question_text is not None
-            pending = PendingClarification(
+            delivery_plan = ClarificationDeliveryPlan(
                 clarification_id=stable_identifier(
                     "clarification",
                     {
@@ -175,7 +175,6 @@ class TaskAwareSessionPreparer:
                     },
                 ),
                 work_id=frame.work_id,
-                triggering_run_id="pending-run-binding",
                 frame_revision=frame.revision,
                 unresolved_slot_ids=tuple(item.slot_id for item in clarification.slots),
                 question_text=clarification.question_text,
@@ -197,8 +196,8 @@ class TaskAwareSessionPreparer:
                 cause=transition_cause,
                 patch=transition_patch,
             ),
-            work_status="waiting_input" if pending is not None else "active",
-            pending_clarification=pending,
+            work_status="active",
+            clarification_plan=delivery_plan,
         )
 
     async def refresh(self, context: SessionSemanticContext) -> SessionTaskPreparation:

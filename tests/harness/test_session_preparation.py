@@ -41,7 +41,7 @@ from weavria.harness import (
     TaskUnderstandingEngine,
     TaskUnderstandingError,
 )
-from weavria.models import FakeModelProvider, ModelCapabilities
+from weavria.models import FakeModelProvider, FakeSessionProvider, ModelCapabilities
 from weavria.sessions import SessionEngine
 from weavria.tools import ToolContext, ToolFault, ToolRegistry, TypedTool
 
@@ -211,6 +211,13 @@ class _DirectSessionModel:
 
     async def generate_session(self, request: SessionRequest) -> ModelTurn:
         self.requests.append(SessionRequest.model_validate_json(request.model_dump_json()))
+        observation = request.current.task_observation
+        if observation is not None:
+            frame = TaskFrame.model_validate_json(json.dumps(observation.payload))
+            if frame.specification.route == "clarify":
+                decision = frame.clarification_decision
+                assert decision is not None
+                return ModelTurn(decision=FinishAction(output=decision.question_text))
         return ModelTurn(decision=FinishAction(output="I am the configured assistant."))
 
 
@@ -416,6 +423,31 @@ async def test_selected_clarification_is_enforced_as_the_delivered_question(
     assert model.calls == 2
     assert waiting.pending_clarification is not None
     assert waiting.pending_clarification.question_text == result.report.output
+
+
+async def test_failed_clarification_delivery_does_not_create_pending_input(
+    tmp_path: Path,
+) -> None:
+    interpreter = FakeModelProvider((_declaration(_clarify()),))
+    preparer = TaskAwareSessionPreparer(TaskUnderstandingEngine(ModelTaskInterpreter(interpreter)))
+    async with SessionEngine(
+        tmp_path / "clarification-delivery-failed.db",
+        model=FakeSessionProvider(()),
+        tools=_registry(),
+        task_preparation=preparer,
+    ) as engine:
+        await engine.create("s")
+        result = await engine.send("s", "Read it.", input_id="input-1")
+        pending = await engine.store.pending_clarifications("s")
+        events = await engine.store.events("s")
+
+    assert result.report.status is RunStatus.FAILED
+    assert pending == ()
+    semantic = [
+        event.data.snapshot for event in events if isinstance(event.data, SessionSemanticCommitted)
+    ]
+    assert semantic[-1].work_status == "blocked"
+    assert semantic[-1].pending_clarification is None
 
 
 async def test_pending_clarification_resumes_the_same_work_across_runs(

@@ -10,7 +10,6 @@ from weavria.artifacts import ArtifactSnapshot
 from weavria.core import (
     ApplicationObservation,
     ConversationTurn,
-    PendingClarification,
     SemanticSnapshot,
     SemanticTransition,
     TaskInput,
@@ -19,6 +18,33 @@ from weavria.core import (
     WorkStatus,
 )
 from weavria.tools import ToolRegistry
+
+
+@dataclass(frozen=True, slots=True)
+class ClarificationDeliveryPlan:
+    """A selected question that is not pending until its exact text is delivered."""
+
+    clarification_id: str
+    work_id: str
+    frame_revision: int
+    unresolved_slot_ids: tuple[str, ...]
+    question_text: str
+    allowed_answer_formats: tuple[str, ...] = ("free_text",)
+
+    def __post_init__(self) -> None:
+        values = (self.clarification_id, self.work_id, self.question_text)
+        if any(not value.strip() for value in values):
+            raise ValueError("clarification delivery plan fields must be nonblank")
+        if self.frame_revision < 1:
+            raise ValueError("clarification frame revision must be positive")
+        if not self.unresolved_slot_ids or len(set(self.unresolved_slot_ids)) != len(
+            self.unresolved_slot_ids
+        ):
+            raise ValueError("clarification delivery plan requires unique unresolved slots")
+        if not self.allowed_answer_formats or len(set(self.allowed_answer_formats)) != len(
+            self.allowed_answer_formats
+        ):
+            raise ValueError("clarification answer formats must be nonempty and unique")
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,7 +74,16 @@ class SessionTaskPreparation:
     need_ledger: dict[str, JsonValue]
     transition: SemanticTransition
     work_status: WorkStatus = "active"
-    pending_clarification: PendingClarification | None = None
+    clarification_plan: ClarificationDeliveryPlan | None = None
+
+    def __post_init__(self) -> None:
+        if self.work_status == "waiting_input":
+            raise ValueError("only the session engine may persist delivered waiting input")
+        if self.clarification_plan is not None and (
+            self.clarification_plan.work_id != self.work_id
+            or self.clarification_plan.frame_revision != self.observation.frame_revision
+        ):
+            raise ValueError("clarification delivery plan disagrees with its preparation")
 
 
 @dataclass(frozen=True, slots=True)
