@@ -15,7 +15,7 @@ from weavria.core import (
 from weavria.runtime import CompletionContext
 
 from .requirements import EvidenceResolver, NeedLedger, NeedStatus
-from .understanding import TaskFrame
+from .understanding import TaskFrame, load_task_frame
 
 _Identifier = Annotated[
     str,
@@ -64,7 +64,7 @@ class CandidateAnswerVerifier(Protocol):
 class TaskCompletionEvaluator:
     """Evaluate declared obligations without trusting model claims of completion."""
 
-    version = "task-obligations/2"
+    version = "task-obligations/3"
 
     def __init__(
         self,
@@ -77,15 +77,32 @@ class TaskCompletionEvaluator:
 
     async def evaluate(self, context: CompletionContext) -> CompletionEvaluation:
         observation = context.task_observation
-        if observation is None or observation.payload_schema != "weavria.task-frame/2":
+        if observation is None or observation.payload_schema not in {
+            "weavria.task-frame/2",
+            "weavria.task-frame/3",
+        }:
             return CompletionEvaluation(
                 disposition="degraded_answer",
                 verdicts=(),
                 outcome="unverifiable",
                 reason_code="task_frame_missing",
             )
-        frame = TaskFrame.model_validate_json(json.dumps(observation.payload))
+        frame = load_task_frame(observation.payload)
         if frame.specification.route == "clarify":
+            decision = frame.clarification_decision
+            if (
+                decision is not None
+                and context.candidate.output.strip() != decision.question_text.strip()
+            ):
+                return CompletionEvaluation(
+                    disposition="repair",
+                    verdicts=(),
+                    next_required_actions=(
+                        f"Ask exactly this selected clarification: {decision.question_text}",
+                    ),
+                    outcome="unverifiable",
+                    reason_code="clarification_question_mismatch",
+                )
             return CompletionEvaluation(
                 disposition="clarify",
                 verdicts=tuple(
@@ -227,7 +244,7 @@ class TaskCompletionEvaluator:
 class TaskObligationCompletionPolicy:
     """Map rich obligation evaluation onto the Runtime v3 completion protocol."""
 
-    version = "task-obligation-completion/2"
+    version = "task-obligation-completion/3"
 
     def __init__(self, evaluator: TaskCompletionEvaluator | None = None) -> None:
         self._evaluator = evaluator or TaskCompletionEvaluator()

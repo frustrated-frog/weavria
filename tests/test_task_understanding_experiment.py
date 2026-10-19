@@ -15,7 +15,8 @@ def test_frozen_task_understanding_ablation_limits_capability_exposure() -> None
         timeout=10,
     )
     report = json.loads(completed.stdout)
-    assert report["dataset_version"] == "task-understanding/1"
+    assert report["dataset_version"] == "task-understanding/2"
+    assert report["solver_version"] == "2"
     assert len(report["dataset_sha256"]) == 64
     assert report["understanding_calls"] == 4
     rows = report["results"]

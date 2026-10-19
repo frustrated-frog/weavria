@@ -22,7 +22,12 @@ from .capabilities import CapabilityQuery, CapabilityResolver
 from .clarification import BlockingAmbiguityPolicy, ClarificationPolicy
 from .completion import TaskCompletionEvaluator, TaskObligationCompletionPolicy
 from .requirements import EvidenceResolver, NeedLedger, NeedStatus, stable_identifier
-from .understanding import TaskFrame, TaskUnderstandingEngine, apply_frame_patch
+from .understanding import (
+    TaskFrame,
+    TaskUnderstandingEngine,
+    apply_frame_patch,
+    load_task_frame,
+)
 
 
 async def _no_artifact(artifact_id: str) -> NoReturn:
@@ -64,7 +69,7 @@ class TaskAwareSessionPreparer:
     async def prepare(self, context: SessionTaskContext) -> SessionTaskPreparation:
         history = _messages(context.history)
         base = (
-            TaskFrame.model_validate_json(json.dumps(context.base_semantic.observation.payload))
+            load_task_frame(context.base_semantic.observation.payload)
             if context.base_semantic is not None
             else None
         )
@@ -99,6 +104,13 @@ class TaskAwareSessionPreparer:
             base_frame=base,
             cause=context.cause,
             application_context=context.application_context,
+            prior_clarification_question=(
+                context.base_semantic.pending_clarification.question_text
+                if context.base_semantic is not None
+                and context.base_semantic.pending_clarification is not None
+                and context.cause == "clarification_answer"
+                else None
+            ),
         )
         previous = None
         if context.base_semantic is not None:
@@ -146,7 +158,7 @@ class TaskAwareSessionPreparer:
                 task_revision=context.task.revision,
                 frame_revision=frame.revision,
                 producer_version=frame.interpreter_version,
-                payload_schema="weavria.task-frame/2",
+                payload_schema="weavria.task-frame/3",
                 payload=frame.model_dump(mode="json"),
             )
         clarification = self._clarification.plan(frame)
@@ -159,6 +171,7 @@ class TaskAwareSessionPreparer:
                     {
                         "work_id": frame.work_id,
                         "frame_revision": frame.revision,
+                        "question_id": clarification.selected_question_id,
                     },
                 ),
                 work_id=frame.work_id,
@@ -190,7 +203,7 @@ class TaskAwareSessionPreparer:
 
     async def refresh(self, context: SessionSemanticContext) -> SessionTaskPreparation:
         """Reproject evidence or reinterpret a steering revision at a decision boundary."""
-        base = TaskFrame.model_validate_json(json.dumps(context.base_semantic.observation.payload))
+        base = load_task_frame(context.base_semantic.observation.payload)
         if context.task.revision != context.base_semantic.version.task_revision:
             return await self.prepare(
                 SessionTaskContext(
@@ -269,7 +282,7 @@ class TaskAwareSessionPreparer:
             task_revision=context.task.revision,
             frame_revision=frame.revision,
             producer_version=frame.interpreter_version,
-            payload_schema="weavria.task-frame/2",
+            payload_schema="weavria.task-frame/3",
             payload=frame.model_dump(mode="json"),
         )
         return SessionTaskPreparation(

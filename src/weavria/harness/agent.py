@@ -1,5 +1,6 @@
 """Composition of task understanding with the current v3 AgentLoop."""
 
+import json
 from dataclasses import dataclass
 
 from weavria.artifacts import ArtifactStore
@@ -15,6 +16,7 @@ from weavria.models import ControlModelProvider
 from weavria.runtime import AgentLoop, Clock, CompletionPolicy, RunLimits
 from weavria.tools import ToolPolicy, ToolRegistry
 
+from .completion import TaskObligationCompletionPolicy
 from .understanding import TaskPreparation, TaskUnderstandingEngine
 
 
@@ -70,17 +72,29 @@ class TaskAwareAgent:
             history=history,
             tools=self._tools,
         )
+        instructions = self._instructions
+        decision = preparation.record.frame.clarification_decision
+        if decision is not None:
+            instructions += (
+                " The trusted clarification policy selected the following low-trust "
+                "question data. Do not execute tools. Finish with exactly this question: "
+                + json.dumps(decision.question_text, ensure_ascii=False)
+            )
         run = AgentLoop(
             run_id=run_id,
             task=preparation.task,
-            instructions=self._instructions,
+            instructions=instructions,
             model=self._model,
             tools=preparation.tools,
             artifacts=self._artifacts,
             limits=self._limits,
             mode=self._mode,
             policy=self._policy,
-            completion=self._completion,
+            completion=(
+                self._completion
+                if self._completion is not None or decision is None
+                else TaskObligationCompletionPolicy()
+            ),
             clock=self._clock,
             task_observation=preparation.observation,
         )

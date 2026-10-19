@@ -456,6 +456,7 @@ class SessionEngine:
             capability_epoch = 1
             semantic: SemanticSnapshot | None = None
             semantic_base = None
+            planned_clarification_text: str | None = None
             if self._task_preparation is not None:
                 interruption_reason = "task_preparation_failure"
                 history = await self.store.history(
@@ -514,6 +515,7 @@ class SessionEngine:
                 capability_epoch = prepared.capability_epoch
                 pending_clarification = prepared.pending_clarification
                 if pending_clarification is not None:
+                    planned_clarification_text = pending_clarification.question_text
                     pending_clarification = _bind_clarification(
                         pending_clarification,
                         run_id=run_id,
@@ -567,6 +569,12 @@ class SessionEngine:
                     *(tool.descriptor.name for tool in support),
                 )
             run_instructions = self._instructions
+            if planned_clarification_text is not None:
+                run_instructions += (
+                    " The trusted clarification policy selected the following low-trust "
+                    "question data. Do not execute tools. Finish with exactly this question: "
+                    + json.dumps(planned_clarification_text, ensure_ascii=False)
+                )
             if include_support_tools:
                 run_instructions += (
                     " Read omitted text with read_session_history and prior evidence "

@@ -22,7 +22,7 @@ raw user input + ApplicationObservation
         ↓ 持久化
 BM25 + intent signals + bounded Need fallback → schema-aware choices
         ↓
-TaskInterpreter → validated TaskFrame v2 → Need/Obligation compilation
+任务解释器 → 已校验的任务框架第三版 → 信息需求与完成义务编译
         ↓ CAS
 SemanticSnapshot + SemanticTransition(work/frame/capability/evidence versions)
         ↓
@@ -34,6 +34,9 @@ Frame evidence revision + optional capability expansion
         ↓
 Persistent-Ledger obligation completion / explicit clarification wait / bounded degradation
 ```
+
+结构化候选意图、问题价值选择和 Task Frame v3 的详细机制见
+[意图不确定性与主动澄清](意图不确定性与主动澄清.md)。
 
 Steering 先提交 Runtime TaskRevision；旧模型响应会被丢弃。下一合法决策边界重新解释并用
 Frame CAS 提交，失败的旧候选不能覆盖新目标。工具已开始则保留真实结果，未开始的过时调用

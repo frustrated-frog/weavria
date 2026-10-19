@@ -117,8 +117,8 @@ async def build_report() -> dict[str, Any]:
             )
     return {
         "schema_version": 1,
-        "dataset_version": "task-understanding/1",
-        "solver_version": "1",
+        "dataset_version": "task-understanding/2",
+        "solver_version": "2",
         "evaluator_version": "1",
         "dataset_sha256": hashlib.sha256(raw).hexdigest(),
         "scope": (

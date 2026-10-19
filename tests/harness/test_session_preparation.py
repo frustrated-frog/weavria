@@ -26,8 +26,12 @@ from weavria.core import (
 )
 from weavria.harness import (
     CapabilityNeed,
+    ClarificationAnswerOption,
+    ClarificationQuestionCandidate,
     CompletionCriterion,
     InformationNeed,
+    IntentHypothesis,
+    IntentUncertainty,
     ModelTaskInterpreter,
     NeedLedger,
     NeedStatus,
@@ -135,11 +139,51 @@ def _execute() -> TaskSpecification:
 
 
 def _clarify() -> TaskSpecification:
+    ambiguity = "The requested value key is missing"
     return TaskSpecification(
         route="clarify",
         intent="Resolve the value target",
         goal="Ask which value should be read from the trusted source",
-        ambiguities=("The requested value key is missing",),
+        ambiguities=(ambiguity,),
+        uncertainty=IntentUncertainty(
+            hypotheses=(
+                IntentHypothesis(
+                    hypothesis_id="read_target",
+                    interpretation="Read the missing target value",
+                    intended_route="execute",
+                    capability_names=("read_value",),
+                    outcome_key="value_read",
+                    support_weight=70,
+                ),
+                IntentHypothesis(
+                    hypothesis_id="read_default_target",
+                    interpretation="Read the default target value",
+                    intended_route="execute",
+                    capability_names=("read_value",),
+                    outcome_key="default_value_read",
+                    support_weight=30,
+                ),
+            ),
+            candidate_questions=(
+                ClarificationQuestionCandidate(
+                    question_id="target_action",
+                    question_text="Which value should I read?",
+                    target_ambiguities=(ambiguity,),
+                    answer_options=(
+                        ClarificationAnswerOption(
+                            answer_id="read",
+                            label="Read a value",
+                            hypothesis_ids=("read_target",),
+                        ),
+                        ClarificationAnswerOption(
+                            answer_id="default",
+                            label="Read the default value",
+                            hypothesis_ids=("read_default_target",),
+                        ),
+                    ),
+                ),
+            ),
+        ),
         completion_criteria=(
             CompletionCriterion(
                 kind="clarification",
@@ -334,6 +378,46 @@ class _ClarifyThenExecuteModel:
         )
 
 
+class _RepairClarificationModel:
+    capabilities = ModelCapabilities(tool_calls=True, multi_tool_calls=True)
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def generate_session(self, request: SessionRequest) -> ModelTurn:
+        self.calls += 1
+        if self.calls == 1:
+            return ModelTurn(decision=FinishAction(output="What do you mean?"))
+        observation = request.current.task_observation
+        assert observation is not None
+        frame = TaskFrame.model_validate_json(json.dumps(observation.payload))
+        decision = frame.clarification_decision
+        assert decision is not None
+        return ModelTurn(decision=FinishAction(output=decision.question_text))
+
+
+async def test_selected_clarification_is_enforced_as_the_delivered_question(
+    tmp_path: Path,
+) -> None:
+    interpreter = FakeModelProvider((_declaration(_clarify()),))
+    model = _RepairClarificationModel()
+    preparer = TaskAwareSessionPreparer(TaskUnderstandingEngine(ModelTaskInterpreter(interpreter)))
+    async with SessionEngine(
+        tmp_path / "clarification-repair.db",
+        model=model,
+        tools=_registry(),
+        task_preparation=preparer,
+    ) as engine:
+        await engine.create("s")
+        result = await engine.send("s", "Read it.", input_id="input-1")
+        waiting = (await engine.store.pending_clarifications("s"))[0]
+
+    assert result.report.output == "Which value should I read?"
+    assert model.calls == 2
+    assert waiting.pending_clarification is not None
+    assert waiting.pending_clarification.question_text == result.report.output
+
+
 async def test_pending_clarification_resumes_the_same_work_across_runs(
     tmp_path: Path,
 ) -> None:
@@ -367,6 +451,9 @@ async def test_pending_clarification_resumes_the_same_work_across_runs(
     assert head is not None and head.work_id == work_id and head.work_status == "succeeded"
     assert head.version.task_revision == 2
     assert head.version.frame_revision == 3
+    resumed_constraints = interpreter.requests[1].task.constraints
+    assert any("Which value should I read?" in item for item in resumed_constraints)
+    assert any("Accepted prior interpretation" in item for item in resumed_constraints)
     clarification_events = [
         event.data for event in events if isinstance(event.data, SessionClarificationChanged)
     ]

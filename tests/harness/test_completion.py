@@ -209,7 +209,7 @@ async def test_completion_uses_revision_bound_persistent_ledger_across_runs() ->
         task_revision=task.revision,
         frame_revision=projected.revision,
         producer_version=projected.interpreter_version,
-        payload_schema="weavria.task-frame/2",
+        payload_schema="weavria.task-frame/3",
         payload=projected.model_dump(mode="json"),
     )
     context = CompletionContext(

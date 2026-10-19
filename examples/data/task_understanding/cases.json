@@ -120,6 +120,51 @@
         "information_needs": [],
         "capability_needs": [],
         "ambiguities": ["The content is unknown", "The recipient is unknown"],
+        "uncertainty": {
+          "schema_version": 1,
+          "hypotheses": [
+            {
+              "schema_version": 1,
+              "hypothesis_id": "send_recent_to_team",
+              "interpretation": "Send the recent content to the team",
+              "intended_route": "execute",
+              "capability_names": ["send_message"],
+              "outcome_key": "recent_content_to_team",
+              "support_weight": 50
+            },
+            {
+              "schema_version": 1,
+              "hypothesis_id": "send_report_to_manager",
+              "interpretation": "Send the report to the manager",
+              "intended_route": "execute",
+              "capability_names": ["send_message"],
+              "outcome_key": "report_to_manager",
+              "support_weight": 50
+            }
+          ],
+          "candidate_questions": [
+            {
+              "schema_version": 1,
+              "question_id": "content_and_recipient",
+              "question_text": "What content should I send, and who should receive it?",
+              "target_ambiguities": ["The content is unknown", "The recipient is unknown"],
+              "answer_options": [
+                {
+                  "schema_version": 1,
+                  "answer_id": "recent_team",
+                  "label": "Recent content to the team",
+                  "hypothesis_ids": ["send_recent_to_team"]
+                },
+                {
+                  "schema_version": 1,
+                  "answer_id": "report_manager",
+                  "label": "Report to the manager",
+                  "hypothesis_ids": ["send_report_to_manager"]
+                }
+              ]
+            }
+          ]
+        },
         "completion_criteria": [
           {
             "schema_version": 1,

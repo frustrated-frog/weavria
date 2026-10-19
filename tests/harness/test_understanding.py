@@ -25,8 +25,12 @@ from weavria.core import (
 from weavria.harness import (
     CapabilityNeed,
     CapabilityView,
+    ClarificationAnswerOption,
+    ClarificationQuestionCandidate,
     CompletionCriterion,
     InformationNeed,
+    IntentHypothesis,
+    IntentUncertainty,
     ModelTaskInterpreter,
     TaskAwareAgent,
     TaskFrame,
@@ -35,6 +39,8 @@ from weavria.harness import (
     TaskUnderstandingError,
     TaskUnderstandingInput,
     apply_frame_patch,
+    load_task_frame,
+    load_task_frame_patch,
 )
 from weavria.models import FakeControlProvider, FakeModelProvider, ModelCapabilities
 from weavria.tools import ToolContext, ToolRegistry, TypedTool
@@ -132,11 +138,51 @@ def _execute() -> TaskSpecification:
 
 
 def _clarify() -> TaskSpecification:
+    ambiguity = "The target document is unknown"
     return TaskSpecification(
         route="clarify",
         intent="Resolve missing input before acting",
         goal="Ask which document the user means",
-        ambiguities=("The target document is unknown",),
+        ambiguities=(ambiguity,),
+        uncertainty=IntentUncertainty(
+            hypotheses=(
+                IntentHypothesis(
+                    hypothesis_id="read_document_target",
+                    interpretation="Read the intended document",
+                    intended_route="execute",
+                    capability_names=("read_document",),
+                    outcome_key="document_read",
+                    support_weight=80,
+                ),
+                IntentHypothesis(
+                    hypothesis_id="send_document_target",
+                    interpretation="Send the intended document",
+                    intended_route="execute",
+                    capability_names=("send_message",),
+                    outcome_key="document_sent",
+                    support_weight=20,
+                ),
+            ),
+            candidate_questions=(
+                ClarificationQuestionCandidate(
+                    question_id="document_action",
+                    question_text="Which document should I read?",
+                    target_ambiguities=(ambiguity,),
+                    answer_options=(
+                        ClarificationAnswerOption(
+                            answer_id="read",
+                            label="Read a document",
+                            hypothesis_ids=("read_document_target",),
+                        ),
+                        ClarificationAnswerOption(
+                            answer_id="send",
+                            label="Send a document",
+                            hypothesis_ids=("send_document_target",),
+                        ),
+                    ),
+                ),
+            ),
+        ),
         completion_criteria=(
             CompletionCriterion(
                 kind="clarification",
@@ -298,6 +344,35 @@ async def test_model_interpreter_repairs_one_invalid_specification_with_bounded_
     assert "rejected by trusted host validation" in repair
     assert "direct tasks cannot require capabilities" in repair
     assert "SENSITIVE-RAW-MODEL-VALUE" not in repair
+
+
+async def test_model_interpreter_rejects_new_clarify_output_without_uncertainty() -> None:
+    legacy = TaskSpecification(
+        route="clarify",
+        intent="Resolve an ambiguous target",
+        goal="Ask which target the user means",
+        ambiguities=("The target is unknown",),
+        completion_criteria=(
+            CompletionCriterion(
+                kind="clarification",
+                description="Ask for the target",
+            ),
+        ),
+    )
+    provider = FakeModelProvider((_declaration(legacy), _declaration(legacy)))
+    interpreter = ModelTaskInterpreter(provider)
+
+    with pytest.raises(
+        TaskUnderstandingError,
+        match="omitted structured intent uncertainty",
+    ):
+        await interpreter.interpret(
+            TaskUnderstandingInput(task=TaskInput(goal="Process it")),
+            max_duration=1,
+        )
+
+    assert len(provider.requests) == 2
+    assert "uncertainty" in provider.requests[1].instructions
 
 
 async def test_unavailable_capability_is_rejected_before_runtime() -> None:
@@ -592,12 +667,20 @@ async def test_frame_revision_preserves_need_identity_and_rejects_stale_patch() 
         cause="steering",
     )
 
-    assert first.record.frame.schema_version == 2
-    assert first.observation.payload_schema == "weavria.task-frame/2"
+    assert first.record.frame.schema_version == 3
+    assert first.observation.payload_schema == "weavria.task-frame/3"
+    legacy_payload = first.record.frame.model_dump(mode="json")
+    legacy_payload["schema_version"] = 2
+    legacy_payload.pop("clarification_decision")
+    assert load_task_frame(legacy_payload).schema_version == 3
     assert second.record.frame.revision == 2
     assert second.record.frame.capability_epoch == first.record.frame.capability_epoch
     assert second.record.frame.requirements[0].need_id == first.record.frame.requirements[0].need_id
     assert second.patch is not None and second.patch.cause == "steering"
+    legacy_patch = second.patch.model_dump(mode="json")
+    legacy_patch["schema_version"] = 2
+    legacy_patch.pop("clarification_decision")
+    assert load_task_frame_patch(legacy_patch).schema_version == 3
     assert (
         apply_frame_patch(first.record.frame, second.patch, second.record.frame)
         == second.record.frame

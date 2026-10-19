@@ -29,6 +29,16 @@ from .completion import (
     TaskCompletionEvaluator,
     TaskObligationCompletionPolicy,
 )
+from .intent import (
+    ClarificationAnswerOption,
+    ClarificationDecision,
+    ClarificationQuestionCandidate,
+    ClarificationQuestionSelector,
+    ClarificationQuestionValue,
+    ConsequenceAwareQuestionSelector,
+    IntentHypothesis,
+    IntentUncertainty,
+)
 from .requirements import (
     CompletionObligation,
     EvidenceAddress,
@@ -61,6 +71,8 @@ from .understanding import (
     TaskUnderstandingInput,
     TaskUnderstandingRecord,
     apply_frame_patch,
+    load_task_frame,
+    load_task_frame_patch,
 )
 
 __all__ = [
@@ -79,12 +91,18 @@ __all__ = [
     "CapabilityRetriever",
     "CapabilityView",
     "CatalogSnapshot",
+    "ClarificationAnswerOption",
+    "ClarificationDecision",
     "ClarificationPlan",
     "ClarificationPolicy",
+    "ClarificationQuestionCandidate",
+    "ClarificationQuestionSelector",
+    "ClarificationQuestionValue",
     "ClarificationSlot",
     "CompletionCriterion",
     "CompletionEvaluation",
     "CompletionObligation",
+    "ConsequenceAwareQuestionSelector",
     "EvidenceAddress",
     "EvidenceBinding",
     "EvidenceEvaluation",
@@ -92,6 +110,8 @@ __all__ = [
     "EvidenceResolver",
     "InformationNeed",
     "InformationRequirement",
+    "IntentHypothesis",
+    "IntentUncertainty",
     "ModelTaskInterpreter",
     "NeedFailure",
     "NeedLedger",
@@ -117,4 +137,6 @@ __all__ = [
     "TaskUnderstandingInput",
     "TaskUnderstandingRecord",
     "apply_frame_patch",
+    "load_task_frame",
+    "load_task_frame_patch",
 ]

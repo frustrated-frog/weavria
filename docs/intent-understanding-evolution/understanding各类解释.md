@@ -76,13 +76,13 @@ AgentLoop
 
 它解决的是“模型输出不能宽松接收”的问题。例如模型多输出一个字段、把整数写成字符串，都会被拒绝。
 
-### `_VersionTwoContract`
+### `_VersionThreeContract`
 
-位置：[understanding.py:75](/Users/machengqian/code/weavria/src/weavria/harness/understanding.py:75)
+位置：`src/weavria/harness/understanding.py`
 
-它沿用 `_Contract` 的严格配置，但 Schema 版本是 `2`。
+它沿用 `_Contract` 的严格配置，但 Schema 版本是 `3`。
 
-目前 `TaskFrame` 和 `TaskFramePatch` 使用 v2，因为它们已经加入：
+目前 `TaskFrame` 和 `TaskFramePatch` 使用 v3。v2 已经加入以下持续任务字段：
 
 - Work 身份；
 - Frame revision；
@@ -91,7 +91,11 @@ AgentLoop
 - Need 状态摘要；
 - Application Context。
 
-简单理解：小型声明对象还是 v1，持续演进和持久化的任务语义对象已经升级为 v2。
+v3 进一步加入 `ClarificationDecision`，保存候选问题的后悔值、交互成本、被选问题和策略版本。
+历史 v2 数据通过 `load_task_frame` 与 `load_task_frame_patch` 显式上转，不伪造旧版本不存在的
+选择结果。
+
+简单理解：小型声明对象仍是 v1，持续演进和持久化的任务语义对象已经升级为 v3。
 
 ## 二、TaskSpecification 的组成部分
 

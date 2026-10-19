@@ -19,3 +19,4 @@
 - [0012 Need Ledger、Frame Revision 与持久语义账本](0012-semantic-ledger-frame-revision.md)
 - [0013 动态能力视图、任务义务验收与无进展恢复](0013-dynamic-capability-completion-progress.md)
 - [0014 语义提交验收、跨 Run 完成事实与安全澄清关联](0014-semantic-acceptance-and-safe-association.md)
+- [0015 结构化意图不确定性与后悔值驱动的主动澄清](0015-后悔值驱动的主动澄清.md)

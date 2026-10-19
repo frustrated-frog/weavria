@@ -101,22 +101,22 @@ SessionEngine 最后同时读取 Runtime outcome 与 task outcome，决定 Work 
 
 ```mermaid
 flowchart TD
-    A[原始用户输入] --> B[解释并验证 TaskSpecification]
-    B --> C{route}
-    C -->|direct| D[空业务能力视图]
+    A[原始用户输入] --> B[解释并验证任务规格]
+    B --> C{执行路径}
+    C -->|直接回答| D[空业务能力视图]
     D --> E[生成回答]
-    E --> F[answer obligation]
-    C -->|clarify| G[BlockingAmbiguityPolicy]
-    G --> H[持久 PendingClarification]
-    H --> I[等待显式 clarification_id]
+    E --> F[回答义务]
+    C -->|澄清| G[后悔值驱动的问题选择]
+    G --> H[持久化待回答澄清]
+    H --> I[等待显式澄清标识]
     I --> B
-    C -->|execute| J[有限 Capability Epoch]
+    C -->|执行| J[有限能力视图版本]
     J --> K[工具执行]
-    K --> L[EvidenceResolver 更新 NeedLedger]
+    K --> L[证据解析器更新需求账本]
     L --> M{义务满足}
     M -->|否且可修复| J
-    M -->|不可验证| N[Work blocked + 明确降级]
-    M -->|是| O[Work succeeded]
+    M -->|不可验证| N[任务阻塞并明确降级]
+    M -->|是| O[任务成功]
     F --> O
 
     classDef input fill:#e8f1ff,stroke:#3569a8,color:#132238
