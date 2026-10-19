@@ -126,56 +126,103 @@ class CompletionCriterion(_Contract):
         return self
 
 
+# 定义模型对当前任务的结构化解释,并继承严格、冻结且禁止额外字段的基础契约。
 class TaskSpecification(_Contract):
+    # 强调该对象必须给出可执行的任务结构,而不是只输出一个宽泛的意图标签。
     """Actionable interpretation rather than a single intent label."""
 
+    # 决定后续路径:direct 直接回答,clarify 先澄清,execute 调用能力完成任务。
     route: Literal["direct", "clarify", "execute"]
+    # 用简洁自然语言概括用户想做什么,供解释、检索和诊断使用。
     intent: _Text
+    # 描述本次 Work 应达到的具体结果,但不会覆盖宿主持有的原始 TaskInput。
     goal: _Text
+    # 列出完成目标依赖的事实信息,默认没有,并限制最多八项以控制解释复杂度。
     information_needs: tuple[InformationNeed, ...] = Field(default=(), max_length=8)
+    # 列出希望宿主暴露的命名能力及用途,默认没有,并限制最多八项。
     capability_needs: tuple[CapabilityNeed, ...] = Field(default=(), max_length=8)
+    # 保存真正阻塞安全推进的歧义,默认没有,每项文本由 _Text 约束且总数最多八项。
     ambiguities: tuple[_Text, ...] = Field(default=(), max_length=8)
+    # 声明判断任务完成所需的条件,至少一项且最多八项,避免没有验收定义的任务规格。
     completion_criteria: tuple[CompletionCriterion, ...] = Field(min_length=1, max_length=8)
 
+    # 在所有字段完成类型校验后执行跨字段校验,因为这些规则依赖完整对象。
     @model_validator(mode="after")
+    # 校验能力、完成条件与路由互相一致,成功时返回当前冻结模型实例。
     def validate_route(self) -> Self:
+        # 提取全部能力名称,用于检查重复项以及完成条件是否引用了已选择的能力。
         names = [need.name for need in self.capability_needs]
+        # 比较列表和集合长度;集合去重后变短就说明同一能力被声明了多次。
         if len(names) != len(set(names)):
+            # 拒绝重复能力,避免同名能力出现相互冲突的用途或必要性定义。
             raise ValueError("capability needs must be unique")
+        # 收集完成条件中所有非空的能力引用,供后续进行引用完整性检查。
         criteria = [
+            # 取出当前完成条件指向的能力名称。
             criterion.capability
+            # 遍历任务规格声明的每一项完成条件。
             for criterion in self.completion_criteria
+            # 只保留 capability_result 条件携带的非空能力引用。
             if criterion.capability is not None
         ]
+        # 如果完成条件引用了 capability_needs 未选择的名称,该引用就越过了能力边界。
         if any(name not in names for name in criteria):
+            # 拒绝悬空或越权引用,保证验收只能要求本规格明确选择的能力。
             raise ValueError("completion criteria can reference selected capabilities only")
+        # 建立必需能力名称集合,可选能力不会被强制要求具有能力结果验收条件。
         required = {need.name for need in self.capability_needs if need.necessity == "required"}
+        # 检查每个必需能力是否都出现在某个 capability_result 完成条件中。
         if not required.issubset(criteria):
+            # 拒绝无法验收的必需能力,避免执行了能力却没有成功判据。
             raise ValueError("every required capability needs a completion criterion")
 
+        # 判断任务是否包含必须从外部来源获取的信息,它不能由直接回答路径假装满足。
         external_required = any(
-            need.required and need.source == "external" for need in self.information_needs
+            # 只有同时标记为 required 和 external 的信息需求才触发此外部证据约束。
+            need.required and need.source == "external"
+            # 逐项检查当前任务规格声明的全部信息需求。
+            for need in self.information_needs
         )
+        # 汇总完成条件种类,用于确认每条路由都声明了与其行为相符的验收方式。
         kinds = {criterion.kind for criterion in self.completion_criteria}
+        # direct 表示无需澄清或业务能力,模型可直接生成最终文本回答。
         if self.route == "direct":
+            # 直接回答不能同时要求工具能力、必需外部信息或尚未解决的阻塞歧义。
             if self.capability_needs or external_required or self.ambiguities:
+                # 拒绝自相矛盾的 direct 规格,防止绕过工具获取或用户澄清步骤。
                 raise ValueError(
+                    # 错误信息概括 direct 路由禁止携带的三类前置依赖。
                     "direct tasks cannot require capabilities, external data or clarity"
                 )
+            # 直接回答最终要交付文本,因此必须具有 response 类型的完成条件。
             if "response" not in kinds:
+                # 没有响应验收条件时拒绝规格,避免无法定义何时已完成直接回答。
                 raise ValueError("direct tasks require a response completion criterion")
+        # clarify 表示关键信息不足,系统应先提出问题并等待用户补充。
         elif self.route == "clarify":
+            # 澄清阶段必须存在阻塞歧义,同时不得提前向执行循环暴露业务能力。
             if self.capability_needs or not self.ambiguities:
+                # 拒绝没有提问依据或仍试图调用能力的澄清规格。
                 raise ValueError("clarification requires ambiguity and exposes no capabilities")
+            # 澄清路径必须声明 clarification 完成条件,用于验收问题是否已经交付。
             if "clarification" not in kinds:
+                # 没有澄清验收条件时拒绝规格,防止 Work 无法进入明确的等待输入状态。
                 raise ValueError("clarify tasks require a clarification criterion")
+        # Literal 已排除其他取值,所以剩余分支必然是 execute 路由。
         else:
+            # execute 必须至少选择一项宿主能力,否则没有需要 Runtime 执行的动作。
             if not self.capability_needs:
+                # 拒绝空能力的执行规格,这类任务应重新解释为 direct 或 clarify。
                 raise ValueError("execute tasks require at least one capability")
+            # 进入执行前必须先消除阻塞歧义,不能边猜用户意图边调用工具。
             if self.ambiguities:
+                # 拒绝仍有阻塞歧义的执行规格,要求解释器改走 clarify 路由。
                 raise ValueError("execute tasks cannot retain blocking ambiguities")
+            # 必需外部信息必须由至少一个 required 能力承担,可选能力不足以保证完成。
             if external_required and not required:
+                # 拒绝缺少必需获取路径的规格,避免把外部事实需求错误交给模型记忆。
                 raise ValueError("required external information needs a required capability")
+        # 所有不变量都成立,把已经验证的任务规格交还给 Pydantic 和后续 Harness 流程。
         return self
 
 
