@@ -2,6 +2,7 @@
 
 from .actions import AgentAction, FinishAction, ToolCallAction, parse_action
 from .control import (
+    COMPLETION_GUIDANCE_JSON_BYTES,
     CONTROL_FEEDBACK_BYTES,
     AdmissionNotice,
     BatchAdmitted,
@@ -21,6 +22,7 @@ from .control import (
     FeedbackBounds,
     RunReport,
     VerificationStarted,
+    fit_completion_guidance,
 )
 from .conversation import (
     ConversationItem,
@@ -104,6 +106,7 @@ from .turns import (
 )
 
 __all__ = [
+    "COMPLETION_GUIDANCE_JSON_BYTES",
     "CONTROL_FEEDBACK_BYTES",
     "AdmissionNotice",
     "AgentAction",
@@ -201,6 +204,7 @@ __all__ = [
     "VerificationStarted",
     "WorkStatus",
     "decode_event",
+    "fit_completion_guidance",
     "maximum_exchange_bytes",
     "minimum_exchange",
     "parse_action",

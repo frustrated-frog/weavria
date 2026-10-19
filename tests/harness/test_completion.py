@@ -4,6 +4,7 @@ from pydantic import BaseModel
 
 from weavria.artifacts import InMemoryArtifactStore
 from weavria.core import (
+    COMPLETION_GUIDANCE_JSON_BYTES,
     CompletionAccept,
     CompletionRepair,
     CompletionUnverifiable,
@@ -13,6 +14,7 @@ from weavria.core import (
     TaskInput,
     TaskObservation,
     ToolCallAction,
+    fit_completion_guidance,
 )
 from weavria.harness import (
     CapabilityNeed,
@@ -179,6 +181,15 @@ async def test_missing_or_partial_evidence_requests_repair() -> None:
 
     assert isinstance(decision, CompletionRepair)
     assert decision.issue_codes == ("missing_evidence",)
+
+
+def test_completion_guidance_is_bounded_by_encoded_bytes() -> None:
+    guidance = fit_completion_guidance("请补充这项中文信息。" * 80)
+
+    decision = CompletionRepair(issue_codes=("missing_information",), guidance=guidance)
+
+    assert decision.guidance.endswith("…")
+    assert len(decision.guidance.encode("utf-8")) <= COMPLETION_GUIDANCE_JSON_BYTES
 
 
 async def test_completion_uses_revision_bound_persistent_ledger_across_runs() -> None:

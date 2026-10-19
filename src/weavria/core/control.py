@@ -26,6 +26,26 @@ from .outcomes import AgentResult
 from .turns import CallSkipped, TurnDecided, TurnFeedback, TurnSettled, validate_turn_feedback
 
 CONTROL_FEEDBACK_BYTES = 1024
+COMPLETION_GUIDANCE_JSON_BYTES = 258
+
+
+def fit_completion_guidance(value: str) -> str:
+    """Fit trusted repair guidance to the exact serialized protocol budget."""
+    adapter = TypeAdapter(str)
+    if len(adapter.dump_json(value)) <= COMPLETION_GUIDANCE_JSON_BYTES:
+        return value
+    suffix = "…"
+    low, high = 0, len(value)
+    accepted = suffix
+    while low <= high:
+        middle = (low + high) // 2
+        candidate = value[:middle].rstrip() + suffix
+        if len(adapter.dump_json(candidate)) <= COMPLETION_GUIDANCE_JSON_BYTES:
+            accepted = candidate
+            low = middle + 1
+        else:
+            high = middle - 1
+    return accepted
 
 
 class FeedbackBounds(ContractModel):
@@ -69,8 +89,10 @@ class CompletionRepair(ContractModel):
     @field_validator("guidance")
     @classmethod
     def bound_guidance(cls, value: str) -> str:
-        if len(TypeAdapter(str).dump_json(value)) > 258:
-            raise ValueError("completion guidance exceeds 258 encoded bytes")
+        if len(TypeAdapter(str).dump_json(value)) > COMPLETION_GUIDANCE_JSON_BYTES:
+            raise ValueError(
+                f"completion guidance exceeds {COMPLETION_GUIDANCE_JSON_BYTES} encoded bytes"
+            )
         return value
 
 

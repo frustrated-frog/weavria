@@ -11,6 +11,7 @@ from weavria.core import (
     CompletionRepair,
     CompletionUnverifiable,
     ToolRecord,
+    fit_completion_guidance,
 )
 from weavria.runtime import CompletionContext
 
@@ -254,7 +255,7 @@ class TaskObligationCompletionPolicy:
         if evaluation.disposition == "repair":
             return CompletionRepair(
                 issue_codes=(evaluation.reason_code,),
-                guidance=evaluation.next_required_actions[0][0:240],
+                guidance=fit_completion_guidance(evaluation.next_required_actions[0]),
             )
         if evaluation.outcome == "unverifiable":
             return CompletionUnverifiable(reason=evaluation.reason_code)

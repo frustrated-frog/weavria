@@ -2,7 +2,7 @@
 
 from .agent import AgentLoop, AgentRun, Clock, LegacyAgentLoop, RunLimits, SystemClock
 from .budget import RootBudget
-from .completion import CompletionContext, CompletionPolicy, NoVerification
+from .completion import CompletionContext, CompletionPolicy, LayeredCompletionPolicy, NoVerification
 from .controller import TurnPreparation, TurnPreparer, prepare_task, resolve_turn
 from .journal import (
     InterventionJournal,
@@ -25,6 +25,7 @@ __all__ = [
     "EventAcceptanceError",
     "InterventionJournal",
     "JournalCommitError",
+    "LayeredCompletionPolicy",
     "LegacyAgentLoop",
     "NoVerification",
     "Phase",

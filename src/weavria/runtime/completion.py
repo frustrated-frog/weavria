@@ -9,6 +9,7 @@ from pydantic import JsonValue, TypeAdapter
 
 from weavria.artifacts import ArtifactAccessError, ArtifactSnapshot, ArtifactStore
 from weavria.core import (
+    CompletionAccept,
     CompletionAssessment,
     CompletionDecision,
     CompletionUnverifiable,
@@ -130,6 +131,30 @@ class NoVerification:
 
     async def verify(self, context: CompletionContext) -> CompletionDecision:
         return CompletionUnverifiable(reason="No completion policy configured")
+
+
+class LayeredCompletionPolicy:
+    """Enforce host invariants before allowing an application policy to add constraints."""
+
+    def __init__(self, required: CompletionPolicy, extension: CompletionPolicy) -> None:
+        self._required = required
+        self._extension = extension
+        self.version = f"layered/1[{required.version};{extension.version}]"
+
+    async def verify(self, context: CompletionContext) -> CompletionDecision:
+        adapter = TypeAdapter[CompletionDecision](CompletionDecision)
+        required = adapter.validate_python(await self._required.verify(context))
+        if not isinstance(required, CompletionAccept):
+            return required
+        extension = adapter.validate_python(await self._extension.verify(context))
+        if not isinstance(extension, CompletionAccept):
+            return extension
+        outcome = (
+            "verified"
+            if required.outcome == "verified" and extension.outcome == "verified"
+            else "unverified"
+        )
+        return CompletionAccept(outcome=outcome)
 
 
 class CompletionCheckError(Exception):

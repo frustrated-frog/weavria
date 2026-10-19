@@ -14,6 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from weavria.core import ApplicationObservation
 from weavria.harness import (
+    EvidenceResolver,
     ModelTaskInterpreter,
     TaskAwareSessionPreparer,
     TaskUnderstandingEngine,
@@ -29,7 +30,7 @@ from weavria.runtime import RunLimits
 from weavria.sessions import SessionConflictError, SessionEngine
 from weavria.tools import ToolRegistry
 
-from .completion import MarketAnswerPolicy
+from .completion import MarketAnswerPolicy, MarketPulseEvidenceExtractor
 from .config import FinScopeSettings
 from .market import MarketPulseClient, market_pulse_tool
 from .model import HTTPChatCompletionTransport
@@ -149,7 +150,8 @@ def create_app(
                 TaskUnderstandingEngine(
                     ModelTaskInterpreter(active_interpreter),
                     max_duration=resolved.model_timeout_seconds,
-                )
+                ),
+                evidence=EvidenceResolver((MarketPulseEvidenceExtractor(),)),
             ),
         )
         await engine.__aenter__()

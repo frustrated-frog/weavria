@@ -40,6 +40,7 @@ from weavria.runtime import (
     CompletionPolicy,
     EventAcceptanceError,
     JournalCommitError,
+    LayeredCompletionPolicy,
     RootBudget,
     RunLimits,
     SystemClock,
@@ -357,7 +358,15 @@ class SessionEngine:
             CompletionPolicy | None,
             getattr(task_preparation, "completion_policy", None),
         )
-        self._completion = completion if completion is not None else prepared_completion
+        self._completion = (
+            LayeredCompletionPolicy(prepared_completion, completion)
+            if prepared_completion is not None
+            and completion is not None
+            and prepared_completion is not completion
+            else completion
+            if completion is not None
+            else prepared_completion
+        )
         self._policy, self._mode = policy, mode
         self._history_budget, self._history_mode = history_budget_bytes, history_mode
         self._clock = clock or SystemClock()

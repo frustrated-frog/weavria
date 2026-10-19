@@ -17,8 +17,12 @@ from weavria.core import (
 )
 from weavria.harness import (
     CapabilityNeed,
+    ClarificationAnswerOption,
+    ClarificationQuestionCandidate,
     CompletionCriterion,
     InformationNeed,
+    IntentHypothesis,
+    IntentUncertainty,
     TaskFrame,
     TaskSpecification,
 )
@@ -72,6 +76,58 @@ def _direct() -> TaskSpecification:
         goal="Explain the configured assistant role",
         completion_criteria=(
             CompletionCriterion(kind="response", description="Answer the identity question"),
+        ),
+    )
+
+
+def _clarify() -> TaskSpecification:
+    ambiguity = "The requested market scope is ambiguous"
+    return TaskSpecification(
+        route="clarify",
+        intent="Resolve the requested market scope",
+        goal="Ask which market scope the user wants",
+        ambiguities=(ambiguity,),
+        uncertainty=IntentUncertainty(
+            hypotheses=(
+                IntentHypothesis(
+                    hypothesis_id="overview",
+                    interpretation="Explain the market overview",
+                    intended_route="execute",
+                    capability_names=("read_market_pulse",),
+                    outcome_key="market_overview",
+                    support_weight=50,
+                ),
+                IntentHypothesis(
+                    hypothesis_id="opportunities",
+                    interpretation="Explain market opportunities",
+                    intended_route="execute",
+                    capability_names=("read_market_pulse",),
+                    outcome_key="market_opportunities",
+                    support_weight=50,
+                ),
+            ),
+            candidate_questions=(
+                ClarificationQuestionCandidate(
+                    question_id="market_scope",
+                    question_text="你想看市场全景, 还是市场机会?",
+                    target_ambiguities=(ambiguity,),
+                    answer_options=(
+                        ClarificationAnswerOption(
+                            answer_id="overview",
+                            label="市场全景",
+                            hypothesis_ids=("overview",),
+                        ),
+                        ClarificationAnswerOption(
+                            answer_id="opportunities",
+                            label="市场机会",
+                            hypothesis_ids=("opportunities",),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+        completion_criteria=(
+            CompletionCriterion(kind="clarification", description="Ask for market scope"),
         ),
     )
 
@@ -165,8 +221,8 @@ async def test_widget_session_executes_real_runtime_and_reports_tool_trace(
 
     assert response.status_code == 200
     payload = MessageOutput.model_validate(response.json())
-    assert payload.status == "completed"
-    assert payload.task_outcome == "verified"
+    assert payload.status == "completed", payload.model_dump_json()
+    assert payload.task_outcome == "unverified"
     assert payload.answer is not None
     assert payload.answer.endswith("[来源:market-pulse:2026-10-15]")
     assert [tool.model_dump() for tool in payload.tools] == [
@@ -234,12 +290,60 @@ async def test_direct_question_uses_task_frame_without_market_tool(tmp_path: Pat
 
     assert response.status_code == 200
     payload = MessageOutput.model_validate(response.json())
-    assert payload.status == "completed"
+    assert payload.status == "completed", payload.model_dump()
     assert payload.task_outcome == "unverifiable"
     assert payload.answer == "我是只读的市场研究助手。"
     assert payload.tools == ()
     assert market_calls == 0
     await market_http.aclose()
+
+
+async def test_application_completion_cannot_bypass_selected_clarification(
+    tmp_path: Path,
+) -> None:
+    provider = FakeSessionProvider(
+        (
+            ModelTurn(decision=FinishAction(output="你具体想看什么?")),
+            ModelTurn(decision=FinishAction(output="你想看市场全景, 还是市场机会?")),
+        )
+    )
+    app = create_app(
+        FinScopeSettings(
+            model_base_url="http://model.test",
+            model_name="fake",
+            model_api_key="",
+            state_path=tmp_path / "sessions.sqlite3",
+        ),
+        provider=provider,
+        interpreter_provider=FakeModelProvider((_declaration(_clarify()),)),
+    )
+
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://sidecar.test"
+        ) as client:
+            created = SessionCreated.model_validate((await client.post("/api/sessions")).json())
+            response = await client.post(
+                f"/api/sessions/{created.session_id}/messages",
+                json={
+                    "input_id": "clarify-1",
+                    "text": "帮我看看市场",
+                    "context": {
+                        "schema_version": 1,
+                        "surface": "market_pulse",
+                        "business_date": "2026-10-15",
+                        "current_view": "panorama",
+                        "quality_status": "READY",
+                        "generated_at": "2026-10-15T15:40:00",
+                    },
+                },
+            )
+
+    payload = MessageOutput.model_validate(response.json())
+    assert response.status_code == 200
+    assert payload.answer == "你想看市场全景, 还是市场机会?"
+    assert payload.clarification_id is not None
+    assert len(provider.requests) == 2
 
 
 async def test_market_source_failure_finishes_unverifiable_without_completion_loop(
@@ -262,6 +366,20 @@ async def test_market_source_failure_finishes_unverifiable_without_completion_lo
                             call_id="market-read-failed",
                             tool_name="read_market_pulse",
                             arguments={"business_date": "2026-10-15", "focus": "overview"},
+                        ),
+                    )
+                )
+            ),
+            ModelTurn(
+                decision=ToolBatch(
+                    calls=(
+                        ToolCallAction(
+                            call_id="market-read-retry",
+                            tool_name="read_market_pulse",
+                            arguments={
+                                "business_date": "2026-10-15",
+                                "focus": "overview",
+                            },
                         ),
                     )
                 )
@@ -312,10 +430,15 @@ async def test_market_source_failure_finishes_unverifiable_without_completion_lo
             "call_id": "market-read-failed",
             "tool_name": "read_market_pulse",
             "status": "failed",
-        }
+        },
+        {
+            "call_id": "market-read-retry",
+            "tool_name": "read_market_pulse",
+            "status": "failed",
+        },
     ]
-    assert market_calls == 1
-    assert len(provider.requests) == 2
+    assert market_calls == 2
+    assert len(provider.requests) == 3
     failure = provider.requests[1].current.feedback
     assert failure is not None and failure.calls[0].status == "failed"
     exchange = provider.requests[1].current.history[0]

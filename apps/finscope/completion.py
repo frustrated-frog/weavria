@@ -2,16 +2,59 @@
 
 import json
 
+from weavria.artifacts import ArtifactSnapshot
 from weavria.core import (
     CompletionAccept,
     CompletionRepair,
     CompletionUnverifiable,
     ToolFailedObservation,
+    ToolRecord,
 )
-from weavria.harness import TaskFrame
+from weavria.harness import (
+    EvidenceEvaluation,
+    InformationRequirement,
+    StructuralEvidenceExtractor,
+    TaskFrame,
+)
 from weavria.runtime import CompletionContext
 
 from .market import MarketPulseOutput
+
+
+class MarketPulseEvidenceExtractor:
+    """Interpret freshness only at the application boundary that owns the source."""
+
+    key = "finscope-market-pulse"
+    version = "1"
+
+    def __init__(self) -> None:
+        self._structural = StructuralEvidenceExtractor()
+
+    def supports(self, requirement: InformationRequirement, record: ToolRecord) -> bool:
+        return record.exchange.action.tool_name == "read_market_pulse"
+
+    async def evaluate(
+        self,
+        requirement: InformationRequirement,
+        record: ToolRecord,
+        snapshot: ArtifactSnapshot,
+    ) -> EvidenceEvaluation:
+        structural = await self._structural.evaluate(requirement, record, snapshot)
+        MarketPulseOutput.model_validate(snapshot.value)
+        missing = tuple(field for field in structural.missing_fields if field != "$freshness")
+        relation = (
+            "supports"
+            if not missing
+            else "partially_supports"
+            if structural.pointers
+            else "unknown"
+        )
+        return EvidenceEvaluation(
+            relation=relation,
+            pointers=structural.pointers,
+            missing_fields=missing,
+            freshness="valid",
+        )
 
 
 class MarketAnswerPolicy:
