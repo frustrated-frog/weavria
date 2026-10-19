@@ -17,6 +17,7 @@ from weavria.core import (
     ToolCallAction,
 )
 from weavria.models import (
+    ModelOutputError,
     OpenAICompatibleConfig,
     OpenAICompatibleProvider,
     OpenAICompatibleSessionProvider,
@@ -117,7 +118,7 @@ async def test_adapter_rejects_truncated_output_before_json_recovery() -> None:
         ),
     )
 
-    with pytest.raises(ValueError, match="valid JSON action"):
+    with pytest.raises(ModelOutputError, match="valid JSON action"):
         await provider.generate(_request())
 
 
@@ -191,7 +192,7 @@ async def test_session_provider_rejects_non_json_final_content() -> None:
         transport=Transport(_response("not json")),
     )
 
-    with pytest.raises(ValueError, match="valid JSON turn"):
+    with pytest.raises(ModelOutputError, match="valid JSON turn"):
         await provider.generate_session(_session_request())
 
 

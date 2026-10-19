@@ -13,7 +13,13 @@ from weavria.core import (
     ToolExchange,
     ToolSucceededObservation,
 )
-from weavria.models import FakeModelProvider, ModelCallError, ModelCapabilities, call_model
+from weavria.models import (
+    FakeModelProvider,
+    ModelCallError,
+    ModelCapabilities,
+    ModelOutputError,
+    call_model,
+)
 
 
 class WaitingProvider:
@@ -71,6 +77,27 @@ async def test_provider_failure_is_classified_with_original_cause(
     assert raised.value.error.category is ErrorCategory.MODEL_FAILURE
     assert isinstance(raised.value.__cause__, RuntimeError)
     assert str(raised.value) == "Model provider failed"
+
+
+async def test_malformed_supplier_output_is_not_misclassified_as_provider_failure(
+    model_request: ModelRequest,
+) -> None:
+    class MalformedOutputProvider:
+        capabilities = ModelCapabilities(tool_calls=False)
+
+        async def generate(self, request: ModelRequest) -> ModelResponse:
+            try:
+                raise ValueError("supplier returned malformed JSON")
+            except ValueError as exc:
+                raise ModelOutputError("response normalization failed") from exc
+
+    with pytest.raises(ModelCallError) as raised:
+        await call_model(MalformedOutputProvider(), model_request)
+
+    assert raised.value.error.category is ErrorCategory.INVALID_MODEL_RESPONSE
+    assert raised.value.error.cause_type == "ModelOutputError"
+    assert isinstance(raised.value.__cause__, ModelOutputError)
+    assert isinstance(raised.value.__cause__.__cause__, ValueError)
 
 
 async def test_framework_revalidates_forged_response(model_request: ModelRequest) -> None:

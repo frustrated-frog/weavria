@@ -11,7 +11,7 @@ from pydantic import BaseModel, ConfigDict, JsonValue, TypeAdapter
 
 from weavria.core import ModelRequest, ModelResponse, ModelTurn, SessionRequest
 
-from .provider import ModelCapabilities
+from .provider import ModelCapabilities, ModelOutputError
 
 _JSON_OBJECT = TypeAdapter(dict[str, JsonValue])
 _LOGGER = logging.getLogger(__name__)
@@ -69,7 +69,7 @@ class OpenAICompatibleProvider:
                 json.dumps(normalized, ensure_ascii=False, separators=(",", ":"))
             )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise ValueError("model response did not contain one valid JSON action") from exc
+            raise ModelOutputError("model response did not contain one valid JSON action") from exc
 
     def _request_body(self, request: ModelRequest) -> dict[str, Any]:
         observations = request.model_dump(mode="json")
@@ -157,7 +157,7 @@ class OpenAICompatibleSessionProvider:
                 json.dumps(normalized, ensure_ascii=False, separators=(",", ":"))
             )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise ValueError("model response did not contain one valid JSON turn") from exc
+            raise ModelOutputError("model response did not contain one valid JSON turn") from exc
 
 
 class _ContentPart(BaseModel):

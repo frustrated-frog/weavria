@@ -530,6 +530,27 @@ class ModelTaskInterpreter:
                     max_duration=remaining,
                 )
             except ModelCallError as exc:
+                if exc.error.category is ErrorCategory.INVALID_MODEL_RESPONSE:
+                    if attempt == 0:
+                        model_request = model_request.model_copy(
+                            update={
+                                "instructions": (
+                                    f"{instructions} Previous response was rejected by the "
+                                    "trusted model adapter because it was not one valid JSON "
+                                    f"action for {_SPECIFICATION_TOOL}. Return a corrected "
+                                    "specification tool call."
+                                )
+                            }
+                        )
+                        continue
+                    error = TaskUnderstandingError(
+                        RunError(
+                            category=ErrorCategory.INVALID_MODEL_RESPONSE,
+                            message="Task interpreter returned an invalid model response",
+                            cause_type=exc.error.cause_type,
+                        )
+                    )
+                    raise error from exc
                 raise TaskUnderstandingError(exc.error) from exc
 
             specification, feedback, cause, failure_message = _validate_model_specification(

@@ -65,6 +65,10 @@ class ModelCallError(Exception):
         super().__init__(error.message)
 
 
+class ModelOutputError(ValueError):
+    """A supplier response was received but could not be normalized safely."""
+
+
 class TurnModelProvider(Protocol):
     """Normalize a model turn; batch capability does not grant parallel execution."""
 
@@ -230,6 +234,25 @@ async def _invoke_model[Input: BaseModel, Response: BaseModel](
                 cause_type=type(exc).__name__,
             ),
             timeout_origin=origin,
+        ) from exc
+    except ModelOutputError as exc:
+        if owner is not None and owner.cancelling() > cancellation_count:
+            raise asyncio.CancelledError from exc
+        if attempt_expired():
+            raise ModelCallError(
+                RunError(
+                    category=ErrorCategory.TIMEOUT,
+                    message="Model attempt timed out",
+                    cause_type=type(exc).__name__,
+                ),
+                timeout_origin=ModelTimeoutOrigin.ATTEMPT,
+            ) from exc
+        raise ModelCallError(
+            RunError(
+                category=ErrorCategory.INVALID_MODEL_RESPONSE,
+                message="Model provider returned an invalid response",
+                cause_type=type(exc).__name__,
+            )
         ) from exc
     except Exception as exc:
         if owner is not None and owner.cancelling() > cancellation_count:

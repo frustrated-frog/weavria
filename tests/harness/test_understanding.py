@@ -42,7 +42,12 @@ from weavria.harness import (
     load_task_frame,
     load_task_frame_patch,
 )
-from weavria.models import FakeControlProvider, FakeModelProvider, ModelCapabilities
+from weavria.models import (
+    FakeControlProvider,
+    FakeModelProvider,
+    ModelCapabilities,
+    ModelOutputError,
+)
 from weavria.tools import ToolContext, ToolRegistry, TypedTool
 
 
@@ -344,6 +349,74 @@ async def test_model_interpreter_repairs_one_invalid_specification_with_bounded_
     assert "rejected by trusted host validation" in repair
     assert "direct tasks cannot require capabilities" in repair
     assert "SENSITIVE-RAW-MODEL-VALUE" not in repair
+
+
+async def test_model_interpreter_retries_one_malformed_supplier_response() -> None:
+    class MalformedThenValidProvider:
+        capabilities = ModelCapabilities(tool_calls=True)
+
+        def __init__(self) -> None:
+            self.requests: list[ModelRequest] = []
+
+        async def generate(self, request: ModelRequest) -> ModelResponse:
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                raise ModelOutputError("response normalization failed")
+            return _declaration(_execute())
+
+    provider = MalformedThenValidProvider()
+    interpreter = ModelTaskInterpreter(provider)
+
+    specification = await interpreter.interpret(
+        TaskUnderstandingInput(
+            task=TaskInput(goal="Read the report"),
+            capabilities=(
+                CapabilityView(
+                    name="read_document",
+                    version="1",
+                    description="Read a named document",
+                    input_schema={"type": "object"},
+                    behavior="read_only",
+                    risk="low",
+                    approval_required=False,
+                ),
+            ),
+        ),
+        max_duration=1,
+    )
+
+    assert specification.route == "execute"
+    assert len(provider.requests) == 2
+    assert "trusted model adapter" in provider.requests[1].instructions
+    assert "valid JSON action" in provider.requests[1].instructions
+
+
+async def test_model_interpreter_bounds_malformed_response_retries() -> None:
+    class AlwaysMalformedProvider:
+        capabilities = ModelCapabilities(tool_calls=True)
+
+        def __init__(self) -> None:
+            self.requests: list[ModelRequest] = []
+
+        async def generate(self, request: ModelRequest) -> ModelResponse:
+            self.requests.append(request)
+            raise ModelOutputError("response normalization failed")
+
+    provider = AlwaysMalformedProvider()
+    interpreter = ModelTaskInterpreter(provider)
+
+    with pytest.raises(
+        TaskUnderstandingError,
+        match="Task interpreter returned an invalid model response",
+    ) as raised:
+        await interpreter.interpret(
+            TaskUnderstandingInput(task=TaskInput(goal="Read the report")),
+            max_duration=1,
+        )
+
+    assert raised.value.error.category is ErrorCategory.INVALID_MODEL_RESPONSE
+    assert raised.value.error.cause_type == "ModelOutputError"
+    assert len(provider.requests) == 2
 
 
 async def test_model_interpreter_rejects_new_clarify_output_without_uncertainty() -> None:
