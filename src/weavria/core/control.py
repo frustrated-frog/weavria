@@ -67,7 +67,7 @@ class AdmissionNotice(ContractModel):
     canonical_tool_key_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
     progress_reason: Literal["repeated_action", "stagnant_action_family"] | None = None
     action_family_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
-    prior_family_attempts: int | None = Field(default=None, ge=1)
+    prior_family_attempts: int | None = Field(default=None, ge=0)
 
     @model_validator(mode="after")
     def bound_notice(self) -> Self:

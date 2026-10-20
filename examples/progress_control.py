@@ -67,6 +67,24 @@ def main() -> None:
                     for character in ("a", "b", "c", "d")
                 ),
             ),
+            ProgressControlCase(
+                case_id="batch_shape_regrouping",
+                goal="Bound one source family across batch shapes",
+                attempts=(
+                    ProgressAttempt(
+                        need_state_sha256=unchanged,
+                        tool_names=("read_source", "read_source", "read_source"),
+                        arguments=tuple({"query": f"variant-{index}"} for index in range(3)),
+                        expected_disposition="allow",
+                    ),
+                    ProgressAttempt(
+                        need_state_sha256=unchanged,
+                        tool_names=("read_source", "read_source"),
+                        arguments=tuple({"query": f"variant-{index}"} for index in range(3, 5)),
+                        expected_disposition="block",
+                    ),
+                ),
+            ),
         ),
         _registry(),
     )

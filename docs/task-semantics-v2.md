@@ -10,9 +10,10 @@ Evidence Binding、动态 Capability View、Pending Clarification、Completion O
 Progress Fingerprint。它们通过 Session Semantic Ledger 跨 Run 持久化。
 
 Progress 控制现在区分精确动作与动作族：Task-aware 路径只在有效 Need 状态、任务语义或能力
-视图改变时建立新前沿，不再让无关或波动的 Artifact SHA256 冒充进展。同一前沿允许有界参数
-探索，随后在派发前返回可诊断的 `stagnant_action_family`；切换独立能力仍然可行。详细决策与
-冻结基线见 [ADR 0022](decisions/0022-语义前沿与有界探索.md)。
+视图改变时建立新前沿，不再让无关或波动的 Artifact SHA256 冒充进展。同一前沿按工具版本动作
+族逐动作计量有界参数探索；批次顺序、大小或拆分不能重置额度，超限时整批在派发前返回可诊断
+的 `stagnant_action_family`，切换独立能力仍然可行。详细决策与冻结基线见
+[ADR 0022](decisions/0022-语义前沿与有界探索.md)。
 
 ## 2. 它解决什么问题
 

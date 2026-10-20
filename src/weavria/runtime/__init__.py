@@ -16,6 +16,7 @@ from .progress import (
     ProgressCheck,
     ProgressPolicy,
     ProgressPolicyFactory,
+    ProgressReservation,
     SemanticProgressPolicy,
     SemanticProgressPolicyFactory,
 )
@@ -38,6 +39,7 @@ __all__ = [
     "ProgressCheck",
     "ProgressPolicy",
     "ProgressPolicyFactory",
+    "ProgressReservation",
     "RequestJournal",
     "ResolutionJournal",
     "RootBudget",

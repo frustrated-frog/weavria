@@ -85,16 +85,40 @@ def test_progress_control_experiment_compares_exact_repeat_baseline() -> None:
                 ),
             ),
         ),
+        ProgressControlCase(
+            case_id="batch_shape_regrouping",
+            goal="Bound one source family across batch shapes",
+            attempts=(
+                ProgressAttempt(
+                    need_state_sha256=unchanged,
+                    tool_names=("primary", "primary", "primary"),
+                    arguments=tuple({"query": f"variant-{index}"} for index in range(3)),
+                    expected_disposition="allow",
+                ),
+                ProgressAttempt(
+                    need_state_sha256=unchanged,
+                    tool_names=("primary", "primary"),
+                    arguments=tuple({"query": f"variant-{index}"} for index in range(3, 5)),
+                    expected_disposition="block",
+                ),
+            ),
+        ),
     )
 
     report = evaluate_progress_control(cases, _registry())
 
-    assert report.policy_version == "semantic-progress/3"
-    assert report.total_attempts == 10
-    assert report.selected_correct == 10
-    assert report.baseline_correct == 9
+    assert report.policy_version == "semantic-progress/4"
+    assert report.baseline_version == "exact-action-only/2"
+    assert report.total_attempts == 12
+    assert report.selected_correct == 12
+    assert report.baseline_correct == 10
     blocked = report.cases[0].attempts[-1]
     assert blocked.selected_reason == "stagnant_action_family"
     assert blocked.prior_family_attempts == 3
     assert blocked.selected_disposition == "block"
     assert blocked.baseline_disposition == "allow"
+    regrouped = report.cases[-1].attempts[-1]
+    assert regrouped.selected_reason == "stagnant_action_family"
+    assert regrouped.prior_family_attempts == 3
+    assert regrouped.selected_disposition == "block"
+    assert regrouped.baseline_disposition == "allow"

@@ -10,6 +10,27 @@ from weavria.tools import ToolRegistry
 
 
 @dataclass(frozen=True, slots=True)
+class ProgressReservation:
+    """Unique actions reserved atomically for one frontier/family pair."""
+
+    action_family_sha256: str
+    canonical_action_sha256s: tuple[str, ...]
+    prior_family_attempts: int
+
+    def __post_init__(self) -> None:
+        if not _is_sha256(self.action_family_sha256):
+            raise ValueError("progress reservation family must be a SHA-256 digest")
+        if not self.canonical_action_sha256s:
+            raise ValueError("progress reservation actions must be nonempty")
+        if any(not _is_sha256(value) for value in self.canonical_action_sha256s):
+            raise ValueError("progress reservation actions must be SHA-256 digests")
+        if len(set(self.canonical_action_sha256s)) != len(self.canonical_action_sha256s):
+            raise ValueError("progress reservation actions must be unique")
+        if type(self.prior_family_attempts) is not int or self.prior_family_attempts < 0:
+            raise ValueError("prior family attempts must be nonnegative")
+
+
+@dataclass(frozen=True, slots=True)
 class ProgressCheck:
     blocked: bool
     repeated: bool
@@ -18,6 +39,7 @@ class ProgressCheck:
     canonical_tool_key_sha256: str
     action_family_sha256: str
     prior_family_attempts: int
+    reservations: tuple[ProgressReservation, ...]
 
 
 class ProgressPolicy(Protocol):
@@ -52,27 +74,27 @@ class ProgressPolicyFactory(Protocol):
 class SemanticProgressPolicyFactory:
     """Versioned construction boundary for SessionEngine and controlled experiments."""
 
-    max_stagnant_batches_per_action_family: int = 3
+    max_stagnant_actions_per_family: int = 3
 
     def __post_init__(self) -> None:
         if (
-            type(self.max_stagnant_batches_per_action_family) is not int
-            or self.max_stagnant_batches_per_action_family < 1
+            type(self.max_stagnant_actions_per_family) is not int
+            or self.max_stagnant_actions_per_family < 1
         ):
             raise ValueError("stagnant action-family limit must be a positive integer")
 
     @property
     def version(self) -> str:
         return (
-            "semantic-progress-factory/1["
+            "semantic-progress-factory/2["
             f"policy={SemanticProgressPolicy.version};"
-            f"max_family_batches={self.max_stagnant_batches_per_action_family}]"
+            f"max_family_actions={self.max_stagnant_actions_per_family}]"
         )
 
     def create(self, tools: ToolRegistry) -> ProgressPolicy:
         return SemanticProgressPolicy(
             tools,
-            max_stagnant_batches_per_action_family=(self.max_stagnant_batches_per_action_family),
+            max_stagnant_actions_per_family=self.max_stagnant_actions_per_family,
         )
 
 
@@ -83,21 +105,18 @@ class SemanticProgressPolicy:
     two-phase protocol: an action is counted only after ``BatchAdmitted`` has been accepted.
     """
 
-    version = "semantic-progress/3"
+    version = "semantic-progress/4"
 
     def __init__(
         self,
         tools: ToolRegistry,
         *,
-        max_stagnant_batches_per_action_family: int = 3,
+        max_stagnant_actions_per_family: int = 3,
     ) -> None:
-        if (
-            type(max_stagnant_batches_per_action_family) is not int
-            or max_stagnant_batches_per_action_family < 1
-        ):
+        if type(max_stagnant_actions_per_family) is not int or max_stagnant_actions_per_family < 1:
             raise ValueError("stagnant action-family limit must be a positive integer")
         self._versions = {item.name: item.version for item in tools.descriptors}
-        self._max_stagnant_batches = max_stagnant_batches_per_action_family
+        self._max_stagnant_actions = max_stagnant_actions_per_family
         self._admitted: dict[tuple[str, str], set[str]] = {}
 
     def inspect(
@@ -145,56 +164,112 @@ class SemanticProgressPolicy:
                 "capability_epoch": capability_epoch,
             }
         )
-        canonical = _digest(
-            [
-                {
-                    "tool_name": call.tool_name,
-                    "tool_version": self._versions.get(call.tool_name, "unknown"),
-                    "arguments": call.arguments,
-                }
-                for call in batch.calls
-            ]
+        actions = tuple(
+            (
+                _digest(
+                    {
+                        "tool_name": call.tool_name,
+                        "tool_version": self._versions.get(call.tool_name, "unknown"),
+                        "arguments": call.arguments,
+                    }
+                ),
+                _digest(
+                    {
+                        "tool_name": call.tool_name,
+                        "tool_version": self._versions.get(call.tool_name, "unknown"),
+                    }
+                ),
+            )
+            for call in batch.calls
         )
-        family = _digest(
-            [
-                {
-                    "tool_name": call.tool_name,
-                    "tool_version": self._versions.get(call.tool_name, "unknown"),
-                }
-                for call in batch.calls
-            ]
+        canonical = _digest([action for action, _ in actions])
+        proposed: dict[str, list[str]] = {}
+        blocked_reason: Literal["repeated_action", "stagnant_action_family"] | None = None
+        blocked_action = actions[0][0]
+        blocked_family = actions[0][1]
+        blocked_prior = len(self._admitted.get((fingerprint, blocked_family), set()))
+        for action, family in actions:
+            admitted = self._admitted.get((fingerprint, family), set())
+            family_proposal = proposed.setdefault(family, [])
+            if action in admitted or action in family_proposal:
+                blocked_reason = "repeated_action"
+            elif len(admitted) + len(family_proposal) >= self._max_stagnant_actions:
+                blocked_reason = "stagnant_action_family"
+            if blocked_reason is not None:
+                blocked_action = action
+                blocked_family = family
+                blocked_prior = len(admitted)
+                break
+            family_proposal.append(action)
+        reservations = (
+            ()
+            if blocked_reason is not None
+            else tuple(
+                ProgressReservation(
+                    action_family_sha256=family,
+                    canonical_action_sha256s=tuple(family_actions),
+                    prior_family_attempts=len(self._admitted.get((fingerprint, family), set())),
+                )
+                for family, family_actions in proposed.items()
+            )
         )
-        admitted = self._admitted.get((fingerprint, family), set())
-        repeated = canonical in admitted
-        stagnant = not repeated and len(admitted) >= self._max_stagnant_batches
+        first_reservation = reservations[0] if reservations else None
+        family = (
+            blocked_family
+            if blocked_reason is not None
+            else first_reservation.action_family_sha256
+            if first_reservation is not None
+            else actions[0][1]
+        )
+        prior = (
+            blocked_prior
+            if blocked_reason is not None
+            else first_reservation.prior_family_attempts
+            if first_reservation is not None
+            else 0
+        )
+        repeated = blocked_reason == "repeated_action"
         reason: Literal["novel_action", "repeated_action", "stagnant_action_family"] = (
-            "repeated_action"
-            if repeated
-            else "stagnant_action_family"
-            if stagnant
-            else "novel_action"
+            blocked_reason if blocked_reason is not None else "novel_action"
         )
         return ProgressCheck(
-            blocked=repeated or stagnant,
+            blocked=blocked_reason is not None,
             repeated=repeated,
             reason=reason,
             fingerprint_sha256=fingerprint,
-            canonical_tool_key_sha256=canonical,
+            canonical_tool_key_sha256=(blocked_action if blocked_reason is not None else canonical),
             action_family_sha256=family,
-            prior_family_attempts=len(admitted),
+            prior_family_attempts=prior,
+            reservations=reservations,
         )
 
     def record_admission(self, check: ProgressCheck) -> None:
-        """Record exactly one accepted action against the frontier it actually consumed."""
+        """Atomically record every action in one accepted batch against its inspected frontier."""
         if check.blocked:
             raise ValueError("a blocked progress proposal cannot be admitted")
-        key = (check.fingerprint_sha256, check.action_family_sha256)
-        admitted = self._admitted.setdefault(key, set())
-        if check.canonical_tool_key_sha256 in admitted:
-            raise ValueError("progress admission was already recorded")
-        if len(admitted) != check.prior_family_attempts:
-            raise ValueError("progress admission does not match the inspected frontier")
-        admitted.add(check.canonical_tool_key_sha256)
+        if not check.reservations:
+            raise ValueError("progress admission requires at least one family reservation")
+        families = [item.action_family_sha256 for item in check.reservations]
+        if len(families) != len(set(families)):
+            raise ValueError("progress admission families must be unique")
+        for reservation in check.reservations:
+            admitted = self._admitted.get(
+                (check.fingerprint_sha256, reservation.action_family_sha256), set()
+            )
+            if len(admitted) != reservation.prior_family_attempts:
+                raise ValueError("progress admission does not match the inspected frontier")
+            if admitted.intersection(reservation.canonical_action_sha256s):
+                raise ValueError("progress admission was already recorded")
+            if (
+                len(admitted) + len(reservation.canonical_action_sha256s)
+                > self._max_stagnant_actions
+            ):
+                raise ValueError("progress admission exceeds its action-family limit")
+        for reservation in check.reservations:
+            admitted = self._admitted.setdefault(
+                (check.fingerprint_sha256, reservation.action_family_sha256), set()
+            )
+            admitted.update(reservation.canonical_action_sha256s)
 
 
 def _frame_semantics_sha256(observation: TaskObservation | None) -> str:

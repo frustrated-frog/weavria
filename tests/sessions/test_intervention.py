@@ -112,7 +112,7 @@ async def test_steering_replans_stale_model_and_keeps_authored_history_across_re
 
 
 class Empty(BaseModel):
-    pass
+    index: int = 0
 
 
 async def test_started_work_is_kept_and_obsolete_queued_calls_are_skipped(tmp_path: Path) -> None:
@@ -137,7 +137,7 @@ async def test_started_work_is_kept_and_obsolete_queued_calls_are_skipped(tmp_pa
             return ModelTurn(
                 decision=ToolBatch(
                     calls=tuple(
-                        ToolCallAction(call_id=f"c{i}", tool_name="read", arguments={})
+                        ToolCallAction(call_id=f"c{i}", tool_name="read", arguments={"index": i})
                         for i in range(3)
                     )
                 )

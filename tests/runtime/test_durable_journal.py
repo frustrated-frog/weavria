@@ -18,7 +18,7 @@ from weavria.core import (
     ToolStarted,
 )
 from weavria.models import FakeControlProvider
-from weavria.runtime import AgentLoop, JournalCommitError, ToolScheduling, reduce_event
+from weavria.runtime import AgentLoop, JournalCommitError, RunLimits, ToolScheduling, reduce_event
 from weavria.tools import ToolContext, ToolRegistry, TypedTool
 
 
@@ -126,7 +126,7 @@ async def test_parallel_commit_failure_seals_dispatch_and_escapes_the_exception_
     executed: list[str] = []
 
     class Empty(BaseModel):
-        pass
+        index: int = 0
 
     async def execute(arguments: Empty, context: ToolContext) -> Empty:
         assert context.call_id is not None
@@ -147,7 +147,7 @@ async def test_parallel_commit_failure_seals_dispatch_and_escapes_the_exception_
             ModelTurn(
                 decision=ToolBatch(
                     calls=tuple(
-                        ToolCallAction(call_id=f"c{i}", tool_name="read", arguments={})
+                        ToolCallAction(call_id=f"c{i}", tool_name="read", arguments={"index": i})
                         for i in range(4)
                     )
                 )
@@ -172,6 +172,7 @@ async def test_parallel_commit_failure_seals_dispatch_and_escapes_the_exception_
             )
         ),
         artifacts=InMemoryArtifactStore(),
+        limits=RunLimits(max_stagnant_actions_per_family=4),
         scheduling=ToolScheduling(max_in_flight=4, parallel_tools=frozenset({"read"})),
         journal=Broken(),
     )

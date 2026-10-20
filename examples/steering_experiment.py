@@ -233,7 +233,10 @@ async def experiment(root: Path) -> dict[str, object]:
             root / (strategy + ".db"),
             model=model,
             tools=world.tools(),
-            limits=RunLimits(max_request_bytes=28000),
+            limits=RunLimits(
+                max_request_bytes=28000,
+                max_stagnant_actions_per_family=5,
+            ),
             completion=Verify(),
             mode=EvidenceMode.FULL,
         ) as engine:

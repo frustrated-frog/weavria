@@ -311,7 +311,7 @@ async def _run_once(
                 max_completion_duration=_MAX_COMPLETION_DURATION_SECONDS,
                 max_completion_repairs=_MAX_COMPLETION_REPAIRS,
                 max_no_progress_rejections=_MAX_NO_PROGRESS_REJECTIONS,
-                max_stagnant_batches_per_action_family=threshold,
+                max_stagnant_actions_per_family=threshold,
             ),
             task_preparation=preparer,
             progress_factory=factory,

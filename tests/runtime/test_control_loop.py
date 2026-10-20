@@ -346,7 +346,7 @@ def test_progress_inspection_counts_only_committed_batch_admission() -> None:
             ),
         )
     )
-    policy = SemanticProgressPolicy(tools, max_stagnant_batches_per_action_family=2)
+    policy = SemanticProgressPolicy(tools, max_stagnant_actions_per_family=2)
     task = TaskInput(goal="Read and report the value")
     proposal = ToolBatch(calls=(call("first", "one"),))
 
@@ -394,7 +394,7 @@ def test_progress_factory_creates_isolated_run_state_and_versioned_configuration
             ),
         )
     )
-    factory = SemanticProgressPolicyFactory(max_stagnant_batches_per_action_family=1)
+    factory = SemanticProgressPolicyFactory(max_stagnant_actions_per_family=1)
     first = factory.create(tools)
     second = factory.create(tools)
     proposal = ToolBatch(calls=(call("first", "one"),))
@@ -425,7 +425,7 @@ def test_progress_factory_creates_isolated_run_state_and_versioned_configuration
     assert first is not second
     assert first_repeat.blocked and first_repeat.reason == "stagnant_action_family"
     assert not second_first.blocked
-    assert "max_family_batches=1" in factory.version
+    assert "max_family_actions=1" in factory.version
 
 
 @pytest.mark.parametrize("limit", [0, True])
@@ -459,7 +459,7 @@ async def test_semantic_frontier_bounds_volatile_outputs_from_one_action_family(
     agent = make_loop(
         provider,
         task_observation=observation,
-        limits=RunLimits(max_stagnant_batches_per_action_family=3),
+        limits=RunLimits(max_stagnant_actions_per_family=3),
     )
 
     result = await agent.execute()
@@ -473,6 +473,153 @@ async def test_semantic_frontier_bounds_volatile_outputs_from_one_action_family(
     assert notice.reason == "no_progress"
     assert notice.progress_reason == "stagnant_action_family"
     assert notice.prior_family_attempts == 3
+
+
+async def test_semantic_frontier_counts_actions_across_different_batch_shapes() -> None:
+    observation = TaskObservation(
+        observation_id="frame-1",
+        input_id="input-1",
+        task_revision=1,
+        frame_revision=1,
+        producer_version="test",
+        payload_schema="weavria.task-frame/2",
+        payload={
+            "need_state_sha256": "a" * 64,
+            "specification": {"goal": "Read a stable value"},
+        },
+    )
+    provider = FakeControlProvider(
+        (
+            batch(
+                call("first-1", "variant-1"),
+                call("first-2", "variant-2"),
+                call("first-3", "variant-3"),
+            ),
+            batch(call("second-1", "variant-4"), call("second-2", "variant-5")),
+            finish(),
+        )
+    )
+    agent = make_loop(
+        provider,
+        task_observation=observation,
+        limits=RunLimits(max_stagnant_actions_per_family=3),
+    )
+
+    result = await agent.execute()
+
+    assert result.status is RunStatus.COMPLETED
+    assert agent.state.tool_calls == 3
+    rejected = [item.data for item in agent.events if isinstance(item.data, BatchRejected)]
+    assert len(rejected) == 1
+    notice = rejected[0].notice
+    assert notice.progress_reason == "stagnant_action_family"
+    assert notice.proposed_calls == 2
+    assert notice.prior_family_attempts == 3
+    replay(agent)
+
+
+def test_progress_rejects_oversized_or_duplicate_first_batch_without_spending_quota() -> None:
+    tools = ToolRegistry(
+        (
+            TypedTool(
+                name="echo",
+                version="1",
+                description="Read a value",
+                input_type=Input,
+                output_type=Output,
+                execute=echo,
+            ),
+        )
+    )
+    policy = SemanticProgressPolicy(tools, max_stagnant_actions_per_family=3)
+    task = TaskInput(goal="Read and report the value")
+    oversized = policy.inspect(
+        task=task,
+        observation=None,
+        records=(),
+        batch=ToolBatch(
+            calls=tuple(call(f"oversized-{index}", f"variant-{index}") for index in range(4))
+        ),
+        capability_epoch=0,
+    )
+    duplicate = policy.inspect(
+        task=task,
+        observation=None,
+        records=(),
+        batch=ToolBatch(calls=(call("duplicate-1", "same"), call("duplicate-2", "same"))),
+        capability_epoch=0,
+    )
+
+    assert oversized.blocked and oversized.reason == "stagnant_action_family"
+    assert oversized.prior_family_attempts == 0 and oversized.reservations == ()
+    assert duplicate.blocked and duplicate.reason == "repeated_action"
+    assert duplicate.prior_family_attempts == 0 and duplicate.reservations == ()
+
+    admissible = policy.inspect(
+        task=task,
+        observation=None,
+        records=(),
+        batch=ToolBatch(
+            calls=tuple(call(f"accepted-{index}", f"variant-{index}") for index in range(3))
+        ),
+        capability_epoch=0,
+    )
+    assert not admissible.blocked
+    assert len(admissible.reservations) == 1
+    assert len(admissible.reservations[0].canonical_action_sha256s) == 3
+    policy.record_admission(admissible)
+    exhausted = policy.inspect(
+        task=task,
+        observation=None,
+        records=(),
+        batch=ToolBatch(calls=(call("after-limit", "another"),)),
+        capability_epoch=0,
+    )
+    assert exhausted.blocked and exhausted.prior_family_attempts == 3
+
+
+def test_progress_reserves_independent_action_families_atomically() -> None:
+    tools = ToolRegistry(
+        tuple(
+            TypedTool(
+                name=name,
+                version="1",
+                description=f"Read through {name}",
+                input_type=Input,
+                output_type=Output,
+                execute=echo,
+            )
+            for name in ("primary", "alternate")
+        )
+    )
+    policy = SemanticProgressPolicy(tools, max_stagnant_actions_per_family=2)
+    task = TaskInput(goal="Read and report the value")
+    mixed = policy.inspect(
+        task=task,
+        observation=None,
+        records=(),
+        batch=ToolBatch(
+            calls=(
+                call("primary-1", "one", name="primary"),
+                call("alternate-1", "one", name="alternate"),
+                call("primary-2", "two", name="primary"),
+                call("alternate-2", "two", name="alternate"),
+            )
+        ),
+        capability_epoch=0,
+    )
+
+    assert not mixed.blocked and len(mixed.reservations) == 2
+    assert {len(item.canonical_action_sha256s) for item in mixed.reservations} == {2}
+    policy.record_admission(mixed)
+    blocked = policy.inspect(
+        task=task,
+        observation=None,
+        records=(),
+        batch=ToolBatch(calls=(call("primary-3", "three", name="primary"),)),
+        capability_epoch=0,
+    )
+    assert blocked.blocked and blocked.prior_family_attempts == 2
 
 
 def test_semantic_frontier_allows_real_need_progress_and_an_alternative_family() -> None:
@@ -489,7 +636,7 @@ def test_semantic_frontier_allows_real_need_progress_and_an_alternative_family()
             for name in ("primary", "alternate")
         )
     )
-    policy = SemanticProgressPolicy(tools, max_stagnant_batches_per_action_family=1)
+    policy = SemanticProgressPolicy(tools, max_stagnant_actions_per_family=1)
     task = TaskInput(goal="Read and report the value")
 
     def observation(digest: str) -> TaskObservation:
@@ -1208,7 +1355,8 @@ async def test_v3_cancellation_joins_running_tool_children_without_fake_settleme
         return Output(value="unreachable")
 
     agent = make_loop(
-        FakeControlProvider((batch(call("a"), call("b"), call("queued")),)), execute=wait
+        FakeControlProvider((batch(call("a", "a"), call("b", "b"), call("queued", "queued")),)),
+        execute=wait,
     )
     task = asyncio.create_task(agent.execute())
     async with asyncio.timeout(1):
@@ -1237,7 +1385,9 @@ async def test_v3_task_revision_keeps_started_results_skips_queued_calls_and_rep
         await release.wait()
         return Output(value=arguments.value)
 
-    provider = FakeControlProvider((batch(call("a"), call("b"), call("queued")), finish("revised")))
+    provider = FakeControlProvider(
+        (batch(call("a", "a"), call("b", "b"), call("queued", "queued")), finish("revised"))
+    )
     agent = make_loop(provider, execute=wait)
     task = asyncio.create_task(agent.execute())
     async with asyncio.timeout(1):
@@ -1266,7 +1416,7 @@ async def test_maximum_batch_reserves_failures_sources_and_bounded_repair_channe
 ):
     from weavria.tools import ToolFault
 
-    proposed = tuple(call(f'来源-"{i}"', "fail" if i % 2 else "ok") for i in range(32))
+    proposed = tuple(call(f'来源-"{i}"', f"fail-{i}" if i % 2 else f"ok-{i}") for i in range(32))
     reservation = reserve_feedback(
         instructions=await sizing_instructions(),
         task=TaskInput(goal="Read and report the value"),
@@ -1277,7 +1427,7 @@ async def test_maximum_batch_reserves_failures_sources_and_bounded_repair_channe
     )
 
     async def mixed(arguments: Input, context: ToolContext) -> Output:
-        if arguments.value == "fail":
+        if arguments.value.startswith("fail-"):
             raise ToolFault(ErrorCategory.POLICY_DENIED, "safe detail " * 4000)
         return Output(value="x" * 10000)
 
@@ -1299,7 +1449,11 @@ async def test_maximum_batch_reserves_failures_sources_and_bounded_repair_channe
         provider,
         execute=mixed,
         completion=Check(),
-        limits=RunLimits(max_tool_calls=32, max_request_bytes=reservation.required_bytes),
+        limits=RunLimits(
+            max_tool_calls=32,
+            max_request_bytes=reservation.required_bytes,
+            max_stagnant_actions_per_family=32,
+        ),
         mode=EvidenceMode.FULL,
     )
     result = await agent.execute()

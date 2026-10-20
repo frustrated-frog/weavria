@@ -51,8 +51,8 @@ class ProgressControlCaseResult(BaseModel):
 class ProgressControlExperiment(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
     policy_version: str
-    baseline_version: Literal["exact-action-only/1"] = "exact-action-only/1"
-    max_stagnant_batches_per_action_family: int = Field(ge=1)
+    baseline_version: Literal["exact-action-only/2"] = "exact-action-only/2"
+    max_stagnant_actions_per_family: int = Field(ge=1)
     cases: tuple[ProgressControlCaseResult, ...]
     selected_correct: int = Field(ge=0)
     baseline_correct: int = Field(ge=0)
@@ -63,7 +63,7 @@ def evaluate_progress_control(
     cases: tuple[ProgressControlCase, ...],
     registry: ToolRegistry,
     *,
-    max_stagnant_batches_per_action_family: int = 3,
+    max_stagnant_actions_per_family: int = 3,
 ) -> ProgressControlExperiment:
     """Compare frontier-family control with an exact-canonical-repeat baseline.
 
@@ -77,9 +77,9 @@ def evaluate_progress_control(
     for case in cases:
         policy = SemanticProgressPolicy(
             registry,
-            max_stagnant_batches_per_action_family=(max_stagnant_batches_per_action_family),
+            max_stagnant_actions_per_family=max_stagnant_actions_per_family,
         )
-        baseline_seen: set[tuple[str, str]] = set()
+        baseline = SemanticProgressPolicy(registry, max_stagnant_actions_per_family=1_000_000)
         attempt_results: list[ProgressAttemptResult] = []
         task = TaskInput(goal=case.goal)
         for attempt_index, attempt in enumerate(case.attempts, 1):
@@ -120,12 +120,18 @@ def evaluate_progress_control(
             selected_disposition: Literal["allow", "block"] = "block" if check.blocked else "allow"
             if not check.blocked:
                 policy.record_admission(check)
-            baseline_key = (check.fingerprint_sha256, check.canonical_tool_key_sha256)
-            baseline_disposition: Literal["allow", "block"] = (
-                "block" if baseline_key in baseline_seen else "allow"
+            baseline_check = baseline.inspect(
+                task=task,
+                observation=observation,
+                records=(),
+                batch=batch,
+                capability_epoch=1,
             )
-            if baseline_disposition == "allow":
-                baseline_seen.add(baseline_key)
+            baseline_disposition: Literal["allow", "block"] = (
+                "block" if baseline_check.blocked else "allow"
+            )
+            if not baseline_check.blocked:
+                baseline.record_admission(baseline_check)
             attempt_results.append(
                 ProgressAttemptResult(
                     attempt_index=attempt_index,
@@ -153,7 +159,7 @@ def evaluate_progress_control(
     total_attempts = sum(len(item.attempts) for item in case_results)
     return ProgressControlExperiment(
         policy_version=SemanticProgressPolicy.version,
-        max_stagnant_batches_per_action_family=max_stagnant_batches_per_action_family,
+        max_stagnant_actions_per_family=max_stagnant_actions_per_family,
         cases=tuple(case_results),
         selected_correct=sum(item.selected_correct for item in case_results),
         baseline_correct=sum(item.baseline_correct for item in case_results),

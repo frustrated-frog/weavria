@@ -147,7 +147,7 @@ class RunLimits:
     max_completion_duration: float = 10.0
     max_completion_repairs: int = 3
     max_no_progress_rejections: int = 2
-    max_stagnant_batches_per_action_family: int = 3
+    max_stagnant_actions_per_family: int = 3
 
     def __post_init__(self) -> None:
         for value in (self.max_model_calls, self.max_tool_calls, self.max_request_bytes):
@@ -158,8 +158,8 @@ class RunLimits:
         if type(self.max_no_progress_rejections) is not int or self.max_no_progress_rejections < 1:
             raise ValueError("no-progress rejection limit must be a positive integer")
         if (
-            type(self.max_stagnant_batches_per_action_family) is not int
-            or self.max_stagnant_batches_per_action_family < 1
+            type(self.max_stagnant_actions_per_family) is not int
+            or self.max_stagnant_actions_per_family < 1
         ):
             raise ValueError("stagnant action-family limit must be a positive integer")
         for duration in (self.max_duration, self.max_model_duration, self.max_completion_duration):
@@ -268,9 +268,7 @@ class _AgentKernel:
         self._instructions = _instructions_for(instructions, tools, journal_version)
         self._progress = progress or SemanticProgressPolicy(
             tools,
-            max_stagnant_batches_per_action_family=(
-                self._limits.max_stagnant_batches_per_action_family
-            ),
+            max_stagnant_actions_per_family=self._limits.max_stagnant_actions_per_family,
         )
         self._no_progress_rejections = 0
         self._no_progress_frontier: str | None = None
