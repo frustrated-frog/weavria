@@ -12,6 +12,16 @@ from weavria.harness import TaskSpecification
 
 type ProgressStrategy = Literal["semantic_frontier", "exact_action_only"]
 type ProgressScenario = Literal["stagnant_missing", "progressive_evidence"]
+type ProviderFinishReason = Literal[
+    "stop",
+    "length",
+    "content_filter",
+    "tool_calls",
+    "other",
+    "missing",
+    "request_failed",
+    "invalid_payload",
+]
 
 
 class _EvaluationModel(BaseModel):
@@ -101,6 +111,7 @@ class LiveProgressRun(_EvaluationModel):
     task_outcome: Literal["verified", "unverified", "unverifiable"] | None = None
     output: str | None = None
     error_category: ErrorCategory | None = None
+    error_cause_type: str | None = Field(default=None, min_length=1, max_length=128)
     harness_error_type: str | None = None
     terminal_reason: str | None = None
     model_calls: int = Field(ge=0)
@@ -108,6 +119,8 @@ class LiveProgressRun(_EvaluationModel):
     tool_calls: int = Field(ge=0)
     no_progress_rejections: int = Field(ge=0)
     action_family_rejections: int = Field(ge=0)
+    admitted_batch_shapes: tuple[tuple[str, ...], ...] = ()
+    provider_finish_reasons: tuple[ProviderFinishReason, ...] = ()
     latency_ms: float = Field(ge=0)
     provider_latency_ms: float = Field(ge=0)
     usage: TokenUsage
@@ -120,6 +133,7 @@ class LiveProgressRun(_EvaluationModel):
             self.task_outcome is not None
             or self.output is not None
             or self.error_category is not None
+            or self.error_cause_type is not None
             or self.terminal_reason is not None
         ):
             raise ValueError("harness failures cannot claim a Runtime terminal outcome")
@@ -133,12 +147,23 @@ class LiveProgressRun(_EvaluationModel):
             raise ValueError("completed live runs require output and forbid an error")
         if self.execution_status is RunStatus.FAILED and self.error_category is None:
             raise ValueError("failed live runs require an error category")
+        if self.error_cause_type is not None and self.error_category is None:
+            raise ValueError("error cause types require a Runtime error category")
         if self.execution_status in {RunStatus.CANCELLED, RunStatus.BUDGET_EXHAUSTED} and (
             self.output is not None or self.error_category is not None
         ):
             raise ValueError("cancelled or exhausted live runs forbid output and errors")
         if self.action_family_rejections > self.no_progress_rejections:
             raise ValueError("action-family rejections are a subset of no-progress rejections")
+        if len(self.provider_finish_reasons) != self.provider_calls:
+            raise ValueError("every Provider call requires one finish-reason observation")
+        if any(
+            not shape or any(not name.strip() for name in shape)
+            for shape in self.admitted_batch_shapes
+        ):
+            raise ValueError("admitted batch shapes require nonblank tool names")
+        if len(self.admitted_batch_shapes) > self.model_calls:
+            raise ValueError("admitted batch shapes cannot exceed model calls")
         return self
 
 
@@ -195,9 +220,9 @@ class LiveProgressConfiguration(_EvaluationModel):
 
 
 class LiveProgressExperiment(_EvaluationModel):
-    schema_version: Literal[1] = 1
+    schema_version: Literal[2] = 2
     dataset_version: str
-    evaluator_version: Literal["live-progress-control/1"] = "live-progress-control/1"
+    evaluator_version: Literal["live-progress-control/2"] = "live-progress-control/2"
     dataset_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     model: str
     repeats: int = Field(ge=1)
@@ -216,7 +241,7 @@ def load_live_progress_dataset(path: Path) -> tuple[LiveProgressDataset, str]:
 
 
 def result_is_correct(case: LiveProgressCase, run: LiveProgressRun) -> bool:
-    """Apply scenario-level outcome checks without grading natural-language style."""
+    """Grade frozen task results independently of the Runtime's answer authority."""
     if run.execution_status is None:
         return False
     if case.scenario == "stagnant_missing":
@@ -226,7 +251,10 @@ def result_is_correct(case: LiveProgressCase, run: LiveProgressRun) -> bool:
             "model_calls",
             "tool_calls",
         }
-    if run.execution_status is not RunStatus.COMPLETED or run.task_outcome != "verified":
+    # The frozen expected terms belong to the evaluator, not the Runtime. Without an
+    # answer verifier the Runtime must preserve ``unverified`` even when all mandatory
+    # evidence obligations are satisfied; the evaluator must not rewrite that outcome.
+    if run.execution_status is not RunStatus.COMPLETED:
         return False
     normalized = (run.output or "").casefold()
     return all(term.casefold() in normalized for term in case.expected_output_terms)

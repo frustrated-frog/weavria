@@ -35,12 +35,15 @@ def _run(
             "task_outcome": "verified" if status is RunStatus.COMPLETED else "unverified",
             "output": output,
             "error_category": (ErrorCategory.NO_PROGRESS if status is RunStatus.FAILED else None),
+            "error_cause_type": ("ProgressLimitError" if status is RunStatus.FAILED else None),
             "terminal_reason": terminal_reason,
             "model_calls": 4,
             "provider_calls": 4,
             "tool_calls": 3,
             "no_progress_rejections": int(terminal_reason == "no_progress"),
             "action_family_rejections": int(terminal_reason == "no_progress"),
+            "admitted_batch_shapes": (("inspect",),),
+            "provider_finish_reasons": ("stop", "stop", "stop", "stop"),
             "latency_ms": 12.5,
             "provider_latency_ms": 10.0,
             "usage": TokenUsage(prompt_tokens=8, completion_tokens=2, total_tokens=10),
@@ -109,6 +112,8 @@ def test_live_report_requires_complete_matrix_and_aggregates_known_usage() -> No
         runs=runs,
     )
 
+    assert report.schema_version == 2
+    assert report.evaluator_version == "live-progress-control/2"
     assert [summary.result_correct for summary in report.summaries] == [2, 2]
     assert [summary.reported_total_tokens for summary in report.summaries] == [20, 20]
     assert all(summary.usage_coverage == 1 for summary in report.summaries)
@@ -123,18 +128,38 @@ def test_live_report_requires_complete_matrix_and_aggregates_known_usage() -> No
         )
 
 
-def test_progressive_result_requires_verified_answer_terms() -> None:
+def test_progressive_result_is_graded_independently_without_upgrading_runtime_outcome() -> None:
     dataset, _ = load_live_progress_dataset(_dataset_path())
     case = dataset.cases[1]
-    incomplete = _run(
+    correct_but_unverified = _run(
         strategy="semantic_frontier",
         case_id=case.case_id,
         status=RunStatus.COMPLETED,
-        output="Atlas is owned by Robin",
+        output="Atlas is owned by Robin and is due 2030-05-01",
+        terminal_reason="completed",
+    ).model_copy(update={"task_outcome": "unverified"})
+    incomplete = correct_but_unverified.model_copy(update={"output": "Atlas is owned by Robin"})
+
+    assert result_is_correct(case, correct_but_unverified)
+    assert correct_but_unverified.task_outcome == "unverified"
+    assert not result_is_correct(case, incomplete)
+
+
+def test_live_run_requires_diagnostics_to_match_provider_and_runtime_outcomes() -> None:
+    dataset, _ = load_live_progress_dataset(_dataset_path())
+    case = dataset.cases[1]
+    run = _run(
+        strategy="semantic_frontier",
+        case_id=case.case_id,
+        status=RunStatus.COMPLETED,
+        output="Atlas is owned by Robin and is due 2030-05-01",
         terminal_reason="completed",
     )
 
-    assert not result_is_correct(case, incomplete)
+    with pytest.raises(ValueError, match="finish-reason"):
+        LiveProgressRun.model_validate(
+            {**run.model_dump(), "provider_finish_reasons": ("stop",)}, strict=True
+        )
 
 
 def test_stagnant_result_does_not_count_provider_failure_as_correct() -> None:

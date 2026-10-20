@@ -11,13 +11,23 @@ from pathlib import Path
 from typing import Any, Literal
 
 import httpx
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from weavria.core import BatchRejected, ModelStarted, RunEnded, SessionRunEvent, ToolRecorded
+from weavria.core import (
+    BatchAdmitted,
+    BatchRejected,
+    ModelStarted,
+    RunEnded,
+    SessionRunEvent,
+    ToolBatch,
+    ToolRecorded,
+    TurnDecided,
+)
 from weavria.evaluation import (
     LiveProgressCase,
     LiveProgressConfiguration,
     LiveProgressRun,
+    ProviderFinishReason,
     TokenUsage,
     build_live_progress_experiment,
     load_live_progress_dataset,
@@ -49,6 +59,7 @@ _BASELINE_FAMILY_LIMIT = 1000
 class ModelCallSample:
     latency_ms: float
     usage: TokenUsage
+    finish_reason: ProviderFinishReason
 
 
 class _UsagePayload(BaseModel):
@@ -60,9 +71,19 @@ class _UsagePayload(BaseModel):
     total_tokens: int | None = None
 
 
+class _ChoicePayload(BaseModel):
+    model_config = ConfigDict(extra="ignore", strict=True)
+    finish_reason: str | None = None
+
+
 class _CompletionPayload(BaseModel):
     model_config = ConfigDict(extra="ignore", strict=True)
     usage: _UsagePayload | None = None
+
+
+class _FinishPayload(BaseModel):
+    model_config = ConfigDict(extra="ignore", strict=True)
+    choices: list[_ChoicePayload] = Field(default_factory=list[_ChoicePayload])
 
 
 class _RecordingHTTPTransport:
@@ -78,17 +99,24 @@ class _RecordingHTTPTransport:
     async def complete(self, body: dict[str, Any]) -> object:
         started = time.perf_counter()
         usage = TokenUsage()
+        finish_reason: ProviderFinishReason = "request_failed"
         try:
             response = await self._client.post(self._url, json=body)
             response.raise_for_status()
-            payload: object = response.json()
+            try:
+                payload: object = response.json()
+            except ValueError:
+                finish_reason = "invalid_payload"
+                raise
             usage = usage_from_payload(payload)
+            finish_reason = finish_reason_from_payload(payload)
             return payload
         finally:
             self.samples.append(
                 ModelCallSample(
                     latency_ms=(time.perf_counter() - started) * 1000,
                     usage=usage,
+                    finish_reason=finish_reason,
                 )
             )
 
@@ -203,6 +231,26 @@ def usage_from_payload(payload: object) -> TokenUsage:
         return TokenUsage()
 
 
+def finish_reason_from_payload(payload: object) -> ProviderFinishReason:
+    """Reduce provider-specific finish values without retaining response content."""
+    try:
+        choices = _FinishPayload.model_validate(payload).choices
+    except ValidationError:
+        return "invalid_payload"
+    if not choices or choices[0].finish_reason is None:
+        return "missing"
+    reason = choices[0].finish_reason
+    if reason == "stop":
+        return "stop"
+    if reason == "length":
+        return "length"
+    if reason == "content_filter":
+        return "content_filter"
+    if reason == "tool_calls":
+        return "tool_calls"
+    return "other"
+
+
 def aggregate_usage(samples: tuple[ModelCallSample, ...]) -> TokenUsage:
     def total(field: str) -> int | None:
         values = [getattr(sample.usage, field) for sample in samples]
@@ -236,12 +284,14 @@ async def _run_once(
     task_outcome = None
     output = None
     error_category = None
+    error_cause_type = None
     harness_error_type = None
     terminal_reason = None
     model_calls = 0
     tool_calls = 0
     no_progress_rejections = 0
     action_family_rejections = 0
+    admitted_batch_shapes: tuple[tuple[str, ...], ...] = ()
     database = root / f"{repetition}-{strategy}-{case.case_id}.db"
     try:
         async with SessionEngine(
@@ -277,18 +327,30 @@ async def _run_once(
             output = result.report.output
             if result.report.error is not None:
                 error_category = result.report.error.category
+                error_cause_type = result.report.error.cause_type
             events = await engine.store.events(session_id)
-        run_facts = tuple(
-            event.data.event.data
+        run_events = tuple(
+            event.data.event
             for event in events
             if isinstance(event.data, SessionRunEvent) and event.data.event.run_id == result.run_id
         )
+        run_facts = tuple(event.data for event in run_events)
         model_calls = sum(isinstance(fact, ModelStarted) for fact in run_facts)
         tool_calls = sum(isinstance(fact, ToolRecorded) for fact in run_facts)
         rejected = tuple(fact for fact in run_facts if isinstance(fact, BatchRejected))
         no_progress_rejections = sum(fact.notice.reason == "no_progress" for fact in rejected)
         action_family_rejections = sum(
             fact.notice.progress_reason == "stagnant_action_family" for fact in rejected
+        )
+        admitted_steps = {
+            event.step_id for event in run_events if isinstance(event.data, BatchAdmitted)
+        }
+        admitted_batch_shapes = tuple(
+            tuple(call.tool_name for call in event.data.turn.decision.calls)
+            for event in run_events
+            if event.step_id in admitted_steps
+            and isinstance(event.data, TurnDecided)
+            and isinstance(event.data.turn.decision, ToolBatch)
         )
         terminal_reason = next(
             (fact.reason for fact in reversed(run_facts) if isinstance(fact, RunEnded)),
@@ -299,11 +361,13 @@ async def _run_once(
         task_outcome = None
         output = None
         error_category = None
+        error_cause_type = None
         terminal_reason = None
         model_calls = 0
         tool_calls = 0
         no_progress_rejections = 0
         action_family_rejections = 0
+        admitted_batch_shapes = ()
         harness_error_type = type(exc).__name__
     samples = tuple(transport.samples[sample_offset:])
     return LiveProgressRun(
@@ -315,6 +379,7 @@ async def _run_once(
         task_outcome=task_outcome,
         output=output,
         error_category=error_category,
+        error_cause_type=error_cause_type,
         harness_error_type=harness_error_type,
         terminal_reason=terminal_reason,
         model_calls=model_calls,
@@ -322,6 +387,8 @@ async def _run_once(
         tool_calls=tool_calls,
         no_progress_rejections=no_progress_rejections,
         action_family_rejections=action_family_rejections,
+        admitted_batch_shapes=admitted_batch_shapes,
+        provider_finish_reasons=tuple(sample.finish_reason for sample in samples),
         latency_ms=(time.perf_counter() - started) * 1000,
         provider_latency_ms=sum(sample.latency_ms for sample in samples),
         usage=aggregate_usage(samples),
