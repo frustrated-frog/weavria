@@ -18,6 +18,14 @@ from .intent_decision import (
     IntentDecisionExperiment,
     evaluate_intent_decision,
 )
+from .progress_control import (
+    ProgressAttempt,
+    ProgressAttemptResult,
+    ProgressControlCase,
+    ProgressControlCaseResult,
+    ProgressControlExperiment,
+    evaluate_progress_control,
+)
 
 __all__ = [
     "CapabilityCase",
@@ -29,7 +37,13 @@ __all__ = [
     "IntentDecisionCase",
     "IntentDecisionCaseResult",
     "IntentDecisionExperiment",
+    "ProgressAttempt",
+    "ProgressAttemptResult",
+    "ProgressControlCase",
+    "ProgressControlCaseResult",
+    "ProgressControlExperiment",
     "evaluate_capability_discovery",
     "evaluate_intent_clarification",
     "evaluate_intent_decision",
+    "evaluate_progress_control",
 ]

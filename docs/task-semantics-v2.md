@@ -9,6 +9,11 @@ Task Frame 不再是 Run 开始时的一次性附言。Weavria 现在维护版�
 Evidence Binding、动态 Capability View、Pending Clarification、Completion Obligation 和
 Progress Fingerprint。它们通过 Session Semantic Ledger 跨 Run 持久化。
 
+Progress 控制现在区分精确动作与动作族：Task-aware 路径只在有效 Need 状态、任务语义或能力
+视图改变时建立新前沿，不再让无关或波动的 Artifact SHA256 冒充进展。同一前沿允许有界参数
+探索，随后在派发前返回可诊断的 `stagnant_action_family`；切换独立能力仍然可行。详细决策与
+冻结基线见 [ADR 0022](decisions/0022-语义前沿与有界探索.md)。
+
 ## 2. 它解决什么问题
 
 旧路径能判断“执行哪个工具”，却不能回答工具结果满足了哪条事实需求，也不能在 steering、
@@ -55,10 +60,14 @@ Registry、Capability View 与 Tool Policy 分别代表“系统知道”“本�
 uv run pytest tests/harness tests/sessions tests/runtime tests/evaluation
 uv run ruff check .
 uv run pyright
+uv run python examples/progress_control.py
 ```
 
 能力发现实验用 `evaluate_capability_discovery` 比较 BM25/Schema 策略与 all-tools 基线的
 expected recall 和 visible count。它是机制诊断，不是自然语言任务完成率结论。
+
+进度控制实验用 `evaluate_progress_control` 比较语义前沿/动作族策略与仅阻止精确重复的基线。
+当前冻结合成轨迹为 8/8 对 7/8；它验证参数逃逸与真实 Need 推进的边界，不证明真实模型收益。
 
 ## 6. 当前刻意没有实现什么
 

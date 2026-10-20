@@ -65,6 +65,9 @@ class AdmissionNotice(ContractModel):
     remaining_tool_calls: int = Field(ge=0)
     progress_fingerprint_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
     canonical_tool_key_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    progress_reason: Literal["repeated_action", "stagnant_action_family"] | None = None
+    action_family_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    prior_family_attempts: int | None = Field(default=None, ge=1)
 
     @model_validator(mode="after")
     def bound_notice(self) -> Self:
@@ -74,6 +77,19 @@ class AdmissionNotice(ContractModel):
             and self.canonical_tool_key_sha256 is not None
         ):
             raise ValueError("no-progress rejection requires both diagnostic digests")
+        progress_details = (
+            self.progress_reason,
+            self.action_family_sha256,
+            self.prior_family_attempts,
+        )
+        # Detail fields were added compatibly to v3. Old persisted notices may omit all three;
+        # newly emitted notices either provide the complete diagnostic tuple or none of it.
+        if any(item is not None for item in progress_details) and not all(
+            item is not None for item in progress_details
+        ):
+            raise ValueError("no-progress detail fields must be complete")
+        if not progress and any(item is not None for item in progress_details):
+            raise ValueError("only no-progress rejection can carry progress details")
         if len(self.model_dump_json().encode()) > CONTROL_FEEDBACK_BYTES:
             raise ValueError("admission notice exceeds its reserved channel")
         return self

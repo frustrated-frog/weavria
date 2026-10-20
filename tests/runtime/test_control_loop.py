@@ -229,8 +229,11 @@ async def test_no_progress_rejects_repeated_canonical_call_after_unchanged_feedb
     assert len(rejected) == 1
     notice = rejected[0].notice
     assert notice.reason == "no_progress"
+    assert notice.progress_reason == "repeated_action"
     assert notice.progress_fingerprint_sha256 is not None
     assert notice.canonical_tool_key_sha256 is not None
+    assert notice.action_family_sha256 is not None
+    assert notice.prior_family_attempts == 1
     assert provider.requests[-1].control == notice
 
 
@@ -306,6 +309,7 @@ def test_progress_ignores_projection_revisions_but_keeps_effective_frame_semanti
         batch=ToolBatch(calls=(call("next-1"),)),
         capability_epoch=1,
     )
+    policy.record_admission(first)
     repeated = policy.inspect(
         task=task,
         observation=observation(3),
@@ -326,6 +330,155 @@ def test_progress_ignores_projection_revisions_but_keeps_effective_frame_semanti
     assert repeated.fingerprint_sha256 == first.fingerprint_sha256
     assert not changed.repeated
     assert changed.fingerprint_sha256 != repeated.fingerprint_sha256
+
+
+def test_progress_inspection_counts_only_committed_batch_admission() -> None:
+    tools = ToolRegistry(
+        (
+            TypedTool(
+                name="echo",
+                version="1",
+                description="Read a value",
+                input_type=Input,
+                output_type=Output,
+                execute=echo,
+            ),
+        )
+    )
+    policy = SemanticProgressPolicy(tools, max_stagnant_batches_per_action_family=2)
+    task = TaskInput(goal="Read and report the value")
+    proposal = ToolBatch(calls=(call("first", "one"),))
+
+    first = policy.inspect(
+        task=task,
+        observation=None,
+        records=(),
+        batch=proposal,
+        capability_epoch=0,
+    )
+    uncommitted_retry = policy.inspect(
+        task=task,
+        observation=None,
+        records=(),
+        batch=proposal,
+        capability_epoch=0,
+    )
+
+    assert not first.blocked
+    assert uncommitted_retry == first
+    policy.record_admission(first)
+    repeated = policy.inspect(
+        task=task,
+        observation=None,
+        records=(),
+        batch=proposal,
+        capability_epoch=0,
+    )
+    assert repeated.blocked and repeated.repeated
+    assert repeated.reason == "repeated_action"
+    with pytest.raises(ValueError, match="blocked progress proposal"):
+        policy.record_admission(repeated)
+
+
+async def test_semantic_frontier_bounds_volatile_outputs_from_one_action_family() -> None:
+    observation = TaskObservation(
+        observation_id="frame-1",
+        input_id="input-1",
+        task_revision=1,
+        frame_revision=1,
+        producer_version="test",
+        payload_schema="weavria.task-frame/2",
+        payload={
+            "need_state_sha256": "a" * 64,
+            "specification": {"goal": "Read a stable value"},
+        },
+    )
+    provider = FakeControlProvider(
+        (
+            batch(call("attempt-1", "volatile-1")),
+            batch(call("attempt-2", "volatile-2")),
+            batch(call("attempt-3", "volatile-3")),
+            batch(call("attempt-4", "volatile-4")),
+            finish(),
+        )
+    )
+    agent = make_loop(
+        provider,
+        task_observation=observation,
+        limits=RunLimits(max_stagnant_batches_per_action_family=3),
+    )
+
+    result = await agent.execute()
+
+    assert result.status is RunStatus.COMPLETED
+    assert agent.state.tool_calls == 3
+    assert len({record.artifact.sha256 for record in agent.state.records if record.artifact}) == 3
+    rejected = [item.data for item in agent.events if isinstance(item.data, BatchRejected)]
+    assert len(rejected) == 1
+    notice = rejected[0].notice
+    assert notice.reason == "no_progress"
+    assert notice.progress_reason == "stagnant_action_family"
+    assert notice.prior_family_attempts == 3
+
+
+def test_semantic_frontier_allows_real_need_progress_and_an_alternative_family() -> None:
+    tools = ToolRegistry(
+        tuple(
+            TypedTool(
+                name=name,
+                version="1",
+                description=f"Read through {name}",
+                input_type=Input,
+                output_type=Output,
+                execute=echo,
+            )
+            for name in ("primary", "alternate")
+        )
+    )
+    policy = SemanticProgressPolicy(tools, max_stagnant_batches_per_action_family=1)
+    task = TaskInput(goal="Read and report the value")
+
+    def observation(digest: str) -> TaskObservation:
+        return TaskObservation(
+            observation_id=f"frame-{digest[0]}",
+            input_id="input-1",
+            task_revision=1,
+            frame_revision=1,
+            producer_version="test",
+            payload_schema="weavria.task-frame/2",
+            payload={
+                "need_state_sha256": digest,
+                "specification": {"goal": "Read and report the value"},
+            },
+        )
+
+    first = policy.inspect(
+        task=task,
+        observation=observation("a" * 64),
+        records=(),
+        batch=ToolBatch(calls=(call("primary-1", "one", name="primary"),)),
+        capability_epoch=1,
+    )
+    policy.record_admission(first)
+    changed_need = policy.inspect(
+        task=task,
+        observation=observation("b" * 64),
+        records=(),
+        batch=ToolBatch(calls=(call("primary-2", "two", name="primary"),)),
+        capability_epoch=1,
+    )
+    same_frontier_alternative = policy.inspect(
+        task=task,
+        observation=observation("a" * 64),
+        records=(),
+        batch=ToolBatch(calls=(call("alternate-1", "two", name="alternate"),)),
+        capability_epoch=1,
+    )
+
+    assert not changed_need.blocked
+    assert changed_need.fingerprint_sha256 != first.fingerprint_sha256
+    assert not same_frontier_alternative.blocked
+    assert same_frontier_alternative.action_family_sha256 != first.action_family_sha256
 
 
 async def test_full_mode_downgrades_to_real_receipt_without_losing_failure() -> None:
@@ -1140,6 +1293,29 @@ def test_oversized_control_fact_is_rejected_before_it_can_enter_the_journal() ->
             budget_bytes=12000,
             remaining_tool_calls=10**900,
         )
+
+
+def test_legacy_no_progress_notice_decodes_without_v3_detail_tuple() -> None:
+    notice = AdmissionNotice.model_validate(
+        {
+            "reason": "no_progress",
+            "proposal_sha256": "a" * 64,
+            "proposed_calls": 1,
+            "required_bytes": 100,
+            "budget_bytes": 1000,
+            "remaining_tool_calls": 2,
+            "progress_fingerprint_sha256": "b" * 64,
+            "canonical_tool_key_sha256": "c" * 64,
+        }
+    )
+
+    assert notice.progress_reason is None
+    assert notice.action_family_sha256 is None
+    assert notice.prior_family_attempts is None
+    incomplete = notice.model_dump()
+    incomplete["progress_reason"] = "repeated_action"
+    with pytest.raises(ValidationError, match="detail fields must be complete"):
+        AdmissionNotice.model_validate(incomplete)
 
 
 async def test_noncompleted_report_cannot_publish_an_accepted_verification() -> None:

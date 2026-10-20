@@ -31,6 +31,7 @@ uv run python examples/control_loop.py
 uv run python examples/control_loop.py --json
 uv run python examples/session_experiment.py
 uv run python examples/steering_experiment.py
+uv run python examples/progress_control.py
 ```
 
 示例实际读取本地资料、保存成果、调用读取工具，并从模型可见内容计算答案。相同任务与预算下比较完整历史、近期窗口和相关片段策略，检查答案来源、调用成本、依赖闭包与状态回放。这是确定性的信息交付实验，不是真实 LLM 能力评测。

@@ -264,6 +264,33 @@ async def test_current_data_is_not_claimed_fresh_by_structural_coverage() -> Non
     assert "$freshness" in ledger.state_for("need-a").missing_fields
 
 
+async def test_progress_digest_ignores_duplicate_partial_artifact_identities() -> None:
+    store, records = await _success_records()
+    resolver = EvidenceResolver()
+    requirement = _requirement(freshness="current")
+    first = await resolver.resolve(
+        work_id="work-a",
+        task_revision=1,
+        frame_revision=1,
+        requirements=(requirement,),
+        records=(records[0],),
+        read_artifact=lambda artifact_id: store.get("run-1", artifact_id),
+    )
+    duplicate_partial = await resolver.resolve(
+        work_id="work-a",
+        task_revision=1,
+        frame_revision=2,
+        requirements=(requirement,),
+        records=(records[1],),
+        read_artifact=lambda artifact_id: store.get("run-1", artifact_id),
+        previous=first,
+    )
+
+    assert duplicate_partial.evidence_revision == first.evidence_revision + 1
+    assert len(duplicate_partial.bindings) == 2
+    assert duplicate_partial.progress_sha256() == first.progress_sha256()
+
+
 async def test_domain_extractor_can_report_contradiction_without_changing_core_rules() -> None:
     class ContradictionExtractor:
         key = "domain-check"

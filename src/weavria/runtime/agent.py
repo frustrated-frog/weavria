@@ -147,6 +147,7 @@ class RunLimits:
     max_completion_duration: float = 10.0
     max_completion_repairs: int = 3
     max_no_progress_rejections: int = 2
+    max_stagnant_batches_per_action_family: int = 3
 
     def __post_init__(self) -> None:
         for value in (self.max_model_calls, self.max_tool_calls, self.max_request_bytes):
@@ -156,6 +157,11 @@ class RunLimits:
             raise ValueError("completion repair limit must be a nonnegative integer")
         if type(self.max_no_progress_rejections) is not int or self.max_no_progress_rejections < 1:
             raise ValueError("no-progress rejection limit must be a positive integer")
+        if (
+            type(self.max_stagnant_batches_per_action_family) is not int
+            or self.max_stagnant_batches_per_action_family < 1
+        ):
+            raise ValueError("stagnant action-family limit must be a positive integer")
         for duration in (self.max_duration, self.max_model_duration, self.max_completion_duration):
             if isinstance(duration, bool) or not math.isfinite(duration) or duration <= 0:
                 raise ValueError("run and model attempt durations must be positive and finite")
@@ -260,8 +266,14 @@ class _AgentKernel:
             feedback_bounds=self._bounds if journal_version == 3 else None,
         )
         self._instructions = _instructions_for(instructions, tools, journal_version)
-        self._progress = progress or SemanticProgressPolicy(tools)
+        self._progress = progress or SemanticProgressPolicy(
+            tools,
+            max_stagnant_batches_per_action_family=(
+                self._limits.max_stagnant_batches_per_action_family
+            ),
+        )
         self._no_progress_rejections = 0
+        self._no_progress_frontier: str | None = None
         self._events_json: list[str] = []
         self._plans: list[EvidencePlan | TurnEvidencePlan | ControlEvidencePlan] = []
         self._state: RunState | None = None
@@ -661,7 +673,10 @@ class _AgentKernel:
                 batch=batch,
                 capability_epoch=self._capability_epoch,
             )
-            if progress.repeated:
+            if progress.blocked:
+                if self._no_progress_frontier != progress.fingerprint_sha256:
+                    self._no_progress_frontier = progress.fingerprint_sha256
+                    self._no_progress_rejections = 0
                 self._no_progress_rejections += 1
                 if self._no_progress_rejections > self._limits.max_no_progress_rejections:
                     raise _NoProgressExhausted
@@ -688,12 +703,29 @@ class _AgentKernel:
                             if reason == "no_progress" and progress is not None
                             else None
                         ),
+                        progress_reason=(
+                            progress.reason
+                            if reason == "no_progress"
+                            and progress is not None
+                            and progress.reason != "novel_action"
+                            else None
+                        ),
+                        action_family_sha256=(
+                            progress.action_family_sha256
+                            if reason == "no_progress" and progress is not None
+                            else None
+                        ),
+                        prior_family_attempts=(
+                            progress.prior_family_attempts
+                            if reason == "no_progress" and progress is not None
+                            else None
+                        ),
                     )
                 ),
                 expected_revision=revision,
             )
             return False
-        return await self._accept(
+        accepted = await self._accept(
             BatchAdmitted(
                 reserved_bytes=reservation.required_bytes,
                 budget_bytes=reservation.budget_bytes,
@@ -702,6 +734,10 @@ class _AgentKernel:
             ),
             expected_revision=revision,
         )
+        if accepted:
+            assert progress is not None
+            self._progress.record_admission(progress)
+        return accepted
 
     async def _verify_completion(
         self, candidate: FinishAction, deadline: float
