@@ -9,6 +9,7 @@ from weavria.harness import (
     DeterministicBeliefUpdater,
     IntentHypothesis,
     IntentUncertainty,
+    RiskAwareAskOrActPolicy,
 )
 from weavria.tools import ToolContext, ToolRegistry, TypedTool
 
@@ -48,6 +49,34 @@ def _registry() -> ToolRegistry:
                 behavior="side_effect",
                 idempotency="unknown",
                 risk="high",
+                approval_required=True,
+            ),
+            TypedTool(
+                name="mutate_value",
+                version="1",
+                description="Mutate one value",
+                input_type=_Input,
+                output_type=_Output,
+                execute=_unused,
+                behavior="side_effect",
+                idempotency="unknown",
+            ),
+            TypedTool(
+                name="inspect_medium_risk_value",
+                version="1",
+                description="Read one medium-risk value",
+                input_type=_Input,
+                output_type=_Output,
+                execute=_unused,
+                risk="medium",
+            ),
+            TypedTool(
+                name="read_approval_value",
+                version="1",
+                description="Read one approval-bound value",
+                input_type=_Input,
+                output_type=_Output,
+                execute=_unused,
                 approval_required=True,
             ),
         )
@@ -101,6 +130,44 @@ def _question(
     )
 
 
+def _binary_uncertainty(
+    primary: IntentHypothesis,
+    secondary: IntentHypothesis,
+) -> IntentUncertainty:
+    return IntentUncertainty(
+        hypotheses=(primary, secondary),
+        candidate_questions=(
+            _question(
+                "action_boundary",
+                "Which of these two outcomes do you want?",
+                ((primary.hypothesis_id,), (secondary.hypothesis_id,)),
+            ),
+        ),
+    )
+
+
+def _decision_for(
+    uncertainty: IntentUncertainty,
+    *,
+    proposed_hypothesis_id: str | None,
+):
+    updater = DeterministicBeliefUpdater()
+    belief = updater.initialize(uncertainty)
+    question = ConsequenceAwareQuestionSelector().select(
+        uncertainty,
+        _registry(),
+        belief=belief,
+    )
+    return RiskAwareAskOrActPolicy().decide(
+        uncertainty,
+        belief,
+        question,
+        _registry(),
+        proposed_hypothesis_id=proposed_hypothesis_id,
+        proposed_action_sha256=("a" * 64 if proposed_hypothesis_id is not None else None),
+    )
+
+
 def test_selector_prefers_question_reducing_high_consequence_action_regret() -> None:
     uncertainty = IntentUncertainty(
         hypotheses=_hypotheses(),
@@ -150,6 +217,10 @@ def test_selector_is_deterministic_when_candidate_values_tie() -> None:
     decision = ConsequenceAwareQuestionSelector().select(uncertainty, _registry())
 
     assert decision.selected_question_id == "question_a"
+
+    forged = decision.model_copy(update={"values": (decision.values[0], decision.values[0])})
+    with pytest.raises(ValidationError, match="unique by question"):
+        type(decision).model_validate_json(forged.model_dump_json())
 
 
 def test_uncertainty_rejects_questions_that_do_not_partition_every_hypothesis() -> None:
@@ -212,6 +283,219 @@ def test_selector_rejects_hypothesis_outside_host_capability_ceiling() -> None:
 
     with pytest.raises(ValueError, match="unavailable capability"):
         ConsequenceAwareQuestionSelector().select(uncertainty, _registry())
+
+
+def test_ask_or_act_asks_when_question_value_exceeds_interaction_cost() -> None:
+    uncertainty = _binary_uncertainty(
+        IntentHypothesis(
+            hypothesis_id="primary",
+            interpretation="Return the primary answer",
+            intended_route="direct",
+            outcome_key="primary_answer",
+            support_weight=60,
+        ),
+        IntentHypothesis(
+            hypothesis_id="secondary",
+            interpretation="Return the secondary answer",
+            intended_route="direct",
+            outcome_key="secondary_answer",
+            support_weight=40,
+        ),
+    )
+
+    decision = _decision_for(uncertainty, proposed_hypothesis_id="primary")
+
+    assert decision.disposition == "ask"
+    assert decision.decision_reason == "question_has_positive_value"
+    assert decision.selected_action.representative_hypothesis_id == "primary"
+    assert decision.question_decision.values[0].net_value_micros > 0
+
+
+def test_ask_or_act_acts_on_dominant_complete_direct_proposal() -> None:
+    uncertainty = _binary_uncertainty(
+        IntentHypothesis(
+            hypothesis_id="primary",
+            interpretation="Return the overwhelmingly likely answer",
+            intended_route="direct",
+            outcome_key="primary_answer",
+            support_weight=100,
+        ),
+        IntentHypothesis(
+            hypothesis_id="secondary",
+            interpretation="Return the unlikely alternative",
+            intended_route="direct",
+            outcome_key="secondary_answer",
+            support_weight=1,
+        ),
+    )
+
+    decision = _decision_for(uncertainty, proposed_hypothesis_id="primary")
+
+    assert decision.disposition == "act"
+    assert decision.decision_reason == "question_not_worth_interaction_cost"
+    assert decision.selected_action.automatic_action_eligible is True
+    assert decision.selected_action.expected_regret_micros == 19_802
+    assert decision.question_decision.values[0].net_value_micros < 0
+
+
+def test_ask_or_act_requires_a_complete_proposal_even_when_action_is_dominant() -> None:
+    uncertainty = _binary_uncertainty(
+        IntentHypothesis(
+            hypothesis_id="primary",
+            interpretation="Return the overwhelmingly likely answer",
+            intended_route="direct",
+            outcome_key="primary_answer",
+            support_weight=100,
+        ),
+        IntentHypothesis(
+            hypothesis_id="secondary",
+            interpretation="Return the unlikely alternative",
+            intended_route="direct",
+            outcome_key="secondary_answer",
+            support_weight=1,
+        ),
+    )
+
+    decision = _decision_for(uncertainty, proposed_hypothesis_id=None)
+
+    assert decision.disposition == "ask"
+    assert decision.decision_reason == "missing_action_proposal"
+
+
+def test_ask_or_act_does_not_execute_a_non_optimal_model_proposal() -> None:
+    uncertainty = _binary_uncertainty(
+        IntentHypothesis(
+            hypothesis_id="primary",
+            interpretation="Return the overwhelmingly likely answer",
+            intended_route="direct",
+            outcome_key="primary_answer",
+            support_weight=100,
+        ),
+        IntentHypothesis(
+            hypothesis_id="secondary",
+            interpretation="Return the unlikely alternative",
+            intended_route="direct",
+            outcome_key="secondary_answer",
+            support_weight=1,
+        ),
+    )
+
+    decision = _decision_for(uncertainty, proposed_hypothesis_id="secondary")
+
+    assert decision.disposition == "ask"
+    assert decision.decision_reason == "proposal_not_optimal"
+    assert decision.selected_action.representative_hypothesis_id == "primary"
+
+
+def test_ask_or_act_breaks_equal_action_regret_by_stable_signature() -> None:
+    uncertainty = _binary_uncertainty(
+        IntentHypothesis(
+            hypothesis_id="first_in_input",
+            interpretation="Return the Z outcome",
+            intended_route="direct",
+            outcome_key="z_outcome",
+            support_weight=50,
+        ),
+        IntentHypothesis(
+            hypothesis_id="second_in_input",
+            interpretation="Return the A outcome",
+            intended_route="direct",
+            outcome_key="a_outcome",
+            support_weight=50,
+        ),
+    )
+
+    decision = _decision_for(uncertainty, proposed_hypothesis_id="second_in_input")
+
+    assert decision.selected_action.outcome_key == "a_outcome"
+    assert decision.selected_action.representative_hypothesis_id == "second_in_input"
+
+
+def test_ask_or_act_allows_only_low_risk_read_only_automatic_execution() -> None:
+    read_uncertainty = _binary_uncertainty(
+        IntentHypothesis(
+            hypothesis_id="read",
+            interpretation="Read the value",
+            intended_route="execute",
+            capability_names=("read_value",),
+            outcome_key="value_read",
+            support_weight=100,
+        ),
+        IntentHypothesis(
+            hypothesis_id="answer",
+            interpretation="Answer without reading",
+            intended_route="direct",
+            outcome_key="answer_only",
+            support_weight=1,
+        ),
+    )
+    send_uncertainty = _binary_uncertainty(
+        IntentHypothesis(
+            hypothesis_id="send",
+            interpretation="Send the value outside the process",
+            intended_route="execute",
+            capability_names=("send_value",),
+            outcome_key="value_sent",
+            support_weight=100,
+        ),
+        IntentHypothesis(
+            hypothesis_id="answer",
+            interpretation="Answer without sending",
+            intended_route="direct",
+            outcome_key="answer_only",
+            support_weight=1,
+        ),
+    )
+
+    read_decision = _decision_for(read_uncertainty, proposed_hypothesis_id="read")
+    send_decision = _decision_for(send_uncertainty, proposed_hypothesis_id="send")
+
+    assert read_decision.disposition == "act"
+    assert read_decision.selected_action.ineligibility_reasons == ()
+    assert send_decision.disposition == "ask"
+    assert send_decision.decision_reason == "automatic_action_blocked"
+    assert send_decision.selected_action.ineligibility_reasons == (
+        "side_effect",
+        "risk_above_low",
+        "approval_required",
+    )
+
+
+@pytest.mark.parametrize(
+    ("capability", "reason"),
+    (
+        ("mutate_value", "side_effect"),
+        ("inspect_medium_risk_value", "risk_above_low"),
+        ("read_approval_value", "approval_required"),
+    ),
+)
+def test_each_automatic_action_safety_constraint_is_non_compensable(
+    capability: str,
+    reason: str,
+) -> None:
+    uncertainty = _binary_uncertainty(
+        IntentHypothesis(
+            hypothesis_id="tool_action",
+            interpretation="Use the proposed capability",
+            intended_route="execute",
+            capability_names=(capability,),
+            outcome_key="tool_outcome",
+            support_weight=100,
+        ),
+        IntentHypothesis(
+            hypothesis_id="answer",
+            interpretation="Answer without a capability",
+            intended_route="direct",
+            outcome_key="answer_only",
+            support_weight=1,
+        ),
+    )
+
+    decision = _decision_for(uncertainty, proposed_hypothesis_id="tool_action")
+
+    assert decision.disposition == "ask"
+    assert decision.decision_reason == "automatic_action_blocked"
+    assert reason in decision.selected_action.ineligibility_reasons
 
 
 def test_belief_initializer_uses_exact_deterministic_fixed_point_support() -> None:

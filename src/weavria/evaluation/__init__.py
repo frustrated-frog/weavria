@@ -12,6 +12,12 @@ from .intent_clarification import (
     ClarificationExperiment,
     evaluate_intent_clarification,
 )
+from .intent_decision import (
+    IntentDecisionCase,
+    IntentDecisionCaseResult,
+    IntentDecisionExperiment,
+    evaluate_intent_decision,
+)
 
 __all__ = [
     "CapabilityCase",
@@ -20,6 +26,10 @@ __all__ = [
     "ClarificationCase",
     "ClarificationCaseResult",
     "ClarificationExperiment",
+    "IntentDecisionCase",
+    "IntentDecisionCaseResult",
+    "IntentDecisionExperiment",
     "evaluate_capability_discovery",
     "evaluate_intent_clarification",
+    "evaluate_intent_decision",
 ]

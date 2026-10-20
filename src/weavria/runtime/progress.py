@@ -97,6 +97,7 @@ def _frame_semantics_sha256(observation: TaskObservation | None) -> str:
         "weavria.task-frame/2",
         "weavria.task-frame/3",
         "weavria.task-frame/4",
+        "weavria.task-frame/5",
     }:
         payload = {
             key: value

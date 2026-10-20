@@ -528,6 +528,91 @@ class ClarificationDecision(_Contract):
     selection_reason: Literal["positive_net_value", "blocking_information_gain"]
     values: tuple[ClarificationQuestionValue, ...] = Field(min_length=1, max_length=4)
 
+    @model_validator(mode="after")
+    def validate_values(self) -> Self:
+        identifiers = [item.question_id for item in self.values]
+        if len(identifiers) != len(set(identifiers)):
+            raise ValueError("clarification decision values must be unique by question")
+        if self.selected_question_id not in identifiers:
+            raise ValueError("selected clarification question must have a value")
+        if len(set(self.target_ambiguities)) != len(self.target_ambiguities):
+            raise ValueError("selected clarification ambiguities must be unique")
+        return self
+
+
+class IntentActionValue(_Contract):
+    """Expected regret and hard auto-action eligibility for one unique consequence."""
+
+    representative_hypothesis_id: _Identifier
+    route: Literal["direct", "execute"]
+    outcome_key: _Identifier
+    capability_names: tuple[_Identifier, ...] = Field(default=(), max_length=8)
+    expected_regret_micros: int = Field(ge=0)
+    automatic_action_eligible: bool
+    ineligibility_reasons: tuple[
+        Literal["side_effect", "risk_above_low", "approval_required"], ...
+    ] = Field(default=(), max_length=3)
+
+    @model_validator(mode="after")
+    def validate_eligibility(self) -> Self:
+        if len(set(self.capability_names)) != len(self.capability_names):
+            raise ValueError("intent action capabilities must be unique")
+        if self.route == "direct" and self.capability_names:
+            raise ValueError("a direct intent action cannot invoke capabilities")
+        if self.route == "execute" and not self.capability_names:
+            raise ValueError("an execute intent action requires capabilities")
+        if len(set(self.ineligibility_reasons)) != len(self.ineligibility_reasons):
+            raise ValueError("intent action ineligibility reasons must be unique")
+        if self.automatic_action_eligible == bool(self.ineligibility_reasons):
+            raise ValueError("intent action eligibility disagrees with its reasons")
+        return self
+
+    @property
+    def action_signature(self) -> tuple[str, str, tuple[str, ...]]:
+        return self.route, self.outcome_key, tuple(sorted(self.capability_names))
+
+
+class IntentDecision(_Contract):
+    """Auditable host decision to ask or act under structured intent uncertainty."""
+
+    policy_version: _Text
+    disposition: Literal["ask", "act"]
+    decision_reason: Literal[
+        "missing_action_proposal",
+        "proposal_not_optimal",
+        "automatic_action_blocked",
+        "question_has_positive_value",
+        "question_not_worth_interaction_cost",
+    ]
+    belief_revision: int = Field(ge=1)
+    belief_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    uncertainty_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    selected_action: IntentActionValue
+    action_values: tuple[IntentActionValue, ...] = Field(min_length=2, max_length=4)
+    question_decision: ClarificationDecision
+    proposed_hypothesis_id: _Identifier | None = None
+    proposed_action_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+
+    @model_validator(mode="after")
+    def validate_decision(self) -> Self:
+        signatures = [item.action_signature for item in self.action_values]
+        if len(signatures) != len(set(signatures)):
+            raise ValueError("intent action values must describe unique consequences")
+        if self.selected_action not in self.action_values:
+            raise ValueError("selected intent action must appear in action values")
+        if (self.proposed_hypothesis_id is None) != (self.proposed_action_sha256 is None):
+            raise ValueError("intent action proposal identity and digest must be paired")
+        if self.disposition == "act":
+            if self.decision_reason != "question_not_worth_interaction_cost":
+                raise ValueError("an act decision requires the low-value-question reason")
+            if self.proposed_hypothesis_id is None:
+                raise ValueError("an act decision requires a complete action proposal")
+            if not self.selected_action.automatic_action_eligible:
+                raise ValueError("an ineligible intent action cannot be selected automatically")
+        elif self.decision_reason == "question_not_worth_interaction_cost":
+            raise ValueError("the low-value-question reason belongs to act decisions only")
+        return self
+
 
 class ClarificationQuestionSelector(Protocol):
     @property
@@ -540,6 +625,24 @@ class ClarificationQuestionSelector(Protocol):
         *,
         belief: IntentBeliefState | None = None,
     ) -> ClarificationDecision: ...
+
+
+class IntentDecisionPolicy(Protocol):
+    """Trusted policy choosing between one selected question and one proposed action."""
+
+    @property
+    def version(self) -> str: ...
+
+    def decide(
+        self,
+        uncertainty: IntentUncertainty,
+        belief: IntentBeliefState,
+        question_decision: ClarificationDecision,
+        tools: ToolRegistry,
+        *,
+        proposed_hypothesis_id: str | None = None,
+        proposed_action_sha256: str | None = None,
+    ) -> IntentDecision: ...
 
 
 class ConsequenceAwareQuestionSelector:
@@ -650,22 +753,212 @@ class ConsequenceAwareQuestionSelector:
         )
 
 
+class RiskAwareAskOrActPolicy:
+    """Choose Ask or Act from exact regret, question value and trusted tool risk.
+
+    The model may propose a complete action for one hypothesis, but it cannot decide
+    whether that action is safe or preferable. Automatic action is deliberately
+    limited to direct responses and low-risk, read-only, approval-free capabilities.
+    Tool Policy remains the final authorization boundary after this semantic choice.
+    """
+
+    version = "risk-aware-ask-or-act/1"
+
+    def decide(
+        self,
+        uncertainty: IntentUncertainty,
+        belief: IntentBeliefState,
+        question_decision: ClarificationDecision,
+        tools: ToolRegistry,
+        *,
+        proposed_hypothesis_id: str | None = None,
+        proposed_action_sha256: str | None = None,
+    ) -> IntentDecision:
+        uncertainty = IntentUncertainty.model_validate_json(uncertainty.model_dump_json())
+        belief = IntentBeliefState.model_validate_json(belief.model_dump_json())
+        question_decision = ClarificationDecision.model_validate_json(
+            question_decision.model_dump_json()
+        )
+        _validate_current_hypotheses(belief, uncertainty)
+        if (proposed_hypothesis_id is None) != (proposed_action_sha256 is None):
+            raise ValueError("intent action proposal identity and digest must be paired")
+
+        descriptors = {item.name: item for item in tools.descriptors}
+        unknown = {
+            name
+            for hypothesis in uncertainty.hypotheses
+            for name in hypothesis.capability_names
+            if name not in descriptors
+        }
+        if unknown:
+            raise ValueError("intent hypothesis references an unavailable capability")
+
+        by_id = {item.hypothesis_id: item for item in uncertainty.hypotheses}
+        if proposed_hypothesis_id is not None and proposed_hypothesis_id not in by_id:
+            raise ValueError("intent action proposal references an unknown hypothesis")
+        weights = {
+            item.hypothesis_id: Fraction(item.support_micros) for item in belief.viable_hypotheses
+        }
+        total = sum(weights.values(), Fraction())
+        normalized = {key: value / total for key, value in weights.items()}
+
+        representatives: dict[tuple[str, str, tuple[str, ...]], IntentHypothesis] = {}
+        for hypothesis in sorted(uncertainty.hypotheses, key=lambda item: item.hypothesis_id):
+            representatives.setdefault(hypothesis.action_signature, hypothesis)
+        valued: list[tuple[Fraction, IntentActionValue]] = []
+        for _, action in sorted(representatives.items()):
+            regret = _expected_regret(
+                tuple(uncertainty.hypotheses),
+                action,
+                normalized,
+                descriptors,
+            )
+            eligible, reasons = _automatic_action_eligibility(action, descriptors)
+            valued.append(
+                (
+                    regret,
+                    IntentActionValue(
+                        representative_hypothesis_id=action.hypothesis_id,
+                        route=action.intended_route,
+                        outcome_key=action.outcome_key,
+                        capability_names=tuple(sorted(action.capability_names)),
+                        expected_regret_micros=_to_micros(regret),
+                        automatic_action_eligible=eligible,
+                        ineligibility_reasons=reasons,
+                    ),
+                )
+            )
+        selected_regret, selected_action = min(
+            valued,
+            key=lambda item: (
+                item[0],
+                item[1].action_signature,
+                item[1].representative_hypothesis_id,
+            ),
+        )
+        _validate_question_decision(
+            uncertainty,
+            question_decision,
+            current_regret_micros=_to_micros(selected_regret),
+        )
+        selected_question_value = next(
+            item
+            for item in question_decision.values
+            if item.question_id == question_decision.selected_question_id
+        )
+        proposed = by_id.get(proposed_hypothesis_id) if proposed_hypothesis_id is not None else None
+
+        disposition: Literal["ask", "act"] = "ask"
+        reason: Literal[
+            "missing_action_proposal",
+            "proposal_not_optimal",
+            "automatic_action_blocked",
+            "question_has_positive_value",
+            "question_not_worth_interaction_cost",
+        ]
+        if proposed is None:
+            reason = "missing_action_proposal"
+        elif proposed.action_signature != selected_action.action_signature:
+            reason = "proposal_not_optimal"
+        elif not selected_action.automatic_action_eligible:
+            reason = "automatic_action_blocked"
+        elif selected_question_value.net_value_micros > 0:
+            reason = "question_has_positive_value"
+        else:
+            disposition = "act"
+            reason = "question_not_worth_interaction_cost"
+
+        return IntentDecision(
+            policy_version=self.version,
+            disposition=disposition,
+            decision_reason=reason,
+            belief_revision=belief.belief_revision,
+            belief_sha256=belief.content_sha256(),
+            uncertainty_sha256=intent_uncertainty_sha256(uncertainty),
+            selected_action=selected_action,
+            action_values=tuple(
+                item for _, item in sorted(valued, key=lambda item: item[1].action_signature)
+            ),
+            question_decision=question_decision,
+            proposed_hypothesis_id=proposed_hypothesis_id,
+            proposed_action_sha256=proposed_action_sha256,
+        )
+
+
+def intent_uncertainty_sha256(uncertainty: IntentUncertainty) -> str:
+    """Return the canonical digest bound into an Ask-or-Act decision."""
+    return hashlib.sha256(
+        json.dumps(
+            uncertainty.model_dump(mode="json"),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+
+
+def _validate_question_decision(
+    uncertainty: IntentUncertainty,
+    decision: ClarificationDecision,
+    *,
+    current_regret_micros: int,
+) -> None:
+    questions = {item.question_id: item for item in uncertainty.candidate_questions}
+    if set(questions) != {item.question_id for item in decision.values}:
+        raise ValueError("clarification decision does not value every candidate question")
+    selected = questions.get(decision.selected_question_id)
+    if selected is None:
+        raise ValueError("clarification decision selected an unknown question")
+    if (
+        decision.question_text != selected.question_text
+        or decision.target_ambiguities != selected.target_ambiguities
+    ):
+        raise ValueError("clarification decision changed the selected question")
+    if any(item.current_regret_micros != current_regret_micros for item in decision.values):
+        raise ValueError("clarification decision used a different current action regret")
+
+
+def _expected_regret(
+    truths: tuple[IntentHypothesis, ...],
+    action: IntentHypothesis,
+    beliefs: dict[str, Fraction],
+    descriptors: dict[str, ToolDescriptor],
+) -> Fraction:
+    return sum(
+        (
+            beliefs[truth.hypothesis_id] * _action_loss(truth, action, descriptors)
+            for truth in truths
+        ),
+        Fraction(),
+    )
+
+
+def _automatic_action_eligibility(
+    action: IntentHypothesis,
+    descriptors: dict[str, ToolDescriptor],
+) -> tuple[
+    bool,
+    tuple[Literal["side_effect", "risk_above_low", "approval_required"], ...],
+]:
+    reasons: list[Literal["side_effect", "risk_above_low", "approval_required"]] = []
+    for name in action.capability_names:
+        descriptor = descriptors[name]
+        if descriptor.behavior == "side_effect" and "side_effect" not in reasons:
+            reasons.append("side_effect")
+        if descriptor.risk != "low" and "risk_above_low" not in reasons:
+            reasons.append("risk_above_low")
+        if descriptor.approval_required and "approval_required" not in reasons:
+            reasons.append("approval_required")
+    return not reasons, tuple(reasons)
+
+
 def _best_expected_regret(
     truths: tuple[IntentHypothesis, ...],
     actions: tuple[IntentHypothesis, ...],
     beliefs: dict[str, Fraction],
     descriptors: dict[str, ToolDescriptor],
 ) -> Fraction:
-    return min(
-        sum(
-            (
-                beliefs[truth.hypothesis_id] * _action_loss(truth, action, descriptors)
-                for truth in truths
-            ),
-            Fraction(),
-        )
-        for action in actions
-    )
+    return min(_expected_regret(truths, action, beliefs, descriptors) for action in actions)
 
 
 def _action_loss(

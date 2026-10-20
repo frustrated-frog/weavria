@@ -3,7 +3,7 @@ import json
 from typing import Literal
 
 import pytest
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, JsonValue, ValidationError
 
 from weavria.artifacts import InMemoryArtifactStore
 from weavria.core import (
@@ -21,6 +21,8 @@ from weavria.core import (
     TaskInput,
     ToolBatch,
     ToolCallAction,
+    ToolFailedObservation,
+    ToolRecorded,
 )
 from weavria.harness import (
     CapabilityNeed,
@@ -33,6 +35,7 @@ from weavria.harness import (
     IntentHypothesis,
     IntentUncertainty,
     ModelTaskInterpreter,
+    ProposedTaskAction,
     TaskAwareAgent,
     TaskFrame,
     TaskSpecification,
@@ -49,7 +52,7 @@ from weavria.models import (
     ModelCapabilities,
     ModelOutputError,
 )
-from weavria.tools import ToolContext, ToolRegistry, TypedTool
+from weavria.tools import PolicyDecision, ToolContext, ToolDescriptor, ToolRegistry, TypedTool
 
 
 class _Input(BaseModel):
@@ -207,6 +210,100 @@ def _resolved_execute(*, outcome_key: str = "document_read") -> TaskSpecificatio
             ),
             "resolved_outcome_key": outcome_key,
         }
+    )
+
+
+def _ask_or_act_specification(
+    *,
+    primary_route: Literal["direct", "execute"],
+    primary_capability: str | None = None,
+) -> TaskSpecification:
+    ambiguity = "Whether the likely action is really intended"
+    primary = IntentHypothesis(
+        hypothesis_id="primary_action",
+        interpretation="Perform the overwhelmingly likely action",
+        intended_route=primary_route,
+        capability_names=((primary_capability,) if primary_capability is not None else ()),
+        outcome_key="primary_outcome",
+        support_weight=100,
+    )
+    secondary = IntentHypothesis(
+        hypothesis_id="secondary_answer",
+        interpretation="Return an alternative answer",
+        intended_route="direct",
+        outcome_key="secondary_outcome",
+        support_weight=1,
+    )
+    capability_needs = (
+        (
+            CapabilityNeed(
+                name=primary_capability,
+                purpose="Perform the proposed action",
+                necessity="required",
+            ),
+        )
+        if primary_capability is not None
+        else ()
+    )
+    information_needs = (
+        (
+            InformationNeed(
+                description="The value required by the proposed action",
+                source="external",
+                freshness="stable",
+            ),
+        )
+        if primary_capability is not None
+        else ()
+    )
+    action_criteria = (
+        (_criterion("capability_result", primary_capability), _criterion())
+        if primary_capability is not None
+        else (_criterion(),)
+    )
+    return TaskSpecification(
+        route="clarify",
+        intent="Choose between two action consequences",
+        goal="Ask only when the uncertainty is worth the interaction cost",
+        ambiguities=(ambiguity,),
+        uncertainty=IntentUncertainty(
+            hypotheses=(primary, secondary),
+            candidate_questions=(
+                ClarificationQuestionCandidate(
+                    question_id="action_boundary",
+                    question_text="Should I perform the likely action or only answer?",
+                    target_ambiguities=(ambiguity,),
+                    answer_options=(
+                        ClarificationAnswerOption(
+                            answer_id="primary",
+                            label="Perform it",
+                            hypothesis_ids=("primary_action",),
+                        ),
+                        ClarificationAnswerOption(
+                            answer_id="secondary",
+                            label="Only answer",
+                            hypothesis_ids=("secondary_answer",),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+        action_proposal=ProposedTaskAction(
+            hypothesis_id="primary_action",
+            outcome_key="primary_outcome",
+            route=primary_route,
+            intent="Perform the overwhelmingly likely action",
+            goal="Complete the likely user outcome",
+            information_needs=information_needs,
+            capability_needs=capability_needs,
+            completion_criteria=action_criteria,
+        ),
+        completion_criteria=(
+            CompletionCriterion(
+                kind="clarification",
+                description="Ask the selected action-boundary question",
+            ),
+        ),
     )
 
 
@@ -753,16 +850,21 @@ async def test_frame_revision_preserves_need_identity_and_rejects_stale_patch() 
         cause="steering",
     )
 
-    assert first.record.frame.schema_version == 4
-    assert first.observation.payload_schema == "weavria.task-frame/4"
-    legacy_v3_payload = first.record.frame.model_dump(mode="json")
+    assert first.record.frame.schema_version == 5
+    assert first.observation.payload_schema == "weavria.task-frame/5"
+    legacy_v4_payload: dict[str, JsonValue] = first.record.frame.model_dump(mode="json")
+    legacy_v4_payload["schema_version"] = 4
+    legacy_v4_payload.pop("intent_decision")
+    legacy_v4_payload.pop("decision_uncertainty")
+    assert load_task_frame(legacy_v4_payload).schema_version == 5
+    legacy_v3_payload: dict[str, JsonValue] = dict(legacy_v4_payload)
     legacy_v3_payload["schema_version"] = 3
     legacy_v3_payload.pop("intent_belief")
-    assert load_task_frame(legacy_v3_payload).schema_version == 4
-    legacy_v2_payload = dict(legacy_v3_payload)
+    assert load_task_frame(legacy_v3_payload).schema_version == 5
+    legacy_v2_payload: dict[str, JsonValue] = dict(legacy_v3_payload)
     legacy_v2_payload["schema_version"] = 2
     legacy_v2_payload.pop("clarification_decision")
-    assert load_task_frame(legacy_v2_payload).schema_version == 4
+    assert load_task_frame(legacy_v2_payload).schema_version == 5
     assert second.record.frame.revision == 2
     assert second.record.frame.capability_epoch == first.record.frame.capability_epoch
     assert second.record.frame.requirements[0].need_id == first.record.frame.requirements[0].need_id
@@ -771,14 +873,19 @@ async def test_frame_revision_preserves_need_identity_and_rejects_stale_patch() 
         == first.record.frame.requirements[0].origin_ref
     )
     assert second.patch is not None and second.patch.cause == "steering"
-    legacy_v3_patch = second.patch.model_dump(mode="json")
+    legacy_v4_patch: dict[str, JsonValue] = second.patch.model_dump(mode="json")
+    legacy_v4_patch["schema_version"] = 4
+    legacy_v4_patch.pop("intent_decision")
+    legacy_v4_patch.pop("decision_uncertainty")
+    assert load_task_frame_patch(legacy_v4_patch).schema_version == 5
+    legacy_v3_patch: dict[str, JsonValue] = dict(legacy_v4_patch)
     legacy_v3_patch["schema_version"] = 3
     legacy_v3_patch.pop("intent_belief")
-    assert load_task_frame_patch(legacy_v3_patch).schema_version == 4
-    legacy_v2_patch = dict(legacy_v3_patch)
+    assert load_task_frame_patch(legacy_v3_patch).schema_version == 5
+    legacy_v2_patch: dict[str, JsonValue] = dict(legacy_v3_patch)
     legacy_v2_patch["schema_version"] = 2
     legacy_v2_patch.pop("clarification_decision")
-    assert load_task_frame_patch(legacy_v2_patch).schema_version == 4
+    assert load_task_frame_patch(legacy_v2_patch).schema_version == 5
     assert (
         apply_frame_patch(first.record.frame, second.patch, second.record.frame)
         == second.record.frame
@@ -828,6 +935,188 @@ async def test_clarification_route_hides_capabilities_and_keeps_raw_goal() -> No
         TaskFrame.model_validate_json(json.dumps(observation.payload)).specification.goal
         == "Ask which document the user means"
     )
+
+
+async def test_low_value_question_materializes_a_complete_safe_direct_proposal() -> None:
+    proposed = _ask_or_act_specification(primary_route="direct")
+    engine = TaskUnderstandingEngine(
+        ModelTaskInterpreter(FakeModelProvider((_declaration(proposed),)))
+    )
+
+    preparation = await engine.prepare(
+        input_id="input-1",
+        task=TaskInput(goal="Use the likely response"),
+        history=(),
+        tools=_tools(),
+    )
+
+    frame = preparation.record.frame
+    assert frame.specification.route == "direct"
+    assert frame.specification.goal == "Complete the likely user outcome"
+    assert frame.clarification_decision is None
+    assert frame.intent_belief is not None and frame.intent_belief.status == "uncertain"
+    assert frame.intent_decision is not None
+    assert frame.intent_decision.disposition == "act"
+    assert frame.intent_decision.decision_reason == "question_not_worth_interaction_cost"
+    assert frame.decision_uncertainty == proposed.uncertainty
+    assert preparation.record.selected_capabilities == ()
+
+    forged_belief_binding = frame.model_dump(mode="json")
+    assert isinstance(forged_belief_binding["intent_decision"], dict)
+    forged_belief_binding["intent_decision"]["belief_sha256"] = "0" * 64
+    with pytest.raises(ValidationError, match="belief digest"):
+        TaskFrame.model_validate_json(json.dumps(forged_belief_binding))
+
+    forged_effective_action = frame.model_dump(mode="json")
+    assert isinstance(forged_effective_action["specification"], dict)
+    forged_effective_action["specification"]["goal"] = "A different effective action"
+    with pytest.raises(ValidationError, match="differs from the accepted proposal"):
+        TaskFrame.model_validate_json(json.dumps(forged_effective_action))
+
+
+async def test_low_value_question_exposes_only_a_safe_read_only_proposal() -> None:
+    proposed = _ask_or_act_specification(
+        primary_route="execute",
+        primary_capability="read_document",
+    )
+    engine = TaskUnderstandingEngine(
+        ModelTaskInterpreter(FakeModelProvider((_declaration(proposed),)))
+    )
+
+    preparation = await engine.prepare(
+        input_id="input-1",
+        task=TaskInput(goal="Use the likely document action"),
+        history=(),
+        tools=_tools(),
+    )
+
+    frame = preparation.record.frame
+    assert frame.specification.route == "execute"
+    assert frame.intent_decision is not None and frame.intent_decision.disposition == "act"
+    assert preparation.record.selected_capabilities == ("read_document",)
+    assert tuple(item.name for item in preparation.tools.descriptors) == ("read_document",)
+
+
+async def test_ask_or_act_never_replaces_concrete_tool_policy_authorization() -> None:
+    class DenyAll:
+        async def authorize(
+            self,
+            run_id: str,
+            descriptor: ToolDescriptor,
+            arguments: JsonValue,
+        ) -> PolicyDecision:
+            return PolicyDecision(False, "deny-all/1", "disabled for this run")
+
+    proposed = _ask_or_act_specification(
+        primary_route="execute",
+        primary_capability="read_document",
+    )
+    understanding = FakeModelProvider((_declaration(proposed),))
+    action = FakeControlProvider(
+        (
+            ModelTurn(
+                decision=ToolBatch(
+                    calls=(
+                        ToolCallAction(
+                            call_id="read-1",
+                            tool_name="read_document",
+                            arguments={"document": "report.txt"},
+                        ),
+                    )
+                )
+            ),
+            ModelTurn(decision=FinishAction(output="The read was denied.")),
+        )
+    )
+    agent = TaskAwareAgent(
+        understanding=TaskUnderstandingEngine(ModelTaskInterpreter(understanding)),
+        model=action,
+        tools=_tools(),
+        artifacts=InMemoryArtifactStore(),
+        instructions="Complete the typed task.",
+        policy=DenyAll(),
+    )
+
+    execution = await agent.execute(
+        run_id="policy-run",
+        task=TaskInput(goal="Use the likely document action"),
+    )
+
+    records = [item.data.record for item in execution.events if isinstance(item.data, ToolRecorded)]
+    assert len(records) == 1
+    observation = records[0].exchange.observation
+    assert isinstance(observation, ToolFailedObservation)
+    assert observation.error.category is ErrorCategory.POLICY_DENIED
+
+
+async def test_side_effect_proposal_cannot_bypass_the_automatic_action_gate() -> None:
+    proposed = _ask_or_act_specification(
+        primary_route="execute",
+        primary_capability="send_message",
+    )
+    engine = TaskUnderstandingEngine(
+        ModelTaskInterpreter(FakeModelProvider((_declaration(proposed),)))
+    )
+
+    preparation = await engine.prepare(
+        input_id="input-1",
+        task=TaskInput(goal="Maybe send the document"),
+        history=(),
+        tools=_tools(),
+    )
+
+    frame = preparation.record.frame
+    assert frame.specification.route == "clarify"
+    assert frame.intent_decision is not None
+    assert frame.intent_decision.disposition == "ask"
+    assert frame.intent_decision.decision_reason == "automatic_action_blocked"
+    assert frame.clarification_decision is not None
+    assert preparation.tools.descriptors == ()
+
+
+async def test_act_decision_is_replayed_exactly_through_a_frame_patch() -> None:
+    proposed = _ask_or_act_specification(primary_route="direct")
+    model = FakeModelProvider((_declaration(_direct()), _declaration(proposed)))
+    engine = TaskUnderstandingEngine(ModelTaskInterpreter(model))
+    first = await engine.prepare(
+        input_id="input-1",
+        task=TaskInput(goal="Start with a direct answer"),
+        history=(),
+        tools=_tools(),
+    )
+
+    second = await engine.prepare(
+        input_id="input-2",
+        task=TaskInput(goal="Use the likely response", revision=2),
+        history=(),
+        tools=_tools(),
+        work_id=first.record.frame.work_id,
+        base_frame=first.record.frame,
+        cause="steering",
+    )
+
+    assert second.patch is not None
+    assert second.record.frame.intent_decision is not None
+    assert second.record.frame.intent_decision.disposition == "act"
+    assert apply_frame_patch(first.record.frame, second.patch, second.record.frame) == (
+        second.record.frame
+    )
+
+
+def test_action_proposal_must_match_its_hypothesis_consequence() -> None:
+    proposed = _ask_or_act_specification(primary_route="direct")
+    assert proposed.action_proposal is not None
+
+    with pytest.raises(ValidationError, match="disagrees with its hypothesis"):
+        TaskSpecification.model_validate(
+            proposed.model_copy(
+                update={
+                    "action_proposal": proposed.action_proposal.model_copy(
+                        update={"outcome_key": "forged_outcome"}
+                    )
+                }
+            )
+        )
 
 
 @pytest.mark.parametrize(

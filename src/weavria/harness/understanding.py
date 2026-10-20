@@ -41,7 +41,11 @@ from .intent import (
     ConsequenceAwareQuestionSelector,
     DeterministicBeliefUpdater,
     IntentBeliefState,
+    IntentDecision,
+    IntentDecisionPolicy,
     IntentUncertainty,
+    RiskAwareAskOrActPolicy,
+    intent_uncertainty_sha256,
 )
 from .requirements import CompletionObligation, InformationRequirement, stable_identifier
 
@@ -86,9 +90,9 @@ class _Contract(BaseModel):
         return value
 
 
-class _VersionFourContract(BaseModel):
+class _VersionFiveContract(BaseModel):
     model_config = _Contract.model_config
-    schema_version: Literal[4] = 4
+    schema_version: Literal[5] = 5
 
     @field_validator("schema_version", mode="before")
     @classmethod
@@ -140,6 +144,29 @@ class CompletionCriterion(_Contract):
         return self
 
 
+class ProposedTaskAction(_Contract):
+    """Complete model proposal bound to one finite intent hypothesis."""
+
+    hypothesis_id: _SemanticKey
+    outcome_key: _SemanticKey
+    route: Literal["direct", "execute"]
+    intent: _Text
+    goal: _Text
+    information_needs: tuple[InformationNeed, ...] = Field(default=(), max_length=8)
+    capability_needs: tuple[CapabilityNeed, ...] = Field(default=(), max_length=8)
+    completion_criteria: tuple[CompletionCriterion, ...] = Field(min_length=1, max_length=8)
+
+    @model_validator(mode="after")
+    def validate_action(self) -> Self:
+        _validate_action_fields(
+            route=self.route,
+            information_needs=self.information_needs,
+            capability_needs=self.capability_needs,
+            completion_criteria=self.completion_criteria,
+        )
+        return self
+
+
 # 定义模型对当前任务的结构化解释,并继承严格、冻结且禁止额外字段的基础契约。
 class TaskSpecification(_Contract):
     """Actionable interpretation rather than a single intent label."""
@@ -158,6 +185,8 @@ class TaskSpecification(_Contract):
     ambiguities: tuple[_Text, ...] = Field(default=(), max_length=8)
     # 仅在澄清路径保存有界候选意图与候选问题;它是模型推断,不是校准概率。
     uncertainty: IntentUncertainty | None = None
+    # 可选的完整行动提案;模型只能提议,是否 Ask 或 Act 由受信策略决定。
+    action_proposal: ProposedTaskAction | None = None
     # 回答上一轮结构化澄清时,模型只负责把自由文本归类到已声明的问题与答案标识。
     clarification_resolution: ClarificationResolution | None = None
     # 澄清完成后声明最终采用的旧候选结果标识,供主机校验新规格没有偏离已接受后验。
@@ -251,12 +280,116 @@ class TaskSpecification(_Contract):
                 raise ValueError("required external information needs a required capability")
         if self.route != "clarify" and self.uncertainty is not None:
             raise ValueError("only clarify tasks can carry intent uncertainty")
+        if self.route != "clarify" and self.action_proposal is not None:
+            raise ValueError("only clarify tasks can carry an intent action proposal")
+        if self.action_proposal is not None:
+            if self.uncertainty is None:
+                raise ValueError("an intent action proposal requires structured uncertainty")
+            hypothesis = next(
+                (
+                    item
+                    for item in self.uncertainty.hypotheses
+                    if item.hypothesis_id == self.action_proposal.hypothesis_id
+                ),
+                None,
+            )
+            if hypothesis is None:
+                raise ValueError("intent action proposal references an unknown hypothesis")
+            proposal_signature = (
+                self.action_proposal.route,
+                self.action_proposal.outcome_key,
+                tuple(sorted(item.name for item in self.action_proposal.capability_needs)),
+            )
+            if proposal_signature != hypothesis.action_signature:
+                raise ValueError("intent action proposal disagrees with its hypothesis")
         if self.route == "clarify" and self.resolved_outcome_key is not None:
             raise ValueError("clarify tasks cannot declare a resolved outcome")
         if self.resolved_outcome_key is not None and self.clarification_resolution is None:
             raise ValueError("a resolved outcome requires a clarification resolution")
         # 所有不变量都成立,把已经验证的任务规格交还给 Pydantic 和后续 Harness 流程。
         return self
+
+
+def _validate_action_fields(
+    *,
+    route: Literal["direct", "execute"],
+    information_needs: tuple[InformationNeed, ...],
+    capability_needs: tuple[CapabilityNeed, ...],
+    completion_criteria: tuple[CompletionCriterion, ...],
+) -> None:
+    names = [item.name for item in capability_needs]
+    if len(names) != len(set(names)):
+        raise ValueError("capability needs must be unique")
+    criterion_capabilities = [
+        item.capability for item in completion_criteria if item.capability is not None
+    ]
+    if any(name not in names for name in criterion_capabilities):
+        raise ValueError("completion criteria can reference selected capabilities only")
+    required = {item.name for item in capability_needs if item.necessity == "required"}
+    if not required.issubset(criterion_capabilities):
+        raise ValueError("every required capability needs a completion criterion")
+    external_required = any(
+        item.required and item.source == "external" for item in information_needs
+    )
+    kinds = {item.kind for item in completion_criteria}
+    if route == "direct":
+        if capability_needs or external_required:
+            raise ValueError("direct actions cannot require capabilities or external data")
+        if "response" not in kinds:
+            raise ValueError("direct actions require a response completion criterion")
+    else:
+        if not capability_needs:
+            raise ValueError("execute actions require at least one capability")
+        if external_required and not required:
+            raise ValueError("required external information needs a required capability")
+
+
+def action_proposal_sha256(proposal: ProposedTaskAction) -> str:
+    """Return the canonical identity bound into an Ask-or-Act decision."""
+    return hashlib.sha256(
+        json.dumps(
+            proposal.model_dump(mode="json"),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+
+
+def _materialize_action_proposal(
+    proposal: ProposedTaskAction,
+    *,
+    clarification_resolution: ClarificationResolution | None,
+) -> TaskSpecification:
+    return TaskSpecification(
+        route=proposal.route,
+        intent=proposal.intent,
+        goal=proposal.goal,
+        information_needs=proposal.information_needs,
+        capability_needs=proposal.capability_needs,
+        clarification_resolution=clarification_resolution,
+        completion_criteria=proposal.completion_criteria,
+    )
+
+
+def _proposal_from_effective_specification(
+    specification: TaskSpecification,
+    *,
+    hypothesis_id: str,
+    outcome_key: str,
+) -> ProposedTaskAction:
+    if specification.route == "clarify":
+        raise ValueError("a clarification specification is not an effective action")
+    return ProposedTaskAction(
+        hypothesis_id=hypothesis_id,
+        outcome_key=outcome_key,
+        route=specification.route,
+        intent=specification.intent,
+        goal=specification.goal,
+        information_needs=specification.information_needs,
+        capability_needs=specification.capability_needs,
+        completion_criteria=specification.completion_criteria,
+    )
 
 
 class OriginalRequestAnchor(_Contract):
@@ -267,7 +400,7 @@ class OriginalRequestAnchor(_Contract):
     task_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
 
 
-class TaskFrame(_VersionFourContract):
+class TaskFrame(_VersionFiveContract):
     """Evolving semantic definition; evidence state is projected independently."""
 
     frame_id: str = Field(pattern=r"^[a-f0-9]{64}$")
@@ -286,6 +419,8 @@ class TaskFrame(_VersionFourContract):
     specification: TaskSpecification
     clarification_decision: ClarificationDecision | None = None
     intent_belief: IntentBeliefState | None = None
+    intent_decision: IntentDecision | None = None
+    decision_uncertainty: IntentUncertainty | None = None
     # 编译后的信息需求
     requirements: tuple[InformationRequirement, ...] = ()
     # 编译后的完成义务
@@ -295,23 +430,56 @@ class TaskFrame(_VersionFourContract):
     @model_validator(mode="after")
     def validate_semantics(self) -> Self:
         if self.specification.route == "clarify":
+            if self.decision_uncertainty is not None:
+                raise ValueError("an ask frame keeps uncertainty in its task specification")
             if self.specification.uncertainty is not None and self.clarification_decision is None:
                 raise ValueError("structured clarification requires a selected question")
             if self.intent_belief is not None and self.intent_belief.status != "uncertain":
                 raise ValueError("a clarify frame requires an uncertain intent belief")
+            if self.intent_decision is not None:
+                if self.intent_decision.disposition != "ask":
+                    raise ValueError("a clarify frame requires an ask intent decision")
+                if self.clarification_decision != self.intent_decision.question_decision:
+                    raise ValueError("clarification decision disagrees with Ask-or-Act")
         elif self.clarification_decision is not None:
             raise ValueError("only a clarify frame can carry a clarification decision")
-        elif self.intent_belief is not None and self.intent_belief.status != "resolved":
-            raise ValueError("a non-clarify frame requires a resolved intent belief")
+        elif self.intent_belief is not None and self.intent_belief.status == "uncertain":
+            if (
+                self.intent_decision is None
+                or self.intent_decision.disposition != "act"
+                or self.decision_uncertainty is None
+            ):
+                raise ValueError("an uncertain action frame requires a persisted act decision")
+        elif self.decision_uncertainty is not None:
+            raise ValueError("decision uncertainty belongs to an uncertain action frame")
         if self.specification.clarification_resolution is not None and self.intent_belief is None:
             raise ValueError("a clarification resolution requires a persistent intent belief")
+        if self.intent_decision is not None:
+            if self.intent_belief is None or self.intent_belief.status != "uncertain":
+                raise ValueError("Ask-or-Act requires an uncertain persistent belief")
+            uncertainty = (
+                self.specification.uncertainty
+                if self.specification.route == "clarify"
+                else self.decision_uncertainty
+            )
+            if uncertainty is None:
+                raise ValueError("Ask-or-Act requires its decision uncertainty")
+            _validate_intent_decision_binding(
+                self.specification,
+                uncertainty,
+                self.intent_belief,
+                self.intent_decision,
+            )
+        elif self.decision_uncertainty is not None:
+            raise ValueError("decision uncertainty requires an Ask-or-Act decision")
         if self.intent_belief is not None:
             if self.intent_belief.status == "uncertain":
-                if self.specification.uncertainty is None:
+                uncertainty = self.specification.uncertainty or self.decision_uncertainty
+                if uncertainty is None:
                     raise ValueError("an uncertain intent belief requires current uncertainty")
                 _validate_frame_belief_uncertainty(
                     self.intent_belief,
-                    self.specification.uncertainty,
+                    uncertainty,
                 )
             else:
                 signatures = {
@@ -357,23 +525,98 @@ def _validate_frame_belief_uncertainty(
         raise ValueError("task frame uncertainty changes accepted hypothesis meaning")
 
 
+def _validate_intent_decision_binding(
+    specification: TaskSpecification,
+    uncertainty: IntentUncertainty,
+    belief: IntentBeliefState,
+    decision: IntentDecision,
+) -> None:
+    if decision.belief_revision != belief.belief_revision:
+        raise ValueError("Ask-or-Act decision uses a different belief revision")
+    if decision.belief_sha256 != belief.content_sha256():
+        raise ValueError("Ask-or-Act decision belief digest does not match")
+    if decision.uncertainty_sha256 != intent_uncertainty_sha256(uncertainty):
+        raise ValueError("Ask-or-Act decision uncertainty digest does not match")
+    hypotheses = {item.hypothesis_id: item for item in uncertainty.hypotheses}
+    action_signatures = {item.action_signature for item in uncertainty.hypotheses}
+    if {item.action_signature for item in decision.action_values} != action_signatures:
+        raise ValueError("Ask-or-Act action values do not cover every consequence")
+    if any(
+        (hypothesis := hypotheses.get(item.representative_hypothesis_id)) is None
+        or hypothesis.action_signature != item.action_signature
+        for item in decision.action_values
+    ):
+        raise ValueError("Ask-or-Act action value representative is not its consequence")
+    representative = hypotheses.get(decision.selected_action.representative_hypothesis_id)
+    if representative is None or representative.action_signature != (
+        decision.selected_action.action_signature
+    ):
+        raise ValueError("Ask-or-Act selected action is not an uncertainty consequence")
+    question = next(
+        (
+            item
+            for item in uncertainty.candidate_questions
+            if item.question_id == decision.question_decision.selected_question_id
+        ),
+        None,
+    )
+    if question is None or (
+        question.question_text != decision.question_decision.question_text
+        or question.target_ambiguities != decision.question_decision.target_ambiguities
+    ):
+        raise ValueError("Ask-or-Act selected question is not an uncertainty candidate")
+    if {item.question_id for item in decision.question_decision.values} != {
+        item.question_id for item in uncertainty.candidate_questions
+    }:
+        raise ValueError("Ask-or-Act question values do not cover every candidate")
+
+    if decision.disposition == "ask":
+        proposal = specification.action_proposal
+        if proposal is None:
+            if decision.proposed_hypothesis_id is not None:
+                raise ValueError("Ask-or-Act references a missing action proposal")
+        elif (
+            decision.proposed_hypothesis_id != proposal.hypothesis_id
+            or decision.proposed_action_sha256 != action_proposal_sha256(proposal)
+        ):
+            raise ValueError("Ask-or-Act action proposal binding does not match")
+        return
+
+    if decision.proposed_hypothesis_id is None:
+        raise ValueError("an act decision requires a proposed hypothesis")
+    proposed_hypothesis = hypotheses.get(decision.proposed_hypothesis_id)
+    if proposed_hypothesis is None or (
+        proposed_hypothesis.action_signature != decision.selected_action.action_signature
+    ):
+        raise ValueError("act decision proposal is not the selected consequence")
+    effective = _proposal_from_effective_specification(
+        specification,
+        hypothesis_id=decision.proposed_hypothesis_id,
+        outcome_key=decision.selected_action.outcome_key,
+    )
+    if decision.proposed_action_sha256 != action_proposal_sha256(effective):
+        raise ValueError("effective task action differs from the accepted proposal")
+
+
 def load_task_frame(value: str | dict[str, JsonValue]) -> TaskFrame:
-    """Load a v4 frame or explicitly upcast a persisted v2/v3 frame.
+    """Load a v5 frame or explicitly upcast a persisted v2/v3/v4 frame.
 
     V2 had no structured clarification decision; V3 had no persistent intent
-    belief. Their missing state remains explicit rather than being fabricated.
+    belief; V4 had no Ask-or-Act decision. Missing state remains explicit.
     """
     payload = json.loads(value) if isinstance(value, str) else json.loads(json.dumps(value))
-    if payload.get("schema_version") in {2, 3}:
-        payload["schema_version"] = 4
+    if payload.get("schema_version") in {2, 3, 4}:
+        payload["schema_version"] = 5
         payload.setdefault("clarification_decision", None)
         payload.setdefault("intent_belief", None)
+        payload.setdefault("intent_decision", None)
+        payload.setdefault("decision_uncertainty", None)
     return TaskFrame.model_validate_json(
         json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     )
 
 
-class TaskFramePatch(_VersionFourContract):
+class TaskFramePatch(_VersionFiveContract):
     """Revision-bound semantic delta accepted only against its named base frame."""
 
     work_id: Annotated[str, StringConstraints(min_length=1, max_length=128, pattern=r"\S")]
@@ -391,6 +634,8 @@ class TaskFramePatch(_VersionFourContract):
     specification: TaskSpecification
     clarification_decision: ClarificationDecision | None = None
     intent_belief: IntentBeliefState | None = None
+    intent_decision: IntentDecision | None = None
+    decision_uncertainty: IntentUncertainty | None = None
     interpreter_version: _Text
     catalogue_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     capability_epoch: int = Field(ge=1)
@@ -411,12 +656,14 @@ class TaskFramePatch(_VersionFourContract):
 
 
 def load_task_frame_patch(value: str | dict[str, JsonValue]) -> TaskFramePatch:
-    """Load a v4 patch or explicitly upcast a persisted v2/v3 patch."""
+    """Load a v5 patch or explicitly upcast a persisted v2/v3/v4 patch."""
     payload = json.loads(value) if isinstance(value, str) else json.loads(json.dumps(value))
-    if payload.get("schema_version") in {2, 3}:
-        payload["schema_version"] = 4
+    if payload.get("schema_version") in {2, 3, 4}:
+        payload["schema_version"] = 5
         payload.setdefault("clarification_decision", None)
         payload.setdefault("intent_belief", None)
+        payload.setdefault("intent_decision", None)
+        payload.setdefault("decision_uncertainty", None)
     return TaskFramePatch.model_validate_json(
         json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     )
@@ -507,7 +754,7 @@ class TaskInterpreter(Protocol):
 class ModelTaskInterpreter:
     """Ask a model for one typed task specification through a synthetic tool call."""
 
-    version = "model-task-understanding/4"
+    version = "model-task-understanding/5"
 
     def __init__(self, provider: ModelProvider) -> None:
         self._provider = provider
@@ -578,7 +825,13 @@ class ModelTaskInterpreter:
             "exactly once. Use the same outcome_key only when two hypotheses have the same "
             "user-visible outcome; direct hypotheses name no capability and execute "
             "hypotheses name only catalogue capabilities. Candidate questions must target "
-            "declared ambiguities. Direct and execute routes must omit uncertainty. When a "
+            "declared ambiguities. Direct and execute routes must omit uncertainty. When one "
+            "most plausible hypothesis has a complete direct or execute specification, also "
+            "provide action_proposal for that hypothesis. The proposal must "
+            "repeat that hypothesis_id and outcome_key, match its route and exact capability "
+            "names, and include all information needs and completion criteria required to act. "
+            "It is only a proposal: the trusted host may still choose to ask. Omit it rather "
+            "than inventing missing action details. When a "
             "prior clarification is supplied, interpret the current task as its explicit "
             "answer and revise the same work rather than treating the answer as an unrelated "
             "request. Set clarification_resolution to the exact prior question_id and the "
@@ -734,6 +987,21 @@ def _validate_model_specification(
             None,
             "Task interpreter used unavailable capabilities in an intent hypothesis",
         )
+    proposal_capabilities = {
+        item.name
+        for item in (
+            specification.action_proposal.capability_needs
+            if specification.action_proposal is not None
+            else ()
+        )
+    }
+    if not proposal_capabilities.issubset(available_capabilities):
+        return (
+            None,
+            "action_proposal.capability_needs: every name must exist in the host catalogue",
+            None,
+            "Task interpreter proposed unavailable capabilities",
+        )
     return specification, "", None, ""
 
 
@@ -767,6 +1035,7 @@ class TaskUnderstandingEngine:
         *,
         question_selector: ClarificationQuestionSelector | None = None,
         belief_updater: BeliefUpdater | None = None,
+        intent_decision_policy: IntentDecisionPolicy | None = None,
         max_duration: float = 15.0,
         max_catalogue_bytes: int = 256_000,
     ) -> None:
@@ -775,6 +1044,7 @@ class TaskUnderstandingEngine:
         self._interpreter = interpreter
         self._question_selector = question_selector or ConsequenceAwareQuestionSelector()
         self._belief_updater = belief_updater or DeterministicBeliefUpdater()
+        self._intent_decision_policy = intent_decision_policy or RiskAwareAskOrActPolicy()
         self._max_duration = max_duration
         if type(max_catalogue_bytes) is not int or max_catalogue_bytes < 1024:
             raise ValueError("capability catalogue budget must be at least 1024 bytes")
@@ -783,9 +1053,9 @@ class TaskUnderstandingEngine:
     @property
     def version(self) -> str:
         return (
-            "task-understanding/4["
+            "task-understanding/5["
             f"{self._interpreter.version};{self._question_selector.version};"
-            f"{self._belief_updater.version}]"
+            f"{self._belief_updater.version};{self._intent_decision_policy.version}]"
         )
 
     async def prepare(
@@ -892,8 +1162,8 @@ class TaskUnderstandingEngine:
                 )
             ) from exc
         available = tuple(capability.name for capability in snapshot.capabilities)
-        selected = tuple(need.name for need in specification.capability_needs)
-        unknown = tuple(name for name in selected if name not in available)
+        declared_selected = tuple(need.name for need in specification.capability_needs)
+        unknown = tuple(name for name in declared_selected if name not in available)
         if unknown:
             raise TaskUnderstandingError(
                 RunError(
@@ -926,9 +1196,27 @@ class TaskUnderstandingEngine:
                     ),
                 )
             )
+        proposal_capabilities = {
+            item.name
+            for item in (
+                specification.action_proposal.capability_needs
+                if specification.action_proposal is not None
+                else ()
+            )
+        }
+        if not proposal_capabilities.issubset(available):
+            raise TaskUnderstandingError(
+                RunError(
+                    category=ErrorCategory.INVALID_MODEL_RESPONSE,
+                    message="Task interpreter proposed unavailable capabilities",
+                )
+            )
+        interpreted_specification = specification
+        intent_decision: IntentDecision | None = None
+        decision_uncertainty: IntentUncertainty | None = None
         try:
             intent_belief = self._derive_intent_belief(
-                specification,
+                interpreted_specification,
                 base_frame=base_frame,
                 cause=cause,
                 clarification_id=prior_clarification_id,
@@ -936,23 +1224,53 @@ class TaskUnderstandingEngine:
             )
             clarification_decision = (
                 self._question_selector.select(
-                    specification.uncertainty,
+                    interpreted_specification.uncertainty,
                     tools,
                     belief=intent_belief,
                 )
-                if specification.uncertainty is not None and intent_belief is not None
+                if interpreted_specification.uncertainty is not None and intent_belief is not None
                 else None
             )
+            if (
+                interpreted_specification.uncertainty is not None
+                and intent_belief is not None
+                and clarification_decision is not None
+            ):
+                proposal = interpreted_specification.action_proposal
+                intent_decision = self._intent_decision_policy.decide(
+                    interpreted_specification.uncertainty,
+                    intent_belief,
+                    clarification_decision,
+                    tools,
+                    proposed_hypothesis_id=(
+                        proposal.hypothesis_id if proposal is not None else None
+                    ),
+                    proposed_action_sha256=(
+                        action_proposal_sha256(proposal) if proposal is not None else None
+                    ),
+                )
+                if intent_decision.disposition == "act":
+                    if proposal is None:
+                        raise ValueError("act decision omitted its complete action proposal")
+                    decision_uncertainty = interpreted_specification.uncertainty
+                    specification = _materialize_action_proposal(
+                        proposal,
+                        clarification_resolution=(
+                            interpreted_specification.clarification_resolution
+                        ),
+                    )
+                    clarification_decision = None
         except ValueError as exc:
             raise TaskUnderstandingError(
                 RunError(
                     category=ErrorCategory.INVALID_MODEL_RESPONSE,
                     message=(
-                        "Structured intent state cannot accept the proposed clarification update"
+                        "Structured intent state or Ask-or-Act policy rejected the proposed update"
                     ),
                     cause_type=type(exc).__name__,
                 )
             ) from exc
+        selected = tuple(need.name for need in specification.capability_needs)
         request_json = snapshot.model_dump_json()
         request_sha256 = hashlib.sha256(request_json.encode()).hexdigest()
         catalogue_json = json.dumps(
@@ -1008,6 +1326,8 @@ class TaskUnderstandingEngine:
                     specification=specification,
                     clarification_decision=clarification_decision,
                     intent_belief=intent_belief,
+                    intent_decision=intent_decision,
+                    decision_uncertainty=decision_uncertainty,
                     requirements=requirements,
                     obligations=obligations,
                     application_context=snapshot.application_context,
@@ -1019,7 +1339,7 @@ class TaskUnderstandingEngine:
                 task_revision=snapshot.task.revision,
                 frame_revision=frame.revision,
                 producer_version=self._interpreter.version,
-                payload_schema="weavria.task-frame/4",
+                payload_schema="weavria.task-frame/5",
                 payload=frame.model_dump(mode="json"),
             )
         except ValidationError as exc:
@@ -1336,6 +1656,8 @@ def create_frame_patch(
         specification=target.specification,
         clarification_decision=target.clarification_decision,
         intent_belief=target.intent_belief,
+        intent_decision=target.intent_decision,
+        decision_uncertainty=target.decision_uncertainty,
         interpreter_version=target.interpreter_version,
         catalogue_sha256=target.catalogue_sha256,
         capability_epoch=target.capability_epoch,
@@ -1379,6 +1701,8 @@ def reduce_frame_patch(base: TaskFrame, patch: TaskFramePatch) -> TaskFrame:
             specification=patch.specification,
             clarification_decision=patch.clarification_decision,
             intent_belief=patch.intent_belief,
+            intent_decision=patch.intent_decision,
+            decision_uncertainty=patch.decision_uncertainty,
             requirements=tuple(requirements[item] for item in patch.requirement_order),
             obligations=patch.obligations,
             application_context=patch.application_context,

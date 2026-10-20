@@ -7,7 +7,9 @@
 > 当前结构化候选意图与问题价值选择见
 > [意图不确定性与主动澄清](意图不确定性与主动澄清.md)；回答后的持久信念、确定性更新与
 > Frame v4 见[持久化意图信念与确定性更新](intent-understanding-evolution/10-持久化意图信念与确定性更新.md)
-> 和 [ADR 0020](decisions/0020-持久化意图信念与确定性更新.md)。
+> 和 [ADR 0020](decisions/0020-持久化意图信念与确定性更新.md)。当前 Frame v5 与风险感知
+> Ask-or-Act 见[询问或行动决策](intent-understanding-evolution/11-风险感知的询问或行动决策.md)
+> 和 [ADR 0021](decisions/0021-风险感知的询问或行动决策.md)。
 
 Weavria 的任务理解位于 Harness 层。它不是业务意图分类器，而是把原始请求、会话证据和
 宿主能力目录编译成一份版本化、低信任的 `TaskFrame`。Runtime 仍只接受宿主拥有的原始
