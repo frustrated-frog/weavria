@@ -91,13 +91,23 @@ class TaskAwareSessionPreparer:
                 sort_keys=True,
             )
         discovery_requirements = ()
+        recall_seed_names: tuple[str, ...] = ()
         if base is not None:
             discovery_goal += " " + base.specification.goal
             discovery_requirements = base.requirements
+            if context.cause == "clarification_answer" and base.intent_belief is not None:
+                recall_seed_names = tuple(
+                    dict.fromkeys(
+                        name
+                        for hypothesis in base.intent_belief.viable_hypotheses
+                        for name in hypothesis.capability_names
+                    )
+                )
         capability_view, _ = self._capabilities.resolve(
             CapabilityQuery(
                 goal=discovery_goal,
                 requirements=discovery_requirements,
+                recall_seed_names=recall_seed_names,
                 allow_side_effects=True,
             ),
             context.tools,

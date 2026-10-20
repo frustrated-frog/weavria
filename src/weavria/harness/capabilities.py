@@ -90,9 +90,18 @@ class CatalogSnapshot(_Contract):
 
 
 class CapabilityQuery(_Contract):
+    """Ephemeral discovery input; recall seeds are hints, never execution grants."""
+
     goal: str = Field(min_length=1, max_length=4096)
     requirements: tuple[InformationRequirement, ...] = ()
+    recall_seed_names: tuple[_Identifier, ...] = Field(default=(), max_length=32)
     allow_side_effects: bool = False
+
+    @model_validator(mode="after")
+    def validate_recall_seeds(self) -> Self:
+        if len(set(self.recall_seed_names)) != len(self.recall_seed_names):
+            raise ValueError("capability recall seeds must be unique")
+        return self
 
 
 class CapabilityCandidate(_Contract):
@@ -234,7 +243,7 @@ class BM25CapabilityRetriever:
 class SchemaAwareSelector:
     """Explain candidate usefulness using output coverage and effect risk."""
 
-    version = "schema-aware/1"
+    version = "schema-aware/2"
 
     def select(
         self,
@@ -281,7 +290,14 @@ class SchemaAwareSelector:
                     score=candidate.lexical_score,
                 )
             )
-        choices.sort(key=lambda item: (-item.score, item.capability_id))
+        recall_seeds = frozenset(query.recall_seed_names)
+        choices.sort(
+            key=lambda item: (
+                item.name not in recall_seeds,
+                -item.score,
+                item.capability_id,
+            )
+        )
         selected = [item for item in choices if item.decision == "select"][:limit]
         return tuple((*selected, *(item for item in choices if item.decision != "select")))
 
@@ -289,7 +305,7 @@ class SchemaAwareSelector:
 class CapabilityResolver:
     """Compose policy filtering, bounded recall fallbacks and schema-aware selection."""
 
-    version = "capability-resolver/2"
+    version = "capability-resolver/3"
 
     def __init__(
         self,
@@ -316,11 +332,25 @@ class CapabilityResolver:
     ) -> tuple[CapabilityEpochView, tuple[CapabilityChoice, ...]]:
         catalogue = CatalogSnapshot.from_registry(registry)
         safe = tuple(item for item in catalogue.capabilities if self._policy.can_discover(item))
+        safe_names = {item.name for item in safe}
+        safe_by_id = {item.capability_id: item for item in safe}
+        query = query.model_copy(
+            update={
+                "recall_seed_names": tuple(
+                    name for name in query.recall_seed_names if name in safe_names
+                )
+            }
+        )
         recalled = self._retriever.retrieve(
             query,
             safe,
             limit=min(len(safe), self._limit * 3) or self._limit,
         )
+        if any(
+            item.capability_id not in safe_by_id or safe_by_id[item.capability_id].name != item.name
+            for item in recalled
+        ):
+            raise ValueError("capability retrieval escaped the discovery policy")
         recalled = _merge_declared_and_schema_candidates(
             query,
             safe,
@@ -328,9 +358,13 @@ class CapabilityResolver:
             limit=min(len(safe), self._limit * 3) or self._limit,
         )
         choices = self._selector.select(query, catalogue, recalled, limit=self._limit)
+        if any(
+            item.capability_id not in safe_by_id or safe_by_id[item.capability_id].name != item.name
+            for item in choices
+        ):
+            raise ValueError("capability selection escaped the discovery policy")
         selected = tuple(item for item in choices if item.decision == "select")
-        by_id = {item.capability_id: item for item in catalogue.capabilities}
-        descriptors = tuple(by_id[item.capability_id] for item in selected)
+        descriptors = tuple(safe_by_id[item.capability_id] for item in selected)
         view = CapabilityEpochView(
             capability_epoch=epoch,
             catalogue_sha256=catalogue.catalogue_sha256,
@@ -435,10 +469,35 @@ def _merge_declared_and_schema_candidates(
     *,
     limit: int,
 ) -> tuple[CapabilityCandidate, ...]:
-    """Recall declared capabilities first, then schema matches only for uncovered Needs."""
+    """Merge policy-safe recall seeds and declared Need candidates into lexical recall."""
     by_name = {item.name: item for item in descriptors}
-    ordered = list(lexical)
-    included = {item.capability_id for item in lexical}
+    seeded = bool(query.recall_seed_names)
+    ordered: list[CapabilityCandidate]
+    included: set[str]
+    if seeded:
+        lexical_by_id = {item.capability_id: item for item in lexical}
+        ordered = []
+        included = set()
+        for name in query.recall_seed_names:
+            descriptor = by_name[name]
+            ordered.append(
+                lexical_by_id.get(
+                    descriptor.capability_id,
+                    CapabilityCandidate(
+                        capability_id=descriptor.capability_id,
+                        name=descriptor.name,
+                        lexical_score=0,
+                        matched_terms=("recall_seed",),
+                    ),
+                )
+            )
+            included.add(descriptor.capability_id)
+        ordered.extend(item for item in lexical if item.capability_id not in included)
+        ordered = ordered[:limit]
+        included = {item.capability_id for item in ordered}
+    else:
+        ordered = list(lexical)
+        included = {item.capability_id for item in lexical}
     for requirement in query.requirements:
         declared = tuple(by_name[name] for name in requirement.capability_names if name in by_name)
         fallback = declared or tuple(
@@ -457,5 +516,5 @@ def _merge_declared_and_schema_candidates(
             )
             included.add(descriptor.capability_id)
             if len(ordered) >= limit:
-                return tuple(ordered)
+                return tuple(ordered[:limit] if seeded else ordered)
     return tuple(ordered[:limit])

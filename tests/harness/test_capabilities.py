@@ -1,6 +1,11 @@
+from typing import Literal
+
+import pytest
 from pydantic import BaseModel
 
 from weavria.harness import (
+    CapabilityCandidate,
+    CapabilityDescriptor,
     CapabilityQuery,
     CapabilityResolver,
     CatalogSnapshot,
@@ -21,12 +26,32 @@ async def _execute(arguments: _Input, context: ToolContext) -> _Output:
     return _Output(market_stage=arguments.symbol)
 
 
+class _PolicyBypassRetriever:
+    version = "policy-bypass/1"
+
+    def __init__(self, candidate: CapabilityCandidate) -> None:
+        self._candidate = candidate
+
+    def retrieve(
+        self,
+        query: CapabilityQuery,
+        candidates: tuple[CapabilityDescriptor, ...],
+        *,
+        limit: int,
+    ) -> tuple[CapabilityCandidate, ...]:
+        del limit
+        assert query.recall_seed_names == ()
+        assert all(item.sensitivity == "public" for item in candidates)
+        return (self._candidate,)
+
+
 def _tool(
     name: str,
     description: str,
     *,
     side_effect: bool = False,
     intent_signals: tuple[str, ...] = (),
+    sensitivity: Literal["public", "private"] = "public",
 ) -> TypedTool[_Input, _Output]:
     return TypedTool(
         name=name,
@@ -40,6 +65,7 @@ def _tool(
         idempotency="unknown" if side_effect else "replay_safe",
         risk="high" if side_effect else "low",
         approval_required=side_effect,
+        sensitivity=sensitivity,
     )
 
 
@@ -217,6 +243,87 @@ def test_schema_fallback_is_bounded_to_an_uncovered_requirement() -> None:
     )
 
     assert view.allowed_tool_names == ("read_price",)
+
+
+def test_exact_recall_seed_enters_resolution_without_text_overlap() -> None:
+    registry = ToolRegistry(
+        (
+            *(_tool(f"distractor_{index}", "Match the current phrase") for index in range(5)),
+            _tool("choose_second", "Opaque beta operation"),
+        )
+    )
+
+    resolver = CapabilityResolver(max_candidates=1)
+    plain_view, _ = resolver.resolve(
+        CapabilityQuery(goal="Match the current phrase"),
+        registry,
+        epoch=1,
+        trigger="initial",
+    )
+    seeded_view, choices = resolver.resolve(
+        CapabilityQuery(
+            goal="Match the current phrase",
+            recall_seed_names=("choose_second",),
+        ),
+        registry,
+        epoch=2,
+        trigger="clarification_answer",
+    )
+
+    assert plain_view.allowed_tool_names == ("distractor_0",)
+    assert seeded_view.allowed_tool_names == ("choose_second",)
+    assert choices[0].name == "choose_second"
+
+
+def test_unknown_or_private_recall_seed_cannot_expand_discovery() -> None:
+    registry = ToolRegistry(
+        (
+            _tool("public_unrelated", "Perform the alpha branch"),
+            _tool("private_choice", "Perform the beta branch", sensitivity="private"),
+        )
+    )
+
+    view, choices = CapabilityResolver(max_candidates=2).resolve(
+        CapabilityQuery(
+            goal="第二个",
+            recall_seed_names=("missing_choice", "private_choice"),
+        ),
+        registry,
+        epoch=2,
+        trigger="clarification_answer",
+    )
+
+    assert view.allowed_tool_names == ()
+    assert choices == ()
+
+
+def test_discovery_policy_remains_a_final_gate_for_seed_aware_retrievers() -> None:
+    registry = ToolRegistry(
+        (
+            _tool("public_unrelated", "Perform the alpha branch"),
+            _tool("private_choice", "Perform the beta branch", sensitivity="private"),
+        )
+    )
+    private = next(
+        item
+        for item in CatalogSnapshot.from_registry(registry).capabilities
+        if item.name == "private_choice"
+    )
+    retriever = _PolicyBypassRetriever(
+        CapabilityCandidate(
+            capability_id=private.capability_id,
+            name=private.name,
+            lexical_score=1,
+        )
+    )
+
+    with pytest.raises(ValueError, match="escaped the discovery policy"):
+        CapabilityResolver(retriever=retriever).resolve(
+            CapabilityQuery(goal="第二个", recall_seed_names=("private_choice",)),
+            registry,
+            epoch=2,
+            trigger="clarification_answer",
+        )
 
 
 def test_catalogue_digest_is_order_sensitive_and_content_addressed() -> None:

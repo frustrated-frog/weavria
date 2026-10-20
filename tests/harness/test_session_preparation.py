@@ -25,7 +25,11 @@ from weavria.core import (
     ToolFailedObservation,
 )
 from weavria.harness import (
+    CapabilityChoice,
+    CapabilityEpochView,
     CapabilityNeed,
+    CapabilityQuery,
+    CapabilityResolver,
     ClarificationAnswerOption,
     ClarificationQuestionCandidate,
     ClarificationResolution,
@@ -42,6 +46,7 @@ from weavria.harness import (
     TaskUnderstandingEngine,
     TaskUnderstandingError,
 )
+from weavria.harness.capabilities import CapabilityTrigger
 from weavria.models import FakeModelProvider, FakeSessionProvider, ModelCapabilities
 from weavria.sessions import SessionEngine
 from weavria.tools import ToolContext, ToolFault, ToolRegistry, TypedTool
@@ -91,6 +96,23 @@ def _registry(*, effect_counter: list[str] | None = None) -> ToolRegistry:
             ),
         )
     )
+
+
+class _RecordingCapabilityResolver(CapabilityResolver):
+    def __init__(self) -> None:
+        super().__init__()
+        self.queries: list[CapabilityQuery] = []
+
+    def resolve(
+        self,
+        query: CapabilityQuery,
+        registry: ToolRegistry,
+        *,
+        epoch: int,
+        trigger: CapabilityTrigger,
+    ) -> tuple[CapabilityEpochView, tuple[CapabilityChoice, ...]]:
+        self.queries.append(query)
+        return super().resolve(query, registry, epoch=epoch, trigger=trigger)
 
 
 def _criterion(
@@ -206,6 +228,179 @@ def _clarify() -> TaskSpecification:
     )
 
 
+def _choice_registry(effect_counter: list[str]) -> ToolRegistry:
+    def choice_tool(name: str, description: str) -> TypedTool[_Input, _Output]:
+        async def execute(arguments: _Input, context: ToolContext) -> _Output:
+            del context
+            effect_counter.append(name)
+            return _Output(value=arguments.value)
+
+        return TypedTool(
+            name=name,
+            version="1",
+            description=description,
+            input_type=_Input,
+            output_type=_Output,
+            execute=execute,
+        )
+
+    return ToolRegistry(
+        (
+            choice_tool("choose_first", "Alpha operation"),
+            choice_tool("choose_second", "Beta operation"),
+            choice_tool("choose_third", "Gamma operation"),
+        )
+    )
+
+
+def _choice_hypothesis(
+    hypothesis_id: str,
+    interpretation: str,
+    capability_name: str,
+    outcome_key: str,
+    support_weight: int,
+) -> IntentHypothesis:
+    return IntentHypothesis(
+        hypothesis_id=hypothesis_id,
+        interpretation=interpretation,
+        intended_route="execute",
+        capability_names=(capability_name,),
+        outcome_key=outcome_key,
+        support_weight=support_weight,
+    )
+
+
+def _resolved_second_after_narrowing() -> TaskSpecification:
+    return TaskSpecification(
+        route="execute",
+        intent="Run the accepted second branch",
+        goal="Carry out the accepted branch",
+        capability_needs=(
+            CapabilityNeed(
+                name="choose_second",
+                purpose="Run the accepted branch",
+                necessity="required",
+            ),
+        ),
+        clarification_resolution=ClarificationResolution(
+            question_id="remaining_branch",
+            answer_id="second",
+        ),
+        resolved_outcome_key="second_chosen",
+        completion_criteria=(
+            _criterion("capability_result", "choose_second"),
+            _criterion(),
+        ),
+    )
+
+
+def _initial_three_choice() -> TaskSpecification:
+    ambiguity = "The requested branch is ambiguous"
+    return TaskSpecification(
+        route="clarify",
+        intent="Resolve which branch the user intends",
+        goal="Resolve ambiguity",
+        ambiguities=(ambiguity,),
+        uncertainty=IntentUncertainty(
+            hypotheses=(
+                _choice_hypothesis(
+                    "first_branch",
+                    "Run the first branch",
+                    "choose_first",
+                    "first_chosen",
+                    40,
+                ),
+                _choice_hypothesis(
+                    "second_branch",
+                    "Run the second branch",
+                    "choose_second",
+                    "second_chosen",
+                    35,
+                ),
+                _choice_hypothesis(
+                    "third_branch",
+                    "Run the third branch",
+                    "choose_third",
+                    "third_chosen",
+                    25,
+                ),
+            ),
+            candidate_questions=(
+                ClarificationQuestionCandidate(
+                    question_id="exclude_third",
+                    question_text="Is it one of the first two branches?",
+                    target_ambiguities=(ambiguity,),
+                    answer_options=(
+                        ClarificationAnswerOption(
+                            answer_id="first_two",
+                            label="One of the first two",
+                            hypothesis_ids=("first_branch", "second_branch"),
+                        ),
+                        ClarificationAnswerOption(
+                            answer_id="third",
+                            label="The third branch",
+                            hypothesis_ids=("third_branch",),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+        completion_criteria=(_criterion("clarification"),),
+    )
+
+
+def _remaining_two_choices() -> TaskSpecification:
+    ambiguity = "The first and second branches are still ambiguous"
+    return TaskSpecification(
+        route="clarify",
+        intent="Resolve which remaining branch the user intends",
+        goal="Resolve ambiguity",
+        ambiguities=(ambiguity,),
+        uncertainty=IntentUncertainty(
+            hypotheses=(
+                _choice_hypothesis(
+                    "first_branch",
+                    "Run the first branch",
+                    "choose_first",
+                    "first_chosen",
+                    40,
+                ),
+                _choice_hypothesis(
+                    "second_branch",
+                    "Run the second branch",
+                    "choose_second",
+                    "second_chosen",
+                    35,
+                ),
+            ),
+            candidate_questions=(
+                ClarificationQuestionCandidate(
+                    question_id="remaining_branch",
+                    question_text="First or second branch?",
+                    target_ambiguities=(ambiguity,),
+                    answer_options=(
+                        ClarificationAnswerOption(
+                            answer_id="first",
+                            label="The first branch",
+                            hypothesis_ids=("first_branch",),
+                        ),
+                        ClarificationAnswerOption(
+                            answer_id="second",
+                            label="The second branch",
+                            hypothesis_ids=("second_branch",),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+        clarification_resolution=ClarificationResolution(
+            question_id="exclude_third",
+            answer_id="first_two",
+        ),
+        completion_criteria=(_criterion("clarification"),),
+    )
+
+
 def _declaration(specification: TaskSpecification) -> ModelResponse:
     return ModelResponse(
         action=ToolCallAction(
@@ -239,7 +434,11 @@ async def test_task_frame_preserves_raw_request_and_hides_business_tools_in_v4_s
 ) -> None:
     interpreter = FakeModelProvider((_declaration(_direct()), _declaration(_direct())))
     model = _DirectSessionModel()
-    preparer = TaskAwareSessionPreparer(TaskUnderstandingEngine(ModelTaskInterpreter(interpreter)))
+    capabilities = _RecordingCapabilityResolver()
+    preparer = TaskAwareSessionPreparer(
+        TaskUnderstandingEngine(ModelTaskInterpreter(interpreter)),
+        capabilities=capabilities,
+    )
     async with SessionEngine(
         tmp_path / "session.db",
         model=model,
@@ -262,6 +461,7 @@ async def test_task_frame_preserves_raw_request_and_hides_business_tools_in_v4_s
     assert frame.request_anchor.input_id == "input-1"
     assert frame.specification.goal == "Explain the assistant role without external facts"
     assert frame.trust == "model_inference"
+    assert [query.recall_seed_names for query in capabilities.queries] == [(), ()]
     second_interpretation = interpreter.requests[1]
     history_messages = [
         message for message in second_interpretation.history if isinstance(message, Message)
@@ -396,6 +596,95 @@ class _ClarifyThenExecuteModel:
                 )
             )
         )
+
+
+class _ChoiceSessionModel:
+    capabilities = ModelCapabilities(tool_calls=True, multi_tool_calls=True)
+
+    async def generate_session(self, request: SessionRequest) -> ModelTurn:
+        observation = request.current.task_observation
+        assert observation is not None
+        frame = TaskFrame.model_validate_json(json.dumps(observation.payload))
+        if frame.specification.route == "clarify":
+            decision = frame.clarification_decision
+            assert decision is not None
+            return ModelTurn(decision=FinishAction(output=decision.question_text))
+        exchanges = [entry for entry in request.current.history if isinstance(entry, ToolExchange)]
+        if exchanges:
+            return ModelTurn(decision=FinishAction(output="The second branch was run."))
+        return ModelTurn(
+            decision=ToolBatch(
+                calls=(
+                    ToolCallAction(
+                        call_id="choose-second",
+                        tool_name="choose_second",
+                        arguments={"value": "accepted"},
+                    ),
+                )
+            )
+        )
+
+
+async def test_short_answers_recall_only_viable_belief_capabilities(
+    tmp_path: Path,
+) -> None:
+    effects: list[str] = []
+    capabilities = _RecordingCapabilityResolver()
+    interpreter = FakeModelProvider(
+        (
+            _declaration(_initial_three_choice()),
+            _declaration(_remaining_two_choices()),
+            _declaration(_resolved_second_after_narrowing()),
+        )
+    )
+    preparer = TaskAwareSessionPreparer(
+        TaskUnderstandingEngine(ModelTaskInterpreter(interpreter)),
+        capabilities=capabilities,
+    )
+    async with SessionEngine(
+        tmp_path / "eliminated-capability.db",
+        model=_ChoiceSessionModel(),
+        tools=_choice_registry(effects),
+        task_preparation=preparer,
+    ) as engine:
+        await engine.create("s")
+        await engine.send(
+            "s",
+            "Choose choose_first, choose_second, or choose_third.",
+            input_id="input-1",
+        )
+        first_waiting = (await engine.store.pending_clarifications("s"))[0]
+        first_clarification = first_waiting.pending_clarification
+        assert first_clarification is not None
+
+        await engine.send(
+            "s",
+            "不是第三个",
+            input_id="input-2",
+            clarification_id=first_clarification.clarification_id,
+        )
+        second_waiting = (await engine.store.pending_clarifications("s"))[0]
+        second_clarification = second_waiting.pending_clarification
+        assert second_clarification is not None
+
+        result = await engine.send(
+            "s",
+            "第二个",
+            input_id="input-3",
+            clarification_id=second_clarification.clarification_id,
+        )
+
+    assert result.report.status is RunStatus.COMPLETED
+    assert effects == ["choose_second"]
+    assert capabilities.queries[1].recall_seed_names == (
+        "choose_first",
+        "choose_second",
+        "choose_third",
+    )
+    assert capabilities.queries[2].recall_seed_names == (
+        "choose_first",
+        "choose_second",
+    )
 
 
 class _RepairClarificationModel:
