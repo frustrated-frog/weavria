@@ -1,0 +1,82 @@
+{
+  "schema_version": 1,
+  "dataset_version": "progress-control-live/1",
+  "cases": [
+    {
+      "case_id": "volatile_missing_field",
+      "scenario": "stagnant_missing",
+      "request": "Use inspect_record to obtain required_marker from the external record. Try reasonable query variants, but never invent the marker and do not claim completion without evidence.",
+      "specification": {
+        "route": "execute",
+        "intent": "Retrieve one required marker from an external record",
+        "goal": "Return required_marker only when the external record actually contains it",
+        "information_needs": [
+          {
+            "description": "The externally stored required marker",
+            "source": "external",
+            "freshness": "stable",
+            "required": true,
+            "required_fields": ["/required_marker"]
+          }
+        ],
+        "capability_needs": [
+          {
+            "name": "inspect_record",
+            "purpose": "Inspect the external record for required_marker",
+            "necessity": "required"
+          }
+        ],
+        "completion_criteria": [
+          {
+            "kind": "capability_result",
+            "description": "A recorded inspect_record result supports the task",
+            "capability": "inspect_record"
+          },
+          {
+            "kind": "response",
+            "description": "The final response reports only evidence-backed findings"
+          }
+        ]
+      },
+      "expected_output_terms": []
+    },
+    {
+      "case_id": "progressive_field_collection",
+      "scenario": "progressive_evidence",
+      "request": "Use read_project_section to collect the project title, owner, and deadline. The valid section names are title, owner, and deadline. Return all three values and do not guess.",
+      "specification": {
+        "route": "execute",
+        "intent": "Collect three required project fields",
+        "goal": "Return the project title, owner, and deadline from external evidence",
+        "information_needs": [
+          {
+            "description": "The project title, owner, and deadline",
+            "source": "external",
+            "freshness": "stable",
+            "required": true,
+            "required_fields": ["/data/title", "/data/owner", "/data/deadline"]
+          }
+        ],
+        "capability_needs": [
+          {
+            "name": "read_project_section",
+            "purpose": "Read one named section of the external project record",
+            "necessity": "required"
+          }
+        ],
+        "completion_criteria": [
+          {
+            "kind": "capability_result",
+            "description": "Recorded section results cover every required project field",
+            "capability": "read_project_section"
+          },
+          {
+            "kind": "response",
+            "description": "The final response reports title, owner, and deadline"
+          }
+        ]
+      },
+      "expected_output_terms": ["Atlas", "Robin", "2030-05-01"]
+    }
+  ]
+}

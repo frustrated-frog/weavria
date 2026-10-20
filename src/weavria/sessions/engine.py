@@ -41,6 +41,7 @@ from weavria.runtime import (
     EventAcceptanceError,
     JournalCommitError,
     LayeredCompletionPolicy,
+    ProgressPolicyFactory,
     RootBudget,
     RunLimits,
     SystemClock,
@@ -339,6 +340,7 @@ class SessionEngine:
         task_preparation: SessionTaskPreparer | None = None,
         clarification_association: ClarificationAssociationPolicy | None = None,
         clarification_timeout_seconds: float | None = 86_400.0,
+        progress_factory: ProgressPolicyFactory | None = None,
     ) -> None:
         if type(history_budget_bytes) is not int or history_budget_bytes < 256:
             raise ValueError("history budget must be at least 256 bytes")
@@ -386,6 +388,7 @@ class SessionEngine:
         self._task_preparation = task_preparation
         self._clarification_association = clarification_association or ExplicitClarificationOnly()
         self._clarification_timeout = clarification_timeout_seconds
+        self._progress_factory = progress_factory
         self._tasks: set[asyncio.Task[object]] = set()
         self._loops: dict[str, AgentLoop] = {}
         self._run_tasks: dict[str, asyncio.Task[object]] = {}
@@ -451,6 +454,11 @@ class SessionEngine:
                     else "none/1",
                     "clarification_association_version": self._clarification_association.version,
                     "clarification_id": clarification_id,
+                    "progress_policy_version": (
+                        self._progress_factory.version
+                        if self._progress_factory is not None
+                        else "agent-loop-default/1"
+                    ),
                 },
                 ensure_ascii=False,
             )
@@ -641,6 +649,11 @@ class SessionEngine:
                 journal=adapter,
                 preparation=adapter,
                 task_observation=task_observation,
+                progress=(
+                    self._progress_factory.create(registry)
+                    if self._progress_factory is not None
+                    else None
+                ),
             )
             self._loops[session_id] = loop
             self._run_tasks[run_id] = owner

@@ -63,3 +63,16 @@ uv run python examples/context_selection.py --demo
 uv sync --extra openai-compatible
 uv run python examples/live_task_understanding.py --repeats 3
 ```
+
+语义前沿进度控制另有端到端真实模型 A/B 入口。它固定 TaskSpecification，比较动作族有界探索与
+仅精确重复阻止，记录任务结果、终止原因、调用、延迟和 Provider Token；当前仓库没有内置真实
+模型成绩：
+
+```bash
+export WEAVRIA_MODEL_BASE_URL='https://provider.example/v1'
+export WEAVRIA_MODEL_NAME='model-name'
+export WEAVRIA_MODEL_API_KEY='...'
+uv run python examples/live_progress_control.py --repeats 3
+```
+
+实验设计、隔离不变量和证据边界见 [ADR 0023](docs/decisions/0023-进度策略隔离与真实模型对照.md)。

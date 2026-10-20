@@ -39,6 +39,43 @@ class ProgressPolicy(Protocol):
         ...
 
 
+class ProgressPolicyFactory(Protocol):
+    """Create isolated mutable policy state for one Run."""
+
+    @property
+    def version(self) -> str: ...
+
+    def create(self, tools: ToolRegistry) -> ProgressPolicy: ...
+
+
+@dataclass(frozen=True, slots=True)
+class SemanticProgressPolicyFactory:
+    """Versioned construction boundary for SessionEngine and controlled experiments."""
+
+    max_stagnant_batches_per_action_family: int = 3
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.max_stagnant_batches_per_action_family) is not int
+            or self.max_stagnant_batches_per_action_family < 1
+        ):
+            raise ValueError("stagnant action-family limit must be a positive integer")
+
+    @property
+    def version(self) -> str:
+        return (
+            "semantic-progress-factory/1["
+            f"policy={SemanticProgressPolicy.version};"
+            f"max_family_batches={self.max_stagnant_batches_per_action_family}]"
+        )
+
+    def create(self, tools: ToolRegistry) -> ProgressPolicy:
+        return SemanticProgressPolicy(
+            tools,
+            max_stagnant_batches_per_action_family=(self.max_stagnant_batches_per_action_family),
+        )
+
+
 class SemanticProgressPolicy:
     """Bound one action family's exploration while the effective task frontier is unchanged.
 

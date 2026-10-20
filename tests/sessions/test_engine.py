@@ -148,6 +148,47 @@ async def test_input_identity_deduplicates_even_after_restart_and_rejects_change
         assert await engine.send("s", "remember", input_id="stable") == original
 
 
+async def test_progress_factory_is_fresh_per_run_and_version_is_persisted(tmp_path: Path) -> None:
+    import json
+    import sqlite3
+
+    from weavria.runtime import SemanticProgressPolicy
+
+    class RecordingFactory:
+        version = "recording-progress-factory/1"
+
+        def __init__(self) -> None:
+            self.policies: list[SemanticProgressPolicy] = []
+
+        def create(self, tools: ToolRegistry) -> SemanticProgressPolicy:
+            policy = SemanticProgressPolicy(tools)
+            self.policies.append(policy)
+            return policy
+
+    path = tmp_path / "session.db"
+    factory = RecordingFactory()
+    async with SessionEngine(
+        path,
+        model=Reader(),
+        tools=tools(),
+        progress_factory=factory,
+    ) as engine:
+        session = await engine.create("s")
+        await engine.send(session, "one", input_id="one")
+        await engine.send(session, "two", input_id="two")
+
+    assert len(factory.policies) == 2 and factory.policies[0] is not factory.policies[1]
+    with sqlite3.connect(path) as connection:
+        configs = [
+            json.loads(row[0])
+            for row in connection.execute("SELECT config FROM runs ORDER BY ordinal").fetchall()
+        ]
+    assert [item["progress_policy_version"] for item in configs] == [
+        factory.version,
+        factory.version,
+    ]
+
+
 async def test_application_context_is_separate_persisted_data_and_part_of_idempotency(
     tmp_path: Path,
 ) -> None:

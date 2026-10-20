@@ -69,6 +69,16 @@ expected recall 和 visible count。它是机制诊断，不是自然语言任�
 进度控制实验用 `evaluate_progress_control` 比较语义前沿/动作族策略与仅阻止精确重复的基线。
 当前冻结合成轨迹为 8/8 对 7/8；它验证参数逃逸与真实 Need 推进的边界，不证明真实模型收益。
 
+显式配置 OpenAI-compatible 环境后，可运行端到端 A/B：
+
+```bash
+uv run python examples/live_progress_control.py --repeats 3
+```
+
+该入口固定 TaskSpecification 以隔离执行控制变量，每个样本使用独立策略、工具状态和数据库，
+并交替策略顺序。报告含数据集摘要、完整配置、任务结果、终止原因、模型/工具调用、延迟和
+Provider Token 覆盖率。当前尚无有效真实模型结果，不能从入口本身推断收益。
+
 ## 6. 当前刻意没有实现什么
 
 - 不用通用规则猜测领域数据的新鲜度、引用格式或事实冲突；这些必须由应用 Extractor/Verifier
@@ -83,6 +93,6 @@ expected recall 和 visible count。它是机制诊断，不是自然语言任�
 
 ## 7. 下一小步
 
-用领域无关的文件、HTTP 与表单任务集运行真实模型，冻结模型、Prompt、预算和策略版本，比较
-all-tools、一阶段 BM25 和动态 Need 驱动扩展的任务完成率、误暴露、无效调用、延迟和 Token。
-真实失败再决定是否引入 dense retrieval、信息增益澄清或更强语义一致性校验。
+先在现有真实模型进度对照上取得可审计样本，再扩展领域无关的文件、HTTP 与多来源替代任务；
+能力发现仍需另行比较 all-tools、一阶段 BM25 和动态 Need 驱动扩展。真实失败再决定是否引入
+dense retrieval、信息增益停止策略或更强语义一致性校验。

@@ -52,6 +52,7 @@ from weavria.runtime import (
     EventAcceptanceError,
     RunLimits,
     SemanticProgressPolicy,
+    SemanticProgressPolicyFactory,
     ToolScheduling,
     reduce_event,
 )
@@ -378,6 +379,59 @@ def test_progress_inspection_counts_only_committed_batch_admission() -> None:
     assert repeated.reason == "repeated_action"
     with pytest.raises(ValueError, match="blocked progress proposal"):
         policy.record_admission(repeated)
+
+
+def test_progress_factory_creates_isolated_run_state_and_versioned_configuration() -> None:
+    tools = ToolRegistry(
+        (
+            TypedTool(
+                name="echo",
+                version="1",
+                description="Read a value",
+                input_type=Input,
+                output_type=Output,
+                execute=echo,
+            ),
+        )
+    )
+    factory = SemanticProgressPolicyFactory(max_stagnant_batches_per_action_family=1)
+    first = factory.create(tools)
+    second = factory.create(tools)
+    proposal = ToolBatch(calls=(call("first", "one"),))
+    check = first.inspect(
+        task=TaskInput(goal="Read a value"),
+        observation=None,
+        records=(),
+        batch=proposal,
+        capability_epoch=1,
+    )
+    first.record_admission(check)
+
+    first_repeat = first.inspect(
+        task=TaskInput(goal="Read a value"),
+        observation=None,
+        records=(),
+        batch=ToolBatch(calls=(call("first-repeat", "two"),)),
+        capability_epoch=1,
+    )
+    second_first = second.inspect(
+        task=TaskInput(goal="Read a value"),
+        observation=None,
+        records=(),
+        batch=ToolBatch(calls=(call("second-first", "two"),)),
+        capability_epoch=1,
+    )
+
+    assert first is not second
+    assert first_repeat.blocked and first_repeat.reason == "stagnant_action_family"
+    assert not second_first.blocked
+    assert "max_family_batches=1" in factory.version
+
+
+@pytest.mark.parametrize("limit", [0, True])
+def test_progress_factory_rejects_nonpositive_or_boolean_limits(limit: int) -> None:
+    with pytest.raises(ValueError, match="positive integer"):
+        SemanticProgressPolicyFactory(limit)
 
 
 async def test_semantic_frontier_bounds_volatile_outputs_from_one_action_family() -> None:

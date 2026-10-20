@@ -12,7 +12,13 @@ from .journal import (
     RunJournal,
     settle_mutation,
 )
-from .progress import ProgressCheck, ProgressPolicy, SemanticProgressPolicy
+from .progress import (
+    ProgressCheck,
+    ProgressPolicy,
+    ProgressPolicyFactory,
+    SemanticProgressPolicy,
+    SemanticProgressPolicyFactory,
+)
 from .scheduling import ToolScheduling
 from .state import EventAcceptanceError, Phase, RunState, reduce_event
 
@@ -31,6 +37,7 @@ __all__ = [
     "Phase",
     "ProgressCheck",
     "ProgressPolicy",
+    "ProgressPolicyFactory",
     "RequestJournal",
     "ResolutionJournal",
     "RootBudget",
@@ -38,6 +45,7 @@ __all__ = [
     "RunLimits",
     "RunState",
     "SemanticProgressPolicy",
+    "SemanticProgressPolicyFactory",
     "SystemClock",
     "ToolScheduling",
     "TurnPreparation",
