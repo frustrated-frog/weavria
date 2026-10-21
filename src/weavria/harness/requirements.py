@@ -99,6 +99,9 @@ class EvidenceAddress(_SemanticContract):
     artifact_id: _Reference
     artifact_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     json_pointer: str = ""
+    # Extractors may bind several artifacts to the same independently governed source.
+    # Absence means independence is unknown; producer call or artifact identity is not a proxy.
+    source_identity_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
 
 
 class EvidenceBinding(_SemanticContract):
@@ -169,7 +172,7 @@ class NeedLedger(_SemanticContract):
         return all(self.state_for(need_id).status is NeedStatus.SATISFIED for need_id in required)
 
     def progress_sha256(self) -> str:
-        """Digest effective Need progress while ignoring duplicate call identities."""
+        """Digest effective Need progress and stable sources, ignoring duplicate calls."""
         bindings = {item.binding_id: item for item in self.bindings}
         payload: list[dict[str, object]] = []
         for state in self.states:
@@ -191,6 +194,15 @@ class NeedLedger(_SemanticContract):
                                 bindings[identity].relation,
                                 bindings[identity].freshness,
                                 bindings[identity].missing_fields,
+                                tuple(
+                                    sorted(
+                                        {
+                                            address.source_identity_sha256
+                                            for address in bindings[identity].addresses
+                                            if address.source_identity_sha256 is not None
+                                        }
+                                    )
+                                ),
                             )
                             for identity in state.evidence_binding_ids
                             if identity in bindings
@@ -210,6 +222,7 @@ class EvidenceEvaluation(_SemanticContract):
     pointers: tuple[str, ...] = ("",)
     missing_fields: tuple[str, ...] = ()
     freshness: Literal["valid", "stale", "unknown"] = "unknown"
+    source_identity_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
 
 
 class EvidenceExtractor(Protocol):
@@ -287,7 +300,7 @@ class EvidenceResolver:
     @property
     def version(self) -> str:
         strategies = ",".join(f"{item.key}@{item.version}" for item in self._extractors)
-        return f"evidence-resolver/1[{strategies}]"
+        return f"evidence-resolver/2[{strategies}]"
 
     async def resolve(
         self,
@@ -342,6 +355,7 @@ class EvidenceResolver:
                         artifact_id=record.artifact.artifact_id,
                         artifact_sha256=record.artifact.sha256,
                         json_pointer=pointer,
+                        source_identity_sha256=evaluation.source_identity_sha256,
                     )
                     for pointer in evaluation.pointers
                 )

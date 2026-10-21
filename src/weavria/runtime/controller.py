@@ -11,10 +11,13 @@ from weavria.core import (
     CompletionRepair,
     FinishAction,
     ModelTurn,
+    ProgressAssessment,
     TaskDirective,
     TaskInput,
     TaskObservation,
     ToolBatch,
+    ToolRecord,
+    TurnFeedback,
     TurnResolution,
 )
 
@@ -39,6 +42,20 @@ class TurnPreparer(Protocol):
     async def prepare_turn(self, task: TaskInput) -> TurnPreparation: ...
 
 
+class ProgressAssessor(Protocol):
+    """Assess accepted feedback after settlement; it cannot accept completion."""
+
+    async def assess_progress(
+        self,
+        *,
+        task: TaskInput,
+        records: tuple[ToolRecord, ...],
+        feedback: TurnFeedback,
+        remaining_model_calls: int,
+        remaining_tool_calls: int,
+    ) -> ProgressAssessment | None: ...
+
+
 def prepare_task(task: TaskInput, directive: TaskDirective) -> TaskInput:
     """Preserve the original goal and ordered instructions; later conflicts take precedence."""
     return TaskInput(
@@ -58,6 +75,7 @@ def resolve_turn(
     stage: Literal["proposal", "execution", "completion"],
     turn: ModelTurn,
     assessment: CompletionAssessment | None = None,
+    progress_assessment: ProgressAssessment | None = None,
 ) -> TurnResolution:
     """Resolve model intent against current requirements and settled execution/acceptance."""
     step: Literal["dispatch", "verify", "continue", "replan", "repair", "complete"]
@@ -66,6 +84,11 @@ def resolve_turn(
         "tool_proposal",
         "finish_candidate",
         "feedback_ready",
+        "progress_observed",
+        "progress_repair",
+        "progress_replan",
+        "progress_ready_to_verify",
+        "progress_blocked",
         "acceptance_gap",
         "acceptance_resolved",
     ]
@@ -80,7 +103,23 @@ def resolve_turn(
     elif stage == "execution":
         if not isinstance(turn.decision, ToolBatch):
             raise ValueError("execution resolution requires a settled tool proposal")
-        step, reason = "continue", "feedback_ready"
+        if progress_assessment is None:
+            step, reason = "continue", "feedback_ready"
+        elif progress_assessment.task_revision != task_revision:
+            raise ValueError("progress assessment belongs to another task revision")
+        else:
+            recommendation = progress_assessment.continuation.recommended_action
+            step, reason = (
+                ("continue", "progress_ready_to_verify")
+                if recommendation == "verify"
+                else ("continue", "progress_observed")
+                if recommendation == "continue"
+                else ("repair", "progress_repair")
+                if recommendation == "repair"
+                else ("replan", "progress_blocked")
+                if recommendation == "stop"
+                else ("replan", "progress_replan")
+            )
     else:
         if (
             not isinstance(turn.decision, FinishAction)
@@ -105,7 +144,17 @@ def resolve_turn(
             if assessment is not None
             else None
         ),
+        progress_assessment_sha256=(
+            hashlib.sha256(progress_assessment.model_dump_json().encode()).hexdigest()
+            if progress_assessment is not None
+            else None
+        ),
         stage=stage,
         next_step=step,
         reason=reason,
+        policy_version=(
+            "progress-aware-resolution/2"
+            if stage == "execution" and progress_assessment is not None
+            else "revision/1"
+        ),
     )

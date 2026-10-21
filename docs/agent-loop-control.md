@@ -99,6 +99,8 @@ AgentLoop 的请求、事件和报告为 v3。旧 TurnRequest v2 / LoopEvent v2 
 | 反馈预算或工具次数不足 | 整批拒绝，保留必需观察；后续决策受模型次数和 Deadline 限制 |
 | 同一语义前沿精确重复动作，包括批内重复 | 整批派发前拒绝并返回 `repeated_action` 摘要 |
 | 同一工具版本动作族已有动作达到停滞阈值 | 后续整批拒绝并返回 `stagnant_action_family`；当前首次并行扇出不被 Progress 阈值截断，仍受 Tool Budget 和批次上限约束 |
+| Task-aware 工具回合完成 | 刷新 Need Ledger，持久化完整 `ProgressAssessment`，向下一轮投影受限 `ProgressNotice`；`verify` 仍需 Completion Policy 验收 |
+| Progress Assessor 故障 | 已结算 ToolRecord 保留，Run 失败关闭；不回滚外部事实、不伪造评估 |
 | 已无下一次模型调用额度 | 不执行新批次，模型预算耗尽 |
 | 参数错误、策略拒绝、普通工具失败 | 保留对应失败与成功兄弟，反馈后重规划 |
 | 来源违反 FeedbackBounds | 端口故障；不截断来源、不伪造回执，清理在途子任务 |
@@ -140,6 +142,8 @@ Task-aware Loop 的进度准入进一步使用 Need 状态而不是原始 Artifa
 工具默认值和字段校验器产生的规范化结果现在共同决定动作身份；原始提议、执行授权参数与不透明
 身份摘要的边界，以及首次合法批量探索不应被停滞阈值误拒绝的理由，见
 [ADR 0024](decisions/0024-规范化动作身份与观察后停滞门控.md)。
+工具回合结算后的义务变化、字段覆盖、独立来源、成本和继续可行性，以及它们如何绑定事件、控制摘要
+和回合决议，见 [ADR 0025](decisions/0025-结算后进度信号与可解释控制.md)。
 
 ## 当前局限和下一步
 

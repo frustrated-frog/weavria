@@ -50,6 +50,7 @@ from .intent import (
     RiskAwareAskOrActPolicy,
     intent_uncertainty_sha256,
 )
+from .progress import NeedProgressEvaluator
 from .requirements import (
     CompletionObligation,
     EvidenceAddress,
@@ -140,6 +141,7 @@ __all__ = [
     "ModelTaskInterpreter",
     "NeedFailure",
     "NeedLedger",
+    "NeedProgressEvaluator",
     "NeedState",
     "NeedStatus",
     "ObligationVerdict",

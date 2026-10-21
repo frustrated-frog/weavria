@@ -30,6 +30,9 @@ from weavria.core import (
     ModelDecided,
     ModelStarted,
     ModelTurn,
+    ProgressAssessed,
+    ProgressAssessment,
+    ProgressNotice,
     RunEnded,
     RunStarted,
     RunStatus,
@@ -92,6 +95,7 @@ class RunState:
     verification_version: str | None = None
     assessment_json: str | None = None
     completion_repairs: int = 0
+    progress_assessment_json: str | None = None
 
     @property
     def control(self) -> ControlFeedback | None:
@@ -106,6 +110,14 @@ class RunState:
         return (
             CompletionAssessment.model_validate_json(self.assessment_json)
             if self.assessment_json
+            else None
+        )
+
+    @property
+    def progress_assessment(self) -> ProgressAssessment | None:
+        return (
+            ProgressAssessment.model_validate_json(self.progress_assessment_json)
+            if self.progress_assessment_json
             else None
         )
 
@@ -173,7 +185,11 @@ def reduce_event(state: RunState | None, event: JournalEvent) -> RunState:
     if isinstance(data, TaskRevised):
         if data.task.revision != state.task.revision + 1:
             raise EventAcceptanceError("task revision must advance exactly once")
-        next_state = replace(next_state, control_json=None)
+        next_state = replace(
+            next_state,
+            control_json=None,
+            progress_assessment_json=None,
+        )
         if state.phase in (Phase.FINISH, Phase.ACCEPTED) or (
             state.phase is Phase.ACTION and state.journal_version == 1
         ):
@@ -247,7 +263,14 @@ def reduce_event(state: RunState | None, event: JournalEvent) -> RunState:
         )
     if isinstance(event, ControlEvent) and isinstance(
         data,
-        (BatchAdmitted, BatchRejected, VerificationStarted, CompletionChecked, CompletionDiscarded),
+        (
+            BatchAdmitted,
+            BatchRejected,
+            ProgressAssessed,
+            VerificationStarted,
+            CompletionChecked,
+            CompletionDiscarded,
+        ),
     ):
         return _reduce_control(state, next_state, data)
     if isinstance(event, (LoopEvent, ControlEvent)) and isinstance(
@@ -324,6 +347,7 @@ def _reduce_turn(
                 pending_json=decision.model_dump_json(),
                 control_json=None,
                 assessment_json=None,
+                progress_assessment_json=None,
                 admission_json=None,
             )
         identities = tuple(c.call_id for c in decision.calls)
@@ -341,6 +365,7 @@ def _reduce_turn(
             consumed_call_ids=(*state.consumed_call_ids, *identities),
             control_json=None,
             assessment_json=None,
+            progress_assessment_json=None,
             admission_json=None,
         )
 
@@ -468,10 +493,32 @@ def _reduce_control(
     next_state: RunState,
     data: BatchAdmitted
     | BatchRejected
+    | ProgressAssessed
     | VerificationStarted
     | CompletionChecked
     | CompletionDiscarded,
 ) -> RunState:
+    if isinstance(data, ProgressAssessed):
+        feedback = state.feedback
+        assessment = data.assessment
+        _require(
+            state.phase is Phase.READY
+            and feedback is not None
+            and state.progress_assessment is None
+            and feedback.task_revision == state.task.revision == assessment.task_revision,
+            "progress assessment requires current settled feedback",
+        )
+        assert feedback is not None
+        _require(
+            assessment.feedback_call_ids == tuple(item.call_id for item in feedback.calls),
+            "progress assessment does not bind the complete settled turn",
+        )
+        notice = ProgressNotice.from_assessment(assessment)
+        return replace(
+            next_state,
+            progress_assessment_json=assessment.model_dump_json(),
+            control_json=notice.model_dump_json(),
+        )
     if isinstance(data, (BatchAdmitted, BatchRejected)):
         turn = state.turn
         _require(

@@ -23,6 +23,7 @@ from .execution import (
 from .lifecycle import RunStatus
 from .model_io import HistoryEntry, TaskInput, TaskObservation, validate_task_observation
 from .outcomes import AgentResult
+from .progress import ProgressAssessment
 from .turns import CallSkipped, TurnDecided, TurnFeedback, TurnSettled, validate_turn_feedback
 
 CONTROL_FEEDBACK_BYTES = 1024
@@ -133,7 +134,46 @@ class CompletionNotice(ContractModel):
     decision: CompletionRepair
 
 
-type ControlFeedback = Annotated[AdmissionNotice | CompletionNotice, Field(discriminator="kind")]
+class ProgressNotice(ContractModel):
+    """Bounded model-visible projection of a full persisted ProgressAssessment."""
+
+    kind: Literal["progress_notice"] = "progress_notice"
+    assessment_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    quality: Literal["positive", "neutral", "regressed", "mixed"]
+    feasibility: Literal["ready", "viable", "constrained", "blocked"]
+    recommended_action: Literal["verify", "continue", "repair", "replan", "stop"]
+    reason_codes: tuple[Annotated[str, Field(pattern=r"^[a-z][a-z0-9_]{0,63}$")], ...] = Field(
+        min_length=1, max_length=8
+    )
+    open_obligations: int = Field(ge=0)
+    coverage_delta: int
+    independent_source_delta: int = Field(ge=0)
+    proposed_calls: int = Field(ge=1, le=32)
+
+    @model_validator(mode="after")
+    def bound_notice(self) -> Self:
+        if len(self.model_dump_json().encode()) > CONTROL_FEEDBACK_BYTES:
+            raise ValueError("progress notice exceeds its reserved channel")
+        return self
+
+    @classmethod
+    def from_assessment(cls, assessment: ProgressAssessment) -> Self:
+        return cls(
+            assessment_sha256=hashlib.sha256(assessment.model_dump_json().encode()).hexdigest(),
+            quality=assessment.quality,
+            feasibility=assessment.continuation.feasibility,
+            recommended_action=assessment.continuation.recommended_action,
+            reason_codes=assessment.continuation.reason_codes,
+            open_obligations=assessment.obligations.open_after,
+            coverage_delta=assessment.coverage.delta,
+            independent_source_delta=len(assessment.information_gain.new_source_sha256s),
+            proposed_calls=assessment.cost.proposed_calls,
+        )
+
+
+type ControlFeedback = Annotated[
+    AdmissionNotice | CompletionNotice | ProgressNotice, Field(discriminator="kind")
+]
 
 
 class ControlRequest(BaseModel):
@@ -215,6 +255,13 @@ class CompletionDiscarded(ContractModel):
     reason: Literal["task_changed"] = "task_changed"
 
 
+class ProgressAssessed(ContractModel):
+    """Persist the full signal vector before its compact control projection is consumed."""
+
+    kind: Literal["progress_assessed"] = "progress_assessed"
+    assessment: ProgressAssessment
+
+
 type ControlData = Annotated[
     RunStarted
     | TaskRevised
@@ -228,6 +275,7 @@ type ControlData = Annotated[
     | ToolRecorded
     | CallSkipped
     | TurnSettled
+    | ProgressAssessed
     | VerificationStarted
     | CompletionChecked
     | CompletionDiscarded

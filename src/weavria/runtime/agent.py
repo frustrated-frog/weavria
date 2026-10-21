@@ -51,6 +51,8 @@ from weavria.core import (
     ModelResponse,
     ModelStarted,
     ModelTurn,
+    ProgressAssessed,
+    ProgressAssessment,
     RunEnded,
     RunError,
     RunReport,
@@ -97,7 +99,13 @@ from .completion import (
     NoVerification,
     check_completion,
 )
-from .controller import TurnPreparation, TurnPreparer, prepare_task, resolve_turn
+from .controller import (
+    ProgressAssessor,
+    TurnPreparation,
+    TurnPreparer,
+    prepare_task,
+    resolve_turn,
+)
 from .journal import (
     InterventionJournal,
     JournalCommitError,
@@ -235,6 +243,7 @@ class _AgentKernel:
         preparation: TurnPreparer | None = None,
         task_observation: TaskObservation | None = None,
         progress: ProgressPolicy | None = None,
+        progress_assessor: ProgressAssessor | None = None,
     ) -> None:
         self._journal = journal
         self._preparation = preparation
@@ -276,6 +285,7 @@ class _AgentKernel:
             tools,
             max_stagnant_actions_per_family=self._limits.max_stagnant_actions_per_family,
         )
+        self._progress_assessor = progress_assessor
         self._no_progress_rejections = 0
         self._no_progress_frontier: str | None = None
         self._events_json: list[str] = []
@@ -493,7 +503,13 @@ class _AgentKernel:
                         )
                         if self._journal_version == 3:
                             assert isinstance(response, ModelTurn)
-                            await self._resolve("execution", response, task.revision)
+                            progress_assessment = await self._assess_progress(task.revision)
+                            await self._resolve(
+                                "execution",
+                                response,
+                                task.revision,
+                                progress_assessment=progress_assessment,
+                            )
         except asyncio.CancelledError as exc:
             self._failure_cause = exc
             if self._journal_failed:
@@ -794,6 +810,26 @@ class _AgentKernel:
             return None
         return assessment
 
+    async def _assess_progress(self, revision: int) -> ProgressAssessment | None:
+        if self._progress_assessor is None or revision != self.state.task.revision:
+            return None
+        feedback = self.state.feedback
+        if feedback is None or feedback.task_revision != revision:
+            raise ValueError("progress assessment requires the latest settled feedback")
+        assessment = await self._progress_assessor.assess_progress(
+            task=self.state.task,
+            records=self.state.records,
+            feedback=feedback,
+            remaining_model_calls=max(0, self._limits.max_model_calls - self.state.model_calls),
+            remaining_tool_calls=max(0, self._limits.max_tool_calls - self.state.tool_calls),
+        )
+        if assessment is None or revision != self.state.task.revision:
+            return None
+        assessment = ProgressAssessment.model_validate_json(assessment.model_dump_json())
+        if await self._accept(ProgressAssessed(assessment=assessment), expected_revision=revision):
+            return assessment
+        return None
+
     async def _execute_turn(
         self,
         calls: tuple[ToolCallAction, ...],
@@ -885,6 +921,8 @@ class _AgentKernel:
                 attempt = f"{step}/model/1"
             elif isinstance(data, (VerificationStarted, CompletionChecked, CompletionDiscarded)):
                 attempt = f"{step}/verification/1"
+            elif isinstance(data, ProgressAssessed):
+                attempt = f"{step}/progress/1"
             elif isinstance(data, (ToolStarted, ToolRecorded)):
                 if self._journal_version == 1:
                     attempt = f"{step}/tool/1"
@@ -1011,6 +1049,7 @@ class _AgentKernel:
         turn: ModelTurn,
         revision: int,
         assessment: CompletionAssessment | None = None,
+        progress_assessment: ProgressAssessment | None = None,
     ) -> TurnResolution:
         async with self._commit_lock:
             resolution = resolve_turn(
@@ -1022,6 +1061,7 @@ class _AgentKernel:
                 stage=stage,
                 turn=turn,
                 assessment=assessment,
+                progress_assessment=progress_assessment,
             )
             if isinstance(self._journal, ResolutionJournal):
                 try:
@@ -1224,6 +1264,7 @@ class AgentLoop(_AgentKernel):
         preparation: TurnPreparer | None = None,
         task_observation: TaskObservation | None = None,
         progress: ProgressPolicy | None = None,
+        progress_assessor: ProgressAssessor | None = None,
         # 构造函数只建立依赖、初始状态和首个事件,不在初始化阶段执行模型或工具。
     ) -> None:
         # 把基类的通用“决策”回调适配为 v3 模型调用,同时保留统一的超时边界。
@@ -1283,6 +1324,7 @@ class AgentLoop(_AgentKernel):
             # 传递反馈大小边界,使 v3 在工具执行前完成反馈预算准入判断。
             feedback_bounds=feedback_bounds,
             progress=progress,
+            progress_assessor=progress_assessor,
             # 完成共享内核初始化;此时实例已拥有初始状态,但尚未进入异步执行循环。
         )
 

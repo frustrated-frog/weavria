@@ -8,12 +8,14 @@ from weavria.core import (
     ConversationTurn,
     Message,
     MessageRole,
+    ProgressAssessment,
     SemanticSnapshot,
     SemanticTransition,
     TaskObservation,
 )
 from weavria.sessions import (
     ClarificationDeliveryPlan,
+    SessionProgressContext,
     SessionSemanticContext,
     SessionTaskContext,
     SessionTaskPreparation,
@@ -22,6 +24,7 @@ from weavria.sessions import (
 from .capabilities import CapabilityQuery, CapabilityResolver
 from .clarification import BlockingAmbiguityPolicy, ClarificationPolicy
 from .completion import TaskCompletionEvaluator, TaskObligationCompletionPolicy
+from .progress import NeedProgressEvaluator
 from .requirements import EvidenceResolver, NeedLedger, NeedStatus, stable_identifier
 from .understanding import (
     TaskFrame,
@@ -54,6 +57,7 @@ class TaskAwareSessionPreparer:
         self._evidence = evidence or EvidenceResolver()
         self._capabilities = capabilities or CapabilityResolver()
         self._clarification = clarification or BlockingAmbiguityPolicy()
+        self._progress = NeedProgressEvaluator()
         self._completion = TaskObligationCompletionPolicy(
             TaskCompletionEvaluator(evidence=self._evidence)
         )
@@ -74,6 +78,29 @@ class TaskAwareSessionPreparer:
             "task-aware-session/5["
             f"{self._understanding.version};{self._evidence.version};"
             f"{self._capabilities.version};{self._clarification.version}]"
+        )
+
+    @property
+    def progress_assessment_version(self) -> str:
+        return self._progress.version
+
+    async def assess_progress(self, context: SessionProgressContext) -> ProgressAssessment:
+        """Evaluate the just-settled turn against committed before/after semantic heads."""
+        before = NeedLedger.model_validate_json(json.dumps(context.before.need_ledger))
+        after = NeedLedger.model_validate_json(json.dumps(context.after.need_ledger))
+        frame = load_task_frame(context.after.observation.payload)
+        return self._progress.assess(
+            task_revision=context.task.revision,
+            frame=frame,
+            before=before,
+            after=after,
+            records=context.records,
+            feedback=context.feedback,
+            remaining_model_calls=context.remaining_model_calls,
+            remaining_tool_calls=context.remaining_tool_calls,
+            capability_expanded=(
+                context.after.version.capability_epoch > context.before.version.capability_epoch
+            ),
         )
 
     async def prepare(self, context: SessionTaskContext) -> SessionTaskPreparation:

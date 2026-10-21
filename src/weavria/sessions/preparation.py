@@ -10,11 +10,13 @@ from weavria.artifacts import ArtifactSnapshot
 from weavria.core import (
     ApplicationObservation,
     ConversationTurn,
+    ProgressAssessment,
     SemanticSnapshot,
     SemanticTransition,
     TaskInput,
     TaskObservation,
     ToolRecord,
+    TurnFeedback,
     WorkStatus,
 )
 from weavria.tools import ToolRegistry
@@ -99,6 +101,25 @@ class SessionSemanticContext:
     records: tuple[ToolRecord, ...]
     read_artifact: Callable[[str], Awaitable[ArtifactSnapshot]]
     trigger: Literal["tool_feedback", "steering"]
+
+
+@dataclass(frozen=True, slots=True)
+class SessionProgressContext:
+    """Accepted semantic snapshots and Runtime counters around one settled tool turn."""
+
+    task: TaskInput
+    before: SemanticSnapshot
+    after: SemanticSnapshot
+    records: tuple[ToolRecord, ...]
+    feedback: TurnFeedback
+    remaining_model_calls: int
+    remaining_tool_calls: int
+
+
+class SessionProgressAssessor(Protocol):
+    """Optional Harness capability; semantic preparation remains usable without it."""
+
+    async def assess_progress(self, context: SessionProgressContext) -> ProgressAssessment: ...
 
 
 class SessionTaskPreparer(Protocol):

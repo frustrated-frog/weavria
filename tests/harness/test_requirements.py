@@ -1,3 +1,4 @@
+import hashlib
 from typing import Literal
 
 import pytest
@@ -121,6 +122,31 @@ class _ProgressiveExtractor:
         )
 
 
+class _AttributedExtractor:
+    key = "attributed"
+    version = "1"
+
+    def supports(self, requirement: InformationRequirement, record: ToolRecord) -> bool:
+        del requirement, record
+        return True
+
+    async def evaluate(
+        self,
+        requirement: InformationRequirement,
+        record: ToolRecord,
+        snapshot: ArtifactSnapshot,
+    ) -> EvidenceEvaluation:
+        del requirement, snapshot
+        key = str(record.exchange.action.arguments["key"])
+        publisher = "publisher-a" if key in {"a", "a-again"} else "publisher-b"
+        return EvidenceEvaluation(
+            relation="supports",
+            pointers=("/value",),
+            freshness="valid",
+            source_identity_sha256=hashlib.sha256(publisher.encode()).hexdigest(),
+        )
+
+
 async def test_resolver_binds_accepted_artifact_and_satisfies_structural_need() -> None:
     store, record = await _success_record()
     resolver = EvidenceResolver()
@@ -142,6 +168,67 @@ async def test_resolver_binds_accepted_artifact_and_satisfies_structural_need() 
     assert address.producer_call_id == "call-1"
     assert record.artifact is not None
     assert address.artifact_sha256 == record.artifact.sha256
+
+
+async def test_progress_digest_advances_for_new_attributed_source_not_duplicate_call() -> None:
+    store = InMemoryArtifactStore()
+    registry = ToolRegistry(
+        (
+            TypedTool(
+                name="fetch",
+                version="1",
+                description="Fetch one value",
+                input_type=_Input,
+                output_type=_Output,
+                execute=_fetch,
+            ),
+        )
+    )
+    executor = ToolExecutor("run-1", registry, store, ReadOnlyPolicy())
+    records = tuple(
+        [
+            await executor.execute(
+                ToolCallAction(
+                    call_id=f"call-source-{index}",
+                    tool_name="fetch",
+                    arguments={"key": key},
+                ),
+                max_duration=1,
+            )
+            for index, key in enumerate(("a", "a-again", "b"), start=1)
+        ]
+    )
+    resolver = EvidenceResolver((_AttributedExtractor(),))
+    requirement = _requirement()
+    first = await resolver.resolve(
+        work_id="work-a",
+        task_revision=1,
+        frame_revision=1,
+        requirements=(requirement,),
+        records=(records[0],),
+        read_artifact=lambda artifact_id: store.get("run-1", artifact_id),
+    )
+    duplicate_source = await resolver.resolve(
+        work_id="work-a",
+        task_revision=1,
+        frame_revision=1,
+        requirements=(requirement,),
+        records=(records[1],),
+        read_artifact=lambda artifact_id: store.get("run-1", artifact_id),
+        previous=first,
+    )
+    independent_source = await resolver.resolve(
+        work_id="work-a",
+        task_revision=1,
+        frame_revision=1,
+        requirements=(requirement,),
+        records=(records[2],),
+        read_artifact=lambda artifact_id: store.get("run-1", artifact_id),
+        previous=duplicate_source,
+    )
+
+    assert duplicate_source.progress_sha256() == first.progress_sha256()
+    assert independent_source.progress_sha256() != duplicate_source.progress_sha256()
 
 
 @pytest.mark.parametrize("complete_second", [True, False])

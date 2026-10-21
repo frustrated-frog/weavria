@@ -22,6 +22,7 @@ from weavria.core import (
     ConversationView,
     ModelTurn,
     PendingClarification,
+    ProgressAssessment,
     SemanticSnapshot,
     SemanticTransition,
     SemanticVersion,
@@ -31,6 +32,8 @@ from weavria.core import (
     TaskInput,
     TaskObservation,
     TaskUpdate,
+    ToolRecord,
+    TurnFeedback,
     TurnResolution,
 )
 from weavria.models import ModelCapabilities, SessionModelProvider
@@ -57,6 +60,8 @@ from .preparation import (
     ClarificationDeliveryPlan,
     ExplicitClarificationOnly,
     SemanticTransitionReducer,
+    SessionProgressAssessor,
+    SessionProgressContext,
     SessionSemanticContext,
     SessionTaskContext,
     SessionTaskPreparer,
@@ -209,6 +214,38 @@ class _SessionAdapter:
                 else None
             ),
             semantic_state=(self._semantic.need_ledger if self._semantic is not None else None),
+        )
+
+    async def assess_progress(
+        self,
+        *,
+        task: TaskInput,
+        records: tuple[ToolRecord, ...],
+        feedback: TurnFeedback,
+        remaining_model_calls: int,
+        remaining_tool_calls: int,
+    ) -> ProgressAssessment | None:
+        if self._task_preparer is None or self._semantic is None:
+            return None
+        assessor_method = getattr(self._task_preparer, "assess_progress", None)
+        if assessor_method is None:
+            return None
+        assessor = cast(SessionProgressAssessor, self._task_preparer)
+        before = self._semantic
+        await self._refresh_semantics(task)
+        after = self._semantic
+        if task.revision != after.version.task_revision:
+            return None
+        return await assessor.assess_progress(
+            SessionProgressContext(
+                task=task,
+                before=before,
+                after=after,
+                records=records,
+                feedback=feedback,
+                remaining_model_calls=remaining_model_calls,
+                remaining_tool_calls=remaining_tool_calls,
+            )
         )
 
     async def _refresh_semantics(self, task: TaskInput) -> None:
@@ -459,6 +496,11 @@ class SessionEngine:
                         if self._progress_factory is not None
                         else "agent-loop-default/1"
                     ),
+                    "progress_assessment_version": getattr(
+                        self._task_preparation,
+                        "progress_assessment_version",
+                        "none/1",
+                    ),
                 },
                 ensure_ascii=False,
             )
@@ -654,6 +696,7 @@ class SessionEngine:
                     if self._progress_factory is not None
                     else None
                 ),
+                progress_assessor=adapter,
             )
             self._loops[session_id] = loop
             self._run_tasks[run_id] = owner

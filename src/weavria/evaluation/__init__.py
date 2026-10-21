@@ -39,6 +39,12 @@ from .progress_live import (
     load_live_progress_dataset,
     result_is_correct,
 )
+from .progress_signals import (
+    ProgressSignalCase,
+    ProgressSignalCaseResult,
+    ProgressSignalExperiment,
+    evaluate_progress_signals,
+)
 
 __all__ = [
     "CapabilityCase",
@@ -60,6 +66,9 @@ __all__ = [
     "ProgressControlCase",
     "ProgressControlCaseResult",
     "ProgressControlExperiment",
+    "ProgressSignalCase",
+    "ProgressSignalCaseResult",
+    "ProgressSignalExperiment",
     "ProgressStrategySummary",
     "ProviderFinishReason",
     "TokenUsage",
@@ -68,6 +77,7 @@ __all__ = [
     "evaluate_intent_clarification",
     "evaluate_intent_decision",
     "evaluate_progress_control",
+    "evaluate_progress_signals",
     "load_live_progress_dataset",
     "result_is_correct",
 ]

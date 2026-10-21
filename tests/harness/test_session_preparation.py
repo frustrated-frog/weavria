@@ -13,10 +13,13 @@ from weavria.core import (
     Message,
     ModelResponse,
     ModelTurn,
+    ProgressAssessed,
+    ProgressNotice,
     RunStatus,
     SessionClarificationChanged,
     SessionInterrupted,
     SessionRequest,
+    SessionRunEvent,
     SessionSemanticCommitted,
     TaskInput,
     ToolBatch,
@@ -521,6 +524,17 @@ async def test_execute_frame_exposes_only_selected_business_capability(
     ledger = NeedLedger.model_validate_json(json.dumps(semantic.need_ledger))
     assert ledger.state_for(frame.requirements[0].need_id).status is NeedStatus.SATISFIED
     assert any(event.data.kind == "semantic_committed" for event in events)
+    progress_events = [
+        event.data.event.data
+        for event in events
+        if isinstance(event.data, SessionRunEvent)
+        and isinstance(event.data.event.data, ProgressAssessed)
+    ]
+    assert len(progress_events) == 1
+    assert progress_events[0].assessment.obligations.open_after == 0
+    assert progress_events[0].assessment.continuation.recommended_action == "verify"
+    assert isinstance(model.requests[1].current.control, ProgressNotice)
+    assert model.requests[1].current.control.recommended_action == "verify"
     first = model.requests[0].current
     assert first.task.goal == "Read alpha."
     assert "read_value" in first.instructions

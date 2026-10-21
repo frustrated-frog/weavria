@@ -15,6 +15,13 @@ Progress 控制现在区分精确动作与动作族：Task-aware 路径只在有
 的 `stagnant_action_family`，切换独立能力仍然可行。详细决策与冻结基线见
 [ADR 0022](decisions/0022-语义前沿与有界探索.md)。
 
+工具批次结算后，Task-aware Session 还会比较前后 Need Ledger，分别记录可观察义务变化、必需字段
+覆盖、由 Extractor 明确归因的独立来源、Runtime 可测成本和继续可行性。完整评估进入
+`ProgressAssessed` 事件，受限摘要作为 `ProgressNotice` 进入下一轮；它可以建议 continue、repair、
+replan、verify 或 stop，但不能授权工具或替代完成验收。来源身份缺失时保持 unknown，不以 Artifact
+或 Call ID 猜测独立性。详细设计见
+[ADR 0025](decisions/0025-结算后进度信号与可解释控制.md)。
+
 ## 2. 它解决什么问题
 
 旧路径能判断“执行哪个工具”，却不能回答工具结果满足了哪条事实需求，也不能在 steering、
@@ -68,7 +75,9 @@ uv run python examples/progress_control.py
 expected recall 和 visible count。它是机制诊断，不是自然语言任务完成率结论。
 
 进度控制实验用 `evaluate_progress_control` 比较语义前沿/动作族策略与仅阻止精确重复的基线。
-当前冻结合成轨迹为 8/8 对 7/8；它验证参数逃逸与真实 Need 推进的边界，不证明真实模型收益。
+当前冻结合成轨迹为 13/13 对 11/13；它验证参数逃逸、批次重组与首次合法扇出的边界，不证明真实
+模型收益。结算后 ProgressAssessment 目前有确定性机制和故障测试，但尚未获得真实模型 A/B 收益
+证据；五类控制建议相对“摘要变化”基线的冻结控制面实验为 5/5 对 2/5，它只证明控制表达力。
 
 显式配置 OpenAI-compatible 环境后，可运行端到端 A/B：
 
@@ -94,6 +103,6 @@ Provider Token 覆盖率。当前尚无有效真实模型结果，不能从入�
 
 ## 7. 下一小步
 
-先在现有真实模型进度对照上取得可审计样本，再扩展领域无关的文件、HTTP 与多来源替代任务；
-能力发现仍需另行比较 all-tools、一阶段 BM25 和动态 Need 驱动扩展。真实失败再决定是否引入
-dense retrieval、信息增益停止策略或更强语义一致性校验。
+冻结领域无关的文件、HTTP、多来源替代与不可恢复失败任务，比较仅看摘要变化、当前解释性规则和
+成本敏感策略；补齐 Provider Token、延迟、来源身份覆盖率与任务完成指标后，再决定是否引入学习式
+继续价值、dense retrieval 或更强语义一致性校验。

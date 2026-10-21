@@ -3,7 +3,7 @@
 from .agent import AgentLoop, AgentRun, Clock, LegacyAgentLoop, RunLimits, SystemClock
 from .budget import RootBudget
 from .completion import CompletionContext, CompletionPolicy, LayeredCompletionPolicy, NoVerification
-from .controller import TurnPreparation, TurnPreparer, prepare_task, resolve_turn
+from .controller import ProgressAssessor, TurnPreparation, TurnPreparer, prepare_task, resolve_turn
 from .journal import (
     InterventionJournal,
     JournalCommitError,
@@ -36,6 +36,7 @@ __all__ = [
     "LegacyAgentLoop",
     "NoVerification",
     "Phase",
+    "ProgressAssessor",
     "ProgressCheck",
     "ProgressPolicy",
     "ProgressPolicyFactory",

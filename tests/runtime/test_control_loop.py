@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, JsonValue, TypeAdapter, ValidationEr
 from weavria.artifacts import ArtifactAccessError, ArtifactSnapshot, InMemoryArtifactStore
 from weavria.context import EvidenceMode, reserve_feedback
 from weavria.core import (
+    ActionCostSignal,
     AdmissionNotice,
     AgentResult,
     BatchAdmitted,
@@ -21,12 +22,19 @@ from weavria.core import (
     CompletionNotice,
     CompletionRepair,
     CompletionUnverifiable,
+    ContinuationSignal,
     ControlEvent,
     ControlRequest,
     ErrorCategory,
+    EvidenceCoverageSignal,
     FeedbackBounds,
     FinishAction,
+    InformationGainSignal,
     ModelTurn,
+    ObligationProgressSignal,
+    ProgressAssessed,
+    ProgressAssessment,
+    ProgressNotice,
     RunEnded,
     RunError,
     RunReport,
@@ -39,6 +47,7 @@ from weavria.core import (
     ToolFailedObservation,
     ToolRecord,
     ToolStarted,
+    TurnFeedback,
     VerificationStarted,
     decode_event,
     maximum_exchange_bytes,
@@ -50,6 +59,7 @@ from weavria.runtime import (
     CompletionContext,
     CompletionPolicy,
     EventAcceptanceError,
+    ProgressAssessor,
     RunLimits,
     SemanticProgressPolicy,
     SemanticProgressPolicyFactory,
@@ -102,6 +112,7 @@ def make_loop(
     mode: EvidenceMode = EvidenceMode.RELEVANT,
     bounds: FeedbackBounds | None = None,
     task_observation: TaskObservation | None = None,
+    progress_assessor: ProgressAssessor | None = None,
 ) -> AgentLoop:
     return AgentLoop(
         run_id="run",
@@ -127,7 +138,78 @@ def make_loop(
         feedback_bounds=bounds,
         scheduling=ToolScheduling(2, frozenset({"echo"})),
         task_observation=task_observation,
+        progress_assessor=progress_assessor,
     )
+
+
+class _ReadyProgressAssessor:
+    async def assess_progress(
+        self,
+        *,
+        task: TaskInput,
+        records: tuple[ToolRecord, ...],
+        feedback: TurnFeedback,
+        remaining_model_calls: int,
+        remaining_tool_calls: int,
+    ) -> ProgressAssessment:
+        del records
+        call_ids = tuple(item.call_id for item in feedback.calls)
+        return ProgressAssessment(
+            task_revision=task.revision,
+            policy_version="test-progress/1",
+            before_state_sha256="a" * 64,
+            after_state_sha256="b" * 64,
+            feedback_call_ids=call_ids,
+            obligations=ObligationProgressSignal(
+                observable_total=1,
+                open_before=1,
+                open_after=0,
+                newly_satisfied_ids=("obligation-a",),
+            ),
+            coverage=EvidenceCoverageSignal(
+                total_units=1,
+                covered_before=0,
+                covered_after=1,
+                newly_covered_units=("need-a#/value",),
+            ),
+            information_gain=InformationGainSignal(
+                attributed_sources_before=0,
+                attributed_sources_after=0,
+                unattributed_new_bindings=1,
+                repeated_source_bindings=0,
+                contradictory_new_bindings=0,
+            ),
+            cost=ActionCostSignal(
+                proposed_calls=len(call_ids),
+                succeeded_calls=len(call_ids),
+                failed_calls=0,
+                skipped_calls=0,
+                artifact_bytes=1,
+                remaining_model_calls=remaining_model_calls,
+                remaining_tool_calls=remaining_tool_calls,
+            ),
+            continuation=ContinuationSignal(
+                feasibility="ready",
+                recommended_action="verify",
+                reason_codes=("observable_obligations_satisfied",),
+            ),
+            quality="positive",
+            material_progress=True,
+        )
+
+
+class _FailingProgressAssessor:
+    async def assess_progress(
+        self,
+        *,
+        task: TaskInput,
+        records: tuple[ToolRecord, ...],
+        feedback: TurnFeedback,
+        remaining_model_calls: int,
+        remaining_tool_calls: int,
+    ) -> ProgressAssessment:
+        del task, records, feedback, remaining_model_calls, remaining_tool_calls
+        raise RuntimeError("assessment backend failed")
 
 
 def replay(agent: AgentLoop) -> None:
@@ -190,6 +272,62 @@ async def test_tool_budget_rejects_whole_batch_and_model_can_change_plan() -> No
     assert isinstance(notice, AdmissionNotice) and notice.reason == "tool_budget"
     assert notice.remaining_tool_calls == 1
     assert agent.state.tool_calls == 1
+    replay(agent)
+
+
+async def test_progress_assessment_is_persisted_projected_and_drives_resolution() -> None:
+    provider = FakeControlProvider((batch(call("read-1")), finish("grounded")))
+    agent = make_loop(provider, progress_assessor=_ReadyProgressAssessor())
+
+    result = await agent.execute()
+
+    assert result.status is RunStatus.COMPLETED
+    assessed = [event.data for event in agent.events if isinstance(event.data, ProgressAssessed)]
+    assert len(assessed) == 1
+    assert assessed[0].assessment.continuation.recommended_action == "verify"
+    notice = provider.requests[1].control
+    assert isinstance(notice, ProgressNotice)
+    assert notice.recommended_action == "verify"
+    execution_resolution = next(item for item in agent.resolutions if item.stage == "execution")
+    assert execution_resolution.next_step == "continue"
+    assert execution_resolution.reason == "progress_ready_to_verify"
+    assert execution_resolution.progress_assessment_sha256 == notice.assessment_sha256
+    assert execution_resolution.policy_version == "progress-aware-resolution/2"
+    state = None
+    for event in agent.events:
+        if isinstance(event.data, ProgressAssessed):
+            forged = event.model_copy(
+                update={
+                    "data": ProgressAssessed(
+                        assessment=event.data.assessment.model_copy(
+                            update={"feedback_call_ids": ("another-call",)}
+                        )
+                    )
+                }
+            )
+            with pytest.raises(EventAcceptanceError, match="complete settled turn"):
+                reduce_event(state, forged)
+            break
+        state = reduce_event(state, event)
+    replay(agent)
+
+
+async def test_progress_assessor_failure_preserves_settled_tool_fact_and_fails_closed() -> None:
+    agent = make_loop(
+        FakeControlProvider((batch(call("read-1")),)),
+        progress_assessor=_FailingProgressAssessor(),
+    )
+
+    result = await agent.execute()
+
+    assert result.status is RunStatus.FAILED
+    assert result.error is not None
+    assert result.error.category is ErrorCategory.RUNTIME_INVARIANT_VIOLATION
+    assert isinstance(agent.failure_cause, RuntimeError)
+    assert [record.exchange.action.call_id for record in agent.state.records] == ["read-1"]
+    assert not any(isinstance(event.data, ProgressAssessed) for event in agent.events)
+    assert isinstance(agent.events[-1].data, RunEnded)
+    assert agent.events[-1].data.reason == "runtime_failure"
     replay(agent)
 
 
