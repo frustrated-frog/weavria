@@ -2,7 +2,7 @@ import asyncio
 from typing import Literal
 
 import pytest
-from pydantic import BaseModel, ConfigDict, JsonValue
+from pydantic import BaseModel, ConfigDict, JsonValue, field_validator
 
 from weavria.artifacts import InMemoryArtifactStore
 from weavria.core import ErrorCategory, ToolCallAction, ToolFailedObservation
@@ -11,6 +11,7 @@ from weavria.tools import (
     ReadOnlyPolicy,
     ToolContext,
     ToolDescriptor,
+    ToolExecutionError,
     ToolExecutor,
     ToolFault,
     ToolRegistry,
@@ -206,6 +207,48 @@ def test_registry_rejects_duplicate_names_and_descriptor_copies_are_independent(
     assert registered.descriptor.input_schema
 
 
+def test_action_identity_uses_validated_defaults_and_tool_normalization() -> None:
+    class SearchInput(BaseModel):
+        model_config = ConfigDict(extra="forbid", strict=True)
+        query: str = "all"
+
+        @field_validator("query")
+        @classmethod
+        def normalize_query(cls, value: str) -> str:
+            return value.strip().casefold()
+
+    async def search(arguments: SearchInput, context: ToolContext) -> Output:
+        return Output(doubled=len(arguments.query))
+
+    registry = ToolRegistry(
+        (
+            TypedTool(
+                name="search",
+                version="2026.1",
+                description="Search normalized text",
+                input_type=SearchInput,
+                output_type=Output,
+                execute=search,
+            ),
+        )
+    )
+
+    omitted = registry.action_identity(action({}, "search", "omitted"))
+    explicit = registry.action_identity(action({"query": " ALL "}, "search", "explicit"))
+    invalid = registry.action_identity(action({"query": 3}, "search", "invalid"))
+    unknown = registry.action_identity(action({}, "missing", "unknown"))
+
+    assert omitted.normalization == explicit.normalization == "validated"
+    assert omitted.tool_version == explicit.tool_version == "2026.1"
+    assert omitted.canonical_action_sha256 == explicit.canonical_action_sha256
+    assert omitted.action_family_sha256 == explicit.action_family_sha256
+    assert invalid.normalization == "invalid_arguments"
+    assert invalid.canonical_action_sha256 != omitted.canonical_action_sha256
+    assert invalid.action_family_sha256 == omitted.action_family_sha256
+    assert unknown.normalization == "unknown_tool" and unknown.tool_version == "unknown"
+    assert unknown.action_family_sha256 != omitted.action_family_sha256
+
+
 @pytest.mark.parametrize("raise_after_cancel", [False, True])
 async def test_suppressed_backend_cancel_is_not_published(raise_after_cancel: bool) -> None:
     started = asyncio.Event()
@@ -275,6 +318,41 @@ async def test_policy_decision_is_bound_to_normalized_input_and_is_a_snapshot() 
     assert record.authorization.allowed and record.authorization.tool_version == "2026.1"
     assert record.authorization.normalized_arguments == {"value": 7}
     assert record.exchange.action.arguments == {}
+
+
+async def test_execution_fails_closed_if_normalization_changes_after_admission() -> None:
+    calls = 0
+
+    class UnstableInput(BaseModel):
+        model_config = ConfigDict(strict=True, extra="forbid")
+        value: int
+
+        @field_validator("value")
+        @classmethod
+        def change_value(cls, value: int) -> int:
+            nonlocal calls
+            calls += 1
+            return value + calls
+
+    async def unstable(arguments: UnstableInput, context: ToolContext) -> Output:
+        return Output(doubled=arguments.value * 2)
+
+    backend = TypedTool(
+        name="unstable",
+        version="1",
+        description="Expose a broken non-deterministic validator",
+        input_type=UnstableInput,
+        output_type=Output,
+        execute=unstable,
+    )
+    registry = ToolRegistry((backend,))
+    proposed = action({"value": 1}, "unstable")
+    identity = registry.action_identity(proposed)
+
+    with pytest.raises(ToolExecutionError, match="normalization changed"):
+        await ToolExecutor("run", registry, InMemoryArtifactStore(), ReadOnlyPolicy()).execute(
+            proposed, max_duration=1, expected_identity=identity
+        )
 
 
 async def test_policy_denial_is_recorded_and_backend_is_not_invoked() -> None:

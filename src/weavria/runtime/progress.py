@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Literal, Protocol
 
 from weavria.core import TaskInput, TaskObservation, ToolBatch, ToolFailedObservation, ToolRecord
-from weavria.tools import ToolRegistry
+from weavria.tools import ToolActionIdentity, ToolRegistry
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,6 +40,7 @@ class ProgressCheck:
     action_family_sha256: str
     prior_family_attempts: int
     reservations: tuple[ProgressReservation, ...]
+    action_identities: tuple[ToolActionIdentity, ...]
 
 
 class ProgressPolicy(Protocol):
@@ -86,9 +87,9 @@ class SemanticProgressPolicyFactory:
     @property
     def version(self) -> str:
         return (
-            "semantic-progress-factory/2["
+            "semantic-progress-factory/3["
             f"policy={SemanticProgressPolicy.version};"
-            f"max_family_actions={self.max_stagnant_actions_per_family}]"
+            f"stagnation_threshold={self.max_stagnant_actions_per_family}]"
         )
 
     def create(self, tools: ToolRegistry) -> ProgressPolicy:
@@ -105,7 +106,7 @@ class SemanticProgressPolicy:
     two-phase protocol: an action is counted only after ``BatchAdmitted`` has been accepted.
     """
 
-    version = "semantic-progress/4"
+    version = "semantic-progress/5"
 
     def __init__(
         self,
@@ -115,7 +116,7 @@ class SemanticProgressPolicy:
     ) -> None:
         if type(max_stagnant_actions_per_family) is not int or max_stagnant_actions_per_family < 1:
             raise ValueError("stagnant action-family limit must be a positive integer")
-        self._versions = {item.name: item.version for item in tools.descriptors}
+        self._tools = tools
         self._max_stagnant_actions = max_stagnant_actions_per_family
         self._admitted: dict[tuple[str, str], set[str]] = {}
 
@@ -164,23 +165,13 @@ class SemanticProgressPolicy:
                 "capability_epoch": capability_epoch,
             }
         )
+        action_identities = tuple(self._tools.action_identity(call) for call in batch.calls)
         actions = tuple(
             (
-                _digest(
-                    {
-                        "tool_name": call.tool_name,
-                        "tool_version": self._versions.get(call.tool_name, "unknown"),
-                        "arguments": call.arguments,
-                    }
-                ),
-                _digest(
-                    {
-                        "tool_name": call.tool_name,
-                        "tool_version": self._versions.get(call.tool_name, "unknown"),
-                    }
-                ),
+                identity.canonical_action_sha256,
+                identity.action_family_sha256,
             )
-            for call in batch.calls
+            for identity in action_identities
         )
         canonical = _digest([action for action, _ in actions])
         proposed: dict[str, list[str]] = {}
@@ -193,7 +184,7 @@ class SemanticProgressPolicy:
             family_proposal = proposed.setdefault(family, [])
             if action in admitted or action in family_proposal:
                 blocked_reason = "repeated_action"
-            elif len(admitted) + len(family_proposal) >= self._max_stagnant_actions:
+            elif len(admitted) >= self._max_stagnant_actions:
                 blocked_reason = "stagnant_action_family"
             if blocked_reason is not None:
                 blocked_action = action
@@ -241,6 +232,7 @@ class SemanticProgressPolicy:
             action_family_sha256=family,
             prior_family_attempts=prior,
             reservations=reservations,
+            action_identities=action_identities,
         )
 
     def record_admission(self, check: ProgressCheck) -> None:
@@ -260,11 +252,8 @@ class SemanticProgressPolicy:
                 raise ValueError("progress admission does not match the inspected frontier")
             if admitted.intersection(reservation.canonical_action_sha256s):
                 raise ValueError("progress admission was already recorded")
-            if (
-                len(admitted) + len(reservation.canonical_action_sha256s)
-                > self._max_stagnant_actions
-            ):
-                raise ValueError("progress admission exceeds its action-family limit")
+            if len(admitted) >= self._max_stagnant_actions:
+                raise ValueError("progress admission starts from an exhausted action family")
         for reservation in check.reservations:
             admitted = self._admitted.setdefault(
                 (check.fingerprint_sha256, reservation.action_family_sha256), set()

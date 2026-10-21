@@ -98,7 +98,7 @@ AgentLoop 的请求、事件和报告为 v3。旧 TurnRequest v2 / LoopEvent v2 
 | --- | --- |
 | 反馈预算或工具次数不足 | 整批拒绝，保留必需观察；后续决策受模型次数和 Deadline 限制 |
 | 同一语义前沿精确重复动作，包括批内重复 | 整批派发前拒绝并返回 `repeated_action` 摘要 |
-| 同一工具版本动作族的唯一参数动作超过上限 | 逐动作计量、整批拒绝并返回 `stagnant_action_family`；改变批次形状不能重置额度，替代工具族仍可提议 |
+| 同一工具版本动作族已有动作达到停滞阈值 | 后续整批拒绝并返回 `stagnant_action_family`；当前首次并行扇出不被 Progress 阈值截断，仍受 Tool Budget 和批次上限约束 |
 | 已无下一次模型调用额度 | 不执行新批次，模型预算耗尽 |
 | 参数错误、策略拒绝、普通工具失败 | 保留对应失败与成功兄弟，反馈后重规划 |
 | 来源违反 FeedbackBounds | 端口故障；不截断来源、不伪造回执，清理在途子任务 |
@@ -137,6 +137,9 @@ uv run pytest tests/runtime/test_control_loop.py tests/models/test_control_contr
 Task-aware Loop 的进度准入进一步使用 Need 状态而不是原始 Artifact 数量定义语义前沿；机制、
 两阶段提交不变量与 exact-action-only 冻结基线见
 [ADR 0022](decisions/0022-语义前沿与有界探索.md)。
+工具默认值和字段校验器产生的规范化结果现在共同决定动作身份；原始提议、执行授权参数与不透明
+身份摘要的边界，以及首次合法批量探索不应被停滞阈值误拒绝的理由，见
+[ADR 0024](decisions/0024-规范化动作身份与观察后停滞门控.md)。
 
 ## 当前局限和下一步
 

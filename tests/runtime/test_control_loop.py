@@ -381,6 +381,44 @@ def test_progress_inspection_counts_only_committed_batch_admission() -> None:
         policy.record_admission(repeated)
 
 
+def test_progress_identity_collapses_omitted_and_explicit_tool_defaults() -> None:
+    tools = ToolRegistry(
+        (
+            TypedTool(
+                name="echo",
+                version="1",
+                description="Read a value",
+                input_type=Input,
+                output_type=Output,
+                execute=echo,
+            ),
+        )
+    )
+    policy = SemanticProgressPolicy(tools, max_stagnant_actions_per_family=3)
+    task = TaskInput(goal="Read and report the default value")
+    omitted = ToolBatch(calls=(ToolCallAction(call_id="omitted", tool_name="echo", arguments={}),))
+    explicit = ToolBatch(calls=(call("explicit", "data", parent=None),))
+
+    first = policy.inspect(
+        task=task,
+        observation=None,
+        records=(),
+        batch=omitted,
+        capability_epoch=0,
+    )
+    policy.record_admission(first)
+    repeated = policy.inspect(
+        task=task,
+        observation=None,
+        records=(),
+        batch=explicit,
+        capability_epoch=0,
+    )
+
+    assert repeated.blocked and repeated.reason == "repeated_action"
+    assert repeated.canonical_tool_key_sha256 == first.reservations[0].canonical_action_sha256s[0]
+
+
 def test_progress_factory_creates_isolated_run_state_and_versioned_configuration() -> None:
     tools = ToolRegistry(
         (
@@ -425,7 +463,7 @@ def test_progress_factory_creates_isolated_run_state_and_versioned_configuration
     assert first is not second
     assert first_repeat.blocked and first_repeat.reason == "stagnant_action_family"
     assert not second_first.blocked
-    assert "max_family_actions=1" in factory.version
+    assert "stagnation_threshold=1" in factory.version
 
 
 @pytest.mark.parametrize("limit", [0, True])
@@ -518,7 +556,7 @@ async def test_semantic_frontier_counts_actions_across_different_batch_shapes() 
     replay(agent)
 
 
-def test_progress_rejects_oversized_or_duplicate_first_batch_without_spending_quota() -> None:
+def test_progress_allows_initial_fanout_but_rejects_duplicates_and_later_stagnation() -> None:
     tools = ToolRegistry(
         (
             TypedTool(
@@ -550,24 +588,13 @@ def test_progress_rejects_oversized_or_duplicate_first_batch_without_spending_qu
         capability_epoch=0,
     )
 
-    assert oversized.blocked and oversized.reason == "stagnant_action_family"
-    assert oversized.prior_family_attempts == 0 and oversized.reservations == ()
+    assert not oversized.blocked and oversized.reason == "novel_action"
+    assert oversized.prior_family_attempts == 0
+    assert len(oversized.reservations) == 1
+    assert len(oversized.reservations[0].canonical_action_sha256s) == 4
     assert duplicate.blocked and duplicate.reason == "repeated_action"
     assert duplicate.prior_family_attempts == 0 and duplicate.reservations == ()
-
-    admissible = policy.inspect(
-        task=task,
-        observation=None,
-        records=(),
-        batch=ToolBatch(
-            calls=tuple(call(f"accepted-{index}", f"variant-{index}") for index in range(3))
-        ),
-        capability_epoch=0,
-    )
-    assert not admissible.blocked
-    assert len(admissible.reservations) == 1
-    assert len(admissible.reservations[0].canonical_action_sha256s) == 3
-    policy.record_admission(admissible)
+    policy.record_admission(oversized)
     exhausted = policy.inspect(
         task=task,
         observation=None,
@@ -575,7 +602,7 @@ def test_progress_rejects_oversized_or_duplicate_first_batch_without_spending_qu
         batch=ToolBatch(calls=(call("after-limit", "another"),)),
         capability_epoch=0,
     )
-    assert exhausted.blocked and exhausted.prior_family_attempts == 3
+    assert exhausted.blocked and exhausted.prior_family_attempts == 4
 
 
 def test_progress_reserves_independent_action_families_atomically() -> None:

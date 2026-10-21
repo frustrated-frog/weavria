@@ -1,6 +1,7 @@
 """Typed tool dispatch, independent authorization and tracked artifact reads."""
 
 import asyncio
+import hashlib
 import json
 import math
 from collections.abc import Awaitable, Callable
@@ -67,6 +68,21 @@ class ToolDescriptor(BaseModel):
         if type(value) is not int:
             raise ValueError("version and attempts must be integers")
         return value
+
+
+@dataclass(frozen=True, slots=True)
+class ToolActionIdentity:
+    """Opaque execution identity derived from one registered tool's validation boundary.
+
+    The identity deliberately excludes ``call_id``. Valid calls hash the normalized argument
+    object produced by the tool contract; invalid and unknown calls hash their raw proposal with
+    an explicit normalization state so they cannot collide with a valid execution input.
+    """
+
+    tool_version: str
+    normalization: Literal["validated", "invalid_arguments", "unknown_tool", "validation_failure"]
+    canonical_action_sha256: str
+    action_family_sha256: str
 
 
 class ToolFault(Exception):
@@ -277,6 +293,50 @@ class ToolRegistry:
         except KeyError as exc:
             raise ToolFault(ErrorCategory.UNKNOWN_TOOL, "Unknown tool") from exc
 
+    def action_identity(self, action: ToolCallAction) -> ToolActionIdentity:
+        """Return a stable identity without authorizing or dispatching the proposed call.
+
+        Validation is intentionally performed before progress admission so omitted defaults and
+        tool-specific Pydantic normalization cannot manufacture distinct exploration attempts.
+        A malformed proposal remains executable as ordinary safe tool feedback; its identity
+        falls back to the raw JSON object and records why normalization was unavailable.
+        """
+        action = ToolCallAction.model_validate_json(
+            ToolCallAction.model_validate(action).model_dump_json()
+        )
+        tool = self._tools.get(action.tool_name)
+        if tool is None:
+            tool_version = "unknown"
+            normalization: Literal[
+                "validated", "invalid_arguments", "unknown_tool", "validation_failure"
+            ] = "unknown_tool"
+            identity_arguments = action.arguments
+        else:
+            tool_version = tool.descriptor.version
+            try:
+                identity_arguments = _normalized_argument_object(
+                    tool.validate_arguments(action.arguments)
+                )
+                normalization = "validated"
+            except ToolFault as exc:
+                identity_arguments = action.arguments
+                normalization = (
+                    "invalid_arguments"
+                    if exc.category is ErrorCategory.INVALID_TOOL_ARGUMENTS
+                    else "validation_failure"
+                )
+            except Exception:
+                # A broken third-party validator must still be classified by ToolExecutor rather
+                # than turn progress inspection becoming a new framework-failure surface.
+                identity_arguments = action.arguments
+                normalization = "validation_failure"
+        return _tool_action_identity(
+            action,
+            tool_version=tool_version,
+            normalization=normalization,
+            arguments=identity_arguments,
+        )
+
     def select(self, names: tuple[str, ...]) -> "ToolRegistry":
         """Return an ordered least-capability view; unknown or duplicate names fail closed."""
         if len(names) != len(set(names)):
@@ -314,6 +374,7 @@ class ToolExecutor:
         *,
         max_duration: float,
         accepted_artifacts: tuple[ArtifactRef, ...] | None = None,
+        expected_identity: ToolActionIdentity | None = None,
     ) -> ToolRecord:
         """Return a classified exchange; external cancellation always propagates."""
         if isinstance(max_duration, bool) or not math.isfinite(max_duration) or max_duration <= 0:
@@ -350,15 +411,27 @@ class ToolExecutor:
             deadline = loop.time() + min(max_duration, descriptor.timeout_seconds)
             limit = asyncio.timeout_at(deadline)
             async with limit:
-                arguments = tool.validate_arguments(action.arguments)
-                normalized = TypeAdapter[JsonValue](JsonValue).validate_json(
-                    arguments.model_dump_json()
+                try:
+                    arguments = tool.validate_arguments(action.arguments)
+                except Exception as exc:
+                    if (
+                        expected_identity is not None
+                        and expected_identity.normalization == "validated"
+                    ):
+                        raise ToolExecutionError(
+                            "tool normalization changed after progress admission"
+                        ) from exc
+                    raise
+                normalized = _normalized_argument_object(arguments)
+                actual_identity = _tool_action_identity(
+                    action,
+                    tool_version=descriptor.version,
+                    normalization="validated",
+                    arguments=normalized,
                 )
-                if not isinstance(normalized, dict):
-                    raise ToolExecutionError("tool input must normalize to an object")
-                policy_input = TypeAdapter[JsonValue](JsonValue).validate_json(
-                    arguments.model_dump_json()
-                )
+                if expected_identity is not None and actual_identity != expected_identity:
+                    raise ToolExecutionError("tool normalization changed after progress admission")
+                policy_input = _normalized_argument_object(arguments)
                 decision = await self._policy.authorize(self._run_id, descriptor, policy_input)
                 authorization = ToolAuthorization(
                     tool_version=descriptor.version,
@@ -452,3 +525,47 @@ class ToolExecutor:
             dependencies=context.dependencies,
             authorization=authorization,
         )
+
+
+def _normalized_argument_object(arguments: BaseModel) -> dict[str, JsonValue]:
+    normalized = TypeAdapter[JsonValue](JsonValue).validate_json(arguments.model_dump_json())
+    if not isinstance(normalized, dict):
+        raise ToolExecutionError("tool input must normalize to an object")
+    return normalized
+
+
+def _canonical_sha256(value: JsonValue) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _tool_action_identity(
+    action: ToolCallAction,
+    *,
+    tool_version: str,
+    normalization: Literal["validated", "invalid_arguments", "unknown_tool", "validation_failure"],
+    arguments: dict[str, JsonValue],
+) -> ToolActionIdentity:
+    family_payload: dict[str, JsonValue] = {
+        "identity_schema": 1,
+        "tool_name": action.tool_name,
+        "tool_version": tool_version,
+    }
+    return ToolActionIdentity(
+        tool_version=tool_version,
+        normalization=normalization,
+        canonical_action_sha256=_canonical_sha256(
+            {
+                **family_payload,
+                "normalization": normalization,
+                "arguments": arguments,
+            }
+        ),
+        action_family_sha256=_canonical_sha256(family_payload),
+    )

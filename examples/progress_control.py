@@ -85,6 +85,18 @@ def main() -> None:
                     ),
                 ),
             ),
+            ProgressControlCase(
+                case_id="legal_initial_fanout",
+                goal="Read four independent sources in one bounded batch",
+                attempts=(
+                    ProgressAttempt(
+                        need_state_sha256=unchanged,
+                        tool_names=("read_source",) * 4,
+                        arguments=tuple({"query": f"source-{index}"} for index in range(4)),
+                        expected_disposition="allow",
+                    ),
+                ),
+            ),
         ),
         _registry(),
     )

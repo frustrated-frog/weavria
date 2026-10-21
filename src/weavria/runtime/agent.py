@@ -82,7 +82,13 @@ from weavria.models import (
     call_model,
     call_model_turn,
 )
-from weavria.tools import ReadOnlyPolicy, ToolExecutor, ToolPolicy, ToolRegistry
+from weavria.tools import (
+    ReadOnlyPolicy,
+    ToolActionIdentity,
+    ToolExecutor,
+    ToolPolicy,
+    ToolRegistry,
+)
 
 from .completion import (
     CompletionCheckError,
@@ -460,13 +466,17 @@ class _AgentKernel:
                         return await self._end(
                             RunStatus.COMPLETED, "finish", output=decision.output
                         )
+                    action_identities: tuple[ToolActionIdentity, ...] = ()
                     if self._journal_version == 3:
                         if self.state.model_calls >= self._limits.max_model_calls:
                             return await self._end(RunStatus.BUDGET_EXHAUSTED, "model_calls")
                         assert isinstance(decision, ToolBatch)
-                        if not await self._admit_batch(decision, self._capability_epoch):
+                        admitted, action_identities = await self._admit_batch(
+                            decision, self._capability_epoch
+                        )
+                        if not admitted:
                             if self.state.phase is Phase.ACTION:
-                                await self._execute_turn(calls, deadline)
+                                await self._execute_turn(calls, deadline, action_identities)
                             continue
                     # Admission is for the whole decision. Never execute an arbitrary
                     # prefix solely because the call budget fits only part of a batch.
@@ -476,7 +486,11 @@ class _AgentKernel:
                         assert calls
                         await self._execute_call(calls[0], deadline)
                     else:
-                        await self._execute_turn(calls, deadline)
+                        await self._execute_turn(
+                            calls,
+                            deadline,
+                            action_identities if self._journal_version == 3 else (),
+                        )
                         if self._journal_version == 3:
                             assert isinstance(response, ModelTurn)
                             await self._resolve("execution", response, task.revision)
@@ -626,7 +640,9 @@ class _AgentKernel:
             self._instruction_source, visible, self._journal_version
         )
 
-    async def _admit_batch(self, batch: ToolBatch, capability_epoch: int) -> bool:
+    async def _admit_batch(
+        self, batch: ToolBatch, capability_epoch: int
+    ) -> tuple[bool, tuple[ToolActionIdentity, ...]]:
         revision = self.state.model_revision
         reservation = reserve_feedback(
             instructions=self._instructions,
@@ -722,7 +738,7 @@ class _AgentKernel:
                 ),
                 expected_revision=revision,
             )
-            return False
+            return False, progress.action_identities if progress is not None else ()
         accepted = await self._accept(
             BatchAdmitted(
                 reserved_bytes=reservation.required_bytes,
@@ -735,7 +751,7 @@ class _AgentKernel:
         if accepted:
             assert progress is not None
             self._progress.record_admission(progress)
-        return accepted
+        return accepted, progress.action_identities if progress is not None else ()
 
     async def _verify_completion(
         self, candidate: FinishAction, deadline: float
@@ -778,15 +794,36 @@ class _AgentKernel:
             return None
         return assessment
 
-    async def _execute_turn(self, calls: tuple[ToolCallAction, ...], deadline: float) -> None:
+    async def _execute_turn(
+        self,
+        calls: tuple[ToolCallAction, ...],
+        deadline: float,
+        action_identities: tuple[ToolActionIdentity, ...] = (),
+    ) -> None:
         accepted = tuple(r.artifact for r in self.state.records if r.artifact is not None)
         revision = self.state.model_revision
+        if action_identities and len(action_identities) != len(calls):
+            raise ValueError("tool action identities must align with the admitted batch")
+        identities = (
+            {
+                call.call_id: identity
+                for call, identity in zip(calls, action_identities, strict=True)
+            }
+            if action_identities
+            else {}
+        )
 
         async def execute(call: ToolCallAction) -> None:
             if self.state.task.revision != revision:
                 await self._accept(CallSkipped(call_id=call.call_id))
                 return
-            await self._execute_call(call, deadline, accepted, expected_revision=revision)
+            await self._execute_call(
+                call,
+                deadline,
+                accepted,
+                expected_revision=revision,
+                expected_identity=identities.get(call.call_id),
+            )
 
         async def skip(call: ToolCallAction) -> None:
             await self._accept(CallSkipped(call_id=call.call_id))
@@ -816,6 +853,7 @@ class _AgentKernel:
         accepted: tuple[ArtifactRef, ...] | None = None,
         *,
         expected_revision: int | None = None,
+        expected_identity: ToolActionIdentity | None = None,
     ) -> None:
         remaining = self._remaining(deadline)
         if remaining <= 0:
@@ -831,6 +869,7 @@ class _AgentKernel:
             call,
             max_duration=remaining,
             accepted_artifacts=accepted,
+            expected_identity=expected_identity,
         )
         self._check_cancel(owner, cancellations)
         await self._accept(ToolRecorded(record=record))

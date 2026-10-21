@@ -103,22 +103,36 @@ def test_progress_control_experiment_compares_exact_repeat_baseline() -> None:
                 ),
             ),
         ),
+        ProgressControlCase(
+            case_id="legal_initial_fanout",
+            goal="Read four independent sources in one bounded batch",
+            attempts=(
+                ProgressAttempt(
+                    need_state_sha256=unchanged,
+                    tool_names=("primary", "primary", "primary", "primary"),
+                    arguments=tuple({"query": f"source-{index}"} for index in range(4)),
+                    expected_disposition="allow",
+                ),
+            ),
+        ),
     )
 
     report = evaluate_progress_control(cases, _registry())
 
-    assert report.policy_version == "semantic-progress/4"
+    assert report.policy_version == "semantic-progress/5"
     assert report.baseline_version == "exact-action-only/2"
-    assert report.total_attempts == 12
-    assert report.selected_correct == 12
-    assert report.baseline_correct == 10
+    assert report.total_attempts == 13
+    assert report.selected_correct == 13
+    assert report.baseline_correct == 11
     blocked = report.cases[0].attempts[-1]
     assert blocked.selected_reason == "stagnant_action_family"
     assert blocked.prior_family_attempts == 3
     assert blocked.selected_disposition == "block"
     assert blocked.baseline_disposition == "allow"
-    regrouped = report.cases[-1].attempts[-1]
+    regrouped = report.cases[-2].attempts[-1]
     assert regrouped.selected_reason == "stagnant_action_family"
     assert regrouped.prior_family_attempts == 3
     assert regrouped.selected_disposition == "block"
     assert regrouped.baseline_disposition == "allow"
+    fanout = report.cases[-1].attempts[0]
+    assert fanout.selected_disposition == fanout.baseline_disposition == "allow"
