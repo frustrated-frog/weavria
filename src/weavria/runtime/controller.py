@@ -78,6 +78,10 @@ def resolve_turn(
     progress_assessment: ProgressAssessment | None = None,
 ) -> TurnResolution:
     """Resolve model intent against current requirements and settled execution/acceptance."""
+    # A task revision wins over every observation derived from the obsolete proposal.
+    # The caller samples the current revision while holding its control commit lock;
+    # dropping the stale assessment here keeps replan/task_changed internally consistent.
+    bound_progress_assessment = progress_assessment if proposal_revision == task_revision else None
     step: Literal["dispatch", "verify", "continue", "replan", "repair", "complete"]
     reason: Literal[
         "task_changed",
@@ -103,12 +107,12 @@ def resolve_turn(
     elif stage == "execution":
         if not isinstance(turn.decision, ToolBatch):
             raise ValueError("execution resolution requires a settled tool proposal")
-        if progress_assessment is None:
+        if bound_progress_assessment is None:
             step, reason = "continue", "feedback_ready"
-        elif progress_assessment.task_revision != task_revision:
+        elif bound_progress_assessment.task_revision != task_revision:
             raise ValueError("progress assessment belongs to another task revision")
         else:
-            recommendation = progress_assessment.continuation.recommended_action
+            recommendation = bound_progress_assessment.continuation.recommended_action
             step, reason = (
                 ("continue", "progress_ready_to_verify")
                 if recommendation == "verify"
@@ -145,8 +149,8 @@ def resolve_turn(
             else None
         ),
         progress_assessment_sha256=(
-            hashlib.sha256(progress_assessment.model_dump_json().encode()).hexdigest()
-            if progress_assessment is not None
+            hashlib.sha256(bound_progress_assessment.model_dump_json().encode()).hexdigest()
+            if bound_progress_assessment is not None
             else None
         ),
         stage=stage,
@@ -154,7 +158,7 @@ def resolve_turn(
         reason=reason,
         policy_version=(
             "progress-aware-resolution/2"
-            if stage == "execution" and progress_assessment is not None
+            if stage == "execution" and bound_progress_assessment is not None
             else "revision/1"
         ),
     )

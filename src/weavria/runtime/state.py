@@ -96,6 +96,7 @@ class RunState:
     assessment_json: str | None = None
     completion_repairs: int = 0
     progress_assessment_json: str | None = None
+    pending_progress_sequence: int | None = None
 
     @property
     def control(self) -> ControlFeedback | None:
@@ -189,6 +190,7 @@ def reduce_event(state: RunState | None, event: JournalEvent) -> RunState:
             next_state,
             control_json=None,
             progress_assessment_json=None,
+            pending_progress_sequence=None,
         )
         if state.phase in (Phase.FINISH, Phase.ACCEPTED) or (
             state.phase is Phase.ACTION and state.journal_version == 1
@@ -228,7 +230,7 @@ def reduce_event(state: RunState | None, event: JournalEvent) -> RunState:
                 "context omitted latest tool feedback",
             )
         _require(set(state.feedback_call_ids) <= selected, "context omitted turn feedback")
-        return replace(next_state, phase=Phase.CONTEXT)
+        return replace(next_state, phase=Phase.CONTEXT, pending_progress_sequence=None)
     if isinstance(data, ModelStarted):
         _require(
             state.phase is Phase.CONTEXT and data.task_revision == state.task.revision,
@@ -348,6 +350,7 @@ def _reduce_turn(
                 control_json=None,
                 assessment_json=None,
                 progress_assessment_json=None,
+                pending_progress_sequence=None,
                 admission_json=None,
             )
         identities = tuple(c.call_id for c in decision.calls)
@@ -366,6 +369,7 @@ def _reduce_turn(
             control_json=None,
             assessment_json=None,
             progress_assessment_json=None,
+            pending_progress_sequence=None,
             admission_json=None,
         )
 
@@ -485,6 +489,11 @@ def _reduce_turn(
         skipped_call_ids=(),
         feedback_call_ids=ordered,
         feedback_json=feedback.model_dump_json(),
+        pending_progress_sequence=(
+            next_state.sequence
+            if state.journal_version == 3 and feedback.task_revision == state.task.revision
+            else None
+        ),
     )
 
 
@@ -508,6 +517,11 @@ def _reduce_control(
             and feedback.task_revision == state.task.revision == assessment.task_revision,
             "progress assessment requires current settled feedback",
         )
+        _require(
+            state.pending_progress_sequence is not None
+            and state.pending_progress_sequence == state.sequence,
+            "progress assessment requires the current unassessed settlement boundary",
+        )
         assert feedback is not None
         _require(
             assessment.feedback_call_ids == tuple(item.call_id for item in feedback.calls),
@@ -518,6 +532,7 @@ def _reduce_control(
             next_state,
             progress_assessment_json=assessment.model_dump_json(),
             control_json=notice.model_dump_json(),
+            pending_progress_sequence=None,
         )
     if isinstance(data, (BatchAdmitted, BatchRejected)):
         turn = state.turn
@@ -564,6 +579,7 @@ def _reduce_control(
             phase=Phase.READY,
             turn_json=None,
             control_json=notice.model_dump_json(),
+            pending_progress_sequence=None,
         )
     pending = state.pending
     _require(isinstance(pending, FinishAction), "completion control requires a candidate")

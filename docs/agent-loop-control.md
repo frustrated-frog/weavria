@@ -100,6 +100,8 @@ AgentLoop 的请求、事件和报告为 v3。旧 TurnRequest v2 / LoopEvent v2 
 | 同一语义前沿精确重复动作，包括批内重复 | 整批派发前拒绝并返回 `repeated_action` 摘要 |
 | 同一工具版本动作族已有动作达到停滞阈值 | 后续整批拒绝并返回 `stagnant_action_family`；当前首次并行扇出不被 Progress 阈值截断，仍受 Tool Budget 和批次上限约束 |
 | Task-aware 工具回合完成 | 刷新 Need Ledger，持久化完整 `ProgressAssessment`，向下一轮投影受限 `ProgressNotice`；`verify` 仍需 Completion Policy 验收 |
+| Progress 评估后 Task Revision 变化 | 丢弃旧评估与决议绑定，以 `revision/1 + replan/task_changed` 进入新任务 |
+| 旧结算反馈被重复评估 | Reducer 根据待消费 TurnSettled 序号拒绝，不允许覆盖更新的控制通知 |
 | Progress Assessor 故障 | 已结算 ToolRecord 保留，Run 失败关闭；不回滚外部事实、不伪造评估 |
 | 已无下一次模型调用额度 | 不执行新批次，模型预算耗尽 |
 | 参数错误、策略拒绝、普通工具失败 | 保留对应失败与成功兄弟，反馈后重规划 |

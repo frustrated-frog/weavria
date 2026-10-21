@@ -3,6 +3,7 @@
 import asyncio
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
+from typing import Literal
 
 import pytest
 from pydantic import BaseModel, ConfigDict, JsonValue, TypeAdapter, ValidationError
@@ -16,6 +17,7 @@ from weavria.core import (
     BatchAdmitted,
     BatchRejected,
     CompletionAccept,
+    CompletionAssessment,
     CompletionChecked,
     CompletionDecision,
     CompletionDiscarded,
@@ -48,6 +50,7 @@ from weavria.core import (
     ToolRecord,
     ToolStarted,
     TurnFeedback,
+    TurnResolution,
     VerificationStarted,
     decode_event,
     maximum_exchange_bytes,
@@ -113,8 +116,9 @@ def make_loop(
     bounds: FeedbackBounds | None = None,
     task_observation: TaskObservation | None = None,
     progress_assessor: ProgressAssessor | None = None,
+    loop_type: type[AgentLoop] = AgentLoop,
 ) -> AgentLoop:
-    return AgentLoop(
+    return loop_type(
         run_id="run",
         task=TaskInput(goal="Read and report the value"),
         instructions="Use evidence",
@@ -210,6 +214,35 @@ class _FailingProgressAssessor:
     ) -> ProgressAssessment:
         del task, records, feedback, remaining_model_calls, remaining_tool_calls
         raise RuntimeError("assessment backend failed")
+
+
+class _RevisionBeforeProgressResolutionLoop(AgentLoop):
+    """Insert a host revision after assessment acceptance and before resolution."""
+
+    async def _resolve(
+        self,
+        stage: Literal["proposal", "execution", "completion"],
+        turn: ModelTurn,
+        revision: int,
+        assessment: CompletionAssessment | None = None,
+        progress_assessment: ProgressAssessment | None = None,
+    ) -> TurnResolution:
+        if (
+            stage == "execution"
+            and progress_assessment is not None
+            and self.state.task.revision == revision
+        ):
+            self.revise_task(
+                TaskInput(goal="Revised while resolving progress", revision=revision + 1),
+                expected_revision=revision,
+            )
+        return await super()._resolve(
+            stage,
+            turn,
+            revision,
+            assessment,
+            progress_assessment,
+        )
 
 
 def replay(agent: AgentLoop) -> None:
@@ -309,6 +342,65 @@ async def test_progress_assessment_is_persisted_projected_and_drives_resolution(
                 reduce_event(state, forged)
             break
         state = reduce_event(state, event)
+    replay(agent)
+
+
+async def test_task_revision_between_progress_assessment_and_resolution_replans() -> None:
+    provider = FakeControlProvider((batch(call("read-1")), finish("revised")))
+    agent = make_loop(
+        provider,
+        progress_assessor=_ReadyProgressAssessor(),
+        loop_type=_RevisionBeforeProgressResolutionLoop,
+    )
+
+    result = await agent.execute()
+
+    assert result.status is RunStatus.COMPLETED and result.output == "revised"
+    resolution = next(item for item in agent.resolutions if item.stage == "execution")
+    assert resolution.task_revision == 2 and resolution.proposal_revision == 1
+    assert resolution.next_step == "replan" and resolution.reason == "task_changed"
+    assert resolution.policy_version == "revision/1"
+    assert resolution.progress_assessment_sha256 is None
+    assert provider.requests[-1].task.revision == 2
+    replay(agent)
+
+
+async def test_rejected_proposal_cannot_reopen_an_assessed_settlement_boundary() -> None:
+    provider = FakeControlProvider(
+        (
+            batch(call("read-1")),
+            batch(call("read-2")),
+            finish("bounded"),
+        )
+    )
+    agent = make_loop(
+        provider,
+        progress_assessor=_ReadyProgressAssessor(),
+        limits=RunLimits(max_tool_calls=1),
+    )
+
+    assert (await agent.execute()).status is RunStatus.COMPLETED
+    state = None
+    assessed_event: ControlEvent | None = None
+    for event in agent.events:
+        assert isinstance(event, ControlEvent)
+        if isinstance(event.data, ProgressAssessed):
+            assessed_event = event
+        state = reduce_event(state, event)
+        if isinstance(event.data, BatchRejected):
+            break
+
+    assert state is not None and assessed_event is not None
+    assert isinstance(state.control, AdmissionNotice)
+    assert state.control.reason == "tool_budget"
+    forged = ControlEvent(
+        run_id=state.run_id,
+        sequence=state.sequence + 1,
+        occurred_at=datetime.now(UTC),
+        data=assessed_event.data,
+    )
+    with pytest.raises(EventAcceptanceError, match="unassessed settlement boundary"):
+        reduce_event(state, forged)
     replay(agent)
 
 
