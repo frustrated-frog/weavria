@@ -4,6 +4,14 @@ from .agent import AgentLoop, AgentRun, Clock, LegacyAgentLoop, RunLimits, Syste
 from .budget import RootBudget
 from .completion import CompletionContext, CompletionPolicy, LayeredCompletionPolicy, NoVerification
 from .controller import ProgressAssessor, TurnPreparation, TurnPreparer, prepare_task, resolve_turn
+from .intervention import (
+    ActionInterventionContext,
+    ActionInterventionError,
+    ActionInterventionPolicy,
+    AllowAllActionInterventionPolicy,
+    ProgressActionInterventionPolicy,
+    evaluate_action_intervention,
+)
 from .journal import (
     InterventionJournal,
     JournalCommitError,
@@ -24,8 +32,12 @@ from .scheduling import ToolScheduling
 from .state import EventAcceptanceError, Phase, RunState, reduce_event
 
 __all__ = [
+    "ActionInterventionContext",
+    "ActionInterventionError",
+    "ActionInterventionPolicy",
     "AgentLoop",
     "AgentRun",
+    "AllowAllActionInterventionPolicy",
     "Clock",
     "CompletionContext",
     "CompletionPolicy",
@@ -36,6 +48,7 @@ __all__ = [
     "LegacyAgentLoop",
     "NoVerification",
     "Phase",
+    "ProgressActionInterventionPolicy",
     "ProgressAssessor",
     "ProgressCheck",
     "ProgressPolicy",
@@ -53,6 +66,7 @@ __all__ = [
     "ToolScheduling",
     "TurnPreparation",
     "TurnPreparer",
+    "evaluate_action_intervention",
     "prepare_task",
     "reduce_event",
     "resolve_turn",

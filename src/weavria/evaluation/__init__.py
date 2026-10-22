@@ -1,5 +1,11 @@
 """Domain-independent, reproducible Harness evaluations."""
 
+from .action_intervention import (
+    ActionInterventionCase,
+    ActionInterventionCaseResult,
+    ActionInterventionExperiment,
+    evaluate_action_interventions,
+)
 from .capability_discovery import (
     CapabilityCase,
     CapabilityCaseResult,
@@ -47,6 +53,9 @@ from .progress_signals import (
 )
 
 __all__ = [
+    "ActionInterventionCase",
+    "ActionInterventionCaseResult",
+    "ActionInterventionExperiment",
     "CapabilityCase",
     "CapabilityCaseResult",
     "CapabilityExperiment",
@@ -73,6 +82,7 @@ __all__ = [
     "ProviderFinishReason",
     "TokenUsage",
     "build_live_progress_experiment",
+    "evaluate_action_interventions",
     "evaluate_capability_discovery",
     "evaluate_intent_clarification",
     "evaluate_intent_decision",

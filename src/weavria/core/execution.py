@@ -70,6 +70,7 @@ class RunStarted(ContractModel):
 
     kind: Literal["run_started"] = "run_started"
     task: TaskInput
+    action_intervention_policy_version: NonBlankString | None = None
 
 
 class TaskRevised(ContractModel):

@@ -1,11 +1,47 @@
-"""User-authored task updates and explicit Harness next-step decisions."""
+"""User-authored updates and explicit, replayable Harness control decisions."""
 
-from typing import Literal, Self
+from typing import Annotated, Literal, Self
 
 from pydantic import Field, model_validator
 
 from ._schema import ContractModel, NonBlankString
 from .model_io import TaskInput
+
+type InterventionReasonCode = Annotated[str, Field(pattern=r"^[a-z][a-z0-9_]{0,63}$")]
+
+
+class InterventionDecision(ContractModel):
+    """A policy verdict over an unchanged model proposal.
+
+    The first intervention protocol deliberately cannot rewrite a proposal.  It
+    either permits the exact candidate to continue to admission or sends the
+    model back to a new decision boundary with an explainable observation.
+    """
+
+    disposition: Literal["allow", "reconsider"]
+    trigger: Literal[
+        "assessment_unavailable",
+        "recommendation_compatible",
+        "verification_advisory",
+        "policy_override",
+        "completion_recommended",
+        "continuation_blocked",
+    ]
+    reason_codes: tuple[InterventionReasonCode, ...] = Field(min_length=1, max_length=8)
+
+    @model_validator(mode="after")
+    def validate_disposition(self) -> Self:
+        allowed = self.trigger in {
+            "assessment_unavailable",
+            "recommendation_compatible",
+            "verification_advisory",
+            "policy_override",
+        }
+        if allowed != (self.disposition == "allow"):
+            raise ValueError("intervention trigger contradicts its disposition")
+        if len(self.reason_codes) != len(set(self.reason_codes)):
+            raise ValueError("intervention reason codes must be unique")
+        return self
 
 
 class TaskDirective(ContractModel):

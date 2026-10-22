@@ -3,11 +3,13 @@
 import hashlib
 from dataclasses import dataclass, replace
 from enum import StrEnum
+from typing import Literal, cast
 
 from pydantic import TypeAdapter
 
 from weavria.core import (
     CONTROL_FEEDBACK_BYTES,
+    ActionInterventionChecked,
     AgentAction,
     AgentResult,
     BatchAdmitted,
@@ -25,6 +27,7 @@ from weavria.core import (
     DecisionDiscarded,
     ExecutionEvent,
     FinishAction,
+    InterventionNotice,
     JournalEvent,
     LoopEvent,
     ModelDecided,
@@ -97,6 +100,10 @@ class RunState:
     completion_repairs: int = 0
     progress_assessment_json: str | None = None
     pending_progress_sequence: int | None = None
+    action_intervention_policy_version: str | None = None
+    intervention_json: str | None = None
+    intervention_frontier_sha256: str | None = None
+    intervention_reconsiderations: int = 0
 
     @property
     def control(self) -> ControlFeedback | None:
@@ -119,6 +126,14 @@ class RunState:
         return (
             ProgressAssessment.model_validate_json(self.progress_assessment_json)
             if self.progress_assessment_json
+            else None
+        )
+
+    @property
+    def intervention(self) -> ActionInterventionChecked | None:
+        return (
+            ActionInterventionChecked.model_validate_json(self.intervention_json)
+            if self.intervention_json
             else None
         )
 
@@ -176,6 +191,7 @@ def reduce_event(state: RunState | None, event: JournalEvent) -> RunState:
             Phase.READY,
             data.task.model_dump_json(),
             journal_version=event.schema_version,
+            action_intervention_policy_version=data.action_intervention_policy_version,
         )
     _require(state.journal_version == event.schema_version, "journal versions cannot be mixed")
     if event.run_id != state.run_id or event.sequence != state.sequence + 1:
@@ -191,6 +207,9 @@ def reduce_event(state: RunState | None, event: JournalEvent) -> RunState:
             control_json=None,
             progress_assessment_json=None,
             pending_progress_sequence=None,
+            intervention_json=None,
+            intervention_frontier_sha256=None,
+            intervention_reconsiderations=0,
         )
         if state.phase in (Phase.FINISH, Phase.ACCEPTED) or (
             state.phase is Phase.ACTION and state.journal_version == 1
@@ -268,6 +287,7 @@ def reduce_event(state: RunState | None, event: JournalEvent) -> RunState:
         (
             BatchAdmitted,
             BatchRejected,
+            ActionInterventionChecked,
             ProgressAssessed,
             VerificationStarted,
             CompletionChecked,
@@ -352,6 +372,9 @@ def _reduce_turn(
                 progress_assessment_json=None,
                 pending_progress_sequence=None,
                 admission_json=None,
+                intervention_json=None,
+                intervention_frontier_sha256=None,
+                intervention_reconsiderations=0,
             )
         identities = tuple(c.call_id for c in decision.calls)
         _require(
@@ -368,9 +391,9 @@ def _reduce_turn(
             consumed_call_ids=(*state.consumed_call_ids, *identities),
             control_json=None,
             assessment_json=None,
-            progress_assessment_json=None,
             pending_progress_sequence=None,
             admission_json=None,
+            intervention_json=None,
         )
 
     turn = state.turn
@@ -385,8 +408,18 @@ def _reduce_turn(
     settled = set(state.settled_call_ids) | set(state.skipped_call_ids)
     if isinstance(data, ToolStarted):
         _require(
-            state.journal_version != 3 or state.admission is not None,
-            "dispatch requires an admitted batch",
+            state.journal_version != 3
+            or (
+                state.admission is not None
+                and (
+                    state.action_intervention_policy_version is None
+                    or (
+                        state.intervention is not None
+                        and state.intervention.decision.disposition == "allow"
+                    )
+                )
+            ),
+            "dispatch requires an allowed intervention and admitted batch",
         )
         _require(
             data.call_id in calls
@@ -489,6 +522,10 @@ def _reduce_turn(
         skipped_call_ids=(),
         feedback_call_ids=ordered,
         feedback_json=feedback.model_dump_json(),
+        progress_assessment_json=None,
+        intervention_json=None,
+        intervention_frontier_sha256=None,
+        intervention_reconsiderations=0,
         pending_progress_sequence=(
             next_state.sequence
             if state.journal_version == 3 and feedback.task_revision == state.task.revision
@@ -502,25 +539,112 @@ def _reduce_control(
     next_state: RunState,
     data: BatchAdmitted
     | BatchRejected
+    | ActionInterventionChecked
     | ProgressAssessed
     | VerificationStarted
     | CompletionChecked
     | CompletionDiscarded,
 ) -> RunState:
+    if isinstance(data, ActionInterventionChecked):
+        turn = state.turn
+        _require(
+            state.phase is Phase.ACTION
+            and state.intervention is None
+            and turn is not None
+            and isinstance(turn.decision, ToolBatch),
+            "intervention requires one unchecked tool proposal",
+        )
+        assert turn is not None and isinstance(turn.decision, ToolBatch)
+        _require(
+            state.action_intervention_policy_version is not None
+            and data.policy_version == state.action_intervention_policy_version,
+            "intervention policy does not match the run configuration",
+        )
+        _require(
+            data.task_revision == state.task.revision == state.model_revision,
+            "intervention belongs to an obsolete task",
+        )
+        _require(
+            data.proposal_sha256
+            == hashlib.sha256(turn.decision.model_dump_json().encode()).hexdigest(),
+            "intervention does not bind the active proposal",
+        )
+        progress = state.progress_assessment
+        progress_sha256 = (
+            hashlib.sha256(progress.model_dump_json().encode()).hexdigest()
+            if progress is not None
+            else None
+        )
+        _require(
+            data.progress_assessment_sha256 == progress_sha256,
+            "intervention does not bind the current progress assessment",
+        )
+        trigger = data.decision.trigger
+        recommendation = progress.continuation.recommended_action if progress is not None else None
+        _require(
+            (trigger == "assessment_unavailable" and progress is None)
+            or (trigger == "completion_recommended" and recommendation == "verify")
+            or (trigger == "verification_advisory" and recommendation == "verify")
+            or (trigger == "continuation_blocked" and recommendation == "stop")
+            or (
+                trigger == "recommendation_compatible"
+                and recommendation in {"continue", "repair", "replan"}
+            )
+            or (trigger == "policy_override" and progress is not None),
+            "intervention trigger contradicts the bound progress recommendation",
+        )
+        prior_reconsiderations = (
+            state.intervention_reconsiderations
+            if state.intervention_frontier_sha256 == progress_sha256
+            else 0
+        )
+        _require(
+            data.prior_reconsiderations == prior_reconsiderations,
+            "intervention reconsideration ordinal is not replayable",
+        )
+        if data.decision.disposition == "allow":
+            return replace(
+                next_state,
+                intervention_json=data.model_dump_json(),
+                intervention_frontier_sha256=progress_sha256,
+                intervention_reconsiderations=prior_reconsiderations,
+            )
+        assert progress_sha256 is not None
+        assert trigger in {"completion_recommended", "continuation_blocked"}
+        notice_trigger = cast(Literal["completion_recommended", "continuation_blocked"], trigger)
+        notice = InterventionNotice(
+            policy_version=data.policy_version,
+            proposal_sha256=data.proposal_sha256,
+            progress_assessment_sha256=progress_sha256,
+            trigger=notice_trigger,
+            reason_codes=data.decision.reason_codes,
+            reconsideration_ordinal=prior_reconsiderations + 1,
+        )
+        return replace(
+            next_state,
+            phase=Phase.READY,
+            turn_json=None,
+            control_json=notice.model_dump_json(),
+            admission_json=None,
+            intervention_json=data.model_dump_json(),
+            intervention_frontier_sha256=progress_sha256,
+            intervention_reconsiderations=prior_reconsiderations + 1,
+            pending_progress_sequence=None,
+        )
     if isinstance(data, ProgressAssessed):
         feedback = state.feedback
         assessment = data.assessment
+        _require(
+            state.pending_progress_sequence is not None
+            and state.pending_progress_sequence == state.sequence,
+            "progress assessment requires the current unassessed settlement boundary",
+        )
         _require(
             state.phase is Phase.READY
             and feedback is not None
             and state.progress_assessment is None
             and feedback.task_revision == state.task.revision == assessment.task_revision,
             "progress assessment requires current settled feedback",
-        )
-        _require(
-            state.pending_progress_sequence is not None
-            and state.pending_progress_sequence == state.sequence,
-            "progress assessment requires the current unassessed settlement boundary",
         )
         assert feedback is not None
         _require(
@@ -533,6 +657,9 @@ def _reduce_control(
             progress_assessment_json=assessment.model_dump_json(),
             control_json=notice.model_dump_json(),
             pending_progress_sequence=None,
+            intervention_json=None,
+            intervention_frontier_sha256=notice.assessment_sha256,
+            intervention_reconsiderations=0,
         )
     if isinstance(data, (BatchAdmitted, BatchRejected)):
         turn = state.turn
@@ -547,6 +674,16 @@ def _reduce_control(
         _require(
             state.model_revision == state.task.revision, "admission belongs to an obsolete task"
         )
+        if state.action_intervention_policy_version is not None:
+            intervention = state.intervention
+            _require(
+                intervention is not None
+                and intervention.decision.disposition == "allow"
+                and intervention.policy_version == state.action_intervention_policy_version
+                and intervention.proposal_sha256
+                == hashlib.sha256(turn.decision.model_dump_json().encode()).hexdigest(),
+                "admission requires an allowed intervention for the exact proposal",
+            )
         if isinstance(data, BatchAdmitted):
             readable = tuple(
                 r.exchange.action.call_id for r in state.records if r.artifact is not None
@@ -580,6 +717,7 @@ def _reduce_control(
             turn_json=None,
             control_json=notice.model_dump_json(),
             pending_progress_sequence=None,
+            intervention_json=None,
         )
     pending = state.pending
     _require(isinstance(pending, FinishAction), "completion control requires a candidate")

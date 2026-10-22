@@ -23,6 +23,7 @@ from weavria.context import (
     reserve_feedback,
 )
 from weavria.core import (
+    ActionInterventionChecked,
     AdmissionNotice,
     AgentResult,
     ArtifactRef,
@@ -106,6 +107,13 @@ from .controller import (
     prepare_task,
     resolve_turn,
 )
+from .intervention import (
+    ActionInterventionContext,
+    ActionInterventionError,
+    ActionInterventionPolicy,
+    ProgressActionInterventionPolicy,
+    evaluate_action_intervention,
+)
 from .journal import (
     InterventionJournal,
     JournalCommitError,
@@ -149,6 +157,10 @@ class _NoProgressExhausted(RuntimeError):
     """The model repeated a semantically unchanged action after bounded feedback."""
 
 
+class _InterventionExhausted(RuntimeError):
+    """The model repeatedly ignored a progress-bound reconsideration."""
+
+
 @dataclass(frozen=True, slots=True)
 class RunLimits:
     """Independent counters and deadline; limits are checked before dispatch."""
@@ -159,7 +171,9 @@ class RunLimits:
     max_duration: float = 60.0
     max_model_duration: float = 30.0
     max_completion_duration: float = 10.0
+    max_intervention_duration: float = 5.0
     max_completion_repairs: int = 3
+    max_intervention_reconsiderations: int = 2
     max_no_progress_rejections: int = 2
     max_stagnant_actions_per_family: int = 3
 
@@ -169,6 +183,11 @@ class RunLimits:
                 raise ValueError("run counter and input limits must be positive integers")
         if type(self.max_completion_repairs) is not int or self.max_completion_repairs < 0:
             raise ValueError("completion repair limit must be a nonnegative integer")
+        if (
+            type(self.max_intervention_reconsiderations) is not int
+            or self.max_intervention_reconsiderations < 1
+        ):
+            raise ValueError("intervention reconsideration limit must be a positive integer")
         if type(self.max_no_progress_rejections) is not int or self.max_no_progress_rejections < 1:
             raise ValueError("no-progress rejection limit must be a positive integer")
         if (
@@ -176,7 +195,12 @@ class RunLimits:
             or self.max_stagnant_actions_per_family < 1
         ):
             raise ValueError("stagnant action-family limit must be a positive integer")
-        for duration in (self.max_duration, self.max_model_duration, self.max_completion_duration):
+        for duration in (
+            self.max_duration,
+            self.max_model_duration,
+            self.max_completion_duration,
+            self.max_intervention_duration,
+        ):
             if isinstance(duration, bool) or not math.isfinite(duration) or duration <= 0:
                 raise ValueError("run and model attempt durations must be positive and finite")
 
@@ -244,6 +268,8 @@ class _AgentKernel:
         task_observation: TaskObservation | None = None,
         progress: ProgressPolicy | None = None,
         progress_assessor: ProgressAssessor | None = None,
+        # 候选工具批次的主动控制策略, None 使用默认的 blocked/stop 干预策略。
+        intervention: ActionInterventionPolicy | None = None,
     ) -> None:
         self._journal = journal
         self._preparation = preparation
@@ -286,6 +312,13 @@ class _AgentKernel:
             max_stagnant_actions_per_family=self._limits.max_stagnant_actions_per_family,
         )
         self._progress_assessor = progress_assessor
+        if journal_version != 3 and intervention is not None:
+            raise ValueError("action intervention is only supported by the v3 control loop")
+        self._intervention = (
+            (intervention if intervention is not None else ProgressActionInterventionPolicy())
+            if journal_version == 3
+            else None
+        )
         self._no_progress_rejections = 0
         self._no_progress_frontier: str | None = None
         self._events_json: list[str] = []
@@ -295,7 +328,14 @@ class _AgentKernel:
         self._executed = False
         self._failure_cause: BaseException | None = None
         self._resolutions_json: list[str] = []
-        self._emit(RunStarted(task=task))
+        self._emit(
+            RunStarted(
+                task=task,
+                action_intervention_policy_version=(
+                    self._intervention.version if self._intervention is not None else None
+                ),
+            )
+        )
 
     @property
     def state(self) -> RunState:
@@ -481,6 +521,10 @@ class _AgentKernel:
                         if self.state.model_calls >= self._limits.max_model_calls:
                             return await self._end(RunStatus.BUDGET_EXHAUSTED, "model_calls")
                         assert isinstance(decision, ToolBatch)
+                        if not await self._intervene_batch(decision, deadline):
+                            if self.state.phase is Phase.ACTION:
+                                await self._execute_turn(calls, deadline)
+                            continue
                         admitted, action_identities = await self._admit_batch(
                             decision, self._capability_epoch
                         )
@@ -547,6 +591,25 @@ class _AgentKernel:
                         category=ErrorCategory.NO_PROGRESS,
                         message="Repeated actions did not improve accepted task state",
                     ),
+                )
+            if isinstance(exc, _InterventionExhausted):
+                return await self._end(
+                    RunStatus.FAILED,
+                    "intervention_exhausted",
+                    error=RunError(
+                        category=ErrorCategory.NO_PROGRESS,
+                        message="Model repeatedly ignored required action reconsideration",
+                    ),
+                )
+            if isinstance(exc, ActionInterventionError):
+                return await self._end(
+                    RunStatus.FAILED,
+                    (
+                        "intervention_timeout"
+                        if exc.error.category is ErrorCategory.TIMEOUT
+                        else "intervention_failure"
+                    ),
+                    error=exc.error,
                 )
             if isinstance(exc, ModelCallError):
                 if exc.error.category is ErrorCategory.TIMEOUT:
@@ -655,6 +718,64 @@ class _AgentKernel:
         self._instructions = _instructions_for(
             self._instruction_source, visible, self._journal_version
         )
+
+    async def _intervene_batch(self, batch: ToolBatch, deadline: float) -> bool:
+        """Evaluate and persist the exact proposal before ordinary admission can run."""
+        policy = self._intervention
+        if policy is None:
+            raise RuntimeError("v3 action intervention policy is not configured")
+        revision = self.state.model_revision
+        if revision is None:
+            raise RuntimeError("action intervention requires a model revision")
+        progress = self.state.progress_assessment
+        progress_sha256 = (
+            hashlib.sha256(progress.model_dump_json().encode()).hexdigest()
+            if progress is not None
+            else None
+        )
+        context = ActionInterventionContext(
+            task=self.state.task,
+            proposal=batch,
+            progress_assessment=progress,
+            remaining_model_calls=max(0, self._limits.max_model_calls - self.state.model_calls),
+            remaining_tool_calls=max(0, self._limits.max_tool_calls - self.state.tool_calls),
+        )
+        decision = await evaluate_action_intervention(
+            policy,
+            context,
+            max_duration=min(
+                self._limits.max_intervention_duration,
+                max(0, self._remaining(deadline)),
+            ),
+        )
+        if self._remaining(deadline) <= 0:
+            raise _DispatchDeadlineExpired("Run deadline expired during action intervention")
+        prior_reconsiderations = (
+            self.state.intervention_reconsiderations
+            if self.state.intervention_frontier_sha256 == progress_sha256
+            else 0
+        )
+        accepted = await self._accept(
+            ActionInterventionChecked(
+                task_revision=revision,
+                policy_version=policy.version,
+                proposal_sha256=hashlib.sha256(batch.model_dump_json().encode()).hexdigest(),
+                progress_assessment_sha256=progress_sha256,
+                prior_reconsiderations=prior_reconsiderations,
+                decision=decision,
+            ),
+            expected_revision=revision,
+        )
+        if not accepted:
+            return False
+        if decision.disposition == "reconsider":
+            if (
+                self.state.intervention_reconsiderations
+                > self._limits.max_intervention_reconsiderations
+            ):
+                raise _InterventionExhausted
+            return False
+        return True
 
     async def _admit_batch(
         self, batch: ToolBatch, capability_epoch: int
@@ -923,6 +1044,8 @@ class _AgentKernel:
                 attempt = f"{step}/verification/1"
             elif isinstance(data, ProgressAssessed):
                 attempt = f"{step}/progress/1"
+            elif isinstance(data, ActionInterventionChecked):
+                attempt = f"{step}/intervention/1"
             elif isinstance(data, (ToolStarted, ToolRecorded)):
                 if self._journal_version == 1:
                     attempt = f"{step}/tool/1"
@@ -1228,7 +1351,7 @@ class LegacyAgentLoop(_AgentKernel):
 
 # 声明第三版 Agent 循环;公共行为复用基类的状态机,当前类负责接入 v3 控制协议。
 class AgentLoop(_AgentKernel):
-    """v3 loop: reserve feedback before effects and resolve candidate completion."""
+    """v3 loop: intervene and reserve feedback before effects, then verify completion."""
 
     # 构造一次性执行的 Agent;初始化会校验并行配置,并由基类写入 RunStarted 事件。
     def __init__(
@@ -1265,6 +1388,8 @@ class AgentLoop(_AgentKernel):
         task_observation: TaskObservation | None = None,
         progress: ProgressPolicy | None = None,
         progress_assessor: ProgressAssessor | None = None,
+        # 候选工具批次的主动控制策略, None 使用默认的 blocked/stop 干预策略。
+        intervention: ActionInterventionPolicy | None = None,
         # 构造函数只建立依赖、初始状态和首个事件,不在初始化阶段执行模型或工具。
     ) -> None:
         # 把基类的通用“决策”回调适配为 v3 模型调用,同时保留统一的超时边界。
@@ -1325,6 +1450,7 @@ class AgentLoop(_AgentKernel):
             feedback_bounds=feedback_bounds,
             progress=progress,
             progress_assessor=progress_assessor,
+            intervention=intervention,
             # 完成共享内核初始化;此时实例已拥有初始状态,但尚未进入异步执行循环。
         )
 

@@ -1,9 +1,10 @@
 """v3 behavior: effects require admission; completion requires accepted evidence."""
 
 import asyncio
+import hashlib
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
-from typing import Literal
+from typing import Literal, cast
 
 import pytest
 from pydantic import BaseModel, ConfigDict, JsonValue, TypeAdapter, ValidationError
@@ -12,10 +13,12 @@ from weavria.artifacts import ArtifactAccessError, ArtifactSnapshot, InMemoryArt
 from weavria.context import EvidenceMode, reserve_feedback
 from weavria.core import (
     ActionCostSignal,
+    ActionInterventionChecked,
     AdmissionNotice,
     AgentResult,
     BatchAdmitted,
     BatchRejected,
+    CallSkipped,
     CompletionAccept,
     CompletionAssessment,
     CompletionChecked,
@@ -32,6 +35,8 @@ from weavria.core import (
     FeedbackBounds,
     FinishAction,
     InformationGainSignal,
+    InterventionDecision,
+    InterventionNotice,
     ModelTurn,
     ObligationProgressSignal,
     ProgressAssessed,
@@ -41,6 +46,7 @@ from weavria.core import (
     RunError,
     RunReport,
     RunStatus,
+    TaskDirective,
     TaskInput,
     TaskObservation,
     ToolBatch,
@@ -58,10 +64,13 @@ from weavria.core import (
 )
 from weavria.models import FakeControlProvider
 from weavria.runtime import (
+    ActionInterventionContext,
+    ActionInterventionPolicy,
     AgentLoop,
     CompletionContext,
     CompletionPolicy,
     EventAcceptanceError,
+    Phase,
     ProgressAssessor,
     RunLimits,
     SemanticProgressPolicy,
@@ -116,6 +125,7 @@ def make_loop(
     bounds: FeedbackBounds | None = None,
     task_observation: TaskObservation | None = None,
     progress_assessor: ProgressAssessor | None = None,
+    intervention: ActionInterventionPolicy | None = None,
     loop_type: type[AgentLoop] = AgentLoop,
 ) -> AgentLoop:
     return loop_type(
@@ -143,6 +153,7 @@ def make_loop(
         scheduling=ToolScheduling(2, frozenset({"echo"})),
         task_observation=task_observation,
         progress_assessor=progress_assessor,
+        intervention=intervention,
     )
 
 
@@ -214,6 +225,95 @@ class _FailingProgressAssessor:
     ) -> ProgressAssessment:
         del task, records, feedback, remaining_model_calls, remaining_tool_calls
         raise RuntimeError("assessment backend failed")
+
+
+class _BlockedProgressAssessor:
+    async def assess_progress(
+        self,
+        *,
+        task: TaskInput,
+        records: tuple[ToolRecord, ...],
+        feedback: TurnFeedback,
+        remaining_model_calls: int,
+        remaining_tool_calls: int,
+    ) -> ProgressAssessment:
+        del records
+        call_ids = tuple(item.call_id for item in feedback.calls)
+        return ProgressAssessment(
+            task_revision=task.revision,
+            policy_version="test-progress/blocked/1",
+            before_state_sha256="a" * 64,
+            after_state_sha256="a" * 64,
+            feedback_call_ids=call_ids,
+            obligations=ObligationProgressSignal(
+                observable_total=1,
+                open_before=1,
+                open_after=1,
+                unchanged_open_ids=("obligation-a",),
+            ),
+            coverage=EvidenceCoverageSignal(
+                total_units=1,
+                covered_before=0,
+                covered_after=0,
+            ),
+            information_gain=InformationGainSignal(
+                attributed_sources_before=0,
+                attributed_sources_after=0,
+                repeated_source_bindings=0,
+                unattributed_new_bindings=0,
+                contradictory_new_bindings=0,
+            ),
+            cost=ActionCostSignal(
+                proposed_calls=len(call_ids),
+                succeeded_calls=len(call_ids),
+                failed_calls=0,
+                skipped_calls=0,
+                artifact_bytes=1,
+                remaining_model_calls=remaining_model_calls,
+                remaining_tool_calls=remaining_tool_calls,
+            ),
+            continuation=ContinuationSignal(
+                feasibility="blocked",
+                recommended_action="stop",
+                reason_codes=("mandatory_sources_unavailable",),
+            ),
+            quality="neutral",
+            material_progress=False,
+        )
+
+
+class _FailingInterventionPolicy:
+    version = "failing-intervention/1"
+
+    async def evaluate(self, context: ActionInterventionContext) -> InterventionDecision:
+        del context
+        raise RuntimeError("intervention backend failed")
+
+
+class _TimeoutInterventionPolicy:
+    version = "timeout-intervention/1"
+
+    async def evaluate(self, context: ActionInterventionContext) -> InterventionDecision:
+        del context
+        raise TimeoutError("intervention backend timed out")
+
+
+class _GatedInterventionPolicy:
+    version = "gated-intervention/1"
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def evaluate(self, context: ActionInterventionContext) -> InterventionDecision:
+        del context
+        self.started.set()
+        await self.release.wait()
+        return InterventionDecision(
+            disposition="allow",
+            trigger="assessment_unavailable",
+            reason_codes=("progress_assessment_unavailable",),
+        )
 
 
 class _RevisionBeforeProgressResolutionLoop(AgentLoop):
@@ -420,6 +520,227 @@ async def test_progress_assessor_failure_preserves_settled_tool_fact_and_fails_c
     assert not any(isinstance(event.data, ProgressAssessed) for event in agent.events)
     assert isinstance(agent.events[-1].data, RunEnded)
     assert agent.events[-1].data.reason == "runtime_failure"
+    replay(agent)
+
+
+async def test_blocked_progress_actively_reconsiders_before_any_new_tool_dispatch() -> None:
+    executed: list[str] = []
+
+    async def recording_echo(arguments: Input, context: ToolContext) -> Output:
+        del context
+        executed.append(arguments.value)
+        return Output(value=arguments.value)
+
+    provider = FakeControlProvider(
+        (
+            batch(call("useful", "accepted")),
+            batch(call("waste", "must-not-run")),
+            finish("No viable source remains"),
+        )
+    )
+    agent = make_loop(
+        provider,
+        execute=recording_echo,
+        progress_assessor=_BlockedProgressAssessor(),
+    )
+
+    result = await agent.execute()
+
+    assert result.status is RunStatus.COMPLETED
+    assert executed == ["accepted"]
+    interventions = [
+        event.data for event in agent.events if isinstance(event.data, ActionInterventionChecked)
+    ]
+    assert [item.decision.disposition for item in interventions] == ["allow", "reconsider"]
+    blocked = interventions[-1]
+    assert blocked.decision.trigger == "continuation_blocked"
+    assert blocked.progress_assessment_sha256 is not None
+    assert blocked.prior_reconsiderations == 0
+    assert [
+        event.data.call_id for event in agent.events if isinstance(event.data, ToolStarted)
+    ] == ["useful"]
+    notice = provider.requests[-1].control
+    assert isinstance(notice, InterventionNotice)
+    assert notice.proposal_sha256 == blocked.proposal_sha256
+    assert notice.progress_assessment_sha256 == blocked.progress_assessment_sha256
+    assert notice.reason_codes == ("mandatory_sources_unavailable",)
+    assert notice.reconsideration_ordinal == 1
+    replay(agent)
+
+
+async def test_completion_repair_supersedes_an_older_stop_intervention() -> None:
+    executed: list[str] = []
+
+    async def recording_echo(arguments: Input, context: ToolContext) -> Output:
+        del context
+        executed.append(arguments.value)
+        return Output(value=arguments.value)
+
+    provider = FakeControlProvider(
+        (
+            batch(call("initial", "accepted")),
+            batch(call("blocked", "must-not-run")),
+            finish("wrong"),
+            batch(call("repair", "corrected")),
+            finish("corrected"),
+        )
+    )
+    agent = make_loop(
+        provider,
+        execute=recording_echo,
+        progress_assessor=_BlockedProgressAssessor(),
+        completion=ValueVerifier(),
+    )
+
+    result = await agent.execute()
+
+    assert result.status is RunStatus.COMPLETED and result.task_outcome == "verified"
+    assert executed == ["accepted", "corrected"]
+    repair_request = provider.requests[3]
+    assert isinstance(repair_request.control, CompletionNotice)
+    repair_intervention = next(
+        event.data
+        for event in agent.events
+        if isinstance(event.data, ActionInterventionChecked)
+        and event.data.proposal_sha256
+        == hashlib.sha256(
+            ToolBatch(calls=(call("repair", "corrected"),)).model_dump_json().encode()
+        ).hexdigest()
+    )
+    assert repair_intervention.decision.trigger == "assessment_unavailable"
+    assert repair_intervention.decision.disposition == "allow"
+    replay(agent)
+
+
+async def test_configured_run_cannot_admit_a_proposal_before_intervention() -> None:
+    agent = make_loop(FakeControlProvider((batch(call("checked")), finish())))
+    assert (await agent.execute()).status is RunStatus.COMPLETED
+    state = None
+    admission: ControlEvent | None = None
+    for event in agent.events:
+        if isinstance(event.data, ActionInterventionChecked):
+            admission = next(
+                candidate
+                for candidate in agent.events
+                if candidate.sequence > event.sequence and isinstance(candidate.data, BatchAdmitted)
+            )
+            break
+        state = reduce_event(state, event)
+
+    assert state is not None and admission is not None
+    forged = admission.model_copy(update={"sequence": state.sequence + 1})
+    with pytest.raises(EventAcceptanceError, match="allowed intervention"):
+        reduce_event(state, forged)
+
+
+async def test_pre_intervention_v3_journal_replays_without_rewriting_history() -> None:
+    agent = make_loop(FakeControlProvider((batch(call("legacy")), finish("done"))))
+    assert (await agent.execute()).status is RunStatus.COMPLETED
+    state = None
+    sequence = 0
+    for event in agent.events:
+        if isinstance(event.data, ActionInterventionChecked):
+            continue
+        sequence += 1
+        payload = event.model_dump()
+        payload["sequence"] = sequence
+        if sequence == 1:
+            data = cast(dict[str, object], payload["data"])
+            data.pop("action_intervention_policy_version")
+        historical = ControlEvent.model_validate(payload)
+        state = reduce_event(state, historical)
+
+    assert state is not None
+    assert state.phase is Phase.TERMINAL
+    assert state.action_intervention_policy_version is None
+    assert state.result is not None and state.result.status is RunStatus.COMPLETED
+
+
+@pytest.mark.parametrize(
+    ("policy", "reason", "category"),
+    [
+        (
+            _FailingInterventionPolicy(),
+            "intervention_failure",
+            ErrorCategory.RUNTIME_INVARIANT_VIOLATION,
+        ),
+        (_TimeoutInterventionPolicy(), "intervention_timeout", ErrorCategory.TIMEOUT),
+    ],
+)
+async def test_intervention_failure_closes_before_admission_or_effect(
+    policy: ActionInterventionPolicy,
+    reason: str,
+    category: ErrorCategory,
+) -> None:
+    agent = make_loop(
+        FakeControlProvider((batch(call("never-started")),)),
+        intervention=policy,
+    )
+
+    result = await agent.execute()
+
+    assert result.status is RunStatus.FAILED
+    assert result.error is not None and result.error.category is category
+    assert agent.state.tool_calls == 0
+    assert not any(isinstance(event.data, BatchAdmitted) for event in agent.events)
+    assert not any(isinstance(event.data, ToolStarted) for event in agent.events)
+    assert isinstance(agent.events[-1].data, RunEnded)
+    assert agent.events[-1].data.reason == reason
+    replay(agent)
+
+
+async def test_task_revision_wins_while_intervention_is_in_flight() -> None:
+    policy = _GatedInterventionPolicy()
+    provider = FakeControlProvider((batch(call("obsolete")), finish("replanned")))
+    agent = make_loop(provider, intervention=policy)
+    owner = asyncio.create_task(agent.execute())
+    await policy.started.wait()
+
+    update = await agent.apply_directive(
+        TaskDirective(input_id="update-1", text="Use the revised requirement")
+    )
+    policy.release.set()
+    result = await owner
+
+    assert update.task.revision == 2
+    assert result.status is RunStatus.COMPLETED and result.output == "replanned"
+    assert not any(isinstance(event.data, ToolStarted) for event in agent.events)
+    skipped = [event.data for event in agent.events if isinstance(event.data, CallSkipped)]
+    assert len(skipped) == 1 and skipped[0].call_id == "obsolete"
+    assert not any(isinstance(event.data, ActionInterventionChecked) for event in agent.events)
+    assert provider.requests[-1].task.revision == 2
+    replay(agent)
+
+
+async def test_repeatedly_ignored_intervention_has_an_explicit_no_progress_terminal() -> None:
+    provider = FakeControlProvider(
+        (
+            batch(call("initial")),
+            batch(call("ignored-1", "one")),
+            batch(call("ignored-2", "two")),
+            batch(call("ignored-3", "three")),
+        )
+    )
+    agent = make_loop(
+        provider,
+        progress_assessor=_BlockedProgressAssessor(),
+        limits=RunLimits(max_intervention_reconsiderations=2),
+    )
+
+    result = await agent.execute()
+
+    assert result.status is RunStatus.FAILED
+    assert result.error is not None and result.error.category is ErrorCategory.NO_PROGRESS
+    assert agent.state.tool_calls == 1
+    reconsidered = [
+        event.data
+        for event in agent.events
+        if isinstance(event.data, ActionInterventionChecked)
+        and event.data.decision.disposition == "reconsider"
+    ]
+    assert [item.prior_reconsiderations for item in reconsidered] == [0, 1, 2]
+    assert isinstance(agent.events[-1].data, RunEnded)
+    assert agent.events[-1].data.reason == "intervention_exhausted"
     replay(agent)
 
 

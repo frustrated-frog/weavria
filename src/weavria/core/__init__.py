@@ -4,6 +4,7 @@ from .actions import AgentAction, FinishAction, ToolCallAction, parse_action
 from .control import (
     COMPLETION_GUIDANCE_JSON_BYTES,
     CONTROL_FEEDBACK_BYTES,
+    ActionInterventionChecked,
     AdmissionNotice,
     BatchAdmitted,
     BatchRejected,
@@ -20,6 +21,7 @@ from .control import (
     ControlFeedback,
     ControlRequest,
     FeedbackBounds,
+    InterventionNotice,
     ProgressAssessed,
     ProgressNotice,
     RunReport,
@@ -65,7 +67,7 @@ from .execution import (
     ToolStarted,
 )
 from .feedback import maximum_exchange_bytes, minimum_exchange
-from .intervention import TaskDirective, TaskUpdate, TurnResolution
+from .intervention import InterventionDecision, TaskDirective, TaskUpdate, TurnResolution
 from .journal import JournalEvent, decode_event
 from .lifecycle import InvalidStateTransitionError, RunStatus, transition_status
 from .messages import AgentRequest, Message, MessageRole
@@ -119,6 +121,7 @@ __all__ = [
     "COMPLETION_GUIDANCE_JSON_BYTES",
     "CONTROL_FEEDBACK_BYTES",
     "ActionCostSignal",
+    "ActionInterventionChecked",
     "AdmissionNotice",
     "AgentAction",
     "AgentRequest",
@@ -156,6 +159,8 @@ __all__ = [
     "FinishAction",
     "HistoryEntry",
     "InformationGainSignal",
+    "InterventionDecision",
+    "InterventionNotice",
     "InvalidActionError",
     "InvalidStateTransitionError",
     "JournalEvent",

@@ -20,6 +20,7 @@ from .execution import (
     ToolRecorded,
     ToolStarted,
 )
+from .intervention import InterventionDecision
 from .lifecycle import RunStatus
 from .model_io import HistoryEntry, TaskInput, TaskObservation, validate_task_observation
 from .outcomes import AgentResult
@@ -171,8 +172,31 @@ class ProgressNotice(ContractModel):
         )
 
 
+class InterventionNotice(ContractModel):
+    """Bounded explanation emitted only when the exact proposal must be replaced."""
+
+    kind: Literal["action_reconsideration"] = "action_reconsideration"
+    policy_version: NonBlankString
+    proposal_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    progress_assessment_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    trigger: Literal["completion_recommended", "continuation_blocked"]
+    reason_codes: tuple[Annotated[str, Field(pattern=r"^[a-z][a-z0-9_]{0,63}$")], ...] = Field(
+        min_length=1, max_length=8
+    )
+    reconsideration_ordinal: int = Field(ge=1)
+
+    @model_validator(mode="after")
+    def bound_notice(self) -> Self:
+        if len(self.reason_codes) != len(set(self.reason_codes)):
+            raise ValueError("intervention reason codes must be unique")
+        if len(self.model_dump_json().encode()) > CONTROL_FEEDBACK_BYTES:
+            raise ValueError("intervention notice exceeds its reserved channel")
+        return self
+
+
 type ControlFeedback = Annotated[
-    AdmissionNotice | CompletionNotice | ProgressNotice, Field(discriminator="kind")
+    AdmissionNotice | CompletionNotice | ProgressNotice | InterventionNotice,
+    Field(discriminator="kind"),
 ]
 
 
@@ -262,6 +286,25 @@ class ProgressAssessed(ContractModel):
     assessment: ProgressAssessment
 
 
+class ActionInterventionChecked(ContractModel):
+    """Bind a policy verdict to the current task, proposal and progress snapshot."""
+
+    kind: Literal["action_intervention_checked"] = "action_intervention_checked"
+    task_revision: int = Field(ge=1)
+    policy_version: NonBlankString
+    proposal_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    progress_assessment_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    prior_reconsiderations: int = Field(ge=0)
+    decision: InterventionDecision
+
+    @model_validator(mode="after")
+    def bind_assessment(self) -> Self:
+        has_assessment = self.progress_assessment_sha256 is not None
+        if has_assessment == (self.decision.trigger == "assessment_unavailable"):
+            raise ValueError("intervention trigger contradicts assessment availability")
+        return self
+
+
 type ControlData = Annotated[
     RunStarted
     | TaskRevised
@@ -269,6 +312,7 @@ type ControlData = Annotated[
     | ModelStarted
     | DecisionDiscarded
     | TurnDecided
+    | ActionInterventionChecked
     | BatchAdmitted
     | BatchRejected
     | ToolStarted
