@@ -9,6 +9,7 @@ import pytest
 LAYERS = {
     "core": (),
     "models": ("core",),
+    "memory": (),
     "artifacts": ("core",),
     "tools": ("core", "artifacts"),
     "context": ("core", "artifacts"),
