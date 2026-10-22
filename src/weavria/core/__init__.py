@@ -67,7 +67,16 @@ from .execution import (
     ToolStarted,
 )
 from .feedback import maximum_exchange_bytes, minimum_exchange
-from .intervention import InterventionDecision, TaskDirective, TaskUpdate, TurnResolution
+from .intervention import (
+    ActionValueContext,
+    ActionValueEstimate,
+    ActionValueObjective,
+    ActionValueProfile,
+    InterventionDecision,
+    TaskDirective,
+    TaskUpdate,
+    TurnResolution,
+)
 from .journal import JournalEvent, decode_event
 from .lifecycle import InvalidStateTransitionError, RunStatus, transition_status
 from .messages import AgentRequest, Message, MessageRole
@@ -122,6 +131,10 @@ __all__ = [
     "CONTROL_FEEDBACK_BYTES",
     "ActionCostSignal",
     "ActionInterventionChecked",
+    "ActionValueContext",
+    "ActionValueEstimate",
+    "ActionValueObjective",
+    "ActionValueProfile",
     "AdmissionNotice",
     "AgentAction",
     "AgentRequest",

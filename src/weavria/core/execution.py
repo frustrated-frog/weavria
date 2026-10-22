@@ -71,6 +71,16 @@ class RunStarted(ContractModel):
     kind: Literal["run_started"] = "run_started"
     task: TaskInput
     action_intervention_policy_version: NonBlankString | None = None
+    action_value_ledger_version: NonBlankString | None = None
+
+    @model_validator(mode="after")
+    def validate_control_versions(self) -> Self:
+        if (
+            self.action_value_ledger_version is not None
+            and self.action_intervention_policy_version is None
+        ):
+            raise ValueError("action-value ledger requires an intervention policy")
+        return self
 
 
 class TaskRevised(ContractModel):

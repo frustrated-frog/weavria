@@ -20,7 +20,7 @@ from .execution import (
     ToolRecorded,
     ToolStarted,
 )
-from .intervention import InterventionDecision
+from .intervention import ActionValueContext, InterventionDecision
 from .lifecycle import RunStatus
 from .model_io import HistoryEntry, TaskInput, TaskObservation, validate_task_observation
 from .outcomes import AgentResult
@@ -179,16 +179,36 @@ class InterventionNotice(ContractModel):
     policy_version: NonBlankString
     proposal_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     progress_assessment_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
-    trigger: Literal["completion_recommended", "continuation_blocked"]
+    trigger: Literal[
+        "completion_recommended",
+        "continuation_blocked",
+        "action_value_low_yield",
+        "action_value_regression_risk",
+    ]
     reason_codes: tuple[Annotated[str, Field(pattern=r"^[a-z][a-z0-9_]{0,63}$")], ...] = Field(
         min_length=1, max_length=8
     )
     reconsideration_ordinal: int = Field(ge=1)
+    action_value_key_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    action_value_observations: int | None = Field(default=None, ge=0)
+    expected_progress_per_call: float | None = Field(default=None, ge=0.0, le=1.0)
+    pessimistic_regression_probability: float | None = Field(default=None, ge=0.0, le=1.0)
 
     @model_validator(mode="after")
     def bound_notice(self) -> Self:
         if len(self.reason_codes) != len(set(self.reason_codes)):
             raise ValueError("intervention reason codes must be unique")
+        value_trigger = self.trigger.startswith("action_value_")
+        value_details = (
+            self.action_value_key_sha256,
+            self.action_value_observations,
+            self.expected_progress_per_call,
+            self.pessimistic_regression_probability,
+        )
+        if value_trigger != all(item is not None for item in value_details):
+            raise ValueError("action-value reconsideration requires its complete estimate")
+        if not value_trigger and any(item is not None for item in value_details):
+            raise ValueError("non-value reconsideration cannot carry an action-value estimate")
         if len(self.model_dump_json().encode()) > CONTROL_FEEDBACK_BYTES:
             raise ValueError("intervention notice exceeds its reserved channel")
         return self
@@ -235,6 +255,7 @@ class BatchAdmitted(ContractModel):
     budget_bytes: int = Field(gt=0)
     readable_call_ids: tuple[NonBlankString, ...]
     bounds: FeedbackBounds
+    action_value_context: ActionValueContext | None = None
 
     @model_validator(mode="after")
     def validate_budget(self) -> Self:
@@ -294,14 +315,30 @@ class ActionInterventionChecked(ContractModel):
     policy_version: NonBlankString
     proposal_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     progress_assessment_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    action_value_context: ActionValueContext | None = None
+    action_value_state_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
     prior_reconsiderations: int = Field(ge=0)
     decision: InterventionDecision
 
     @model_validator(mode="after")
     def bind_assessment(self) -> Self:
         has_assessment = self.progress_assessment_sha256 is not None
-        if has_assessment == (self.decision.trigger == "assessment_unavailable"):
+        if self.decision.trigger == "assessment_unavailable" and has_assessment:
             raise ValueError("intervention trigger contradicts assessment availability")
+        if self.decision.trigger != "assessment_unavailable" and not has_assessment:
+            raise ValueError("assessed intervention trigger requires a progress assessment")
+        value_fields = (
+            self.action_value_context is not None and self.action_value_state_sha256 is not None
+        )
+        if (self.action_value_context is None) != (self.action_value_state_sha256 is None):
+            raise ValueError("action-value intervention inputs must be complete")
+        if self.decision.value_estimate is not None:
+            value_context = self.action_value_context
+            if not value_fields or (
+                self.decision.value_estimate.value_key_sha256
+                != (value_context.value_key_sha256 if value_context is not None else None)
+            ):
+                raise ValueError("action-value estimate does not bind the candidate context")
         return self
 
 

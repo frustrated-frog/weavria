@@ -5,12 +5,16 @@ from .budget import RootBudget
 from .completion import CompletionContext, CompletionPolicy, LayeredCompletionPolicy, NoVerification
 from .controller import ProgressAssessor, TurnPreparation, TurnPreparer, prepare_task, resolve_turn
 from .intervention import (
+    ACTION_VALUE_LEDGER_VERSION,
     ActionInterventionContext,
     ActionInterventionError,
     ActionInterventionPolicy,
     AllowAllActionInterventionPolicy,
+    HardStopActionInterventionPolicy,
     ProgressActionInterventionPolicy,
+    action_value_state_sha256,
     evaluate_action_intervention,
+    observe_action_value,
 )
 from .journal import (
     InterventionJournal,
@@ -32,6 +36,7 @@ from .scheduling import ToolScheduling
 from .state import EventAcceptanceError, Phase, RunState, reduce_event
 
 __all__ = [
+    "ACTION_VALUE_LEDGER_VERSION",
     "ActionInterventionContext",
     "ActionInterventionError",
     "ActionInterventionPolicy",
@@ -42,6 +47,7 @@ __all__ = [
     "CompletionContext",
     "CompletionPolicy",
     "EventAcceptanceError",
+    "HardStopActionInterventionPolicy",
     "InterventionJournal",
     "JournalCommitError",
     "LayeredCompletionPolicy",
@@ -66,7 +72,9 @@ __all__ = [
     "ToolScheduling",
     "TurnPreparation",
     "TurnPreparer",
+    "action_value_state_sha256",
     "evaluate_action_intervention",
+    "observe_action_value",
     "prepare_task",
     "reduce_event",
     "resolve_turn",

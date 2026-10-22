@@ -1,5 +1,7 @@
 """User-authored updates and explicit, replayable Harness control decisions."""
 
+import hashlib
+import json
 from typing import Annotated, Literal, Self
 
 from pydantic import Field, model_validator
@@ -8,6 +10,146 @@ from ._schema import ContractModel, NonBlankString
 from .model_io import TaskInput
 
 type InterventionReasonCode = Annotated[str, Field(pattern=r"^[a-z][a-z0-9_]{0,63}$")]
+type _Digest = Annotated[str, Field(pattern=r"^[a-f0-9]{64}$")]
+type ActionValueObjective = Literal["initial", "verify", "continue", "repair", "replan", "stop"]
+
+
+def _action_value_key_sha256(
+    *,
+    task_revision: int,
+    objective: ActionValueObjective,
+    action_family_sha256s: tuple[str, ...],
+) -> str:
+    """Hash the outcome-comparable unit without including call IDs or arguments."""
+    return hashlib.sha256(
+        json.dumps(
+            {
+                "task_revision": task_revision,
+                "objective": objective,
+                "action_family_sha256s": sorted(action_family_sha256s),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+
+
+class ActionValueContext(ContractModel):
+    """The exact semantic bucket used to compare a proposed batch with prior outcomes."""
+
+    task_revision: int = Field(ge=1)
+    objective: ActionValueObjective
+    proposal_sha256: _Digest
+    action_family_sha256s: tuple[_Digest, ...] = Field(min_length=1, max_length=32)
+    value_key_sha256: _Digest
+
+    @model_validator(mode="after")
+    def validate_key(self) -> Self:
+        if tuple(sorted(self.action_family_sha256s)) != self.action_family_sha256s:
+            raise ValueError("action-value families must use canonical sorted order")
+        expected = _action_value_key_sha256(
+            task_revision=self.task_revision,
+            objective=self.objective,
+            action_family_sha256s=self.action_family_sha256s,
+        )
+        if self.value_key_sha256 != expected:
+            raise ValueError("action-value key does not match its semantic scope")
+        return self
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        task_revision: int,
+        objective: ActionValueObjective,
+        proposal_sha256: str,
+        action_family_sha256s: tuple[str, ...],
+    ) -> Self:
+        families = tuple(sorted(action_family_sha256s))
+        return cls(
+            task_revision=task_revision,
+            objective=objective,
+            proposal_sha256=proposal_sha256,
+            action_family_sha256s=families,
+            value_key_sha256=_action_value_key_sha256(
+                task_revision=task_revision,
+                objective=objective,
+                action_family_sha256s=families,
+            ),
+        )
+
+
+class ActionValueProfile(ContractModel):
+    """Replay-derived outcomes for one objective and action-family composition.
+
+    Outcome classes are disjoint. ``mixed`` means the turn made material progress
+    and regressed another signal, so it contributes to both Bayesian marginals.
+    """
+
+    task_revision: int = Field(ge=1)
+    objective: ActionValueObjective
+    action_family_sha256s: tuple[_Digest, ...] = Field(min_length=1, max_length=32)
+    value_key_sha256: _Digest
+    observations: int = Field(ge=1)
+    productive_turns: int = Field(ge=0)
+    neutral_turns: int = Field(ge=0)
+    regressed_turns: int = Field(ge=0)
+    mixed_turns: int = Field(ge=0)
+    proposed_calls: int = Field(ge=1)
+    succeeded_calls: int = Field(ge=0)
+    failed_calls: int = Field(ge=0)
+    skipped_calls: int = Field(ge=0)
+    obligation_gains: int = Field(ge=0)
+    coverage_gains: int = Field(ge=0)
+    independent_source_gains: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def validate_profile(self) -> Self:
+        if tuple(sorted(self.action_family_sha256s)) != self.action_family_sha256s:
+            raise ValueError("action-value profile families must be canonical")
+        expected = _action_value_key_sha256(
+            task_revision=self.task_revision,
+            objective=self.objective,
+            action_family_sha256s=self.action_family_sha256s,
+        )
+        if self.value_key_sha256 != expected:
+            raise ValueError("action-value profile key does not match its scope")
+        if (
+            self.productive_turns + self.neutral_turns + self.regressed_turns + self.mixed_turns
+            != self.observations
+        ):
+            raise ValueError("action-value outcome classes must cover every observation")
+        if self.succeeded_calls + self.failed_calls + self.skipped_calls != self.proposed_calls:
+            raise ValueError("action-value call counters must cover every proposed call")
+        if self.proposed_calls != self.observations * len(self.action_family_sha256s):
+            raise ValueError("action-value cost must match its observed batch composition")
+        return self
+
+
+class ActionValueEstimate(ContractModel):
+    """Persisted numerical basis for one pre-dispatch intervention verdict."""
+
+    value_key_sha256: _Digest
+    observations: int = Field(ge=0)
+    candidate_calls: int = Field(ge=1, le=32)
+    progress_mean: float = Field(ge=0.0, le=1.0)
+    progress_lower: float = Field(ge=0.0, le=1.0)
+    progress_upper: float = Field(ge=0.0, le=1.0)
+    expected_progress_per_call: float = Field(ge=0.0, le=1.0)
+    regression_mean: float = Field(ge=0.0, le=1.0)
+    regression_lower: float = Field(ge=0.0, le=1.0)
+    regression_upper: float = Field(ge=0.0, le=1.0)
+    minimum_observations: int = Field(ge=1)
+    minimum_expected_progress_per_call: float = Field(ge=0.0, le=1.0)
+    maximum_pessimistic_regression_probability: float = Field(ge=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def validate_intervals(self) -> Self:
+        if not self.progress_lower <= self.progress_mean <= self.progress_upper:
+            raise ValueError("progress posterior interval is not ordered")
+        if not self.regression_lower <= self.regression_mean <= self.regression_upper:
+            raise ValueError("regression posterior interval is not ordered")
+        return self
 
 
 class InterventionDecision(ContractModel):
@@ -24,10 +166,15 @@ class InterventionDecision(ContractModel):
         "recommendation_compatible",
         "verification_advisory",
         "policy_override",
+        "action_value_exploration",
+        "action_value_supported",
         "completion_recommended",
         "continuation_blocked",
+        "action_value_low_yield",
+        "action_value_regression_risk",
     ]
     reason_codes: tuple[InterventionReasonCode, ...] = Field(min_length=1, max_length=8)
+    value_estimate: ActionValueEstimate | None = None
 
     @model_validator(mode="after")
     def validate_disposition(self) -> Self:
@@ -36,11 +183,16 @@ class InterventionDecision(ContractModel):
             "recommendation_compatible",
             "verification_advisory",
             "policy_override",
+            "action_value_exploration",
+            "action_value_supported",
         }
         if allowed != (self.disposition == "allow"):
             raise ValueError("intervention trigger contradicts its disposition")
         if len(self.reason_codes) != len(set(self.reason_codes)):
             raise ValueError("intervention reason codes must be unique")
+        value_trigger = self.trigger.startswith("action_value_")
+        if value_trigger != (self.value_estimate is not None):
+            raise ValueError("action-value trigger requires its numerical estimate")
         return self
 
 

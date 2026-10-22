@@ -10,6 +10,7 @@ from pydantic import TypeAdapter
 from weavria.core import (
     CONTROL_FEEDBACK_BYTES,
     ActionInterventionChecked,
+    ActionValueProfile,
     AgentAction,
     AgentResult,
     BatchAdmitted,
@@ -53,6 +54,8 @@ from weavria.core import (
     VerificationStarted,
     parse_action,
 )
+
+from .intervention import action_value_state_sha256, observe_action_value
 
 
 class EventAcceptanceError(ValueError):
@@ -101,6 +104,8 @@ class RunState:
     progress_assessment_json: str | None = None
     pending_progress_sequence: int | None = None
     action_intervention_policy_version: str | None = None
+    action_value_ledger_version: str | None = None
+    action_value_profiles_json: tuple[str, ...] = ()
     intervention_json: str | None = None
     intervention_frontier_sha256: str | None = None
     intervention_reconsiderations: int = 0
@@ -135,6 +140,13 @@ class RunState:
             ActionInterventionChecked.model_validate_json(self.intervention_json)
             if self.intervention_json
             else None
+        )
+
+    @property
+    def action_value_profiles(self) -> tuple[ActionValueProfile, ...]:
+        return tuple(
+            ActionValueProfile.model_validate_json(value)
+            for value in self.action_value_profiles_json
         )
 
     @property
@@ -192,6 +204,7 @@ def reduce_event(state: RunState | None, event: JournalEvent) -> RunState:
             data.task.model_dump_json(),
             journal_version=event.schema_version,
             action_intervention_policy_version=data.action_intervention_policy_version,
+            action_value_ledger_version=data.action_value_ledger_version,
         )
     _require(state.journal_version == event.schema_version, "journal versions cannot be mixed")
     if event.run_id != state.run_id or event.sequence != state.sequence + 1:
@@ -210,6 +223,7 @@ def reduce_event(state: RunState | None, event: JournalEvent) -> RunState:
             intervention_json=None,
             intervention_frontier_sha256=None,
             intervention_reconsiderations=0,
+            action_value_profiles_json=(),
         )
         if state.phase in (Phase.FINISH, Phase.ACCEPTED) or (
             state.phase is Phase.ACTION and state.journal_version == 1
@@ -579,6 +593,33 @@ def _reduce_control(
             data.progress_assessment_sha256 == progress_sha256,
             "intervention does not bind the current progress assessment",
         )
+        if state.action_value_ledger_version is not None:
+            value_context = data.action_value_context
+            _require(
+                value_context is not None
+                and data.action_value_state_sha256
+                == action_value_state_sha256(state.action_value_profiles)
+                and value_context.task_revision == state.task.revision
+                and value_context.proposal_sha256 == data.proposal_sha256,
+                "intervention does not bind the current action-value state",
+            )
+            assert value_context is not None
+            _require(
+                len(value_context.action_family_sha256s) == len(turn.decision.calls),
+                "action-value context does not cover the complete proposal",
+            )
+            expected_objective = (
+                progress.continuation.recommended_action if progress is not None else "initial"
+            )
+            _require(
+                value_context.objective == expected_objective,
+                "action-value objective contradicts the current progress recommendation",
+            )
+        else:
+            _require(
+                data.action_value_context is None and data.action_value_state_sha256 is None,
+                "unconfigured run cannot accept action-value inputs",
+            )
         trigger = data.decision.trigger
         recommendation = progress.continuation.recommended_action if progress is not None else None
         _require(
@@ -588,6 +629,16 @@ def _reduce_control(
             or (trigger == "continuation_blocked" and recommendation == "stop")
             or (
                 trigger == "recommendation_compatible"
+                and recommendation in {"continue", "repair", "replan"}
+            )
+            or (
+                trigger
+                in {
+                    "action_value_exploration",
+                    "action_value_supported",
+                    "action_value_low_yield",
+                    "action_value_regression_risk",
+                }
                 and recommendation in {"continue", "repair", "replan"}
             )
             or (trigger == "policy_override" and progress is not None),
@@ -610,8 +661,22 @@ def _reduce_control(
                 intervention_reconsiderations=prior_reconsiderations,
             )
         assert progress_sha256 is not None
-        assert trigger in {"completion_recommended", "continuation_blocked"}
-        notice_trigger = cast(Literal["completion_recommended", "continuation_blocked"], trigger)
+        assert trigger in {
+            "completion_recommended",
+            "continuation_blocked",
+            "action_value_low_yield",
+            "action_value_regression_risk",
+        }
+        notice_trigger = cast(
+            Literal[
+                "completion_recommended",
+                "continuation_blocked",
+                "action_value_low_yield",
+                "action_value_regression_risk",
+            ],
+            trigger,
+        )
+        estimate = data.decision.value_estimate
         notice = InterventionNotice(
             policy_version=data.policy_version,
             proposal_sha256=data.proposal_sha256,
@@ -619,6 +684,14 @@ def _reduce_control(
             trigger=notice_trigger,
             reason_codes=data.decision.reason_codes,
             reconsideration_ordinal=prior_reconsiderations + 1,
+            action_value_key_sha256=(estimate.value_key_sha256 if estimate is not None else None),
+            action_value_observations=(estimate.observations if estimate is not None else None),
+            expected_progress_per_call=(
+                estimate.expected_progress_per_call if estimate is not None else None
+            ),
+            pessimistic_regression_probability=(
+                estimate.regression_lower if estimate is not None else None
+            ),
         )
         return replace(
             next_state,
@@ -648,10 +721,24 @@ def _reduce_control(
         )
         assert feedback is not None
         _require(
-            assessment.feedback_call_ids == tuple(item.call_id for item in feedback.calls),
+            assessment.feedback_call_ids == tuple(item.call_id for item in feedback.calls)
+            and assessment.cost.proposed_calls == len(feedback.calls),
             "progress assessment does not bind the complete settled turn",
         )
         notice = ProgressNotice.from_assessment(assessment)
+        profiles = state.action_value_profiles
+        if state.action_value_ledger_version is not None:
+            admission = state.admission
+            _require(
+                admission is not None and admission.action_value_context is not None,
+                "progress assessment requires its admitted action-value context",
+            )
+            assert admission is not None and admission.action_value_context is not None
+            profiles = observe_action_value(
+                profiles,
+                admission.action_value_context,
+                assessment,
+            )
         return replace(
             next_state,
             progress_assessment_json=assessment.model_dump_json(),
@@ -660,6 +747,7 @@ def _reduce_control(
             intervention_json=None,
             intervention_frontier_sha256=notice.assessment_sha256,
             intervention_reconsiderations=0,
+            action_value_profiles_json=tuple(item.model_dump_json() for item in profiles),
         )
     if isinstance(data, (BatchAdmitted, BatchRejected)):
         turn = state.turn
@@ -692,6 +780,19 @@ def _reduce_control(
                 data.readable_call_ids == readable,
                 "reservation must cover the complete readable view",
             )
+            if state.action_value_ledger_version is not None:
+                intervention = state.intervention
+                _require(
+                    data.action_value_context is not None
+                    and intervention is not None
+                    and data.action_value_context == intervention.action_value_context,
+                    "admission must preserve the checked action-value context",
+                )
+            else:
+                _require(
+                    data.action_value_context is None,
+                    "unconfigured run cannot admit an action-value context",
+                )
             return replace(next_state, admission_json=data.model_dump_json())
         notice = data.notice
         _require(

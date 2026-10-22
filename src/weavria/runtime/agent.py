@@ -24,6 +24,7 @@ from weavria.context import (
 )
 from weavria.core import (
     ActionInterventionChecked,
+    ActionValueContext,
     AdmissionNotice,
     AgentResult,
     ArtifactRef,
@@ -108,10 +109,12 @@ from .controller import (
     resolve_turn,
 )
 from .intervention import (
+    ACTION_VALUE_LEDGER_VERSION,
     ActionInterventionContext,
     ActionInterventionError,
     ActionInterventionPolicy,
     ProgressActionInterventionPolicy,
+    action_value_state_sha256,
     evaluate_action_intervention,
 )
 from .journal import (
@@ -334,6 +337,9 @@ class _AgentKernel:
                 action_intervention_policy_version=(
                     self._intervention.version if self._intervention is not None else None
                 ),
+                action_value_ledger_version=(
+                    ACTION_VALUE_LEDGER_VERSION if journal_version == 3 else None
+                ),
             )
         )
 
@@ -521,12 +527,20 @@ class _AgentKernel:
                         if self.state.model_calls >= self._limits.max_model_calls:
                             return await self._end(RunStatus.BUDGET_EXHAUSTED, "model_calls")
                         assert isinstance(decision, ToolBatch)
-                        if not await self._intervene_batch(decision, deadline):
+                        (
+                            intervention_allowed,
+                            checked_identities,
+                            value_context,
+                        ) = await self._intervene_batch(decision, deadline)
+                        if not intervention_allowed:
                             if self.state.phase is Phase.ACTION:
                                 await self._execute_turn(calls, deadline)
                             continue
                         admitted, action_identities = await self._admit_batch(
-                            decision, self._capability_epoch
+                            decision,
+                            self._capability_epoch,
+                            checked_identities=checked_identities,
+                            action_value_context=value_context,
                         )
                         if not admitted:
                             if self.state.phase is Phase.ACTION:
@@ -719,7 +733,9 @@ class _AgentKernel:
             self._instruction_source, visible, self._journal_version
         )
 
-    async def _intervene_batch(self, batch: ToolBatch, deadline: float) -> bool:
+    async def _intervene_batch(
+        self, batch: ToolBatch, deadline: float
+    ) -> tuple[bool, tuple[ToolActionIdentity, ...], ActionValueContext]:
         """Evaluate and persist the exact proposal before ordinary admission can run."""
         policy = self._intervention
         if policy is None:
@@ -733,12 +749,26 @@ class _AgentKernel:
             if progress is not None
             else None
         )
+        proposal_sha256 = hashlib.sha256(batch.model_dump_json().encode()).hexdigest()
+        action_identities = tuple(self._tool_ceiling.action_identity(call) for call in batch.calls)
+        value_context = ActionValueContext.create(
+            task_revision=revision,
+            objective=(
+                progress.continuation.recommended_action if progress is not None else "initial"
+            ),
+            proposal_sha256=proposal_sha256,
+            action_family_sha256s=tuple(
+                identity.action_family_sha256 for identity in action_identities
+            ),
+        )
         context = ActionInterventionContext(
             task=self.state.task,
             proposal=batch,
             progress_assessment=progress,
             remaining_model_calls=max(0, self._limits.max_model_calls - self.state.model_calls),
             remaining_tool_calls=max(0, self._limits.max_tool_calls - self.state.tool_calls),
+            action_value_context=value_context,
+            action_value_profiles=self.state.action_value_profiles,
         )
         decision = await evaluate_action_intervention(
             policy,
@@ -759,26 +789,35 @@ class _AgentKernel:
             ActionInterventionChecked(
                 task_revision=revision,
                 policy_version=policy.version,
-                proposal_sha256=hashlib.sha256(batch.model_dump_json().encode()).hexdigest(),
+                proposal_sha256=proposal_sha256,
                 progress_assessment_sha256=progress_sha256,
+                action_value_context=value_context,
+                action_value_state_sha256=action_value_state_sha256(
+                    self.state.action_value_profiles
+                ),
                 prior_reconsiderations=prior_reconsiderations,
                 decision=decision,
             ),
             expected_revision=revision,
         )
         if not accepted:
-            return False
+            return False, action_identities, value_context
         if decision.disposition == "reconsider":
             if (
                 self.state.intervention_reconsiderations
                 > self._limits.max_intervention_reconsiderations
             ):
                 raise _InterventionExhausted
-            return False
-        return True
+            return False, action_identities, value_context
+        return True, action_identities, value_context
 
     async def _admit_batch(
-        self, batch: ToolBatch, capability_epoch: int
+        self,
+        batch: ToolBatch,
+        capability_epoch: int,
+        *,
+        checked_identities: tuple[ToolActionIdentity, ...],
+        action_value_context: ActionValueContext,
     ) -> tuple[bool, tuple[ToolActionIdentity, ...]]:
         revision = self.state.model_revision
         reservation = reserve_feedback(
@@ -824,6 +863,10 @@ class _AgentKernel:
                 batch=batch,
                 capability_epoch=self._capability_epoch,
             )
+            if progress.action_identities != checked_identities:
+                raise RuntimeError(
+                    "tool action identity changed between intervention and admission"
+                )
             if progress.blocked:
                 if self._no_progress_frontier != progress.fingerprint_sha256:
                     self._no_progress_frontier = progress.fingerprint_sha256
@@ -882,6 +925,7 @@ class _AgentKernel:
                 budget_bytes=reservation.budget_bytes,
                 readable_call_ids=reservation.readable_call_ids,
                 bounds=self._bounds,
+                action_value_context=action_value_context,
             ),
             expected_revision=revision,
         )

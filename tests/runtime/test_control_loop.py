@@ -282,6 +282,61 @@ class _BlockedProgressAssessor:
         )
 
 
+class _NeutralReplanProgressAssessor:
+    async def assess_progress(
+        self,
+        *,
+        task: TaskInput,
+        records: tuple[ToolRecord, ...],
+        feedback: TurnFeedback,
+        remaining_model_calls: int,
+        remaining_tool_calls: int,
+    ) -> ProgressAssessment:
+        del records
+        call_ids = tuple(item.call_id for item in feedback.calls)
+        return ProgressAssessment(
+            task_revision=task.revision,
+            policy_version="test-progress/neutral-replan/1",
+            before_state_sha256="a" * 64,
+            after_state_sha256="a" * 64,
+            feedback_call_ids=call_ids,
+            obligations=ObligationProgressSignal(
+                observable_total=1,
+                open_before=1,
+                open_after=1,
+                unchanged_open_ids=("obligation-a",),
+            ),
+            coverage=EvidenceCoverageSignal(
+                total_units=1,
+                covered_before=0,
+                covered_after=0,
+            ),
+            information_gain=InformationGainSignal(
+                attributed_sources_before=0,
+                attributed_sources_after=0,
+                repeated_source_bindings=0,
+                unattributed_new_bindings=0,
+                contradictory_new_bindings=0,
+            ),
+            cost=ActionCostSignal(
+                proposed_calls=len(call_ids),
+                succeeded_calls=len(call_ids),
+                failed_calls=0,
+                skipped_calls=0,
+                artifact_bytes=1,
+                remaining_model_calls=remaining_model_calls,
+                remaining_tool_calls=remaining_tool_calls,
+            ),
+            continuation=ContinuationSignal(
+                feasibility="constrained",
+                recommended_action="replan",
+                reason_codes=("no_material_progress",),
+            ),
+            quality="neutral",
+            material_progress=False,
+        )
+
+
 class _FailingInterventionPolicy:
     version = "failing-intervention/1"
 
@@ -462,6 +517,7 @@ async def test_task_revision_between_progress_assessment_and_resolution_replans(
     assert resolution.policy_version == "revision/1"
     assert resolution.progress_assessment_sha256 is None
     assert provider.requests[-1].task.revision == 2
+    assert agent.state.action_value_profiles == ()
     replay(agent)
 
 
@@ -647,12 +703,17 @@ async def test_pre_intervention_v3_journal_replays_without_rewriting_history() -
         if sequence == 1:
             data = cast(dict[str, object], payload["data"])
             data.pop("action_intervention_policy_version")
+            data.pop("action_value_ledger_version")
+        data = cast(dict[str, object], payload["data"])
+        if data.get("kind") == "batch_admitted":
+            data.pop("action_value_context")
         historical = ControlEvent.model_validate(payload)
         state = reduce_event(state, historical)
 
     assert state is not None
     assert state.phase is Phase.TERMINAL
     assert state.action_intervention_policy_version is None
+    assert state.action_value_ledger_version is None
     assert state.result is not None and state.result.status is RunStatus.COMPLETED
 
 
@@ -741,6 +802,67 @@ async def test_repeatedly_ignored_intervention_has_an_explicit_no_progress_termi
     assert [item.prior_reconsiderations for item in reconsidered] == [0, 1, 2]
     assert isinstance(agent.events[-1].data, RunEnded)
     assert agent.events[-1].data.reason == "intervention_exhausted"
+    replay(agent)
+
+
+async def test_action_value_profile_prevents_a_low_yield_family_before_dispatch() -> None:
+    provider = FakeControlProvider(
+        (
+            batch(call("initial", "zero")),
+            batch(call("replan-1", "one")),
+            batch(call("replan-2", "two")),
+            batch(call("replan-3", "three")),
+            batch(call("prevented", "four")),
+            finish("No productive action family remains"),
+        )
+    )
+    agent = make_loop(
+        provider,
+        progress_assessor=_NeutralReplanProgressAssessor(),
+        limits=RunLimits(max_stagnant_actions_per_family=10),
+    )
+
+    result = await agent.execute()
+
+    assert result.status is RunStatus.COMPLETED
+    assert [
+        event.data.call_id for event in agent.events if isinstance(event.data, ToolStarted)
+    ] == ["initial", "replan-1", "replan-2", "replan-3"]
+    profiles = agent.state.action_value_profiles
+    replan_profile = next(item for item in profiles if item.objective == "replan")
+    assert replan_profile.observations == 3
+    assert replan_profile.neutral_turns == 3
+    checked = next(
+        event.data
+        for event in agent.events
+        if isinstance(event.data, ActionInterventionChecked)
+        and event.data.decision.trigger == "action_value_low_yield"
+    )
+    estimate = checked.decision.value_estimate
+    assert estimate is not None
+    assert estimate.observations == 3
+    assert estimate.expected_progress_per_call < 0.25
+    notice = provider.requests[-1].control
+    assert isinstance(notice, InterventionNotice)
+    assert notice.trigger == "action_value_low_yield"
+    assert notice.action_value_observations == 3
+    assert notice.action_value_key_sha256 == estimate.value_key_sha256
+
+    state = None
+    for event in agent.events:
+        if isinstance(event.data, ActionInterventionChecked) and (
+            event.data.proposal_sha256 == checked.proposal_sha256
+        ):
+            forged = event.model_copy(
+                update={
+                    "data": event.data.model_copy(update={"action_value_state_sha256": "f" * 64})
+                }
+            )
+            assert state is not None
+            with pytest.raises(EventAcceptanceError, match="action-value state"):
+                reduce_event(state, forged)
+            break
+        state = reduce_event(state, event)
     replay(agent)
 
 

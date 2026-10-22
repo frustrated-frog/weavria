@@ -6,6 +6,12 @@ from .action_intervention import (
     ActionInterventionExperiment,
     evaluate_action_interventions,
 )
+from .action_value import (
+    ActionValueExperiment,
+    ActionValueTrajectoryCase,
+    ActionValueTrajectoryResult,
+    evaluate_action_value_policy,
+)
 from .capability_discovery import (
     CapabilityCase,
     CapabilityCaseResult,
@@ -56,6 +62,9 @@ __all__ = [
     "ActionInterventionCase",
     "ActionInterventionCaseResult",
     "ActionInterventionExperiment",
+    "ActionValueExperiment",
+    "ActionValueTrajectoryCase",
+    "ActionValueTrajectoryResult",
     "CapabilityCase",
     "CapabilityCaseResult",
     "CapabilityExperiment",
@@ -83,6 +92,7 @@ __all__ = [
     "TokenUsage",
     "build_live_progress_experiment",
     "evaluate_action_interventions",
+    "evaluate_action_value_policy",
     "evaluate_capability_discovery",
     "evaluate_intent_clarification",
     "evaluate_intent_decision",
