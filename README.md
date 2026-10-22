@@ -6,7 +6,7 @@ Weavria 是一套实验性的 Python Agent Harness 与 Runtime，重点是让模
 
 当前支持本地单用户持久多轮会话与运行中 steering：`SessionEngine` 连接独立 Run，用户中途改变要求时修订当前任务、停止旧调用继续派发、保留已启动工作的结果，并逐轮重建历史上下文和重新验收。Harness 用独立 `TurnResolution` 表达重规划、继续、修正与完成；模型 Finish 仍需经过验收。重启后可追问、查看补充要求及重读历史成果，尚未实现自动执行 Resume。使用与限制见 [持久会话](docs/persistent-sessions.md)，机制和设计取舍见 [ADR 0008](docs/decisions/0008-interactive-turn-harness.md)。
 
-新增独立 `weavria.memory` 第一批内核：宿主明确准入的长期断言可以按作用域持久化、修订、保留争议，并按现实有效时间和系统获知时间查询；包含事务日志、幂等消费游标、精确与 BM25 检索。尚未接入自动提取、Session 消费和任务感知召回。运行 `uv run python examples/memory_kernel.py` 观察机制，设计、验证和限制见[记忆内核与双时间事实](docs/记忆内核与双时间事实.md)。
+新增独立 `weavria.memory` 第一批内核：宿主明确准入的长期断言可以按作用域持久化、修订、保留争议，并按现实有效时间和系统获知时间查询；包含事务日志、幂等消费游标、精确与 BM25 检索。已增加显式 Session 输入/steering 消费、带原文引用的模型提取、独立复核与可恢复准入；任务感知召回尚未接入。运行 `uv run python examples/memory_kernel.py` 观察机制，设计、验证和限制见[记忆内核与双时间事实](docs/记忆内核与双时间事实.md)与[记忆形成与修订决策](docs/记忆形成与修订决策.md)。
 
 ## 开发环境
 

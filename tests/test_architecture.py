@@ -15,6 +15,7 @@ LAYERS = {
     "context": ("core", "artifacts"),
     "runtime": ("core", "models", "artifacts", "tools", "context"),
     "harness": (
+        "memory",
         "core",
         "models",
         "artifacts",

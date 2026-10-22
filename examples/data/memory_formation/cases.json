@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "dataset_version": "memory-formation-pilot/1",
+  "cases": [
+    {"id":"01", "inputs":["本项目从今天起统一使用中文编写技术文档，这是长期约定。"], "checks":[{"day":3,"values":["Chinese"],"qualified":0}]},
+    {"id":"02", "inputs":["本项目从今天起统一使用中文编写技术文档。", "从2026年1月10日零点起，本项目技术文档统一改用英文，之前仍然用中文。"], "checks":[{"day":5,"values":["Chinese"],"qualified":0},{"day":15,"values":["English"],"qualified":0}]},
+    {"id":"03", "inputs":["本项目从今天起统一使用中文编写技术文档。", "纠正上一条：我刚才说错了。本项目从2026年1月1日起一直要求用英文写技术文档，并没有改过。"], "checks":[{"day":1,"values":["English"],"qualified":0},{"day":3,"values":["English"],"qualified":0}]},
+    {"id":"04", "inputs":["本项目从今天起统一使用中文编写技术文档。", "补充一个长期例外：本项目的README从今天起用英文。其他技术文档继续遵守中文要求。"], "checks":[{"day":3,"values":["Chinese","English"],"qualified":1}]},
+    {"id":"05", "inputs":["请把这句话翻译成英文：项目文档用中文。只翻译这一句。"], "checks":[{"day":3,"values":[],"qualified":0}]},
+    {"id":"06", "inputs":["假设有人建议本项目的技术文档都用英文，你会怎么评价？这只是一个假设，不是我们的规定。"], "checks":[{"day":3,"values":[],"qualified":0}]},
+    {"id":"07", "inputs":["本项目从今天起统一使用中文编写技术文档。", "未来可能考虑改成英文，目前还没有决定，现有约定继续有效。"], "checks":[{"day":3,"values":["Chinese"],"qualified":0}]},
+    {"id":"08", "inputs":["本项目从今天起统一使用中文编写技术文档。", "再确认一下，本项目技术文档仍然使用中文，没有变化。"], "checks":[{"day":3,"values":["Chinese"],"qualified":0}]},
+    {"id":"09", "inputs":["我个人在所有项目都偏好英文技术文档。这是我的全局偏好，不是本项目的规则。"], "checks":[{"day":3,"values":[],"qualified":0}]},
+    {"id":"10", "inputs":["本项目技术文档在2026年1月1日零点至1月10日零点之间使用中文。这个约定在1月10日零点失效，之后尚未确定。"], "checks":[{"day":5,"values":["Chinese"],"qualified":0},{"day":15,"values":[],"qualified":0}]},
+    {"id":"11", "inputs":["本项目从今天起统一使用英文编写技术文档。", "有人问是不是要改成中文。答案是否定的，我们没有这样的变更。"], "checks":[{"day":3,"values":["English"],"qualified":0}]},
+    {"id":"12", "inputs":["请在这次演示里举一个虚构例子：本项目技术文档用英文。不要把例子当成真实规则，也不要记住它。"], "checks":[{"day":3,"values":[],"qualified":0}]}
+  ]
+}

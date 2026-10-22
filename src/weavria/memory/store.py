@@ -29,6 +29,12 @@ from .contracts import (
     MemoryStorageError,
     MemoryVersion,
 )
+from .formation import (
+    MemoryFormationInput,
+    MemoryFormationJob,
+    MemoryReconciliation,
+)
+from .formation_storage import append_job, current_job
 from .reducer import reduce_mutations
 from .retrieval import pack_recall, rank_versions
 
@@ -151,7 +157,7 @@ class SQLiteMemoryStore:
             raise
 
     async def open(self) -> Self:
-        """Open schema v1, rejecting other schemas and unrelated existing databases."""
+        """Open schema v2, migrating v1 additively without rewriting accepted events."""
         if self._state != "new":
             raise MemoryStorageError("memory store can only open once")
         self._state = "opening"
@@ -178,7 +184,7 @@ class SQLiteMemoryStore:
         with self._transaction():
             version = conn.execute("PRAGMA user_version").fetchone()[0]
             application = conn.execute("PRAGMA application_id").fetchone()[0]
-            if version not in (0, 1) or application not in (0, 0x57564D31):
+            if version not in (0, 1, 2) or application not in (0, 0x57564D31):
                 raise MemoryStorageError("unsupported memory database version")
             if version == 0:
                 if conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchone():
@@ -209,6 +215,16 @@ class SQLiteMemoryStore:
                     conn.execute(statement)
             elif application != 0x57564D31:
                 raise MemoryStorageError("database is not a memory journal")
+            if version < 2:
+                conn.execute(
+                    "CREATE TABLE memory_formation(scope TEXT, job_id TEXT, revision INTEGER, "
+                    "data TEXT NOT NULL, PRIMARY KEY(scope,job_id,revision))"
+                )
+                conn.execute(
+                    "CREATE TABLE memory_guards(scope TEXT, head INTEGER, expected_head INTEGER, "
+                    "PRIMARY KEY(scope,head))"
+                )
+                conn.execute("PRAGMA user_version=2")
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=FULL")
 
@@ -337,6 +353,8 @@ class SQLiteMemoryStore:
         access: MemoryAccess,
         batch: MemoryBatch,
         *,
+        expected_head: int | None = None,
+        formation_id: str | None = None,
         deadline: datetime | None = None,
     ) -> MemoryReceipt:
         """Atomically commit admitted mutations; repeat identities return their original receipt."""
@@ -344,12 +362,25 @@ class SQLiteMemoryStore:
         _grant(access, batch.scope, write=True)
         if len(batch.model_dump_json().encode()) > self._max_batch_bytes:
             raise MemoryCapacityError("memory batch exceeds serialized capacity")
+        if expected_head is not None and (type(expected_head) is not int or expected_head < 0):
+            raise ValueError("expected head must be a nonnegative integer")
+        if formation_id is not None and expected_head is None:
+            raise ValueError("formation commits require the reviewed memory head")
         principal = access.principal_id
         scope = _scope_key(batch.scope)
         fingerprint = _fingerprint(batch)
 
         def commit() -> MemoryReceipt:
             with self._transaction(deadline=deadline) as conn:
+                job = current_job(conn, scope, formation_id) if formation_id is not None else None
+                if formation_id is not None and (
+                    job is None
+                    or job.principal_id != principal
+                    or job.plan is None
+                    or job.plan.batch != batch
+                    or job.plan.memory_head != expected_head
+                ):
+                    raise MemoryConflictError("commit does not match persisted formation plan")
                 row = conn.execute(
                     "SELECT fingerprint,data FROM memory_events WHERE scope=? AND batch_id=?",
                     (scope, batch.batch_id),
@@ -360,6 +391,10 @@ class SQLiteMemoryStore:
                         raise MemoryConflictError(
                             "batch identity has different content or principal"
                         )
+                    if job is not None and job.completed_head != event.head:
+                        raise MemoryConflictError(
+                            "batch was accepted outside its formation transaction"
+                        )
                     return MemoryReceipt(
                         batch_id=batch.batch_id,
                         head=event.head,
@@ -368,6 +403,10 @@ class SQLiteMemoryStore:
                         duplicate=True,
                     )
                 head = self._head(scope) + 1
+                if expected_head is not None and head != expected_head + 1:
+                    raise MemoryConflictError("memory changed after reconciliation")
+                if job is not None and job.completed_head is not None:
+                    raise MemoryStorageError("completed formation has no accepted batch")
                 now = self._now()
                 if now.tzinfo is None or now.utcoffset() is None:
                     raise ValueError("injected clock must return a timezone-aware datetime")
@@ -422,6 +461,19 @@ class SQLiteMemoryStore:
                     ),
                 )
                 self._apply(scope, event)
+                if expected_head is not None:
+                    conn.execute(
+                        "INSERT INTO memory_guards VALUES(?,?,?)", (scope, head, expected_head)
+                    )
+                if job is not None:
+                    completed = MemoryFormationJob.model_validate(
+                        {
+                            **job.model_dump(),
+                            "revision": job.revision + 1,
+                            "completed_head": head,
+                        }
+                    )
+                    append_job(conn, scope, completed, expected_revision=job.revision)
                 return MemoryReceipt(
                     batch_id=batch.batch_id, head=head, recorded_at=now, versions=versions
                 )
@@ -616,6 +668,12 @@ class SQLiteMemoryStore:
                         or (previous_time is not None and event.recorded_at < previous_time)
                     ):
                         raise MemoryStorageError("journal order is invalid")
+                    guard = conn.execute(
+                        "SELECT expected_head FROM memory_guards WHERE scope=? AND head=?",
+                        (key, event.head),
+                    ).fetchone()
+                    if guard is not None and guard[0] != event.head - 1:
+                        raise MemoryStorageError("journal read-head guard is invalid")
                     ids = {m.target_id for m in event.batch.mutations if m.target_id is not None}
                     ids.update(
                         m.assertion.memory_id
@@ -651,3 +709,172 @@ class SQLiteMemoryStore:
                     expected_head += 1
 
         await self._submit(rebuild, deadline=deadline)
+
+    async def reconciliation(
+        self,
+        access: MemoryAccess,
+        scope: MemoryScope,
+        *,
+        deadline: datetime | None = None,
+    ) -> MemoryReconciliation:
+        """Read the complete bounded current scope, including future and uncertain validity.
+
+        Fails closed above 128 assertions or the configured byte budget. A ranked
+        subset cannot establish the absence of a competing assertion.
+        """
+        _grant(access, scope)
+        key = _scope_key(scope)
+
+        def read() -> MemoryReconciliation:
+            with self._transaction(write=False, deadline=deadline) as conn:
+                head = self._head(key)
+                rows = conn.execute(
+                    "SELECT data FROM memory_versions WHERE scope=? AND retired_head IS NULL "
+                    "AND status!='retracted' ORDER BY id LIMIT 129",
+                    (key,),
+                )
+                versions: list[MemoryVersion] = []
+                size = 0
+                for row in rows:
+                    size += len(row[0].encode())
+                    if len(versions) == 128 or size > min(self._max_recall_bytes, 262144):
+                        raise MemoryCapacityError(
+                            "complete reconciliation snapshot exceeds capacity"
+                        )
+                    versions.append(MemoryVersion.model_validate_json(row[0]))
+                return MemoryReconciliation(scope=scope, head=head, versions=tuple(versions))
+
+        return await self._submit(read, deadline=deadline)
+
+    async def start_formation(
+        self,
+        access: MemoryAccess,
+        request: MemoryFormationInput,
+        *,
+        pipeline_version: str,
+        deadline: datetime | None = None,
+    ) -> MemoryFormationJob:
+        """Persist the evidence window once; retries must retain its input and policy identity."""
+        request = MemoryFormationInput.model_validate_json(request.model_dump_json())
+        _grant(access, request.scope, write=True)
+        job = MemoryFormationJob(
+            job_id=request.identity(),
+            revision=1,
+            principal_id=access.principal_id,
+            pipeline_version=pipeline_version,
+            input=request,
+        )
+        key = _scope_key(request.scope)
+
+        def start() -> MemoryFormationJob:
+            with self._transaction(deadline=deadline) as conn:
+                previous = current_job(conn, key, job.job_id)
+                if previous is not None:
+                    if (
+                        previous.input != request
+                        or previous.principal_id != job.principal_id
+                        or previous.pipeline_version != pipeline_version
+                    ):
+                        raise MemoryConflictError(
+                            "formation identity has different input, principal or policy"
+                        )
+                    return previous
+                if self._cursor(key, request.stream_id) != request.position - 1:
+                    raise MemoryConflictError("formation source position is not next")
+                append_job(conn, key, job, expected_revision=0)
+                return job
+
+        return await self._submit(start, deadline=deadline)
+
+    async def formation(
+        self,
+        access: MemoryAccess,
+        scope: MemoryScope,
+        job_id: str,
+        *,
+        deadline: datetime | None = None,
+    ) -> MemoryFormationJob | None:
+        """Read the latest work state; this is an audit API, not recalled knowledge."""
+        _grant(access, scope)
+        key = _scope_key(scope)
+        return await self._submit(lambda: current_job(self._conn(), key, job_id), deadline=deadline)
+
+    async def save_formation(
+        self,
+        access: MemoryAccess,
+        job: MemoryFormationJob,
+        *,
+        expected_revision: int,
+        deadline: datetime | None = None,
+    ) -> MemoryFormationJob:
+        """Append an extraction or decision attempt using revision CAS.
+
+        Evidence, pipeline identity and a saved extraction cannot be rewritten.
+        Only commit can assign completion, atomically with the facts and cursor.
+        """
+        job = MemoryFormationJob.model_validate_json(job.model_dump_json())
+        _grant(access, job.input.scope, write=True)
+        if len(job.model_dump_json().encode()) > self._max_batch_bytes:
+            raise MemoryCapacityError("formation work record exceeds capacity")
+        key = _scope_key(job.input.scope)
+
+        def save() -> MemoryFormationJob:
+            with self._transaction(deadline=deadline) as conn:
+                previous = current_job(conn, key, job.job_id)
+                if previous is None or previous.revision != expected_revision:
+                    raise MemoryConflictError("formation revision changed")
+                if (
+                    job.principal_id != access.principal_id
+                    or job.principal_id != previous.principal_id
+                ):
+                    raise MemoryAccessError("formation belongs to another principal")
+                if (
+                    job.input != previous.input
+                    or job.pipeline_version != previous.pipeline_version
+                    or job.completed_head is not None
+                    or previous.completed_head is not None
+                    or (previous.extraction is not None and job.extraction != previous.extraction)
+                ):
+                    raise MemoryConflictError("immutable formation evidence or completion changed")
+                append_job(conn, key, job, expected_revision=expected_revision)
+                return job
+
+        return await self._submit(save, deadline=deadline)
+
+    async def formation_history(
+        self,
+        access: MemoryAccess,
+        scope: MemoryScope,
+        job_id: str,
+        *,
+        after_revision: int = 0,
+        limit: int = 100,
+        deadline: datetime | None = None,
+    ) -> tuple[MemoryFormationJob, ...]:
+        """Page through immutable extraction, review and completion records."""
+        if after_revision < 0 or not 1 <= limit <= 1000:
+            raise ValueError("invalid formation history page")
+        _grant(access, scope)
+        key = _scope_key(scope)
+
+        def read() -> tuple[MemoryFormationJob, ...]:
+            rows = self._conn().execute(
+                "SELECT data FROM memory_formation WHERE scope=? AND job_id=? AND revision>? "
+                "ORDER BY revision LIMIT ?",
+                (key, job_id, after_revision, limit),
+            )
+            return tuple(MemoryFormationJob.model_validate_json(row[0]) for row in rows)
+
+        return await self._submit(read, deadline=deadline)
+
+    async def head(
+        self,
+        access: MemoryAccess,
+        scope: MemoryScope,
+        *,
+        deadline: datetime | None = None,
+    ) -> int:
+        """Read the current scope revision without loading facts."""
+        _grant(access, scope)
+        key = _scope_key(scope)
+        return await self._submit(lambda: self._head(key), deadline=deadline)
