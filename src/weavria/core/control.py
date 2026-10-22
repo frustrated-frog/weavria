@@ -34,6 +34,7 @@ from .lifecycle import RunStatus
 from .model_io import HistoryEntry, TaskInput, TaskObservation, validate_task_observation
 from .outcomes import AgentResult
 from .progress import ProgressAssessment
+from .recovery import RecoveryNotice, RecoveryResolved
 from .turns import CallSkipped, TurnDecided, TurnFeedback, TurnSettled, validate_turn_feedback
 
 CONTROL_FEEDBACK_BYTES = 1024
@@ -236,7 +237,7 @@ class InterventionNotice(BaseModel):
 
 
 type ControlFeedback = Annotated[
-    AdmissionNotice | CompletionNotice | ProgressNotice | InterventionNotice,
+    AdmissionNotice | CompletionNotice | ProgressNotice | InterventionNotice | RecoveryNotice,
     Field(discriminator="kind"),
 ]
 
@@ -245,7 +246,7 @@ class ControlRequest(BaseModel):
     """v3 observations include auditable rejection and correction, without role elevation."""
 
     model_config = ContractModel.model_config
-    schema_version: Literal[3] = 3
+    schema_version: Literal[3, 4] = 3
     instructions: str
     task: TaskInput
     task_observation: TaskObservation | None = None
@@ -260,6 +261,8 @@ class ControlRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_observations(self) -> Self:
+        if self.schema_version < 4 and isinstance(self.control, RecoveryNotice):
+            raise ValueError("recovery feedback requires ControlRequest v4")
         validate_turn_feedback(self.task, self.history, self.feedback)
         validate_task_observation(self.task, self.task_observation)
         if (
@@ -393,6 +396,7 @@ type ControlData = Annotated[
     | ModelStarted
     | DecisionDiscarded
     | TurnDecided
+    | RecoveryResolved
     | ActionInterventionChecked
     | BatchAdmitted
     | BatchRejected
@@ -413,7 +417,7 @@ class ControlEvent(BaseModel):
     """v3 log distinguishes model proposals, admitted calls and accepted completion."""
 
     model_config = ContractModel.model_config
-    schema_version: Literal[3] = 3
+    schema_version: Literal[3, 4] = 3
     run_id: NonBlankString
     sequence: int = Field(ge=1)
     step_id: NonBlankString | None = None
@@ -433,6 +437,21 @@ class ControlEvent(BaseModel):
 
     @model_validator(mode="after")
     def validate_identity(self) -> Self:
+        if self.schema_version < 4 and (
+            isinstance(self.data, RecoveryResolved)
+            or (
+                isinstance(self.data, (RunStarted, ContextSelected))
+                and self.data.schema_version != 1
+            )
+            or (isinstance(self.data, TurnDecided) and self.data.turn.schema_version != 1)
+        ):
+            raise ValueError("recovery facts require ControlEvent v4")
+        if (
+            self.schema_version == 4
+            and isinstance(self.data, (RunStarted, ContextSelected))
+            and self.data.schema_version != 2
+        ):
+            raise ValueError("recovery journal requires bound configuration and context")
         if self.attempt_id is not None and self.step_id is None:
             raise ValueError("attempt identity requires a step")
         return self

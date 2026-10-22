@@ -13,8 +13,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Self, cast
 
-from weavria.artifacts import ArtifactAccessError, ArtifactSnapshot
-from weavria.context import ContextDemand, HistoryRetrievalConfig, RetrievedHistory
+from weavria.artifacts import ArtifactAccessError, ArtifactSnapshot, read_recovery_range
+from weavria.context import (
+    ContextBuildError,
+    ContextDemand,
+    HistoryRetrievalConfig,
+    RetrievedHistory,
+    validate_recovery_view,
+)
 from weavria.core import (
     ApplicationObservation,
     ArtifactRef,
@@ -23,6 +29,7 @@ from weavria.core import (
     ControlEvent,
     ConversationTurn,
     PastCall,
+    RecoveryResolved,
     RunEnded,
     RunReport,
     SemanticSnapshot,
@@ -830,6 +837,25 @@ class SQLiteSessionStore:
                 if row[1] != "running" or row[2] != fact.sequence - 1:
                     raise SessionConflictError("run is no longer writable at this position")
                 next_state = reduce_event(state, fact)
+                if isinstance(fact.data, RecoveryResolved) and fact.data.ranges:
+                    assert state is not None
+                    records = {r.exchange.action.call_id: r for r in state.records}
+                    for part in fact.data.ranges:
+                        ref = records[part.call_id].artifact
+                        assert ref is not None
+                        source = conn.execute(
+                            "SELECT reference,content FROM artifacts WHERE run_id=? AND id=?",
+                            (fact.run_id, ref.artifact_id),
+                        ).fetchone()
+                        try:
+                            if source is None:
+                                raise ArtifactAccessError("recovery source is not durable")
+                            snapshot = ArtifactSnapshot(source[0], source[1])
+                            if snapshot.reference != ref:
+                                raise ArtifactAccessError("recovery source identity changed")
+                            read_recovery_range(snapshot, part)
+                        except ArtifactAccessError as exc:
+                            raise SessionConflictError(str(exc)) from exc
                 if isinstance(fact.data, ToolRecorded):
                     record = fact.data.record
                     if record.artifact is not None:
@@ -1271,6 +1297,19 @@ class SQLiteSessionStore:
                     or request.conversation.session_id != session_id
                 ):
                     raise SessionConflictError("model request disagrees with its accepted context")
+                if state.journal_version == 4:
+                    if (
+                        compilation is None
+                        or compilation.schema_version != 4
+                        or compilation.recovery_ranges != state.recovery_ranges
+                    ):
+                        raise SessionConflictError(
+                            "compiled recovery differs from its accepted lease"
+                        )
+                    try:
+                        validate_recovery_view(request.current, state.recovery_ranges)
+                    except ContextBuildError as exc:
+                        raise SessionConflictError(str(exc)) from exc
                 notice = SessionContextPrepared(
                     run_id=run_id,
                     model_call=state.model_calls,

@@ -226,7 +226,11 @@ class ConversationView(BaseModel):
     turns: tuple[ConversationItem, ...] = ()
     omitted_turns: int = Field(default=0, ge=0)
     policy_version: Literal[
-        "conversation/2", "context-compiler/1", "context-compiler/2", "context-compiler/3"
+        "conversation/2",
+        "context-compiler/1",
+        "context-compiler/2",
+        "context-compiler/3",
+        "context-compiler/4",
     ] = "conversation/2"
 
     @model_validator(mode="after")

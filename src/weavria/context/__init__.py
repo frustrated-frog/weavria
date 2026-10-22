@@ -25,6 +25,8 @@ from .policies import (
     HistorySelector,
     RecentHistory,
 )
+from .recovery import RecoveryContextBuilder
+from .recovery_views import validate_recovery_view
 from .retrieval import (
     HistoryRetrievalConfig,
     RetrievedHistory,
@@ -67,6 +69,7 @@ __all__ = [
     "HistoryRetrievalConfig",
     "HistorySelector",
     "RecentHistory",
+    "RecoveryContextBuilder",
     "RetrievedHistory",
     "SelectionReason",
     "SessionContextCompiler",
@@ -79,4 +82,5 @@ __all__ = [
     "project_turn",
     "reserve_feedback",
     "select_conversation",
+    "validate_recovery_view",
 ]

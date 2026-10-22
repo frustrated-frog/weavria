@@ -14,6 +14,10 @@ from weavria.core import (
     ConversationTurn,
     ConversationView,
     HistoryRetrievalReport,
+    RecoverContext,
+    RecoveryLimits,
+    RecoveryRange,
+    RecoveryResolved,
     SessionRequest,
     TaskInput,
     TaskObservation,
@@ -100,6 +104,34 @@ class SessionContextCompiler:
             max_bytes=config.max_index_bytes,
         )
 
+    async def plan_recovery(
+        self,
+        *,
+        request: RecoverContext,
+        run_id: str,
+        revision: int,
+        records: tuple[ToolRecord, ...],
+        seen: tuple[RecoveryRange, ...],
+        limits: RecoveryLimits,
+        round: int,
+        used_bytes: int,
+    ) -> RecoveryResolved:
+        """Plan bounded recovery from accepted originals using the shared source index."""
+        from .recovery import plan_recovery
+
+        return await plan_recovery(
+            self._index,
+            self.config,
+            request=request,
+            run_id=run_id,
+            revision=revision,
+            records=records,
+            seen=seen,
+            limits=limits,
+            round=round,
+            used_bytes=used_bytes,
+        )
+
     async def compile(
         self,
         *,
@@ -114,12 +146,18 @@ class SessionContextCompiler:
         required_call_ids: tuple[str, ...] = (),
         focus: ContextFocus | None = None,
         retrieval: HistoryRetrievalReport | None = None,
+        recovery_ranges: tuple[RecoveryRange, ...] = (),
     ) -> CompiledSessionContext:
         """Compile accepted sources, raising on invalid identity or exhausted budgets.
 
         Cancellation propagates without publishing a partial plan. The caller
         owns deadline enforcement and persistence before model transport.
         """
+        if recovery_ranges and base.schema_version != 4:
+            raise ContextBuildError("recovery requires control request v4")
+        required_call_ids = tuple(
+            dict.fromkeys((*required_call_ids, *(p.call_id for p in recovery_ranges)))
+        )
         if type(max_request_bytes) is not int or max_request_bytes <= 0:
             raise ValueError("request byte budget must be positive")
         if len(turns) + len(records) > self.config.max_units:
@@ -199,16 +237,27 @@ class SessionContextCompiler:
             offset=len(history_units),
             mandatory=mandatory,
             max_passages=self.config.max_passages,
+            recovery_ranges=recovery_ranges,
         )
         padding = CONTROL_FEEDBACK_BYTES - len(
             base.control.model_dump_json().encode() if base.control else b"null"
         )
-        policy_version = 3 if retrieval is not None or self.config.max_history_spans > 1 else 2
+        policy_version = (
+            4
+            if base.schema_version == 4
+            else 3
+            if retrieval is not None or self.config.max_history_spans > 1
+            else 2
+        )
         empty = ConversationView(
             session_id=session_id,
             through_sequence=sequence,
             omitted_turns=total_turns,
-            policy_version="context-compiler/3" if policy_version == 3 else "context-compiler/2",
+            policy_version="context-compiler/4"
+            if policy_version == 4
+            else "context-compiler/3"
+            if policy_version == 3
+            else "context-compiler/2",
         )
         template = SessionRequest.model_construct(conversation=empty, current=base)
         wire = template.model_dump(mode="json")
@@ -282,7 +331,7 @@ class SessionContextCompiler:
             raise ContextBuildError("token counter returned an invalid byte ceiling")
         covered = coverage(units, selected)
         report = ContextCompilation(
-            schema_version=3 if policy_version == 3 else 2,
+            schema_version=policy_version,
             policy_version=f"context-compiler/{policy_version}[{self.config.policy}]",
             counter_version=self.counter.version,
             task_revision=base.task.revision,
@@ -317,5 +366,6 @@ class SessionContextCompiler:
                 if not any(k.startswith(f"d:{d.demand_id}:") for k in covered)
             ),
             retrieval=retrieval,
+            recovery_ranges=recovery_ranges,
         )
         return CompiledSessionContext(encoded, report.model_dump_json())

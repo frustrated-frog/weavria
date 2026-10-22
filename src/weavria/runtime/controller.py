@@ -12,6 +12,7 @@ from weavria.core import (
     FinishAction,
     ModelTurn,
     ProgressAssessment,
+    RecoverContext,
     TaskDirective,
     TaskInput,
     TaskObservation,
@@ -78,6 +79,8 @@ def resolve_turn(
     progress_assessment: ProgressAssessment | None = None,
 ) -> TurnResolution:
     """Resolve model intent against current requirements and settled execution/acceptance."""
+    if isinstance(turn.decision, RecoverContext):
+        raise ValueError("recovery is resolved by its own accepted context recovery fact")
     # A task revision wins over every observation derived from the obsolete proposal.
     # The caller samples the current revision while holding its control commit lock;
     # dropping the stale assessment here keeps replan/task_changed internally consistent.

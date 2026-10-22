@@ -38,6 +38,10 @@ from weavria.core import (
     ModelTurn,
     PendingClarification,
     ProgressAssessment,
+    RecoverContext,
+    RecoveryLimits,
+    RecoveryRange,
+    RecoveryResolved,
     SemanticSnapshot,
     SemanticTransition,
     SemanticVersion,
@@ -139,6 +143,7 @@ class _SessionAdapter:
         compiler_config: ContextCompilerConfig | None,
         token_counter: SessionTokenCounter | None,
         history_retrieval: HistoryRetrievalConfig | None,
+        context_recovery: RecoveryLimits | None = None,
     ) -> None:
         self._provider, self._budget = provider, budget
         self._store, self._run_id = store, run_id
@@ -168,6 +173,7 @@ class _SessionAdapter:
         self._history_sequence = 0
         self._history_count = 0
         self._retrieval_config = history_retrieval
+        self._recovery_limits = context_recovery
 
     @property
     def capabilities(self) -> ModelCapabilities:
@@ -220,6 +226,7 @@ class _SessionAdapter:
             if self._task_observation is not None
             and self._task_observation.task_revision == task.revision
             else None,
+            recovery=self._recovery_limits is not None,
         )
         empty = ConversationView(session_id=self._session_id, through_sequence=sequence)
         wire_fixed = len(
@@ -263,6 +270,55 @@ class _SessionAdapter:
             semantic_state=(self._semantic.need_ledger if self._semantic is not None else None),
         )
 
+    async def plan_recovery(
+        self,
+        *,
+        request: RecoverContext,
+        run_id: str,
+        revision: int,
+        records: tuple[ToolRecord, ...],
+        seen: tuple[RecoveryRange, ...],
+        limits: RecoveryLimits,
+        round: int,
+        used_bytes: int,
+    ) -> RecoveryResolved:
+        if self._compiler is None or run_id != self._run_id or limits != self._recovery_limits:
+            raise ValueError("recovery compiler is not bound to this run")
+        return await self._compiler.plan_recovery(
+            request=request,
+            run_id=run_id,
+            revision=revision,
+            records=records,
+            seen=seen,
+            limits=limits,
+            round=round,
+            used_bytes=used_bytes,
+        )
+
+    async def build_recovered_control(
+        self,
+        *,
+        base: ControlRequest,
+        records: tuple[ToolRecord, ...],
+        max_request_bytes: int,
+        required_call_ids: tuple[str, ...],
+        ranges: tuple[RecoveryRange, ...],
+    ) -> ControlEvidencePlan:
+        if self._recovery_limits is None or base.schema_version != 4:
+            raise ValueError("recovery is not enabled")
+        return await self.build_control(
+            run_id=self._run_id,
+            instructions=base.instructions,
+            task=base.task,
+            task_observation=base.task_observation,
+            records=records,
+            max_request_bytes=max_request_bytes,
+            feedback=base.feedback,
+            control=base.control,
+            required_call_ids=required_call_ids,
+            recovery_ranges=ranges,
+        )
+
     async def build_control(
         self,
         *,
@@ -275,10 +331,12 @@ class _SessionAdapter:
         feedback: TurnFeedback | None = None,
         control: ControlFeedback | None = None,
         required_call_ids: tuple[str, ...] = (),
+        recovery_ranges: tuple[RecoveryRange, ...] = (),
     ) -> ControlEvidencePlan:
         if self._compiler is None or run_id != self._run_id:
             raise ValueError("context compiler is not bound to this run")
         base = ControlRequest(
+            schema_version=4 if self._recovery_limits is not None else 3,
             instructions=instructions,
             task=task,
             task_observation=task_observation,
@@ -326,6 +384,7 @@ class _SessionAdapter:
             required_call_ids=required_call_ids,
             focus=focus,
             retrieval=retrieval,
+            recovery_ranges=recovery_ranges,
         )
         outer, report = compiled.request, compiled.compilation
         self._prepared = {task.revision: outer.conversation}
@@ -517,12 +576,20 @@ class SessionEngine:
         context_compiler: ContextCompilerConfig | None = None,
         token_counter: SessionTokenCounter | None = None,
         history_retrieval: HistoryRetrievalConfig | None = None,
+        context_recovery: RecoveryLimits | None = None,
     ) -> None:
         if (context_compiler is None) != (token_counter is None):
             raise ValueError("context compiler and token counter must be configured together")
         if context_compiler is not None and token_counter is not None:
             if context_compiler.output_tokens < token_counter.output_tokens:
                 raise ValueError("compiler output reserve is below the provider output cap")
+        if context_recovery is not None and context_compiler is None:
+            raise ValueError("context recovery requires the context compiler")
+        self._recovery_limits = (
+            RecoveryLimits.model_validate_json(context_recovery.model_dump_json())
+            if context_recovery
+            else None
+        )
         self._compiler_config, self._token_counter = context_compiler, token_counter
         if history_retrieval is not None and context_compiler is None:
             raise ValueError("history retrieval requires the context compiler")
@@ -628,7 +695,9 @@ class SessionEngine:
             config = json.dumps(
                 {
                     "schema_version": (
-                        3
+                        4
+                        if self._recovery_limits is not None
+                        else 3
                         if self._retrieval_config is not None
                         or (
                             self._compiler_config is not None
@@ -649,6 +718,11 @@ class SessionEngine:
                             "token_counter_version": self._token_counter.version,
                         }
                         if self._compiler_config is not None and self._token_counter is not None
+                        else {}
+                    ),
+                    **(
+                        {"context_recovery": self._recovery_limits.model_dump(mode="json")}
+                        if self._recovery_limits
                         else {}
                     ),
                     "model_port": type(self._model).__module__
@@ -851,6 +925,7 @@ class SessionEngine:
                 self._compiler_config,
                 self._token_counter,
                 self._retrieval_config,
+                self._recovery_limits,
             )
             remaining = root_budget.remaining(self._clock.monotonic())
             run_limits = replace(
@@ -884,6 +959,7 @@ class SessionEngine:
                 ),
                 progress_assessor=adapter,
                 context_builder=adapter if self._compiler_config is not None else None,
+                context_recovery=self._recovery_limits,
             )
             self._loops[session_id] = loop
             self._run_tasks[run_id] = owner

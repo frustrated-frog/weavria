@@ -12,6 +12,7 @@ from pydantic import (
 )
 
 from ._schema import ContractModel, NonBlankString
+from .recovery import RecoveryRange
 from .retrieval import HistoryRetrievalReport
 
 
@@ -29,7 +30,7 @@ class ContextCompilation(BaseModel):
     """Bind allocation diagnostics to the exact complete request sent to a provider."""
 
     model_config = ContractModel.model_config
-    schema_version: Literal[1, 2, 3] = 1
+    schema_version: Literal[1, 2, 3, 4] = 1
 
     policy_version: NonBlankString
     counter_version: NonBlankString
@@ -52,6 +53,7 @@ class ContextCompilation(BaseModel):
     choices: tuple[ContextChoice, ...]
     uncovered_demand_ids: tuple[str, ...] = ()
     retrieval: HistoryRetrievalReport | None = None
+    recovery_ranges: tuple[RecoveryRange, ...] = Field(default=(), max_length=8)
 
     @field_validator("schema_version", mode="before")
     @classmethod
@@ -66,6 +68,8 @@ class ContextCompilation(BaseModel):
             data.pop("allocation_exhausted", None)
         if self.schema_version < 3:
             data.pop("retrieval", None)
+        if self.schema_version < 4:
+            data.pop("recovery_ranges", None)
         return data
 
     @model_validator(mode="after")
@@ -76,6 +80,17 @@ class ContextCompilation(BaseModel):
             self.schema_version < 3 or self.retrieval.task_revision != self.task_revision
         ):
             raise ValueError("retrieval diagnostics require compilation v3 and the same revision")
+        if self.recovery_ranges and self.schema_version < 4:
+            raise ValueError("recovery ranges require compilation v4")
+        choices = {c.source_id: c for c in self.choices}
+        for part in self.recovery_ranges:
+            choice = choices.get(f"call:{part.call_id}")
+            if (
+                choice is None
+                or not choice.required
+                or choice.representation not in ("raw", "excerpt")
+            ):
+                raise ValueError("recovery range must remain readable and mandatory")
         if self.input_tokens > self.input_budget_tokens:
             raise ValueError("compiled request exceeds its input token budget")
         if self.request_bytes + self.control_reserve_bytes > self.budget_bytes:

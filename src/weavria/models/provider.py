@@ -15,6 +15,7 @@ from weavria.core import (
     ModelRequest,
     ModelResponse,
     ModelTurn,
+    RecoverContext,
     RunError,
     SessionRequest,
     ToolBatch,
@@ -109,6 +110,7 @@ async def call_session_model(
         ModelTurn,
         max_duration,
     )
+    _validate_recovery(result, request.current.schema_version == 4)
     _validate_batch_capabilities(result, capabilities)
     return result
 
@@ -125,6 +127,7 @@ async def call_controlled_model(
         ModelTurn,
         max_duration,
     )
+    _validate_recovery(result, request.schema_version == 4)
     _validate_batch_capabilities(result, capabilities)
     return result
 
@@ -163,6 +166,7 @@ async def call_model_turn(
         ModelTurn,
         max_duration,
     )
+    _validate_recovery(result, False)
     _validate_batch_capabilities(result, capabilities)
     return result
 
@@ -287,3 +291,13 @@ async def _invoke_model[Input: BaseModel, Response: BaseModel](
             )
         ) from exc
     return result, capabilities
+
+
+def _validate_recovery(result: ModelTurn, enabled: bool) -> None:
+    if not enabled and (isinstance(result.decision, RecoverContext) or result.schema_version == 2):
+        raise ModelCallError(
+            RunError(
+                category=ErrorCategory.INVALID_MODEL_RESPONSE,
+                message="Context recovery protocol is not enabled",
+            )
+        )

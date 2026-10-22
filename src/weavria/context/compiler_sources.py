@@ -15,6 +15,7 @@ from weavria.core import (
     ConversationTurn,
     DirectiveView,
     LocatedTextExcerpt,
+    RecoveryRange,
     ToolExchange,
     ToolRecord,
     ToolSucceededObservation,
@@ -27,6 +28,7 @@ from .conversation import project_turn
 from .demand import ContextDemand
 from .evidence import Passage, index_passages, terms
 from .indexing import bounded_passages
+from .recovery_ranges import range_passage
 from .selection import ContextBuildError
 from .spans import complementary_passages, exact_text_view
 
@@ -113,7 +115,9 @@ class SourceIndex:
             OrderedDict()
         )
 
-    async def load(self, run_id: str, records: tuple[ToolRecord, ...]) -> tuple[IndexedSource, ...]:
+    async def load(
+        self, run_id: str, records: tuple[ToolRecord, ...], *, respect_context_paths: bool = True
+    ) -> tuple[IndexedSource, ...]:
         self._active_passages = self._active_bytes = 0
         known: set[str] = set()
         result: list[IndexedSource] = []
@@ -147,7 +151,7 @@ class SourceIndex:
             self._cache_sizes[key] = snapshot.reference.size_bytes + self._passage_bytes(passages)
             self._trim_cache()
             self._reserve_index(passages)
-            if record.context_paths:
+            if respect_context_paths and record.context_paths:
                 passages = tuple(
                     passage
                     for passage in passages
@@ -291,10 +295,12 @@ async def source_units(
     offset: int,
     mandatory: set[str],
     max_passages: int,
+    recovery_ranges: tuple[RecoveryRange, ...] = (),
 ) -> tuple[ContextUnit, ...]:
     indices = {
         source.record.exchange.action.call_id: offset + i for i, source in enumerate(sources)
     }
+    mandatory = mandatory | {p.call_id for p in recovery_ranges}
     if not mandatory <= indices.keys():
         raise ContextBuildError("feedback references unaccepted calls")
     result: list[ContextUnit] = []
@@ -302,6 +308,7 @@ async def source_units(
         await asyncio.sleep(0)
         record = source.record
         call_id = record.exchange.action.call_id
+        protected = tuple(range_passage(source, p) for p in recovery_ranges if p.call_id == call_id)
         variants = [Representation("reference", minimum_exchange(record).model_dump_json(), ())]
         if source.snapshot is not None:
             reference = source.snapshot.reference
@@ -311,9 +318,24 @@ async def source_units(
                 "size_bytes": reference.size_bytes,
             }
 
+            if protected:
+                variants = [
+                    Representation(
+                        "excerpt",
+                        _exchange_view(
+                            record.exchange,
+                            {
+                                **common,
+                                "representation": "excerpts",
+                                "passages": [p.view() for p in protected],
+                            },
+                        ),
+                        scorer.features(protected, source=source),
+                    )
+                ]
             ranked = await scorer.rank(source, max_passages)
             for size in sorted({1, min(2, len(ranked)), min(4, len(ranked)), len(ranked)} - {0}):
-                chosen = ranked[:size]
+                chosen = tuple(dict.fromkeys((*protected, *ranked[:size])))
                 variants.append(
                     Representation(
                         "excerpt",

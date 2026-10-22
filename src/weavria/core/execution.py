@@ -3,12 +3,21 @@
 from datetime import datetime
 from typing import Annotated, Literal, Self
 
-from pydantic import Field, JsonValue, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    JsonValue,
+    SerializerFunctionWrapHandler,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 from ._schema import ContractModel, NonBlankString
 from .actions import AgentAction
 from .model_io import TaskInput, ToolExchange
 from .outcomes import AgentResult, ToolSucceededObservation
+from .recovery import RecoveryLimits
 
 type JsonPointer = Annotated[str, Field(pattern=r"^(?:|/(?:[^~]|~[01])*)$")]
 
@@ -65,8 +74,30 @@ class ToolRecord(ContractModel):
         return self
 
 
-class RunStarted(ContractModel):
+class RunStarted(BaseModel):
     """Initialize the run with its authoritative task input."""
+
+    model_config = ContractModel.model_config
+    schema_version: Literal[1, 2] = 1
+    recovery_limits: RecoveryLimits | None = None
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def validate_version_type(cls, value: object) -> object:
+        return ContractModel.validate_version_type(value)
+
+    @model_serializer(mode="wrap")
+    def preserve_legacy_wire(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        data = handler(self)
+        if self.schema_version == 1:
+            data.pop("recovery_limits", None)
+        return data
+
+    @model_validator(mode="after")
+    def validate_recovery_version(self) -> Self:
+        if (self.schema_version == 2) != (self.recovery_limits is not None):
+            raise ValueError("recovery payload requires version 2")
+        return self
 
     kind: Literal["run_started"] = "run_started"
     task: TaskInput
@@ -90,8 +121,30 @@ class TaskRevised(ContractModel):
     task: TaskInput
 
 
-class ContextSelected(ContractModel):
+class ContextSelected(BaseModel):
     """Identify the bounded model view without exporting its content."""
+
+    model_config = ContractModel.model_config
+    schema_version: Literal[1, 2] = 1
+    recovery_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def validate_version_type(cls, value: object) -> object:
+        return ContractModel.validate_version_type(value)
+
+    @model_serializer(mode="wrap")
+    def preserve_legacy_wire(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        data = handler(self)
+        if self.schema_version == 1:
+            data.pop("recovery_sha256", None)
+        return data
+
+    @model_validator(mode="after")
+    def validate_recovery_version(self) -> Self:
+        if (self.schema_version == 2) != (self.recovery_sha256 is not None):
+            raise ValueError("recovery payload requires version 2")
+        return self
 
     kind: Literal["context_selected"] = "context_selected"
     request_bytes: int = Field(gt=0)
@@ -183,6 +236,8 @@ class ExecutionEvent(ContractModel):
 
     @model_validator(mode="after")
     def validate_identity(self) -> Self:
+        if isinstance(self.data, (RunStarted, ContextSelected)) and self.data.schema_version != 1:
+            raise ValueError("legacy journal cannot carry recovery payloads")
         if self.attempt_id is not None and self.step_id is None:
             raise ValueError("attempt identity requires a step")
         return self

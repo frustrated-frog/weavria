@@ -27,6 +27,7 @@ from .model_io import (
     validate_task_observation,
 )
 from .outcomes import ToolFailedObservation
+from .recovery import RecoverContext
 
 
 class ToolBatch(ContractModel):
@@ -43,10 +44,23 @@ class ToolBatch(ContractModel):
         return self
 
 
-class ModelTurn(ContractModel):
+class ModelTurn(BaseModel):
     """One model decision: a nonempty batch or completion, never both."""
 
-    decision: Annotated[ToolBatch | FinishAction, Field(discriminator="kind")]
+    model_config = ContractModel.model_config
+    schema_version: Literal[1, 2] = 1
+    decision: Annotated[ToolBatch | FinishAction | RecoverContext, Field(discriminator="kind")]
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def validate_version_type(cls, value: object) -> object:
+        return ContractModel.validate_version_type(value)
+
+    @model_validator(mode="after")
+    def validate_recovery(self) -> Self:
+        if isinstance(self.decision, RecoverContext) and self.schema_version != 2:
+            raise ValueError("context recovery requires ModelTurn v2")
+        return self
 
 
 class TurnDecided(ContractModel):
@@ -180,6 +194,10 @@ class LoopEvent(BaseModel):
 
     @model_validator(mode="after")
     def validate_identity(self) -> Self:
+        if isinstance(self.data, (RunStarted, ContextSelected)) and self.data.schema_version != 1:
+            raise ValueError("legacy journal cannot carry recovery payloads")
+        if isinstance(self.data, TurnDecided) and self.data.turn.schema_version != 1:
+            raise ValueError("legacy journal cannot carry ModelTurn v2")
         if self.attempt_id is not None and self.step_id is None:
             raise ValueError("attempt identity requires a step")
         return self

@@ -39,6 +39,10 @@ from weavria.core import (
     ProgressAssessed,
     ProgressAssessment,
     ProgressNotice,
+    RecoverContext,
+    RecoveryLimits,
+    RecoveryRange,
+    RecoveryResolved,
     RunEnded,
     RunStarted,
     RunStatus,
@@ -55,6 +59,7 @@ from weavria.core import (
     TurnSettled,
     VerificationStarted,
     parse_action,
+    recovery_digest,
 )
 
 from .intervention import action_value_state_sha256, observe_action_value
@@ -66,6 +71,7 @@ class EventAcceptanceError(ValueError):
 
 class Phase(StrEnum):
     READY = "ready"
+    RECOVERY = "recovery"
     CONTEXT = "context"
     MODEL = "model"
     ACTION = "action"
@@ -113,6 +119,28 @@ class RunState:
     intervention_reconsiderations: int = 0
     context_call_ids: tuple[str, ...] = ()
     context_request_sha256: str | None = None
+    recovery_limits_json: str | None = None
+    recovery_rounds: int = 0
+    recovery_bytes: int = 0
+    recovery_ranges_json: tuple[str, ...] = ()
+    recovery_seen_json: tuple[str, ...] = ()
+    recovery_attempts: tuple[tuple[str, str], ...] = ()
+
+    @property
+    def recovery_limits(self) -> RecoveryLimits | None:
+        return (
+            RecoveryLimits.model_validate_json(self.recovery_limits_json)
+            if self.recovery_limits_json
+            else None
+        )
+
+    @property
+    def recovery_ranges(self) -> tuple[RecoveryRange, ...]:
+        return tuple(RecoveryRange.model_validate_json(p) for p in self.recovery_ranges_json)
+
+    @property
+    def recovery_seen(self) -> tuple[RecoveryRange, ...]:
+        return tuple(RecoveryRange.model_validate_json(p) for p in self.recovery_seen_json)
 
     @property
     def control(self) -> ControlFeedback | None:
@@ -207,6 +235,9 @@ def reduce_event(state: RunState | None, event: JournalEvent) -> RunState:
             Phase.READY,
             data.task.model_dump_json(),
             journal_version=event.schema_version,
+            recovery_limits_json=data.recovery_limits.model_dump_json()
+            if data.recovery_limits
+            else None,
             action_intervention_policy_version=data.action_intervention_policy_version,
             action_value_ledger_version=data.action_value_ledger_version,
         )
@@ -228,6 +259,9 @@ def reduce_event(state: RunState | None, event: JournalEvent) -> RunState:
             intervention_frontier_sha256=None,
             intervention_reconsiderations=0,
             action_value_profiles_json=(),
+            recovery_ranges_json=(),
+            recovery_seen_json=(),
+            recovery_attempts=(),
         )
         if state.phase in (Phase.FINISH, Phase.ACCEPTED) or (
             state.phase is Phase.ACTION and state.journal_version == 1
@@ -243,13 +277,22 @@ def reduce_event(state: RunState | None, event: JournalEvent) -> RunState:
         return replace(next_state, task_json=data.task.model_dump_json(), phase=phase)
     if isinstance(data, ContextSelected):
         _require(state.phase is Phase.READY, "context must be built at a decision boundary")
-        if state.journal_version == 3:
+        if state.journal_version >= 3:
             padding = CONTROL_FEEDBACK_BYTES - len(
                 state.control_json.encode() if state.control_json else b"null"
             )
             _require(
                 data.request_bytes + padding <= data.budget_bytes,
                 "context omitted the control feedback reserve",
+            )
+        if state.journal_version == 4:
+            _require(
+                data.recovery_sha256 == recovery_digest(state.recovery_ranges),
+                "context differs from recovery lease",
+            )
+            _require(
+                {p.call_id for p in state.recovery_ranges} <= set(data.selected_call_ids),
+                "context omitted protected sources",
             )
         records = {r.exchange.action.call_id: r for r in state.records}
         selected = set(data.selected_call_ids)
@@ -261,7 +304,7 @@ def reduce_event(state: RunState | None, event: JournalEvent) -> RunState:
             all(set(records[c].dependencies) <= selected for c in selected),
             "context is not dependency closed",
         )
-        if state.records and state.journal_version != 3:
+        if state.records and state.journal_version < 3:
             _require(
                 state.records[-1].exchange.action.call_id in selected,
                 "context omitted latest tool feedback",
@@ -306,6 +349,8 @@ def reduce_event(state: RunState | None, event: JournalEvent) -> RunState:
             pending_json=data.action.model_dump_json(),
             phase=Phase.FINISH if isinstance(data.action, FinishAction) else Phase.ACTION,
         )
+    if isinstance(data, RecoveryResolved):
+        return _reduce_recovery(state, next_state, data)
     if isinstance(event, ControlEvent) and isinstance(
         data,
         (
@@ -355,18 +400,23 @@ def reduce_event(state: RunState | None, event: JournalEvent) -> RunState:
         if data.result.status is RunStatus.COMPLETED:
             pending = state.pending
             _require(
-                state.phase is (Phase.ACCEPTED if state.journal_version == 3 else Phase.FINISH)
+                state.phase is (Phase.ACCEPTED if state.journal_version >= 3 else Phase.FINISH)
                 and isinstance(pending, FinishAction)
                 and pending.output == data.result.output,
                 "completion requires accepted finish",
             )
-            if state.journal_version == 3:
+            if state.journal_version >= 3:
                 _require(
                     state.assessment is not None
                     and state.assessment.task_revision == state.task.revision,
                     "completion requires a current assessment",
                 )
-        return replace(next_state, phase=Phase.TERMINAL, result_json=data.result.model_dump_json())
+        return replace(
+            next_state,
+            phase=Phase.TERMINAL,
+            result_json=data.result.model_dump_json(),
+            recovery_ranges_json=(),
+        )
     raise EventAcceptanceError("event is not legal for an existing run")
 
 
@@ -385,7 +435,20 @@ def _reduce_turn(
             state.phase is Phase.MODEL and state.model_revision == state.task.revision,
             "turn is out of phase or belongs to an obsolete task",
         )
+        next_state = replace(next_state, recovery_ranges_json=())
         decision = data.turn.decision
+        if isinstance(decision, RecoverContext):
+            _require(
+                state.journal_version == 4 and state.recovery_limits is not None,
+                "recovery was not enabled",
+            )
+            return replace(
+                next_state,
+                phase=Phase.RECOVERY,
+                turn_json=data.turn.model_dump_json(),
+                recovery_rounds=state.recovery_rounds + 1,
+                control_json=None,
+            )
         if isinstance(decision, FinishAction):
             return replace(
                 next_state,
@@ -432,7 +495,7 @@ def _reduce_turn(
     settled = set(state.settled_call_ids) | set(state.skipped_call_ids)
     if isinstance(data, ToolStarted):
         _require(
-            state.journal_version != 3
+            state.journal_version < 3
             or (
                 state.admission is not None
                 and (
@@ -468,7 +531,7 @@ def _reduce_turn(
         prior = {r.exchange.action.call_id for r in state.records} - calls.keys()
         _require(set(data.record.dependencies) <= prior, "tool reads an unaccepted turn result")
         artifact = data.record.artifact
-        if state.journal_version == 3:
+        if state.journal_version >= 3:
             admission = state.admission
             _require(admission is not None, "tool feedback requires admission")
             assert admission is not None
@@ -502,7 +565,7 @@ def _reduce_turn(
         )
         return replace(next_state, skipped_call_ids=(*state.skipped_call_ids, data.call_id))
     _require(
-        state.journal_version != 3
+        state.journal_version < 3
         or state.admission is not None
         or (
             state.task.revision != state.model_revision
@@ -552,7 +615,7 @@ def _reduce_turn(
         intervention_reconsiderations=0,
         pending_progress_sequence=(
             next_state.sequence
-            if state.journal_version == 3 and feedback.task_revision == state.task.revision
+            if state.journal_version >= 3 and feedback.task_revision == state.task.revision
             else None
         ),
     )
@@ -902,4 +965,87 @@ def _reduce_control(
         phase=Phase.ACCEPTED,
         assessment_json=assessment.model_dump_json(),
         verification_version=None,
+    )
+
+
+def _reduce_recovery(state: RunState, next_state: RunState, data: RecoveryResolved) -> RunState:
+    turn, limits = state.turn, state.recovery_limits
+    _require(
+        state.journal_version == 4
+        and state.phase is Phase.RECOVERY
+        and turn is not None
+        and isinstance(turn.decision, RecoverContext)
+        and limits is not None,
+        "recovery fact requires an accepted recovery turn",
+    )
+    assert turn is not None and limits is not None
+    notice = data.notice
+    corpus = hashlib.sha256(("[" + ",".join(state.records_json) + "]").encode()).hexdigest()
+    _require(
+        data.task_revision == state.model_revision and data.corpus_sha256 == corpus,
+        "recovery belongs to another revision or corpus",
+    )
+    _require(
+        notice.request_sha256
+        == hashlib.sha256(turn.decision.model_dump_json().encode()).hexdigest(),
+        "recovery does not bind its accepted request",
+    )
+    _require(
+        notice.round == state.recovery_rounds
+        and notice.remaining_rounds == max(0, limits.max_rounds - state.recovery_rounds),
+        "recovery round accounting is invalid",
+    )
+    stale = data.task_revision != state.task.revision
+    _require((notice.status == "stale") == stale, "obsolete recovery must settle stale")
+    exhausted = (
+        state.recovery_rounds > limits.max_rounds or state.recovery_bytes >= limits.max_total_bytes
+    )
+    if exhausted and not stale:
+        _require(notice.status == "limit", "exhausted recovery must settle without work")
+    key = (notice.request_sha256, data.corpus_sha256)
+    if key in state.recovery_attempts and not stale and not exhausted:
+        _require(notice.status == "redundant", "duplicate recovery request must not repeat work")
+    _require(
+        len(data.ranges) <= limits.max_ranges
+        and notice.recovered_bytes <= limits.max_bytes_per_round
+        and state.recovery_bytes + notice.recovered_bytes <= limits.max_total_bytes,
+        "recovery exceeds configured limits",
+    )
+    records = {r.exchange.action.call_id: r for r in state.records}
+    previous = list(state.recovery_seen)
+    for part in data.ranges:
+        record = records.get(part.call_id)
+        _require(
+            record is not None
+            and record.artifact is not None
+            and record.artifact.sha256 == part.source_sha256,
+            "recovery source is not an accepted artifact",
+        )
+        _require(
+            not any(
+                p.call_id == part.call_id
+                and p.source_sha256 == part.source_sha256
+                and p.pointer == part.pointer
+                and (
+                    p.kind != "text"
+                    or part.kind != "text"
+                    or max(p.start, part.start) < min(p.end, part.end)
+                )
+                for p in previous
+            ),
+            "recovery repeats a seen range",
+        )
+        previous.append(part)
+    ranges = tuple(p.model_dump_json() for p in data.ranges)
+    return replace(
+        next_state,
+        phase=Phase.READY,
+        turn_json=None,
+        control_json=None if stale else notice.model_dump_json(),
+        recovery_ranges_json=ranges,
+        recovery_seen_json=(*state.recovery_seen_json, *ranges),
+        recovery_bytes=state.recovery_bytes + notice.recovered_bytes,
+        recovery_attempts=(*state.recovery_attempts, key)
+        if not stale and not exhausted and key not in state.recovery_attempts
+        else state.recovery_attempts,
     )

@@ -42,6 +42,8 @@ uv run python examples/progress_control.py
 
 上下文编译还可显式启用持久历史检索与多区间原文表示，按 Session 和历史截止位置搜索最近 64 次交互以外的来源，并按预算交付同一字段内的分散事实。索引增量提交、取消、水位、词项工作额度和请求原文核验均有回归验证。运行 `uv run python examples/history_context.py` 比较窗口、检索单区间与检索多区间；配置和实验边界见 [持久历史发现与多区间上下文](docs/持久历史发现与多区间上下文.md)。
 
+上下文编译可进一步用 `context_recovery=RecoveryLimits()` 启用有预算的主动恢复：模型通过独立 `recover_context` 决策发现并找回当前 Run 已接受、却被省略的原文片段。完整请求准入、有限期保留、区间去重、任务修订和取消都受 Runtime 管理，普通工具权限仍从已接受上下文生成。实现流程、版本和失败边界见 [主动上下文恢复与预算闭环](docs/主动上下文恢复与预算闭环.md)；运行 `uv run python examples/context_recovery.py` 可复现真实源码材料上的三种交付策略对照。
+
 轮次实验从实际目录内容发现多个资料源，批量读取并依据失败反馈寻找替代资料；在串行与有界并发下核验结果、来源、成本和回放。原有 v2 机制与源码调研见 [轮次与反馈](docs/agent-loop.md)，现在通过 `LegacyAgentLoop` 显式保留。`AgentRun` 和 v1 日志保持兼容。
 
 当前 `AgentLoop` 使用 `ControlRequest` / `ControlEvent` / `RunReport` v3：批次先计算最低反馈和依赖闭包上界，预算不足给模型拒绝观察；Finish 先成为候选，由 `CompletionPolicy` 检查实际成果、反馈缺口继续修正，或报告无法验证。默认没有验收规则时明确返回 `unverifiable`，不会自动调用评判模型。设计、迁移及冻结的文件任务对照见 [AgentLoop v3](docs/agent-loop-control.md) 与 [ADR 0006](docs/decisions/0006-feedback-admission-completion-control.md)。实验验证控制机制及额外调用成本，尚不能证明真实 LLM 的规划或纠错收益。

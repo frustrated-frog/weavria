@@ -189,8 +189,8 @@ class ControlEvidencePlan(_EvidencePlan):
     def metadata(self) -> dict[str, JsonValue]:
         return {
             **_EvidencePlan.metadata(self),
-            "schema_version": 3,
-            "request_schema_version": 3,
+            "schema_version": self.request.schema_version,
+            "request_schema_version": self.request.schema_version,
             "control_padding_bytes": self.control_padding_bytes,
             **(
                 {

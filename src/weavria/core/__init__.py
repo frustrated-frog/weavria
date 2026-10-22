@@ -218,6 +218,12 @@ __all__ = [
     "ProgressAssessed",
     "ProgressAssessment",
     "ProgressNotice",
+    "RecoverContext",
+    "RecoveryLimits",
+    "RecoveryNotice",
+    "RecoveryRange",
+    "RecoveryResolved",
+    "RecoveryStatus",
     "RetrievedHistoryCandidate",
     "RunEnded",
     "RunError",
@@ -270,5 +276,16 @@ __all__ = [
     "maximum_exchange_bytes",
     "minimum_exchange",
     "parse_action",
+    "recovery_digest",
     "transition_status",
 ]
+
+from .recovery import (
+    RecoverContext,
+    RecoveryLimits,
+    RecoveryNotice,
+    RecoveryRange,
+    RecoveryResolved,
+    RecoveryStatus,
+    recovery_digest,
+)
