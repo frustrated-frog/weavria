@@ -41,6 +41,7 @@ class ProgressCheck:
     prior_family_attempts: int
     reservations: tuple[ProgressReservation, ...]
     action_identities: tuple[ToolActionIdentity, ...]
+    adaptive_exploration: bool = False
 
 
 class ProgressPolicy(Protocol):
@@ -55,6 +56,7 @@ class ProgressPolicy(Protocol):
         records: tuple[ToolRecord, ...],
         batch: ToolBatch,
         capability_epoch: int,
+        adaptive_exploration: bool = False,
     ) -> ProgressCheck: ...
 
     def record_admission(self, check: ProgressCheck) -> None:
@@ -106,7 +108,7 @@ class SemanticProgressPolicy:
     two-phase protocol: an action is counted only after ``BatchAdmitted`` has been accepted.
     """
 
-    version = "semantic-progress/5"
+    version = "semantic-progress/6"
 
     def __init__(
         self,
@@ -128,6 +130,7 @@ class SemanticProgressPolicy:
         records: tuple[ToolRecord, ...],
         batch: ToolBatch,
         capability_epoch: int,
+        adaptive_exploration: bool = False,
     ) -> ProgressCheck:
         payload = observation.payload if observation is not None else {}
         need_state = payload.get("need_state_sha256")
@@ -184,7 +187,7 @@ class SemanticProgressPolicy:
             family_proposal = proposed.setdefault(family, [])
             if action in admitted or action in family_proposal:
                 blocked_reason = "repeated_action"
-            elif len(admitted) >= self._max_stagnant_actions:
+            elif not adaptive_exploration and len(admitted) >= self._max_stagnant_actions:
                 blocked_reason = "stagnant_action_family"
             if blocked_reason is not None:
                 blocked_action = action
@@ -233,6 +236,7 @@ class SemanticProgressPolicy:
             prior_family_attempts=prior,
             reservations=reservations,
             action_identities=action_identities,
+            adaptive_exploration=adaptive_exploration,
         )
 
     def record_admission(self, check: ProgressCheck) -> None:
@@ -252,7 +256,7 @@ class SemanticProgressPolicy:
                 raise ValueError("progress admission does not match the inspected frontier")
             if admitted.intersection(reservation.canonical_action_sha256s):
                 raise ValueError("progress admission was already recorded")
-            if len(admitted) >= self._max_stagnant_actions:
+            if not check.adaptive_exploration and len(admitted) >= self._max_stagnant_actions:
                 raise ValueError("progress admission starts from an exhausted action family")
         for reservation in check.reservations:
             admitted = self._admitted.setdefault(

@@ -11,6 +11,7 @@ from weavria.core import (
     CONTROL_FEEDBACK_BYTES,
     ActionInterventionChecked,
     ActionValueProfile,
+    ActionValueScope,
     AgentAction,
     AgentResult,
     BatchAdmitted,
@@ -604,6 +605,12 @@ def _reduce_control(
                 "intervention does not bind the current action-value state",
             )
             assert value_context is not None
+            if state.action_value_ledger_version == "bayesian-action-value-ledger/2":
+                _require(
+                    value_context.schema_version == 2
+                    and value_context.scope == ActionValueScope.from_assessment(progress),
+                    "action-value scope does not bind accepted open obligations",
+                )
             _require(
                 len(value_context.action_family_sha256s) == len(turn.decision.calls),
                 "action-value context does not cover the complete proposal",
@@ -678,6 +685,7 @@ def _reduce_control(
         )
         estimate = data.decision.value_estimate
         notice = InterventionNotice(
+            schema_version=estimate.schema_version if estimate is not None else 1,
             policy_version=data.policy_version,
             proposal_sha256=data.proposal_sha256,
             progress_assessment_sha256=progress_sha256,

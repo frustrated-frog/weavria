@@ -4,14 +4,43 @@ import hashlib
 import json
 from typing import Annotated, Literal, Self
 
-from pydantic import Field, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    SerializerFunctionWrapHandler,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 from ._schema import ContractModel, NonBlankString
 from .model_io import TaskInput
+from .progress import ProgressAssessment
 
 type InterventionReasonCode = Annotated[str, Field(pattern=r"^[a-z][a-z0-9_]{0,63}$")]
 type _Digest = Annotated[str, Field(pattern=r"^[a-f0-9]{64}$")]
 type ActionValueObjective = Literal["initial", "verify", "continue", "repair", "replan", "stop"]
+
+
+class ActionValueScope(ContractModel):
+    """Accepted open obligations, not a model-authored label or a claimed reward."""
+
+    open_obligation_ids: tuple[NonBlankString, ...] = Field(default=(), max_length=128)
+    complete: bool = False
+
+    @model_validator(mode="after")
+    def validate_ids(self) -> Self:
+        if tuple(sorted(set(self.open_obligation_ids))) != self.open_obligation_ids:
+            raise ValueError("action-value scope must use unique canonical obligations")
+        return self
+
+    @classmethod
+    def from_assessment(cls, assessment: ProgressAssessment | None) -> Self:
+        if assessment is None:
+            return cls()
+        signal = assessment.obligations
+        identities = tuple(sorted(set(signal.unchanged_open_ids + signal.reopened_ids)))
+        return cls(open_obligation_ids=identities, complete=len(identities) == signal.open_after)
 
 
 def _action_value_key_sha256(
@@ -19,22 +48,36 @@ def _action_value_key_sha256(
     task_revision: int,
     objective: ActionValueObjective,
     action_family_sha256s: tuple[str, ...],
+    scope: ActionValueScope | None = None,
 ) -> str:
     """Hash the outcome-comparable unit without including call IDs or arguments."""
+    payload: dict[str, object] = {
+        "task_revision": task_revision,
+        "objective": objective,
+        "action_family_sha256s": sorted(action_family_sha256s),
+    }
+    if scope is not None:
+        payload["scope"] = scope.model_dump(mode="json")
     return hashlib.sha256(
         json.dumps(
-            {
-                "task_revision": task_revision,
-                "objective": objective,
-                "action_family_sha256s": sorted(action_family_sha256s),
-            },
+            payload,
             sort_keys=True,
             separators=(",", ":"),
         ).encode()
     ).hexdigest()
 
 
-class ActionValueContext(ContractModel):
+class _ActionValueContract(BaseModel):
+    model_config = ContractModel.model_config
+    schema_version: Literal[1, 2] = 1
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def validate_version_type(cls, value: object) -> object:
+        return ContractModel.validate_version_type(value)
+
+
+class ActionValueContext(_ActionValueContract):
     """The exact semantic bucket used to compare a proposed batch with prior outcomes."""
 
     task_revision: int = Field(ge=1)
@@ -42,15 +85,26 @@ class ActionValueContext(ContractModel):
     proposal_sha256: _Digest
     action_family_sha256s: tuple[_Digest, ...] = Field(min_length=1, max_length=32)
     value_key_sha256: _Digest
+    scope: ActionValueScope | None = None
+
+    @model_serializer(mode="wrap")
+    def preserve_v1_wire(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        data = handler(self)
+        if self.schema_version == 1:
+            data.pop("scope", None)
+        return data
 
     @model_validator(mode="after")
     def validate_key(self) -> Self:
+        if (self.schema_version == 2) != (self.scope is not None):
+            raise ValueError("only action-value context v2 requires an obligation scope")
         if tuple(sorted(self.action_family_sha256s)) != self.action_family_sha256s:
             raise ValueError("action-value families must use canonical sorted order")
         expected = _action_value_key_sha256(
             task_revision=self.task_revision,
             objective=self.objective,
             action_family_sha256s=self.action_family_sha256s,
+            scope=self.scope,
         )
         if self.value_key_sha256 != expected:
             raise ValueError("action-value key does not match its semantic scope")
@@ -64,9 +118,11 @@ class ActionValueContext(ContractModel):
         objective: ActionValueObjective,
         proposal_sha256: str,
         action_family_sha256s: tuple[str, ...],
+        scope: ActionValueScope | None = None,
     ) -> Self:
         families = tuple(sorted(action_family_sha256s))
         return cls(
+            schema_version=2 if scope is not None else 1,
             task_revision=task_revision,
             objective=objective,
             proposal_sha256=proposal_sha256,
@@ -75,11 +131,13 @@ class ActionValueContext(ContractModel):
                 task_revision=task_revision,
                 objective=objective,
                 action_family_sha256s=families,
+                scope=scope,
             ),
+            scope=scope,
         )
 
 
-class ActionValueProfile(ContractModel):
+class ActionValueProfile(_ActionValueContract):
     """Replay-derived outcomes for one objective and action-family composition.
 
     Outcome classes are disjoint. ``mixed`` means the turn made material progress
@@ -102,15 +160,26 @@ class ActionValueProfile(ContractModel):
     obligation_gains: int = Field(ge=0)
     coverage_gains: int = Field(ge=0)
     independent_source_gains: int = Field(ge=0)
+    scope: ActionValueScope | None = None
+
+    @model_serializer(mode="wrap")
+    def preserve_v1_wire(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        data = handler(self)
+        if self.schema_version == 1:
+            data.pop("scope", None)
+        return data
 
     @model_validator(mode="after")
     def validate_profile(self) -> Self:
+        if (self.schema_version == 2) != (self.scope is not None):
+            raise ValueError("only action-value profile v2 requires an obligation scope")
         if tuple(sorted(self.action_family_sha256s)) != self.action_family_sha256s:
             raise ValueError("action-value profile families must be canonical")
         expected = _action_value_key_sha256(
             task_revision=self.task_revision,
             objective=self.objective,
             action_family_sha256s=self.action_family_sha256s,
+            scope=self.scope,
         )
         if self.value_key_sha256 != expected:
             raise ValueError("action-value profile key does not match its scope")
@@ -126,7 +195,24 @@ class ActionValueProfile(ContractModel):
         return self
 
 
-class ActionValueEstimate(ContractModel):
+class ActionGainEstimate(ContractModel):
+    """Gamma-Poisson gain rate per proposed call, with a posterior moment interval."""
+
+    dimension: Literal["obligations", "coverage", "independent_sources"]
+    gained_units: int = Field(ge=0)
+    exposure_calls: int = Field(ge=0)
+    mean: float = Field(ge=0)
+    lower: float = Field(ge=0)
+    upper: float = Field(ge=0)
+
+    @model_validator(mode="after")
+    def validate_interval(self) -> Self:
+        if not self.lower <= self.mean <= self.upper:
+            raise ValueError("gain-rate posterior interval is not ordered")
+        return self
+
+
+class ActionValueEstimate(_ActionValueContract):
     """Persisted numerical basis for one pre-dispatch intervention verdict."""
 
     value_key_sha256: _Digest
@@ -135,16 +221,40 @@ class ActionValueEstimate(ContractModel):
     progress_mean: float = Field(ge=0.0, le=1.0)
     progress_lower: float = Field(ge=0.0, le=1.0)
     progress_upper: float = Field(ge=0.0, le=1.0)
-    expected_progress_per_call: float = Field(ge=0.0, le=1.0)
+    expected_progress_per_call: float = Field(ge=0.0)
     regression_mean: float = Field(ge=0.0, le=1.0)
     regression_lower: float = Field(ge=0.0, le=1.0)
     regression_upper: float = Field(ge=0.0, le=1.0)
     minimum_observations: int = Field(ge=1)
-    minimum_expected_progress_per_call: float = Field(ge=0.0, le=1.0)
+    minimum_expected_progress_per_call: float = Field(ge=0.0)
     maximum_pessimistic_regression_probability: float = Field(ge=0.0, le=1.0)
+    gain_estimates: tuple[ActionGainEstimate, ...] = ()
+
+    @model_serializer(mode="wrap")
+    def preserve_v1_wire(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        data = handler(self)
+        if self.schema_version == 1:
+            data.pop("gain_estimates", None)
+        return data
 
     @model_validator(mode="after")
     def validate_intervals(self) -> Self:
+        if self.schema_version == 1:
+            if (
+                self.gain_estimates
+                or self.expected_progress_per_call > 1
+                or self.minimum_expected_progress_per_call > 1
+            ):
+                raise ValueError("legacy estimate must retain probability-per-call semantics")
+        else:
+            if tuple(item.dimension for item in self.gain_estimates) != (
+                "obligations",
+                "coverage",
+                "independent_sources",
+            ):
+                raise ValueError("gain estimate must cover all three ordered dimensions")
+            if self.expected_progress_per_call != max(item.mean for item in self.gain_estimates):
+                raise ValueError("gain summary must equal the maximum component mean")
         if not self.progress_lower <= self.progress_mean <= self.progress_upper:
             raise ValueError("progress posterior interval is not ordered")
         if not self.regression_lower <= self.regression_mean <= self.regression_upper:

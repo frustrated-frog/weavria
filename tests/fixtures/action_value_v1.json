@@ -1,0 +1,769 @@
+{
+  "events": [
+    {
+      "schema_version": 3,
+      "run_id": "run",
+      "sequence": 1,
+      "step_id": null,
+      "attempt_id": null,
+      "occurred_at": "2026-10-22T14:09:53.204989Z",
+      "data": {
+        "schema_version": 1,
+        "kind": "run_started",
+        "task": {
+          "schema_version": 1,
+          "goal": "Read and report the value",
+          "constraints": [],
+          "revision": 1
+        },
+        "action_intervention_policy_version": "progress-action-intervention/2[min_observations=3;min_expected_yield=0.25;max_pessimistic_regression=0.35;uncertainty=1]",
+        "action_value_ledger_version": "bayesian-action-value-ledger/1"
+      }
+    },
+    {
+      "schema_version": 3,
+      "run_id": "run",
+      "sequence": 2,
+      "step_id": "run/step/1",
+      "attempt_id": null,
+      "occurred_at": "2026-10-22T14:09:53.206528Z",
+      "data": {
+        "schema_version": 1,
+        "kind": "context_selected",
+        "request_bytes": 1524,
+        "budget_bytes": 12000,
+        "request_sha256": "9cc579d993db1acad50946d0ced57c96a24f91ea509f1f22436c498dc38e0f75",
+        "selected_call_ids": []
+      }
+    },
+    {
+      "schema_version": 3,
+      "run_id": "run",
+      "sequence": 3,
+      "step_id": "run/step/1",
+      "attempt_id": "run/step/1/model/1",
+      "occurred_at": "2026-10-22T14:09:53.206887Z",
+      "data": {
+        "schema_version": 1,
+        "kind": "model_started",
+        "task_revision": 1
+      }
+    },
+    {
+      "schema_version": 3,
+      "run_id": "run",
+      "sequence": 4,
+      "step_id": "run/step/1",
+      "attempt_id": null,
+      "occurred_at": "2026-10-22T14:09:53.207292Z",
+      "data": {
+        "schema_version": 1,
+        "kind": "turn_decided",
+        "turn": {
+          "schema_version": 1,
+          "decision": {
+            "schema_version": 1,
+            "kind": "tool_batch",
+            "calls": [
+              {
+                "schema_version": 1,
+                "kind": "tool_call",
+                "call_id": "first",
+                "tool_name": "echo",
+                "arguments": {
+                  "value": "one",
+                  "parent": null
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "schema_version": 3,
+      "run_id": "run",
+      "sequence": 5,
+      "step_id": "run/step/1",
+      "attempt_id": "run/step/1/intervention/1",
+      "occurred_at": "2026-10-22T14:09:53.208009Z",
+      "data": {
+        "schema_version": 1,
+        "kind": "action_intervention_checked",
+        "task_revision": 1,
+        "policy_version": "progress-action-intervention/2[min_observations=3;min_expected_yield=0.25;max_pessimistic_regression=0.35;uncertainty=1]",
+        "proposal_sha256": "f5c5f2c093005697382d4d15950fc602f7ff4a640c72989b46ce51855bd63b51",
+        "progress_assessment_sha256": null,
+        "action_value_context": {
+          "schema_version": 1,
+          "task_revision": 1,
+          "objective": "initial",
+          "proposal_sha256": "f5c5f2c093005697382d4d15950fc602f7ff4a640c72989b46ce51855bd63b51",
+          "action_family_sha256s": [
+            "ddfb5206e2f99dd34b81126ec7ac6a9a7e3d3ecb47d1d411b32d73355dc483ec"
+          ],
+          "value_key_sha256": "c26550dc66010461621d6094b3a54cb73ae3ea01528f044a61717927d574514a"
+        },
+        "action_value_state_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "prior_reconsiderations": 0,
+        "decision": {
+          "schema_version": 1,
+          "disposition": "allow",
+          "trigger": "assessment_unavailable",
+          "reason_codes": [
+            "progress_assessment_unavailable"
+          ],
+          "value_estimate": null
+        }
+      }
+    },
+    {
+      "schema_version": 3,
+      "run_id": "run",
+      "sequence": 6,
+      "step_id": "run/step/1",
+      "attempt_id": null,
+      "occurred_at": "2026-10-22T14:09:53.208779Z",
+      "data": {
+        "schema_version": 1,
+        "kind": "batch_admitted",
+        "reserved_bytes": 3168,
+        "budget_bytes": 12000,
+        "readable_call_ids": [],
+        "bounds": {
+          "schema_version": 1,
+          "max_artifact_id_json_bytes": 130,
+          "max_result_bytes": 4000000
+        },
+        "action_value_context": {
+          "schema_version": 1,
+          "task_revision": 1,
+          "objective": "initial",
+          "proposal_sha256": "f5c5f2c093005697382d4d15950fc602f7ff4a640c72989b46ce51855bd63b51",
+          "action_family_sha256s": [
+            "ddfb5206e2f99dd34b81126ec7ac6a9a7e3d3ecb47d1d411b32d73355dc483ec"
+          ],
+          "value_key_sha256": "c26550dc66010461621d6094b3a54cb73ae3ea01528f044a61717927d574514a"
+        }
+      }
+    },
+    {
+      "schema_version": 3,
+      "run_id": "run",
+      "sequence": 7,
+      "step_id": "run/step/1",
+      "attempt_id": "run/step/1/tool/first/1",
+      "occurred_at": "2026-10-22T14:09:53.209165Z",
+      "data": {
+        "schema_version": 1,
+        "kind": "tool_started",
+        "call_id": "first"
+      }
+    },
+    {
+      "schema_version": 3,
+      "run_id": "run",
+      "sequence": 8,
+      "step_id": "run/step/1",
+      "attempt_id": "run/step/1/tool/first/1",
+      "occurred_at": "2026-10-22T14:09:53.210285Z",
+      "data": {
+        "schema_version": 1,
+        "kind": "tool_recorded",
+        "record": {
+          "schema_version": 1,
+          "exchange": {
+            "schema_version": 1,
+            "kind": "tool_exchange",
+            "action": {
+              "schema_version": 1,
+              "kind": "tool_call",
+              "call_id": "first",
+              "tool_name": "echo",
+              "arguments": {
+                "value": "one",
+                "parent": null
+              }
+            },
+            "observation": {
+              "schema_version": 1,
+              "kind": "tool_succeeded",
+              "call_id": "first",
+              "tool_name": "echo",
+              "output": {
+                "artifact_id": "45c120b3830e54d681380379b75816df58ccb178b911325def5937d199a27b31",
+                "sha256": "f0c1acd64d1aaacf9b160e8ab7f83c6e73b8d0386389b22eb13d40e800586227",
+                "size_bytes": 15,
+                "policy_version": "read_only/1"
+              }
+            }
+          },
+          "artifact": {
+            "schema_version": 1,
+            "artifact_id": "45c120b3830e54d681380379b75816df58ccb178b911325def5937d199a27b31",
+            "run_id": "run",
+            "call_id": "first",
+            "sha256": "f0c1acd64d1aaacf9b160e8ab7f83c6e73b8d0386389b22eb13d40e800586227",
+            "size_bytes": 15
+          },
+          "dependencies": [],
+          "authorization": {
+            "schema_version": 1,
+            "tool_version": "1",
+            "policy_version": "read_only/1",
+            "allowed": true,
+            "reason": "allowed",
+            "normalized_arguments": {
+              "value": "one",
+              "parent": null
+            }
+          },
+          "context_paths": []
+        }
+      }
+    },
+    {
+      "schema_version": 3,
+      "run_id": "run",
+      "sequence": 9,
+      "step_id": "run/step/1",
+      "attempt_id": null,
+      "occurred_at": "2026-10-22T14:09:53.210727Z",
+      "data": {
+        "schema_version": 1,
+        "kind": "turn_settled"
+      }
+    },
+    {
+      "schema_version": 3,
+      "run_id": "run",
+      "sequence": 10,
+      "step_id": "run/step/1",
+      "attempt_id": "run/step/1/progress/1",
+      "occurred_at": "2026-10-22T14:09:53.211217Z",
+      "data": {
+        "schema_version": 1,
+        "kind": "progress_assessed",
+        "assessment": {
+          "schema_version": 1,
+          "task_revision": 1,
+          "policy_version": "test-progress/neutral-replan/1",
+          "before_state_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "after_state_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "feedback_call_ids": [
+            "first"
+          ],
+          "obligations": {
+            "schema_version": 1,
+            "observable_total": 1,
+            "open_before": 1,
+            "open_after": 1,
+            "newly_satisfied_ids": [],
+            "reopened_ids": [],
+            "unchanged_open_ids": [
+              "obligation-a"
+            ]
+          },
+          "coverage": {
+            "schema_version": 1,
+            "total_units": 1,
+            "covered_before": 0,
+            "covered_after": 0,
+            "newly_covered_units": [],
+            "lost_coverage_units": []
+          },
+          "information_gain": {
+            "schema_version": 1,
+            "attributed_sources_before": 0,
+            "attributed_sources_after": 0,
+            "new_source_sha256s": [],
+            "repeated_source_bindings": 0,
+            "unattributed_new_bindings": 0,
+            "contradictory_new_bindings": 0
+          },
+          "cost": {
+            "schema_version": 1,
+            "proposed_calls": 1,
+            "succeeded_calls": 1,
+            "failed_calls": 0,
+            "skipped_calls": 0,
+            "artifact_bytes": 1,
+            "model_calls_used": 1,
+            "remaining_model_calls": 15,
+            "remaining_tool_calls": 11,
+            "measurement": "runtime_counters/1"
+          },
+          "continuation": {
+            "schema_version": 1,
+            "feasibility": "constrained",
+            "recommended_action": "replan",
+            "reason_codes": [
+              "no_material_progress"
+            ]
+          },
+          "quality": "neutral",
+          "material_progress": false
+        }
+      }
+    },
+    {
+      "schema_version": 3,
+      "run_id": "run",
+      "sequence": 11,
+      "step_id": "run/step/2",
+      "attempt_id": null,
+      "occurred_at": "2026-10-22T14:09:53.212617Z",
+      "data": {
+        "schema_version": 1,
+        "kind": "context_selected",
+        "request_bytes": 2460,
+        "budget_bytes": 12000,
+        "request_sha256": "ec7740f5a0250a0264df16c09317e30a04a2a2411d342083e06e7e6e8136696a",
+        "selected_call_ids": [
+          "first"
+        ]
+      }
+    },
+    {
+      "schema_version": 3,
+      "run_id": "run",
+      "sequence": 12,
+      "step_id": "run/step/2",
+      "attempt_id": "run/step/2/model/1",
+      "occurred_at": "2026-10-22T14:09:53.212953Z",
+      "data": {
+        "schema_version": 1,
+        "kind": "model_started",
+        "task_revision": 1
+      }
+    },
+    {
+      "schema_version": 3,
+      "run_id": "run",
+      "sequence": 13,
+      "step_id": "run/step/2",
+      "attempt_id": null,
+      "occurred_at": "2026-10-22T14:09:53.213466Z",
+      "data": {
+        "schema_version": 1,
+        "kind": "turn_decided",
+        "turn": {
+          "schema_version": 1,
+          "decision": {
+            "schema_version": 1,
+            "kind": "tool_batch",
+            "calls": [
+              {
+                "schema_version": 1,
+                "kind": "tool_call",
+                "call_id": "second",
+                "tool_name": "echo",
+                "arguments": {
+                  "value": "two",
+                  "parent": null
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "schema_version": 3,
+      "run_id": "run",
+      "sequence": 14,
+      "step_id": "run/step/2",
+      "attempt_id": "run/step/2/intervention/1",
+      "occurred_at": "2026-10-22T14:09:53.214497Z",
+      "data": {
+        "schema_version": 1,
+        "kind": "action_intervention_checked",
+        "task_revision": 1,
+        "policy_version": "progress-action-intervention/2[min_observations=3;min_expected_yield=0.25;max_pessimistic_regression=0.35;uncertainty=1]",
+        "proposal_sha256": "0f6206a1b0ecc6267ec4c4826cef6115f5940179e348253f6a01193c7b320905",
+        "progress_assessment_sha256": "9890e139da4b9d6337eae6fd99f7780d88af4ca7f81406075ebcb4a1e77f68ef",
+        "action_value_context": {
+          "schema_version": 1,
+          "task_revision": 1,
+          "objective": "replan",
+          "proposal_sha256": "0f6206a1b0ecc6267ec4c4826cef6115f5940179e348253f6a01193c7b320905",
+          "action_family_sha256s": [
+            "ddfb5206e2f99dd34b81126ec7ac6a9a7e3d3ecb47d1d411b32d73355dc483ec"
+          ],
+          "value_key_sha256": "7563bf4b7f42f2f0d2be79c7a89dc245b95b5f0e0481d24c01cddff137dc6764"
+        },
+        "action_value_state_sha256": "805a46f13ff0c63f0e27cbd846d77a03ceeed8a8e4f7b2fb14c29c194a32390d",
+        "prior_reconsiderations": 0,
+        "decision": {
+          "schema_version": 1,
+          "disposition": "allow",
+          "trigger": "action_value_exploration",
+          "reason_codes": [
+            "action_value_cold_start",
+            "no_material_progress"
+          ],
+          "value_estimate": {
+            "schema_version": 1,
+            "value_key_sha256": "7563bf4b7f42f2f0d2be79c7a89dc245b95b5f0e0481d24c01cddff137dc6764",
+            "observations": 0,
+            "candidate_calls": 1,
+            "progress_mean": 0.5,
+            "progress_lower": 0.211324865,
+            "progress_upper": 0.788675135,
+            "expected_progress_per_call": 0.5,
+            "regression_mean": 0.25,
+            "regression_lower": 0.056350833,
+            "regression_upper": 0.443649167,
+            "minimum_observations": 3,
+            "minimum_expected_progress_per_call": 0.25,
+            "maximum_pessimistic_regression_probability": 0.35
+          }
+        }
+      }
+    },
+    {
+      "schema_version": 3,
+      "run_id": "run",
+      "sequence": 15,
+      "step_id": "run/step/2",
+      "attempt_id": null,
+      "occurred_at": "2026-10-22T14:09:53.215370Z",
+      "data": {
+        "schema_version": 1,
+        "kind": "batch_admitted",
+        "reserved_bytes": 3623,
+        "budget_bytes": 12000,
+        "readable_call_ids": [
+          "first"
+        ],
+        "bounds": {
+          "schema_version": 1,
+          "max_artifact_id_json_bytes": 130,
+          "max_result_bytes": 4000000
+        },
+        "action_value_context": {
+          "schema_version": 1,
+          "task_revision": 1,
+          "objective": "replan",
+          "proposal_sha256": "0f6206a1b0ecc6267ec4c4826cef6115f5940179e348253f6a01193c7b320905",
+          "action_family_sha256s": [
+            "ddfb5206e2f99dd34b81126ec7ac6a9a7e3d3ecb47d1d411b32d73355dc483ec"
+          ],
+          "value_key_sha256": "7563bf4b7f42f2f0d2be79c7a89dc245b95b5f0e0481d24c01cddff137dc6764"
+        }
+      }
+    },
+    {
+      "schema_version": 3,
+      "run_id": "run",
+      "sequence": 16,
+      "step_id": "run/step/2",
+      "attempt_id": "run/step/2/tool/second/1",
+      "occurred_at": "2026-10-22T14:09:53.215771Z",
+      "data": {
+        "schema_version": 1,
+        "kind": "tool_started",
+        "call_id": "second"
+      }
+    },
+    {
+      "schema_version": 3,
+      "run_id": "run",
+      "sequence": 17,
+      "step_id": "run/step/2",
+      "attempt_id": "run/step/2/tool/second/1",
+      "occurred_at": "2026-10-22T14:09:53.216932Z",
+      "data": {
+        "schema_version": 1,
+        "kind": "tool_recorded",
+        "record": {
+          "schema_version": 1,
+          "exchange": {
+            "schema_version": 1,
+            "kind": "tool_exchange",
+            "action": {
+              "schema_version": 1,
+              "kind": "tool_call",
+              "call_id": "second",
+              "tool_name": "echo",
+              "arguments": {
+                "value": "two",
+                "parent": null
+              }
+            },
+            "observation": {
+              "schema_version": 1,
+              "kind": "tool_succeeded",
+              "call_id": "second",
+              "tool_name": "echo",
+              "output": {
+                "artifact_id": "194375a2361d4ba0dbc331daa5ffbb103c853e29374fa295e53159a5803fcaf3",
+                "sha256": "beed5f75a037ee79e240508ccaaeb53a855ed1662987ef7c181c194c072e6761",
+                "size_bytes": 15,
+                "policy_version": "read_only/1"
+              }
+            }
+          },
+          "artifact": {
+            "schema_version": 1,
+            "artifact_id": "194375a2361d4ba0dbc331daa5ffbb103c853e29374fa295e53159a5803fcaf3",
+            "run_id": "run",
+            "call_id": "second",
+            "sha256": "beed5f75a037ee79e240508ccaaeb53a855ed1662987ef7c181c194c072e6761",
+            "size_bytes": 15
+          },
+          "dependencies": [],
+          "authorization": {
+            "schema_version": 1,
+            "tool_version": "1",
+            "policy_version": "read_only/1",
+            "allowed": true,
+            "reason": "allowed",
+            "normalized_arguments": {
+              "value": "two",
+              "parent": null
+            }
+          },
+          "context_paths": []
+        }
+      }
+    },
+    {
+      "schema_version": 3,
+      "run_id": "run",
+      "sequence": 18,
+      "step_id": "run/step/2",
+      "attempt_id": null,
+      "occurred_at": "2026-10-22T14:09:53.217315Z",
+      "data": {
+        "schema_version": 1,
+        "kind": "turn_settled"
+      }
+    },
+    {
+      "schema_version": 3,
+      "run_id": "run",
+      "sequence": 19,
+      "step_id": "run/step/2",
+      "attempt_id": "run/step/2/progress/1",
+      "occurred_at": "2026-10-22T14:09:53.217690Z",
+      "data": {
+        "schema_version": 1,
+        "kind": "progress_assessed",
+        "assessment": {
+          "schema_version": 1,
+          "task_revision": 1,
+          "policy_version": "test-progress/neutral-replan/1",
+          "before_state_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "after_state_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "feedback_call_ids": [
+            "second"
+          ],
+          "obligations": {
+            "schema_version": 1,
+            "observable_total": 1,
+            "open_before": 1,
+            "open_after": 1,
+            "newly_satisfied_ids": [],
+            "reopened_ids": [],
+            "unchanged_open_ids": [
+              "obligation-a"
+            ]
+          },
+          "coverage": {
+            "schema_version": 1,
+            "total_units": 1,
+            "covered_before": 0,
+            "covered_after": 0,
+            "newly_covered_units": [],
+            "lost_coverage_units": []
+          },
+          "information_gain": {
+            "schema_version": 1,
+            "attributed_sources_before": 0,
+            "attributed_sources_after": 0,
+            "new_source_sha256s": [],
+            "repeated_source_bindings": 0,
+            "unattributed_new_bindings": 0,
+            "contradictory_new_bindings": 0
+          },
+          "cost": {
+            "schema_version": 1,
+            "proposed_calls": 1,
+            "succeeded_calls": 1,
+            "failed_calls": 0,
+            "skipped_calls": 0,
+            "artifact_bytes": 1,
+            "model_calls_used": 1,
+            "remaining_model_calls": 14,
+            "remaining_tool_calls": 10,
+            "measurement": "runtime_counters/1"
+          },
+          "continuation": {
+            "schema_version": 1,
+            "feasibility": "constrained",
+            "recommended_action": "replan",
+            "reason_codes": [
+              "no_material_progress"
+            ]
+          },
+          "quality": "neutral",
+          "material_progress": false
+        }
+      }
+    },
+    {
+      "schema_version": 3,
+      "run_id": "run",
+      "sequence": 20,
+      "step_id": "run/step/3",
+      "attempt_id": null,
+      "occurred_at": "2026-10-22T14:09:53.219336Z",
+      "data": {
+        "schema_version": 1,
+        "kind": "context_selected",
+        "request_bytes": 2962,
+        "budget_bytes": 12000,
+        "request_sha256": "5ec80cdbc5581533627455e008f9e78ca1f0fa8351e17ccb78e1ae195aef9041",
+        "selected_call_ids": [
+          "first",
+          "second"
+        ]
+      }
+    },
+    {
+      "schema_version": 3,
+      "run_id": "run",
+      "sequence": 21,
+      "step_id": "run/step/3",
+      "attempt_id": "run/step/3/model/1",
+      "occurred_at": "2026-10-22T14:09:53.219670Z",
+      "data": {
+        "schema_version": 1,
+        "kind": "model_started",
+        "task_revision": 1
+      }
+    },
+    {
+      "schema_version": 3,
+      "run_id": "run",
+      "sequence": 22,
+      "step_id": "run/step/3",
+      "attempt_id": null,
+      "occurred_at": "2026-10-22T14:09:53.220092Z",
+      "data": {
+        "schema_version": 1,
+        "kind": "turn_decided",
+        "turn": {
+          "schema_version": 1,
+          "decision": {
+            "schema_version": 1,
+            "kind": "finish",
+            "output": "done"
+          }
+        }
+      }
+    },
+    {
+      "schema_version": 3,
+      "run_id": "run",
+      "sequence": 23,
+      "step_id": "run/step/3",
+      "attempt_id": "run/step/3/verification/1",
+      "occurred_at": "2026-10-22T14:09:53.220344Z",
+      "data": {
+        "schema_version": 1,
+        "kind": "verification_started",
+        "policy_version": "none/1"
+      }
+    },
+    {
+      "schema_version": 3,
+      "run_id": "run",
+      "sequence": 24,
+      "step_id": "run/step/3",
+      "attempt_id": "run/step/3/verification/1",
+      "occurred_at": "2026-10-22T14:09:53.221003Z",
+      "data": {
+        "schema_version": 1,
+        "kind": "completion_checked",
+        "assessment": {
+          "schema_version": 1,
+          "task_revision": 1,
+          "policy_version": "none/1",
+          "candidate_sha256": "33ade3085dfc0cd3f518d3d3e677d6190efba1adc49fdacb29e2eb662f1371c7",
+          "decision": {
+            "schema_version": 1,
+            "kind": "unverifiable",
+            "reason": "No completion policy configured"
+          },
+          "evidence_call_ids": []
+        }
+      }
+    },
+    {
+      "schema_version": 3,
+      "run_id": "run",
+      "sequence": 25,
+      "step_id": "run/step/3",
+      "attempt_id": null,
+      "occurred_at": "2026-10-22T14:09:53.221465Z",
+      "data": {
+        "schema_version": 1,
+        "kind": "run_ended",
+        "result": {
+          "schema_version": 1,
+          "run_id": "run",
+          "status": "completed",
+          "output": "done",
+          "error": null
+        },
+        "reason": "completion_checked"
+      }
+    }
+  ],
+  "profiles": [
+    {
+      "schema_version": 1,
+      "task_revision": 1,
+      "objective": "replan",
+      "action_family_sha256s": [
+        "ddfb5206e2f99dd34b81126ec7ac6a9a7e3d3ecb47d1d411b32d73355dc483ec"
+      ],
+      "value_key_sha256": "7563bf4b7f42f2f0d2be79c7a89dc245b95b5f0e0481d24c01cddff137dc6764",
+      "observations": 1,
+      "productive_turns": 0,
+      "neutral_turns": 1,
+      "regressed_turns": 0,
+      "mixed_turns": 0,
+      "proposed_calls": 1,
+      "succeeded_calls": 1,
+      "failed_calls": 0,
+      "skipped_calls": 0,
+      "obligation_gains": 0,
+      "coverage_gains": 0,
+      "independent_source_gains": 0
+    },
+    {
+      "schema_version": 1,
+      "task_revision": 1,
+      "objective": "initial",
+      "action_family_sha256s": [
+        "ddfb5206e2f99dd34b81126ec7ac6a9a7e3d3ecb47d1d411b32d73355dc483ec"
+      ],
+      "value_key_sha256": "c26550dc66010461621d6094b3a54cb73ae3ea01528f044a61717927d574514a",
+      "observations": 1,
+      "productive_turns": 0,
+      "neutral_turns": 1,
+      "regressed_turns": 0,
+      "mixed_turns": 0,
+      "proposed_calls": 1,
+      "succeeded_calls": 1,
+      "failed_calls": 0,
+      "skipped_calls": 0,
+      "obligation_gains": 0,
+      "coverage_gains": 0,
+      "independent_source_gains": 0
+    }
+  ]
+}

@@ -22,7 +22,7 @@ from .understanding import TaskFrame
 class NeedProgressEvaluator:
     """Compare accepted Need projections without pretending unknown sources are independent."""
 
-    version = "need-progress-assessment/1"
+    version = "need-progress-assessment/2"
 
     def assess(
         self,
@@ -352,12 +352,6 @@ def _continuation(
             recommended_action="verify",
             reason_codes=("observable_obligations_satisfied",),
         )
-    if unavailable and len(unavailable) == len(required_states):
-        return ContinuationSignal(
-            feasibility="blocked",
-            recommended_action="stop",
-            reason_codes=("mandatory_sources_unavailable",),
-        )
     if regressed:
         return ContinuationSignal(
             feasibility="constrained",
@@ -381,6 +375,14 @@ def _continuation(
             feasibility="viable",
             recommended_action="replan",
             reason_codes=("new_capability_available",),
+        )
+    # A failed call only describes that path. Even all declared capabilities failing
+    # does not prove that every parameter, source or future capability is exhausted.
+    if unavailable:
+        return ContinuationSignal(
+            feasibility="constrained",
+            recommended_action="replan",
+            reason_codes=("observed_paths_unavailable",),
         )
     return ContinuationSignal(
         feasibility="constrained",

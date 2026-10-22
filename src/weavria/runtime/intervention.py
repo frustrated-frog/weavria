@@ -3,11 +3,12 @@
 import asyncio
 import hashlib
 import math
-from typing import Protocol
+from typing import Literal, Protocol
 
 from pydantic import TypeAdapter
 
 from weavria.core import (
+    ActionGainEstimate,
     ActionValueContext,
     ActionValueEstimate,
     ActionValueProfile,
@@ -19,7 +20,7 @@ from weavria.core import (
     ToolBatch,
 )
 
-ACTION_VALUE_LEDGER_VERSION = "bayesian-action-value-ledger/1"
+ACTION_VALUE_LEDGER_VERSION = "bayesian-action-value-ledger/2"
 
 
 def action_value_state_sha256(profiles: tuple[ActionValueProfile, ...]) -> str:
@@ -48,6 +49,7 @@ def observe_action_value(
         current.task_revision != context.task_revision
         or current.objective != context.objective
         or current.action_family_sha256s != context.action_family_sha256s
+        or current.scope != context.scope
     ):
         raise ValueError("action-value profile key collided with another scope")
 
@@ -57,6 +59,8 @@ def observe_action_value(
     mixed = assessment.quality == "mixed"
     if current is None:
         updated = ActionValueProfile(
+            schema_version=context.schema_version,
+            scope=context.scope,
             task_revision=context.task_revision,
             objective=context.objective,
             action_family_sha256s=context.action_family_sha256s,
@@ -76,6 +80,8 @@ def observe_action_value(
         )
     else:
         updated = ActionValueProfile(
+            schema_version=current.schema_version,
+            scope=current.scope,
             task_revision=current.task_revision,
             objective=current.objective,
             action_family_sha256s=current.action_family_sha256s,
@@ -214,8 +220,8 @@ class ProgressActionInterventionPolicy:
 
     ``continue``, ``repair`` and ``replan`` describe how the model should choose its
     next proposal. For those objectives the policy groups prior settled turns by the
-    normalized tool-family multiset, estimates progress and regression marginals with
-    Beta posteriors, and rejects only after a bounded cold-start period. ``verify``
+    normalized tool-family multiset and accepted open obligations, then estimates
+    gain rates and regression risk after a cold-start period. ``verify``
     remains advisory; ``blocked / stop`` remains an immediate hard contradiction.
     """
 
@@ -229,12 +235,15 @@ class ProgressActionInterventionPolicy:
     ) -> None:
         if type(minimum_observations) is not int or minimum_observations < 1:
             raise ValueError("minimum action-value observations must be positive")
-        for value in (
-            minimum_expected_progress_per_call,
-            maximum_pessimistic_regression_probability,
+        if (
+            isinstance(minimum_expected_progress_per_call, bool)
+            or not math.isfinite(minimum_expected_progress_per_call)
+            or minimum_expected_progress_per_call < 0
         ):
-            if isinstance(value, bool) or not math.isfinite(value) or not 0 <= value <= 1:
-                raise ValueError("action-value probability thresholds must be within [0, 1]")
+            raise ValueError("action-value gain threshold must be finite and nonnegative")
+        value = maximum_pessimistic_regression_probability
+        if isinstance(value, bool) or not math.isfinite(value) or not 0 <= value <= 1:
+            raise ValueError("action-value regression probability must be within [0, 1]")
         if (
             isinstance(uncertainty_scale, bool)
             or not math.isfinite(uncertainty_scale)
@@ -249,7 +258,7 @@ class ProgressActionInterventionPolicy:
     @property
     def version(self) -> str:
         return (
-            "progress-action-intervention/2["
+            "progress-action-intervention/3["
             f"min_observations={self._minimum_observations};"
             f"min_expected_yield={self._minimum_yield:g};"
             f"max_pessimistic_regression={self._maximum_regression:g};"
@@ -295,12 +304,16 @@ class ProgressActionInterventionPolicy:
             None,
         )
         estimate = self._estimate(value_context, profile)
-        if estimate.observations < self._minimum_observations:
+        incomplete_scope = value_context.scope is not None and not value_context.scope.complete
+        if estimate.observations < self._minimum_observations or incomplete_scope:
             return InterventionDecision(
                 disposition="allow",
                 trigger="action_value_exploration",
                 reason_codes=_reason_codes(
-                    "action_value_cold_start", assessment.continuation.reason_codes
+                    "action_value_scope_incomplete"
+                    if incomplete_scope
+                    else "action_value_cold_start",
+                    assessment.continuation.reason_codes,
                 ),
                 value_estimate=estimate,
             )
@@ -313,7 +326,7 @@ class ProgressActionInterventionPolicy:
                 ),
                 value_estimate=estimate,
             )
-        if estimate.expected_progress_per_call < self._minimum_yield:
+        if all(item.upper < self._minimum_yield for item in estimate.gain_estimates):
             return InterventionDecision(
                 disposition="reconsider",
                 trigger="action_value_low_yield",
@@ -360,14 +373,38 @@ class ProgressActionInterventionPolicy:
             uncertainty_scale=self._uncertainty_scale,
         )
         candidate_calls = len(context.action_family_sha256s)
+        # These are three different units. Never add them: completing one field can
+        # also satisfy an obligation. Require low optimistic yield in EVERY dimension.
+        gains = (
+            _gain_rate(
+                "obligations",
+                profile.obligation_gains if profile else 0,
+                profile.proposed_calls if profile else 0,
+                self._uncertainty_scale,
+            ),
+            _gain_rate(
+                "coverage",
+                profile.coverage_gains if profile else 0,
+                profile.proposed_calls if profile else 0,
+                self._uncertainty_scale,
+            ),
+            _gain_rate(
+                "independent_sources",
+                profile.independent_source_gains if profile else 0,
+                profile.proposed_calls if profile else 0,
+                self._uncertainty_scale,
+            ),
+        )
         return ActionValueEstimate(
+            schema_version=2,
             value_key_sha256=context.value_key_sha256,
             observations=observations,
             candidate_calls=candidate_calls,
             progress_mean=progress_mean,
             progress_lower=progress_lower,
             progress_upper=progress_upper,
-            expected_progress_per_call=_rounded(progress_mean / candidate_calls),
+            expected_progress_per_call=max(item.mean for item in gains),
+            gain_estimates=gains,
             regression_mean=regression_mean,
             regression_lower=regression_lower,
             regression_upper=regression_upper,
@@ -375,6 +412,27 @@ class ProgressActionInterventionPolicy:
             minimum_expected_progress_per_call=self._minimum_yield,
             maximum_pessimistic_regression_probability=self._maximum_regression,
         )
+
+
+def _gain_rate(
+    dimension: Literal["obligations", "coverage", "independent_sources"],
+    gained: int,
+    calls: int,
+    uncertainty: float,
+) -> ActionGainEstimate:
+    # Gamma(shape=1, rate=1) prior; counts use proposed calls as exposure, so failed
+    # and skipped work remains costly. This estimates observed units, not task success.
+    shape, rate = 1.0 + gained, 1.0 + calls
+    mean = shape / rate
+    radius = uncertainty * math.sqrt(shape) / rate
+    return ActionGainEstimate(
+        dimension=dimension,
+        gained_units=gained,
+        exposure_calls=calls,
+        mean=_rounded(mean),
+        lower=_rounded(max(0.0, mean - radius)),
+        upper=_rounded(mean + radius),
+    )
 
 
 class HardStopActionInterventionPolicy:

@@ -98,7 +98,7 @@ AgentLoop 的请求、事件和报告为 v3。旧 TurnRequest v2 / LoopEvent v2 
 | --- | --- |
 | 反馈预算或工具次数不足 | 整批拒绝，保留必需观察；后续决策受模型次数和 Deadline 限制 |
 | 同一语义前沿精确重复动作，包括批内重复 | 整批派发前拒绝并返回 `repeated_action` 摘要 |
-| 同一工具版本动作族已有动作达到停滞阈值 | 后续整批拒绝并返回 `stagnant_action_family`；当前首次并行扇出不被 Progress 阈值截断，仍受 Tool Budget 和批次上限约束 |
+| 无有效自适应价值判定时，同一工具版本动作族已有动作达到停滞阈值 | 后续整批拒绝并返回 `stagnant_action_family`；当前首次并行扇出不被 Progress 阈值截断，仍受 Tool Budget 和批次上限约束 |
 | Task-aware 工具回合完成 | 刷新 Need Ledger，持久化完整 `ProgressAssessment`，向下一轮投影受限 `ProgressNotice`；`verify` 仍需 Completion Policy 验收 |
 | Progress 评估后 Task Revision 变化 | 丢弃旧评估与决议绑定，以 `revision/1 + replan/task_changed` 进入新任务 |
 | 旧结算反馈被重复评估 | Reducer 根据待消费 TurnSettled 序号拒绝，不允许覆盖更新的控制通知 |
@@ -146,6 +146,12 @@ Task-aware Loop 的进度准入进一步使用 Need 状态而不是原始 Artifa
 [ADR 0024](decisions/0024-规范化动作身份与观察后停滞门控.md)。
 工具回合结算后的义务变化、字段覆盖、独立来源、成本和继续可行性，以及它们如何绑定事件、控制摘要
 和回合决议，见 [ADR 0025](decisions/0025-结算后进度信号与可解释控制.md)。
+
+## 行动价值控制修正
+
+当前主动干预使用 `progress-action-intervention/3`：按实际义务、覆盖和独立来源收益分别估计单位调用收益率，只有所有维度的乐观上界都较低时才否决，回归风险独立判断。价值范围绑定已接受的开放义务集合；有效价值判定接管同族探索停止，精确重复和资源预算仍独立阻断。
+
+默认进度评估器将已观察路径不可用转成重新规划，允许尝试备用来源；不再由单个不可重试失败推出任务级停止。算法、协议版本、旧日志兼容、测试和局限见 [ADR 0028](decisions/0028-行动收益量纲与局部失败控制修正.md)。
 
 ## 当前局限和下一步
 

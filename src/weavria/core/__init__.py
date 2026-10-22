@@ -68,10 +68,12 @@ from .execution import (
 )
 from .feedback import maximum_exchange_bytes, minimum_exchange
 from .intervention import (
+    ActionGainEstimate,
     ActionValueContext,
     ActionValueEstimate,
     ActionValueObjective,
     ActionValueProfile,
+    ActionValueScope,
     InterventionDecision,
     TaskDirective,
     TaskUpdate,
@@ -130,11 +132,13 @@ __all__ = [
     "COMPLETION_GUIDANCE_JSON_BYTES",
     "CONTROL_FEEDBACK_BYTES",
     "ActionCostSignal",
+    "ActionGainEstimate",
     "ActionInterventionChecked",
     "ActionValueContext",
     "ActionValueEstimate",
     "ActionValueObjective",
     "ActionValueProfile",
+    "ActionValueScope",
     "AdmissionNotice",
     "AgentAction",
     "AgentRequest",

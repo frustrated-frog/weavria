@@ -14,6 +14,8 @@ from weavria.context import EvidenceMode, reserve_feedback
 from weavria.core import (
     ActionCostSignal,
     ActionInterventionChecked,
+    ActionValueContext,
+    ActionValueScope,
     AdmissionNotice,
     AgentResult,
     BatchAdmitted,
@@ -809,9 +811,7 @@ async def test_action_value_profile_prevents_a_low_yield_family_before_dispatch(
     provider = FakeControlProvider(
         (
             batch(call("initial", "zero")),
-            batch(call("replan-1", "one")),
-            batch(call("replan-2", "two")),
-            batch(call("replan-3", "three")),
+            *(batch(call(f"replan-{i}", f"variant-{i}")) for i in range(1, 9)),
             batch(call("prevented", "four")),
             finish("No productive action family remains"),
         )
@@ -819,7 +819,15 @@ async def test_action_value_profile_prevents_a_low_yield_family_before_dispatch(
     agent = make_loop(
         provider,
         progress_assessor=_NeutralReplanProgressAssessor(),
-        limits=RunLimits(max_stagnant_actions_per_family=10),
+        task_observation=TaskObservation(
+            observation_id="stable",
+            input_id="input",
+            task_revision=1,
+            frame_revision=1,
+            producer_version="test/1",
+            payload_schema="weavria.task-frame/5",
+            payload={"need_state_sha256": "a" * 64},
+        ),
     )
 
     result = await agent.execute()
@@ -827,11 +835,11 @@ async def test_action_value_profile_prevents_a_low_yield_family_before_dispatch(
     assert result.status is RunStatus.COMPLETED
     assert [
         event.data.call_id for event in agent.events if isinstance(event.data, ToolStarted)
-    ] == ["initial", "replan-1", "replan-2", "replan-3"]
+    ] == ["initial", *(f"replan-{i}" for i in range(1, 9))]
     profiles = agent.state.action_value_profiles
     replan_profile = next(item for item in profiles if item.objective == "replan")
-    assert replan_profile.observations == 3
-    assert replan_profile.neutral_turns == 3
+    assert replan_profile.observations == 8
+    assert replan_profile.neutral_turns == 8
     checked = next(
         event.data
         for event in agent.events
@@ -840,12 +848,12 @@ async def test_action_value_profile_prevents_a_low_yield_family_before_dispatch(
     )
     estimate = checked.decision.value_estimate
     assert estimate is not None
-    assert estimate.observations == 3
+    assert estimate.observations == 8
     assert estimate.expected_progress_per_call < 0.25
     notice = provider.requests[-1].control
     assert isinstance(notice, InterventionNotice)
     assert notice.trigger == "action_value_low_yield"
-    assert notice.action_value_observations == 3
+    assert notice.action_value_observations == 8
     assert notice.action_value_key_sha256 == estimate.value_key_sha256
 
     state = None
@@ -864,6 +872,70 @@ async def test_action_value_profile_prevents_a_low_yield_family_before_dispatch(
             break
         state = reduce_event(state, event)
     replay(agent)
+
+
+async def test_adaptive_exploration_still_rejects_exact_repeats() -> None:
+    provider = FakeControlProvider(
+        (
+            batch(call("initial", "first")),
+            batch(call("novel", "second")),
+            batch(call("repeated", "second")),
+            finish(),
+        )
+    )
+    agent = make_loop(
+        provider,
+        progress_assessor=_NeutralReplanProgressAssessor(),
+        task_observation=TaskObservation(
+            observation_id="stable",
+            input_id="input",
+            task_revision=1,
+            frame_revision=1,
+            producer_version="test/1",
+            payload_schema="weavria.task-frame/5",
+            payload={"need_state_sha256": "a" * 64},
+        ),
+    )
+    result = await agent.execute()
+    assert result.status is RunStatus.COMPLETED
+    assert [
+        event.data.call_id for event in agent.events if isinstance(event.data, ToolStarted)
+    ] == ["initial", "novel"]
+    rejected = [event.data for event in agent.events if isinstance(event.data, BatchRejected)]
+    assert rejected[0].notice.progress_reason == "repeated_action"
+    replay(agent)
+
+
+async def test_reducer_rejects_invented_action_value_scope() -> None:
+    agent = make_loop(
+        FakeControlProvider((batch(call("first")), finish())),
+        progress_assessor=_NeutralReplanProgressAssessor(),
+    )
+    await agent.execute()
+    state = None
+    for event in agent.events:
+        if isinstance(event.data, ActionInterventionChecked):
+            context = event.data.action_value_context
+            assert context is not None
+            forged_context = ActionValueContext.create(
+                task_revision=context.task_revision,
+                objective=context.objective,
+                proposal_sha256=context.proposal_sha256,
+                action_family_sha256s=context.action_family_sha256s,
+                scope=ActionValueScope(open_obligation_ids=("invented",), complete=True),
+            )
+            forged = event.model_copy(
+                update={
+                    "data": event.data.model_copy(
+                        update={"action_value_context": forged_context},
+                    )
+                }
+            )
+            with pytest.raises(EventAcceptanceError, match="accepted open obligations"):
+                reduce_event(state, forged)
+            return
+        state = reduce_event(state, event)
+    pytest.fail("run did not check an action intervention")
 
 
 async def test_rejected_ids_are_consumed_and_repeated_rejection_is_bounded() -> None:

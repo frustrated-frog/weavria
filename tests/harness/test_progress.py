@@ -1,5 +1,6 @@
 import hashlib
 
+import pytest
 from pydantic import BaseModel
 
 from weavria.artifacts import ArtifactSnapshot, InMemoryArtifactStore
@@ -232,7 +233,21 @@ async def test_progress_separates_coverage_obligation_and_independent_source_gai
     assert second_assessment.continuation.recommended_action == "verify"
 
 
-async def test_exhausted_budget_makes_unfinished_progress_explicitly_blocked() -> None:
+@pytest.mark.parametrize(
+    ("tool_budget", "expanded", "expected_action", "reason"),
+    (
+        (0, False, "stop", "continuation_budget_exhausted"),
+        (0, True, "stop", "continuation_budget_exhausted"),
+        (3, False, "replan", "observed_paths_unavailable"),
+        (3, True, "replan", "new_capability_available"),
+    ),
+)
+async def test_failed_path_is_local_but_exhausted_budget_blocks_continuation(
+    tool_budget: int,
+    expanded: bool,
+    expected_action: str,
+    reason: str,
+) -> None:
     registry = _registry()
     task, frame = await _task_frame(registry)
     store = InMemoryArtifactStore()
@@ -258,7 +273,7 @@ async def test_exhausted_budget_makes_unfinished_progress_explicitly_blocked() -
                 error=RunError(
                     category=ErrorCategory.TOOL_FAILURE,
                     message="source unavailable",
-                    retryable=True,
+                    retryable=False,
                 ),
             ),
         )
@@ -284,12 +299,14 @@ async def test_exhausted_budget_makes_unfinished_progress_explicitly_blocked() -
             calls=(CallFeedback(call_id="call-failed", status="failed"),),
         ),
         remaining_model_calls=2,
-        remaining_tool_calls=0,
-        capability_expanded=False,
+        remaining_tool_calls=tool_budget,
+        capability_expanded=expanded,
     )
 
     assert assessment.quality == "neutral"
     assert assessment.cost.failed_calls == 1
-    assert assessment.continuation.feasibility == "blocked"
-    assert assessment.continuation.recommended_action == "stop"
-    assert assessment.continuation.reason_codes == ("continuation_budget_exhausted",)
+    assert assessment.continuation.feasibility == (
+        "blocked" if tool_budget == 0 else "viable" if expanded else "constrained"
+    )
+    assert assessment.continuation.recommended_action == expected_action
+    assert assessment.continuation.reason_codes == (reason,)

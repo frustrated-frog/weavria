@@ -25,6 +25,7 @@ from weavria.context import (
 from weavria.core import (
     ActionInterventionChecked,
     ActionValueContext,
+    ActionValueScope,
     AdmissionNotice,
     AgentResult,
     ArtifactRef,
@@ -752,6 +753,7 @@ class _AgentKernel:
         proposal_sha256 = hashlib.sha256(batch.model_dump_json().encode()).hexdigest()
         action_identities = tuple(self._tool_ceiling.action_identity(call) for call in batch.calls)
         value_context = ActionValueContext.create(
+            scope=ActionValueScope.from_assessment(progress),
             task_revision=revision,
             objective=(
                 progress.continuation.recommended_action if progress is not None else "initial"
@@ -851,6 +853,18 @@ class _AgentKernel:
         )
         progress = None
         if reason is None:
+            intervention = self.state.intervention
+            estimate = intervention.decision.value_estimate if intervention is not None else None
+            # Only a persisted, allowed v2 value judgement owns exploratory stopping.
+            # Exact repeats, capability/feedback/tool budgets and Tool Policy still apply.
+            adaptive_exploration = (
+                intervention is not None
+                and intervention.decision.disposition == "allow"
+                and estimate is not None
+                and estimate.schema_version == 2
+                and action_value_context.scope is not None
+                and action_value_context.scope.complete
+            )
             progress = self._progress.inspect(
                 task=self.state.task,
                 observation=(
@@ -862,6 +876,7 @@ class _AgentKernel:
                 records=self.state.records,
                 batch=batch,
                 capability_epoch=self._capability_epoch,
+                adaptive_exploration=adaptive_exploration,
             )
             if progress.action_identities != checked_identities:
                 raise RuntimeError(

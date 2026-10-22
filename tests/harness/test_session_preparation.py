@@ -7,6 +7,7 @@ import pytest
 from pydantic import BaseModel, ConfigDict
 
 from weavria.core import (
+    ActionInterventionChecked,
     AdmissionNotice,
     ErrorCategory,
     FinishAction,
@@ -26,6 +27,7 @@ from weavria.core import (
     ToolCallAction,
     ToolExchange,
     ToolFailedObservation,
+    ToolStarted,
 )
 from weavria.harness import (
     CapabilityChoice,
@@ -542,6 +544,103 @@ async def test_execute_frame_exposes_only_selected_business_capability(
     assert first.task_observation is not None
     frame = TaskFrame.model_validate_json(json.dumps(first.task_observation.payload))
     assert frame.specification.capability_needs[0].name == "read_value"
+
+
+async def test_nonretryable_primary_failure_allows_untried_backup(tmp_path: Path) -> None:
+    effects: list[str] = []
+
+    async def primary(arguments: _Input, context: ToolContext) -> _Output:
+        effects.append("primary")
+        raise ToolFault(ErrorCategory.TOOL_FAILURE, "primary source unavailable", retryable=False)
+
+    async def backup(arguments: _Input, context: ToolContext) -> _Output:
+        effects.append("backup")
+        return _Output(value="verified backup value")
+
+    registry = ToolRegistry(
+        tuple(
+            TypedTool(
+                name=name,
+                version="1",
+                description="Read the requested external value",
+                input_type=_Input,
+                output_type=_Output,
+                execute=execute,
+            )
+            for name, execute in (("read_value", primary), ("read_backup", backup))
+        )
+    )
+    specification = _execute().model_copy(
+        update={
+            "capability_needs": (
+                CapabilityNeed(name="read_value", purpose="Obtain value", necessity="required"),
+                CapabilityNeed(name="read_backup", purpose="Obtain value", necessity="required"),
+            ),
+            # Both capability criteria bind the same compiled Need.
+            "completion_criteria": (
+                _criterion("capability_result", "read_value"),
+                _criterion("capability_result", "read_backup"),
+                _criterion(),
+            ),
+        }
+    )
+    preparer = TaskAwareSessionPreparer(
+        TaskUnderstandingEngine(
+            ModelTaskInterpreter(FakeModelProvider((_declaration(specification),)))
+        )
+    )
+    provider = FakeSessionProvider(
+        (
+            ModelTurn(
+                decision=ToolBatch(
+                    calls=(
+                        ToolCallAction(
+                            call_id="primary-call",
+                            tool_name="read_value",
+                            arguments={"value": "alpha"},
+                        ),
+                    )
+                )
+            ),
+            ModelTurn(
+                decision=ToolBatch(
+                    calls=(
+                        ToolCallAction(
+                            call_id="backup-call",
+                            tool_name="read_backup",
+                            arguments={"value": "alpha"},
+                        ),
+                    )
+                )
+            ),
+            ModelTurn(decision=FinishAction(output="verified backup value")),
+        )
+    )
+    async with SessionEngine(
+        tmp_path / "backup.db", model=provider, tools=registry, task_preparation=preparer
+    ) as engine:
+        await engine.create("s")
+        result = await engine.send("s", "Read alpha.", input_id="input-1")
+        events = await engine.store.events("s")
+    run_data = [
+        event.data.event.data for event in events if isinstance(event.data, SessionRunEvent)
+    ]
+    assessed = [item.assessment for item in run_data if isinstance(item, ProgressAssessed)]
+    assert assessed[0].continuation.recommended_action == "replan"
+    assert assessed[0].cost.failed_calls == 1
+    assert effects == ["primary", "backup"]
+    assert [item.call_id for item in run_data if isinstance(item, ToolStarted)] == [
+        "primary-call",
+        "backup-call",
+    ]
+    assert all(
+        item.decision.disposition == "allow"
+        for item in run_data
+        if isinstance(item, ActionInterventionChecked)
+    )
+    assert assessed[-1].continuation.recommended_action == "verify"
+    assert result.report.status is RunStatus.COMPLETED
+    assert result.report.task_outcome == "unverified"
 
 
 async def test_unverifiable_completion_blocks_work_even_when_execution_finishes(

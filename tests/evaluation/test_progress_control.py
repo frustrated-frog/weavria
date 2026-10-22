@@ -119,7 +119,7 @@ def test_progress_control_experiment_compares_exact_repeat_baseline() -> None:
 
     report = evaluate_progress_control(cases, _registry())
 
-    assert report.policy_version == "semantic-progress/5"
+    assert report.policy_version == "semantic-progress/6"
     assert report.baseline_version == "exact-action-only/2"
     assert report.total_attempts == 13
     assert report.selected_correct == 13

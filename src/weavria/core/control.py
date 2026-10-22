@@ -172,8 +172,16 @@ class ProgressNotice(ContractModel):
         )
 
 
-class InterventionNotice(ContractModel):
+class InterventionNotice(BaseModel):
     """Bounded explanation emitted only when the exact proposal must be replaced."""
+
+    model_config = ContractModel.model_config
+    schema_version: Literal[1, 2] = 1
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def validate_version_type(cls, value: object) -> object:
+        return ContractModel.validate_version_type(value)
 
     kind: Literal["action_reconsideration"] = "action_reconsideration"
     policy_version: NonBlankString
@@ -191,11 +199,15 @@ class InterventionNotice(ContractModel):
     reconsideration_ordinal: int = Field(ge=1)
     action_value_key_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
     action_value_observations: int | None = Field(default=None, ge=0)
-    expected_progress_per_call: float | None = Field(default=None, ge=0.0, le=1.0)
+    expected_progress_per_call: float | None = Field(default=None, ge=0.0)
     pessimistic_regression_probability: float | None = Field(default=None, ge=0.0, le=1.0)
 
     @model_validator(mode="after")
     def bound_notice(self) -> Self:
+        if self.schema_version == 1 and (
+            self.expected_progress_per_call is not None and self.expected_progress_per_call > 1
+        ):
+            raise ValueError("legacy notice requires a probability-per-call estimate")
         if len(self.reason_codes) != len(set(self.reason_codes)):
             raise ValueError("intervention reason codes must be unique")
         value_trigger = self.trigger.startswith("action_value_")
