@@ -7,11 +7,11 @@ import json
 import os
 import tempfile
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field
@@ -60,7 +60,9 @@ class Dataset(BaseModel):
 class Transport:
     """Evaluation-only transport; retain counts, never credentials or raw responses."""
 
-    def __init__(self, base: str, key: str, timeout: float) -> None:
+    def __init__(
+        self, base: str, key: str, timeout: float, *, options: dict[str, object] | None = None
+    ) -> None:
         self.url = base.rstrip("/")
         if not self.url.endswith("/chat/completions"):
             self.url += "/chat/completions"
@@ -69,12 +71,40 @@ class Transport:
             timeout=timeout,
         )
         self.calls = 0
+        self.options = options or {}
+        self.observations: list[dict[str, object]] = []
 
     async def complete(self, body: dict[str, Any]) -> object:
         self.calls += 1
-        response = await self.client.post(self.url, json=body)
+        response = await self.client.post(self.url, json=body | self.options)
+        observation: dict[str, object] = {"status": response.status_code}
+        self.observations.append(observation)
         response.raise_for_status()
-        return response.json()
+        payload: object = response.json()
+        # Explicit allowlist: never retain response text, reasoning, headers or credentials.
+        if isinstance(payload, dict):
+            parsed = cast(dict[str, Any], payload)
+            if isinstance(parsed.get("model"), str):
+                observation["model"] = parsed["model"]
+            raw_usage = parsed.get("usage")
+            if isinstance(raw_usage, dict):
+                usage = cast(dict[str, Any], raw_usage)
+                observation["usage"] = {
+                    key: usage[key]
+                    for key in ("prompt_tokens", "completion_tokens", "total_tokens")
+                    if type(usage.get(key)) is int and usage[key] >= 0
+                }
+            raw_choices = parsed.get("choices")
+            if isinstance(raw_choices, list) and raw_choices:
+                choices = cast(list[Any], raw_choices)
+                reason: object = (
+                    cast(dict[str, Any], choices[0]).get("finish_reason")
+                    if isinstance(choices[0], dict)
+                    else None
+                )
+                if reason in ("stop", "length", "content_filter", "tool_calls"):
+                    observation["finish_reason"] = reason
+        return cast(object, payload)
 
 
 class SharedExtraction:
@@ -158,7 +188,23 @@ def metrics(check: Check, values: list[object], qualified: int) -> dict[str, obj
     }
 
 
-async def evaluate(repeats: int, *, dataset_path: Path) -> dict[str, object]:
+def failure_kind(exc: BaseException) -> str:
+    """Report diagnostic classes, never exception text containing provider data or secrets."""
+    names: list[str] = []
+    cause: BaseException | None = exc
+    while cause is not None and len(names) < 5:
+        names.append(type(cause).__name__)
+        cause = cause.__cause__
+    return " <- ".join(names)
+
+
+async def evaluate(
+    repeats: int,
+    *,
+    dataset_path: Path,
+    on_trial: Callable[[dict[str, object]], None] | None = None,
+) -> dict[str, object]:
+    started_at = datetime.now(UTC).isoformat()
     base = os.environ.get("WEAVRIA_MODEL_BASE_URL")
     model = os.environ.get("WEAVRIA_MODEL_NAME")
     if not base or not model:
@@ -168,11 +214,28 @@ async def evaluate(repeats: int, *, dataset_path: Path) -> dict[str, object]:
     raw = await asyncio.to_thread(dataset_path.read_bytes)
     dataset = Dataset.model_validate_json(raw)
     timeout = float(os.environ.get("WEAVRIA_MODEL_TIMEOUT_SECONDS", "60"))
-    config = OpenAICompatibleConfig(model=model, temperature=0.0, max_output_tokens=4096)
-    configuration = hashlib.sha256(json.dumps(asdict(config), sort_keys=True).encode()).hexdigest()[
-        :16
-    ]
-    transport = Transport(base, os.environ.get("WEAVRIA_MODEL_API_KEY", ""), timeout)
+    thinking = os.environ.get("WEAVRIA_MODEL_THINKING")
+    effort = os.environ.get("WEAVRIA_MODEL_REASONING_EFFORT")
+    if thinking not in (None, "enabled", "disabled") or effort not in (None, "low", "high", "max"):
+        raise ValueError("invalid explicit thinking or reasoning effort configuration")
+    if effort is not None and thinking != "enabled":
+        raise ValueError("reasoning effort requires explicitly enabled thinking")
+    options: dict[str, object] = {}
+    if thinking is not None:
+        options["thinking"] = {"type": thinking}
+    if effort is not None:
+        options["reasoning_effort"] = effort
+    config = OpenAICompatibleConfig(
+        model=model,
+        temperature=0.0,
+        max_output_tokens=int(os.environ.get("WEAVRIA_MODEL_MAX_OUTPUT_TOKENS", "4096")),
+    )
+    configuration = hashlib.sha256(
+        json.dumps({"provider": asdict(config), "transport": options}, sort_keys=True).encode()
+    ).hexdigest()[:16]
+    transport = Transport(
+        base, os.environ.get("WEAVRIA_MODEL_API_KEY", ""), timeout, options=options
+    )
     provider = OpenAICompatibleProvider(config, transport=transport)
     extractor = ModelMemoryExtractor(provider, configuration_id=configuration)
     reviewer = ModelMemoryReviewer(provider, configuration_id=configuration)
@@ -188,6 +251,7 @@ async def evaluate(repeats: int, *, dataset_path: Path) -> dict[str, object]:
                     baseline: dict[str, tuple[MemoryCandidate, datetime]] = {}
                     errors: list[str] = []
                     decisions: list[dict[str, object]] = []
+                    wire_start = len(transport.observations)
                     extraction_calls = review_calls = 0
                     extraction_seconds = review_seconds = 0.0
                     async with SQLiteMemoryStore(
@@ -203,7 +267,7 @@ async def evaluate(repeats: int, *, dataset_path: Path) -> dict[str, object]:
                                     await extractor.extract(source, max_duration=timeout),
                                 )
                             except Exception as exc:
-                                errors.append(f"input {position}: extraction {type(exc).__name__}")
+                                errors.append(f"input {position}: extraction {failure_kind(exc)}")
                                 break
                             finally:
                                 extraction_calls += transport.calls - before
@@ -248,7 +312,7 @@ async def evaluate(repeats: int, *, dataset_path: Path) -> dict[str, object]:
                                 )
                             except Exception as exc:
                                 errors.append(
-                                    f"input {position}: review/commit {type(exc).__name__}"
+                                    f"input {position}: review/commit {failure_kind(exc)}"
                                 )
                                 break
                             finally:
@@ -308,21 +372,66 @@ async def evaluate(repeats: int, *, dataset_path: Path) -> dict[str, object]:
                                 "extraction_seconds_shared": extraction_seconds,
                                 "review_seconds_extra": review_seconds,
                                 "checks": checks,
+                                "transport_observations": transport.observations[wire_start:],
                             }
                         )
+                        if on_trial is not None:
+                            on_trial(rows[-1])
     finally:
         await transport.client.aclose()
     return {
-        "schema_version": 1,
+        "schema_version": 2,
+        "started_at": started_at,
+        "finished_at": datetime.now(UTC).isoformat(),
         "dataset_version": dataset.dataset_version,
         "dataset_sha256": hashlib.sha256(raw).hexdigest(),
         "model": model,
         "configuration": asdict(config),
+        "transport_options": options,
+        "timeout_seconds": timeout,
         "repeats": repeats,
         "extractor": extractor.version,
         "reviewer": reviewer.version,
         "scope": "12 narrow language-policy cases; not general task-benefit evidence",
         "rows": rows,
+        "summary": summarize(rows),
+    }
+
+
+def summarize(rows: list[dict[str, object]]) -> dict[str, object]:
+    """Separate execution coverage from conditional semantic scores; incomplete is not success."""
+    complete = [row for row in rows if row["complete_trial"]]
+    checks = [check for row in complete for check in cast(list[dict[str, Any]], row["checks"])]
+    arms = {
+        arm: {
+            "passed_checks": sum(bool(check[arm]["passed"]) for check in checks),
+            "total_checks": len(checks),
+            "passed_trials": sum(
+                all(check[arm]["passed"] for check in cast(list[dict[str, Any]], row["checks"]))
+                for row in complete
+            ),
+            "total_trials": len(complete),
+        }
+        for arm in ("latest_value", "reviewed")
+    }
+    observations = [
+        observation
+        for row in rows
+        for observation in cast(list[dict[str, Any]], row.get("transport_observations", []))
+    ]
+    totals = {
+        key: sum(observation.get("usage", {}).get(key, 0) for observation in observations)
+        for key in ("prompt_tokens", "completion_tokens", "total_tokens")
+    }
+    return {
+        "completed_trials": len(complete),
+        "scheduled_trials": len(rows),
+        "arms": arms,
+        "extraction_calls_shared": sum(cast(int, row["extraction_calls_shared"]) for row in rows),
+        "review_calls_extra": sum(cast(int, row["review_calls_extra"]) for row in rows),
+        "reported_usage": totals,
+        "responses_with_usage": sum(bool(o.get("usage")) for o in observations),
+        "response_models": sorted({o["model"] for o in observations if "model" in o}),
     }
 
 
@@ -336,7 +445,15 @@ def main() -> None:
     if not 1 <= args.repeats <= 20:
         parser.error("repeats must be between 1 and 20")
     dataset = Path(__file__).parent / "data" / "memory_formation" / "cases.json"
-    result = asyncio.run(evaluate(args.repeats, dataset_path=dataset))
+
+    def progress(row: dict[str, object]) -> None:
+        print(
+            f"repeat={row['repeat']} case={row['case']} complete={row['complete_trial']} "
+            f"errors={row['errors']}",
+            flush=True,
+        )
+
+    result = asyncio.run(evaluate(args.repeats, dataset_path=dataset, on_trial=progress))
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n")
     print(f"评测结果已写入 {args.output}")

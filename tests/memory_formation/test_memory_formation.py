@@ -2,6 +2,7 @@
 
 import asyncio
 import hashlib
+import json
 import sqlite3
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
@@ -546,6 +547,27 @@ async def test_model_adapters_validate_structured_response_and_keep_text_untrust
     invalid = FakeModelProvider((ModelResponse(action=FinishAction(output="done")),))
     with pytest.raises(MemoryFormationError):
         await ModelMemoryExtractor(invalid, configuration_id="fake").extract(source, max_duration=1)
+
+
+def test_model_visible_time_contract_excludes_invalid_current_timestamps() -> None:
+    source = request()
+    candidate = proposal(source).candidates[0]
+    assert candidate.time_kind == "current"
+    wire = candidate.model_dump_json()
+    assert MemoryCandidate.model_validate_json(wire).model_dump_json() == wire
+    invalid = candidate.model_dump(mode="json") | {"valid_from": "2026-01-01T00:00:00Z"}
+    with pytest.raises(ValidationError, match="only dated proposals"):
+        MemoryCandidate.model_validate_json(json.dumps(invalid))
+    # Consumers see a conditional constraint, not merely nullable independent fields.
+    schema = MemoryCandidate.model_json_schema()
+    time_rule = schema["allOf"][0]
+    assert time_rule["if"]["properties"]["time_kind"] == {"const": "dated"}
+    assert time_rule["then"]["required"] == ["valid_from"]
+    assert time_rule["then"]["properties"]["valid_from"]["type"] == "string"
+    assert time_rule["else"]["properties"] == {
+        "valid_from": {"type": "null"},
+        "valid_to": {"type": "null"},
+    }
 
 
 async def test_completion_record_failure_rolls_back_fact_and_cursor(tmp_path: Path) -> None:

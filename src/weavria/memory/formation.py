@@ -6,7 +6,7 @@ from datetime import datetime
 from typing import Literal, Self
 from zoneinfo import ZoneInfo
 
-from pydantic import Field, model_validator
+from pydantic import ConfigDict, Field, model_validator
 
 from .contracts import (
     Identifier,
@@ -75,14 +75,50 @@ class MemoryCitation(MemoryModel):
 class MemoryCandidate(MemoryModel):
     """Untrusted semantic interpretation; no authority, scope ID or mutation privilege."""
 
+    # Mirror the existing cross-field validator in the model-visible schema. Persisted
+    # v1 bytes do not change; this only closes a misleading generation contract.
+    model_config = ConfigDict(
+        json_schema_extra={
+            "allOf": [
+                {
+                    "if": {"properties": {"time_kind": {"const": "dated"}}},
+                    "then": {
+                        "required": ["valid_from"],
+                        "properties": {"valid_from": {"type": "string", "format": "date-time"}},
+                    },
+                    "else": {
+                        "properties": {
+                            "valid_from": {"type": "null"},
+                            "valid_to": {"type": "null"},
+                        }
+                    },
+                }
+            ]
+        }
+    )
+
     subject: Identifier
     predicate: Identifier
-    value: str = Field(min_length=1, max_length=2048)
-    qualifiers: dict[str, str] = Field(default_factory=dict, max_length=16)
+    value: str = Field(
+        min_length=1,
+        max_length=2048,
+        description=(
+            "One concise semantic value in the source language, not a narrative or rationale."
+        ),
+    )
+    qualifiers: dict[str, str] = Field(
+        default_factory=dict,
+        max_length=16,
+        description="Conditions narrowing applicability; not provenance, undecided alternatives, "
+        "repetition of the bound scope, or an explanation of the claim.",
+    )
     text: str = Field(min_length=1, max_length=4096)
     scope_kind: Literal["tenant", "user", "project", "session", "agent", "uncertain"]
     retention: Literal["durable", "transient", "uncertain"]
-    time_kind: Literal["unknown", "current", "dated"]
+    time_kind: Literal["unknown", "current", "dated"] = Field(
+        description="unknown/current require null or omitted valid_from AND valid_to. "
+        "The host resolves current to occurred_at. dated requires an explicit UTC valid_from.",
+    )
     valid_from: datetime | None = None
     valid_to: datetime | None = None
     citations: tuple[MemoryCitation, ...] = Field(min_length=1, max_length=8)

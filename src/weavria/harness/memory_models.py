@@ -56,7 +56,7 @@ class ModelMemoryExtractor:
 
     def __init__(self, provider: ModelProvider, *, configuration_id: str) -> None:
         self.provider = provider
-        self.version = f"model-memory-extractor/1:{configuration_id}"
+        self.version = f"model-memory-extractor/2:{configuration_id}"
 
     async def extract(
         self,
@@ -73,15 +73,27 @@ class ModelMemoryExtractor:
             "every candidate must cite the focal source plus any needed earlier source. "
             "Return zero candidates for casual talk, questions, one-off instructions, hypothetical "
             "examples or uncertain implications. Split independent claims. Do not invent details. "
-            "Use author_subject for self-reference and consistent concise subject/predicate keys. "
+            "Use author_subject only for a statement about the author, not for a statement "
+            "about their project. For the bound project use input.scope.key as subject. "
+            "Use consistent concise subject/predicate keys across the evidence window. "
+            "value is one concise value in the original language, without commentary, "
+            "alternatives, uncertainty or a sentence summarizing the change. Keep those in text. "
+            "A reaffirmation repeats the original claim; an undecided alternative does not "
+            "create a new condition or a second durable fact. "
             "Preserve ALL conditions (project, audience, document, exception) as qualifiers; "
-            "never promote task-local information to a global user preference. scope_kind must "
+            "Do not put validity dates, provenance, change status or restatements of the "
+            "bound scope in qualifiers. Reuse the same words for the same conditions; don't "
+            "translate condition values between inputs. "
+            "Never promote task-local information to a global user preference. scope_kind must "
             "describe the scope supported by the statement; use uncertain when unclear. "
             "Each citation is a literal contiguous quote from a supplied document. start is a "
             "Unicode code-point offset; omit it for a unique quote. time_kind=unknown when the "
             "start is unspecified, current only when explicitly effective now, dated for an "
             "explicit date resolved using occurred_at and timezone. Do not infer a current "
-            "start just from publication time. Use half-open intervals. Do not infer expiry. "
+            "start just from publication time. For current and unknown, omit valid_from and "
+            "valid_to or set BOTH to null; the host resolves current. For dated, valid_from "
+            "must be a UTC timestamp and valid_to is null unless an end is explicit. "
+            "Use half-open intervals. Do not infer expiry. "
             "Claims about changes and corrections must retain their wording in text and quotes.",
             {"input": request.model_dump(mode="json")},
             max_duration,

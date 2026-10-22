@@ -105,23 +105,89 @@ async def test_live_runner_shares_extraction_and_never_sends_expected_answers(
     clients: list[httpx.AsyncClient] = []
 
     class LocalTransport(experiment.Transport):
-        def __init__(self, base: str, key: str, timeout: float) -> None:
+        def __init__(
+            self, base: str, key: str, timeout: float, *, options: dict[str, object] | None = None
+        ) -> None:
             self.url = "https://fixture.invalid/chat/completions"
             self.client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
             self.calls = 0
+            self.options = options or {}
+            self.observations: list[dict[str, object]] = []
             clients.append(self.client)
 
     monkeypatch.setattr(experiment, "Transport", LocalTransport)
     monkeypatch.setenv("WEAVRIA_MODEL_BASE_URL", "https://fixture.invalid")
     monkeypatch.setenv("WEAVRIA_MODEL_NAME", "fixture-model")
     monkeypatch.setenv("WEAVRIA_MODEL_API_KEY", "never-report-this")
+    monkeypatch.setenv("WEAVRIA_MODEL_THINKING", "enabled")
+    monkeypatch.setenv("WEAVRIA_MODEL_REASONING_EFFORT", "high")
     result = await experiment.evaluate(1, dataset_path=path)
     encoded = json.dumps(result)
     assert "never-report-this" not in encoded
     assert len(calls) == 2 and all(client.is_closed for client in clients)
+    assert all(call["thinking"] == {"type": "enabled"} for call in calls)
+    assert result["transport_options"] == {
+        "thinking": {"type": "enabled"},
+        "reasoning_effort": "high",
+    }
     assert result["dataset_sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
     rows = cast(list[dict[str, Any]], result["rows"])
     assert rows[0]["complete_trial"] is True
     assert rows[0]["extraction_calls_shared"] == rows[0]["review_calls_extra"] == 1
     assert rows[0]["checks"][0]["latest_value"]["passed"] is True
     assert rows[0]["checks"][0]["reviewed"]["passed"] is True
+    failed = dict(rows[0], complete_trial=False)
+    summary = experiment.summarize([rows[0], failed])
+    assert summary["completed_trials"] == 1 and summary["scheduled_trials"] == 2
+    assert summary["arms"] == {
+        arm: {"passed_checks": 1, "total_checks": 1, "passed_trials": 1, "total_trials": 1}
+        for arm in ("latest_value", "reviewed")
+    }
+
+
+async def test_transport_records_only_usage_and_failure_metadata() -> None:
+    def respond(request: httpx.Request) -> httpx.Response:
+        assert request.headers["Authorization"] == "Bearer fixture-secret"
+        return httpx.Response(
+            200,
+            json={
+                "model": "resolved-model-version",
+                "usage": {
+                    "prompt_tokens": 12,
+                    "completion_tokens": 8,
+                    "total_tokens": 20,
+                    "private_field": "must-not-retain",
+                },
+                "choices": [
+                    {
+                        "finish_reason": "length",
+                        "message": {
+                            "content": "raw-response",
+                            "reasoning_content": "hidden-reasoning",
+                        },
+                    }
+                ],
+            },
+        )
+
+    transport = experiment.Transport("https://fixture.invalid", "fixture-secret", 10)
+    await transport.client.aclose()
+    transport.client = httpx.AsyncClient(
+        headers={"Authorization": "Bearer fixture-secret"}, transport=httpx.MockTransport(respond)
+    )
+    try:
+        await transport.complete({})
+    finally:
+        await transport.client.aclose()
+    assert transport.observations == [
+        {
+            "status": 200,
+            "model": "resolved-model-version",
+            "finish_reason": "length",
+            "usage": {"prompt_tokens": 12, "completion_tokens": 8, "total_tokens": 20},
+        }
+    ]
+    cause = ValueError("secret-in-exception")
+    outer = RuntimeError("raw-provider-body")
+    outer.__cause__ = cause
+    assert experiment.failure_kind(outer) == "RuntimeError <- ValueError"
