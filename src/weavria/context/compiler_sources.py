@@ -22,9 +22,11 @@ from weavria.core import (
 )
 
 from .allocation import ContextUnit, Representation
+from .budget import ContextCapacityError
 from .conversation import project_turn
 from .demand import ContextDemand
 from .evidence import Passage, index_passages, terms
+from .indexing import bounded_passages
 from .selection import ContextBuildError
 
 
@@ -42,13 +44,76 @@ class IndexedSource:
 class SourceIndex:
     """Bounded per-owner cache of immutable original passages, never selected views."""
 
-    def __init__(self, store: ArtifactStore, *, capacity: int) -> None:
+    def __init__(
+        self,
+        store: ArtifactStore,
+        *,
+        capacity: int,
+        max_passages: int = 65536,
+        max_bytes: int = 67108864,
+    ) -> None:
         self.store, self.capacity = store, capacity
+        self.max_passages, self.max_bytes = max_passages, max_bytes
+        self._history: OrderedDict[str, tuple[Passage, ...]] = OrderedDict()
+        self._cache_sizes: dict[tuple[str, str] | str, int] = {}
+        self._active_passages = self._active_bytes = 0
+        self._init_cache()
+
+    async def history_passages(
+        self, turns: tuple[ConversationTurn, ...]
+    ) -> tuple[tuple[Passage, ...], ...]:
+        result: list[tuple[Passage, ...]] = []
+        for turn in turns:
+            key = digest(turn.model_dump_json())
+            if key not in self._history:
+                self._history[key] = await bounded_passages(
+                    {
+                        "user": turn.user,
+                        "assistant": turn.assistant,
+                        "updates": [u.directive.text for u in turn.updates],
+                    },
+                    max_passages=self.max_passages,
+                    max_bytes=self.max_bytes,
+                )
+            entry = self._history[key]
+            self._cache_sizes[key] = self._passage_bytes(entry)
+            self._history.move_to_end(key)
+            self._trim_cache()
+            self._reserve_index(entry)
+            result.append(entry)
+            await asyncio.sleep(0)
+        return tuple(result)
+
+    @staticmethod
+    def _passage_bytes(passages: tuple[Passage, ...]) -> int:
+        return sum(len(p.pointer.encode()) + len(p.value_json.encode()) for p in passages)
+
+    def _reserve_index(self, passages: tuple[Passage, ...]) -> None:
+        self._active_passages += len(passages)
+        self._active_bytes += self._passage_bytes(passages)
+        if self._active_passages > self.max_passages:
+            raise ContextCapacityError("index_passages", self._active_passages, self.max_passages)
+        if self._active_bytes > self.max_bytes:
+            raise ContextCapacityError("index_bytes", self._active_bytes, self.max_bytes)
+
+    def _trim_cache(self) -> None:
+        while (
+            len(self._cache_sizes) > self.capacity
+            or sum(self._cache_sizes.values()) > self.max_bytes
+        ):
+            if self._cache:
+                key, _ = self._cache.popitem(last=False)
+            else:
+                key, _ = self._history.popitem(last=False)
+            self._cache_sizes.pop(key, None)
+
+    def _init_cache(self) -> None:
         self._cache: OrderedDict[tuple[str, str], tuple[ArtifactSnapshot, tuple[Passage, ...]]] = (
             OrderedDict()
         )
 
     async def load(self, run_id: str, records: tuple[ToolRecord, ...]) -> tuple[IndexedSource, ...]:
+        self._active_passages = self._active_bytes = 0
         known: set[str] = set()
         result: list[IndexedSource] = []
         for record in records:
@@ -68,13 +133,19 @@ class SourceIndex:
                 snapshot = await self.store.get(*key)
                 if snapshot.reference != reference:
                     raise ContextBuildError("artifact identity disagrees with accepted execution")
-                self._cache[key] = snapshot, index_passages(snapshot.value)
-                if len(self._cache) > self.capacity:
-                    self._cache.popitem(last=False)
+                self._cache[key] = (
+                    snapshot,
+                    await bounded_passages(
+                        snapshot.value, max_passages=self.max_passages, max_bytes=self.max_bytes
+                    ),
+                )
             snapshot, passages = self._cache[key]
             self._cache.move_to_end(key)
             if snapshot.reference != reference:
                 raise ContextBuildError("cached artifact identity disagrees with execution")
+            self._cache_sizes[key] = snapshot.reference.size_bytes + self._passage_bytes(passages)
+            self._trim_cache()
+            self._reserve_index(passages)
             if record.context_paths:
                 passages = tuple(
                     passage
@@ -99,6 +170,7 @@ class CoverageScorer:
 
     def __init__(self, demands: tuple[ContextDemand, ...], passages: tuple[Passage, ...]) -> None:
         self.demands = demands
+        self._features: dict[Passage, tuple[tuple[str, float], ...]] = {}
         frequencies: Counter[str] = Counter()
         for passage in passages:
             frequencies.update(set(passage.tokens))
@@ -118,6 +190,28 @@ class CoverageScorer:
                 )
             )
 
+        self._term_features: dict[str, list[tuple[str, float]]] = {}
+        for identity, weight, query in self._queries:
+            for term, idf in query:
+                self._term_features.setdefault(term, []).append(
+                    (f"d:{identity}:t:{term}", weight * idf)
+                )
+
+    @classmethod
+    async def create(
+        cls, demands: tuple[ContextDemand, ...], passages: tuple[Passage, ...], *, max_work: int
+    ) -> "CoverageScorer":
+        # Conservative cap also covers per-source evidence anchor matching.
+        work = len(passages) * sum(len(set(terms(d.query))) + len(d.anchors) for d in demands)
+        if work > max_work:
+            raise ContextCapacityError("scoring_work", work, max_work)
+        scorer = cls(demands, passages)
+        for i, passage in enumerate(passages):
+            scorer.features((passage,))
+            if i % 64 == 0:
+                await asyncio.sleep(0)
+        return scorer
+
     def features(
         self,
         passages: tuple[Passage, ...],
@@ -126,18 +220,21 @@ class CoverageScorer:
     ) -> tuple[tuple[str, float], ...]:
         result: dict[str, float] = {}
         for passage in passages:
-            tokens = set(passage.tokens)
-            relevance = 0.0
-            for identity, weight, query in self._queries:
-                for term, idf in query:
-                    if term in tokens:
-                        value = weight * idf
-                        result[f"d:{identity}:t:{term}"] = value
+            cached = self._features.get(passage)
+            if cached is None:
+                tokens = set(passage.tokens)
+                features: dict[str, float] = {}
+                relevance = 0.0
+                for term in sorted(tokens):
+                    for key, value in self._term_features.get(term, ()):
+                        features[key] = value
                         relevance += value
-            if relevance:
-                # Small novelty bonus distinguishes relevant complementary passages;
-                # exact duplicates receive the same feature, regardless of call ID.
-                result[f"p:{digest(passage.value_json)}"] = 0.05 * relevance
+                if relevance:
+                    features[f"p:{digest(passage.value_json)}"] = 0.05 * relevance
+                cached = tuple(sorted(features.items()))
+                self._features[passage] = cached
+            for key, value in cached:
+                result[key] = max(result.get(key, 0.0), value)
         if source is not None and source.snapshot is not None:
             reference = source.snapshot.reference
             for demand in self.demands:
@@ -161,19 +258,24 @@ class CoverageScorer:
                         result[f"d:{demand.demand_id}:a:{key}"] = demand.weight
         return tuple(sorted(result.items()))
 
-    def rank(self, source: IndexedSource, limit: int) -> tuple[Passage, ...]:
-        candidates = tuple(self.features((p,), source=source) for p in source.passages)
+    async def rank(self, source: IndexedSource, limit: int) -> tuple[Passage, ...]:
+        candidates: list[tuple[tuple[str, float], ...]] = []
+        for i, passage in enumerate(source.passages):
+            candidates.append(self.features((passage,), source=source))
+            if i % 64 == 0:
+                await asyncio.sleep(0)
         covered: dict[str, float] = {}
         remaining = set(range(len(candidates)))
         selected: list[Passage] = []
         for _ in range(min(limit, len(remaining))):
-            index = max(
-                sorted(remaining),
-                key=lambda i: (
-                    sum(max(0.0, v - covered.get(k, 0.0)) for k, v in candidates[i]),
-                    -i,
-                ),
-            )
+            best: tuple[float, int] | None = None
+            index = 0
+            for i in sorted(remaining):
+                score = (sum(max(0.0, v - covered.get(k, 0.0)) for k, v in candidates[i]), -i)
+                if best is None or score > best:
+                    best, index = score, i
+                if i % 128 == 0:
+                    await asyncio.sleep(0)
             remaining.remove(index)
             selected.append(source.passages[index])
             for key, value in candidates[index]:
@@ -181,7 +283,7 @@ class CoverageScorer:
         return tuple(selected)
 
 
-def source_units(
+async def source_units(
     sources: tuple[IndexedSource, ...],
     scorer: CoverageScorer,
     *,
@@ -196,6 +298,7 @@ def source_units(
         raise ContextBuildError("feedback references unaccepted calls")
     result: list[ContextUnit] = []
     for source in sources:
+        await asyncio.sleep(0)
         record = source.record
         call_id = record.exchange.action.call_id
         variants = [Representation("reference", minimum_exchange(record).model_dump_json(), ())]
@@ -207,7 +310,7 @@ def source_units(
                 "size_bytes": reference.size_bytes,
             }
 
-            ranked = scorer.rank(source, max_passages)
+            ranked = await scorer.rank(source, max_passages)
             for size in sorted({1, min(2, len(ranked)), min(4, len(ranked)), len(ranked)} - {0}):
                 chosen = ranked[:size]
                 variants.append(
@@ -245,6 +348,13 @@ def source_units(
                     ),
                 )
             )
+        if call_id in mandatory:
+            variants = [variants[0]] + [
+                Representation(
+                    v.kind, v.payload_json, (*v.features, (f"availability:{call_id}", 0.25))
+                )
+                for v in variants[1:]
+            ]
         result.append(
             ContextUnit(
                 f"call:{call_id}",
@@ -279,26 +389,34 @@ def _exchange_view(exchange: ToolExchange, output: dict[str, JsonValue]) -> str:
     ).model_dump_json()
 
 
-def conversation_units(
-    turns: tuple[ConversationTurn, ...], scorer: CoverageScorer
+async def conversation_units(
+    turns: tuple[ConversationTurn, ...],
+    scorer: CoverageScorer,
+    indexed: tuple[tuple[Passage, ...], ...],
 ) -> tuple[ContextUnit, ...]:
-    return tuple(
-        _conversation_unit(turn, scorer, required=i >= len(turns) - 2)
-        for i, turn in enumerate(turns)
-    )
+    result: list[ContextUnit] = []
+    for i, turn in enumerate(turns):
+        result.append(_conversation_unit(turn, scorer, indexed[i], required=i >= len(turns) - 2))
+        await asyncio.sleep(0)
+    return tuple(result)
 
 
 def _conversation_unit(
     turn: ConversationTurn,
     scorer: CoverageScorer,
+    indexed: tuple[Passage, ...],
     *,
     required: bool,
 ) -> ContextUnit:
     minimum = project_turn(turn, full=False)
     full = project_turn(turn, full=True)
 
-    def excerpt(text: str, radius: int) -> LocatedTextExcerpt:
-        parts = index_passages(text)
+    fields: dict[str, list[Passage]] = {}
+    for passage in indexed:
+        fields.setdefault(passage.pointer, []).append(passage)
+
+    def excerpt(text: str, radius: int, pointer: str) -> LocatedTextExcerpt:
+        parts = fields.get(pointer, [])
         if not parts or radius == 0:
             start = end = 0
         else:
@@ -320,8 +438,10 @@ def _conversation_unit(
         return ConversationItem(
             run_id=turn.run_id,
             ordinal=turn.ordinal,
-            user=excerpt(turn.user, radius),
-            assistant=excerpt(turn.assistant, radius) if turn.assistant is not None else None,
+            user=excerpt(turn.user, radius, "/user"),
+            assistant=excerpt(turn.assistant, radius, "/assistant")
+            if turn.assistant is not None
+            else None,
             status=turn.status,
             task_outcome=turn.task_outcome,
             calls=turn.calls,
@@ -332,9 +452,9 @@ def _conversation_unit(
                 DirectiveView(
                     input_id=u.directive.input_id,
                     revision=u.task.revision,
-                    text=excerpt(u.directive.text, radius),
+                    text=excerpt(u.directive.text, radius, f"/updates/{i}"),
                 )
-                for u in turn.updates
+                for i, u in enumerate(turn.updates)
             ),
         )
 
@@ -354,7 +474,7 @@ def _conversation_unit(
     for radius in (1, 2):
         view = item(radius)
         variants.append(Representation("excerpt", view.model_dump_json(), features(view)))
-    variants.append(Representation("raw", full.model_dump_json(), features(full)))
+    variants.append(Representation("raw", full.model_dump_json(), scorer.features(indexed)))
     return ContextUnit(
         f"turn:{turn.run_id}",
         digest(turn.model_dump_json()),

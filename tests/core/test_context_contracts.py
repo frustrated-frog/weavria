@@ -4,8 +4,11 @@ from datetime import UTC, datetime
 import pytest
 
 from weavria.core import (
+    BatchAdmitted,
     ContextCompilation,
     ConversationItem,
+    EvidenceAccessView,
+    FeedbackBounds,
     LocatedTextExcerpt,
     SessionContextCompiled,
     SessionEvent,
@@ -79,3 +82,38 @@ def test_compilation_fact_requires_explicit_v4_envelope() -> None:
         occurred_at=datetime.now(UTC),
     )
     assert SessionEvent.model_validate_json(event.model_dump_json()) == event
+    encoded = report.model_dump_json()
+    assert "allocation_steps" not in encoded and "allocation_exhausted" not in encoded
+    assert ContextCompilation.model_validate_json(encoded).model_dump_json() == encoded
+    current = ContextCompilation.model_validate(
+        report.model_copy(
+            update={"schema_version": 2, "allocation_steps": 7, "allocation_exhausted": True}
+        )
+    )
+    assert ContextCompilation.model_validate_json(current.model_dump_json()) == current
+    with pytest.raises(ValueError, match="v2"):
+        ContextCompilation.model_validate(report.model_copy(update={"allocation_steps": 7}))
+
+
+def test_legacy_admission_roundtrips_without_new_access_field_and_v2_requires_scope() -> None:
+    legacy = BatchAdmitted(
+        reserved_bytes=100,
+        budget_bytes=200,
+        readable_call_ids=(),
+        bounds=FeedbackBounds(),
+    )
+    encoded = legacy.model_dump_json()
+    assert "evidence_access" not in encoded
+    assert BatchAdmitted.model_validate_json(encoded).model_dump_json() == encoded
+    with pytest.raises(ValueError, match="v2"):
+        BatchAdmitted.model_validate(legacy.model_copy(update={"schema_version": 2}))
+    scope = EvidenceAccessView.from_records((), (), task_revision=1, request_sha256="0" * 64)
+    current = BatchAdmitted.model_validate(
+        legacy.model_copy(
+            update={
+                "schema_version": 2,
+                "evidence_access": scope,
+            }
+        )
+    )
+    assert BatchAdmitted.model_validate_json(current.model_dump_json()) == current

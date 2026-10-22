@@ -4,12 +4,13 @@ from dataclasses import replace
 from typing import TypedDict
 
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, JsonValue
 
 from weavria.artifacts import ArtifactSnapshot, InMemoryArtifactStore
 from weavria.context import (
     ContextBudgetError,
     ContextBuildError,
+    ContextCapacityError,
     ContextCompilerConfig,
     ContextDemand,
     ContextFocus,
@@ -431,3 +432,160 @@ async def test_latest_failure_preserves_category_and_retryability_when_details_d
     assert exchange.observation.error.retryable
     assert "backend detail" not in plan.request_json
     assert plan.compilation.choices[0].representation == "reference"
+
+
+async def test_latest_siblings_compete_by_value_independently_of_record_order(
+    session_counter: OpenAICompatibleTokenCounter,
+) -> None:
+    store, records = await sources(
+        (
+            "opaque padding " * 100,
+            "Aurora launch key is VIOLET. " + "archive padding " * 100,
+        )
+    )
+    selections: list[dict[str, str]] = []
+    for ordered in (records, tuple(reversed(records))):
+        plan = await compiler(store, session_counter).compile(
+            run_id="run",
+            session_id="s",
+            sequence=0,
+            base=base("Aurora launch key"),
+            turns=(),
+            total_turns=0,
+            records=ordered,
+            required_call_ids=("c0", "c1"),
+            max_request_bytes=2800,
+        )
+        assert "VIOLET" in plan.request_json
+        selections.append({c.source_id: c.representation for c in plan.compilation.choices})
+    assert selections[0] == selections[1]
+    assert selections[0]["call:c0"] == "reference"
+    assert selections[0]["call:c1"] == "excerpt"
+
+
+@pytest.mark.parametrize(
+    "resource,limit",
+    [
+        ("source_bytes", 100),
+        ("index_passages", 2),
+        ("index_bytes", 64),
+        ("scoring_work", 1),
+    ],
+)
+async def test_source_work_limits_are_explicit_without_silent_clipping(
+    session_counter: OpenAICompatibleTokenCounter,
+    resource: str,
+    limit: int,
+) -> None:
+    store, records = await sources(("alpha source " * 200,))
+    limits = replace(
+        ContextCompilerConfig(window_tokens=10000, output_tokens=256),
+        **{f"max_{resource}": limit},
+    )
+    with pytest.raises(ContextCapacityError) as error:
+        await SessionContextCompiler(store, config=limits, counter=session_counter).compile(
+            run_id="run",
+            session_id="s",
+            sequence=0,
+            base=base("alpha evidence"),
+            turns=(),
+            total_turns=0,
+            records=records,
+            max_request_bytes=4000,
+        )
+    assert error.value.resource == resource
+    assert error.value.requested > error.value.capacity
+
+
+async def test_cpu_indexing_is_cancellable_and_does_not_publish_partial_index() -> None:
+    from weavria.context.indexing import bounded_passages
+
+    task = asyncio.create_task(
+        bounded_passages(
+            "large source " * 150000,
+            max_passages=65536,
+            max_bytes=4000000,
+        )
+    )
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert not task.done()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    # A subsequent build starts clean and retains an exact character range.
+    fresh = await bounded_passages("中文原文", max_passages=4, max_bytes=100)
+    assert fresh[0].start == 0 and fresh[0].end == 4
+
+
+@pytest.mark.parametrize(
+    "required,resource", [((), "candidate_units"), (("c0", "c1"), "mandatory_units")]
+)
+async def test_capacity_distinguishes_mandatory_closure_from_optional_candidates(
+    session_counter: OpenAICompatibleTokenCounter,
+    required: tuple[str, ...],
+    resource: str,
+) -> None:
+    store, records = await sources(("alpha", "beta"))
+    engine = SessionContextCompiler(
+        store,
+        counter=session_counter,
+        config=ContextCompilerConfig(window_tokens=10000, output_tokens=256, max_units=1),
+    )
+    with pytest.raises(ContextCapacityError) as error:
+        await engine.compile(
+            run_id="run",
+            session_id="s",
+            sequence=0,
+            base=base("alpha"),
+            turns=(),
+            total_turns=0,
+            records=records,
+            required_call_ids=required,
+            max_request_bytes=4000,
+        )
+    assert (error.value.resource, error.value.requested, error.value.capacity) == (resource, 2, 1)
+
+
+async def test_long_history_reuses_indices_across_steering_with_bounded_search(
+    session_counter: OpenAICompatibleTokenCounter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import weavria.context.compiler_sources as indexing
+
+    original = indexing.bounded_passages
+    builds = 0
+
+    async def count_index(value: JsonValue, *, max_passages: int, max_bytes: int):
+        nonlocal builds
+        builds += 1
+        return await original(value, max_passages=max_passages, max_bytes=max_bytes)
+
+    monkeypatch.setattr(indexing, "bounded_passages", count_index)
+    store, records = await sources(("alpha beta gamma information " * 10000,))
+    turns = tuple(turn(i, "historical alpha beta " * 100) for i in range(1, 65))
+    engine = SessionContextCompiler(
+        store,
+        counter=session_counter,
+        config=ContextCompilerConfig(
+            window_tokens=12000, output_tokens=256, max_allocation_steps=24
+        ),
+    )
+    for revision, query in enumerate(
+        ("alpha information", "beta information", "gamma information"), 1
+    ):
+        plan = await engine.compile(
+            run_id="run",
+            session_id="s",
+            sequence=64,
+            base=base(query, revision=revision),
+            turns=turns,
+            total_turns=64,
+            records=records,
+            max_request_bytes=6000,
+        )
+        assert plan.compilation.task_revision == revision
+        assert plan.compilation.allocation_steps <= 24
+        assert plan.compilation.allocation_exhausted
+        assert plan.compilation.input_tokens <= plan.compilation.input_budget_tokens
+        assert builds == 65  # One artifact and each immutable original interaction exactly once.

@@ -51,6 +51,7 @@ from .conversation import (
     TextExcerpt,
 )
 from .errors import ErrorCategory, InvalidActionError, RunError
+from .evidence_access import EvidenceAccessView
 from .execution import (
     ArtifactRef,
     ContextSelected,
@@ -173,6 +174,7 @@ __all__ = [
     "DecisionDiscarded",
     "DirectiveView",
     "ErrorCategory",
+    "EvidenceAccessView",
     "EvidenceCoverageSignal",
     "ExecutionData",
     "ExecutionEvent",

@@ -36,6 +36,16 @@ class ContextTokenBudgetError(ContextBuildError):
         )
 
 
+class ContextCapacityError(ContextBuildError):
+    """Source preparation exceeded an explicit resource capacity, not a model budget."""
+
+    def __init__(self, resource: str, requested: int, capacity: int) -> None:
+        self.resource, self.requested, self.capacity = resource, requested, capacity
+        super().__init__(
+            f"Context preparation needs {requested} {resource}; capacity is {capacity}"
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class ContextCompilerConfig:
     """Window, output and uncertainty reserves are separate from JSON byte limits."""
@@ -46,9 +56,24 @@ class ContextCompilerConfig:
     policy: Literal["coverage", "relevance", "recent", "full"] = "coverage"
     max_units: int = 256
     max_passages: int = 8
+    max_source_bytes: int = 16_777_216
+    max_index_bytes: int = 67_108_864
+    max_index_passages: int = 65_536
+    max_scoring_work: int = 2_000_000
+    max_allocation_steps: int = 4096
 
     def __post_init__(self) -> None:
-        for value in (self.window_tokens, self.output_tokens, self.max_units, self.max_passages):
+        for value in (
+            self.window_tokens,
+            self.output_tokens,
+            self.max_units,
+            self.max_passages,
+            self.max_source_bytes,
+            self.max_index_bytes,
+            self.max_index_passages,
+            self.max_scoring_work,
+            self.max_allocation_steps,
+        ):
             if type(value) is not int or value <= 0:
                 raise ValueError("compiler limits must be positive integers")
         if type(self.safety_tokens) is not int or self.safety_tokens < 0:

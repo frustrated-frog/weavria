@@ -21,11 +21,15 @@ from weavria.core import (
 )
 
 from .allocation import AllocationCost, ContextAllocator, coverage
-from .budget import ContextCompilerConfig, ContextTokenBudgetError, SessionTokenCounter
+from .budget import (
+    ContextCapacityError,
+    ContextCompilerConfig,
+    ContextTokenBudgetError,
+    SessionTokenCounter,
+)
 from .compiler_sources import (
     CoverageScorer,
     SourceIndex,
-    conversation_passages,
     conversation_units,
     digest,
     source_units,
@@ -87,7 +91,12 @@ class SessionContextCompiler:
         if config.output_tokens < counter.output_tokens:
             raise ValueError("compiler output reserve is smaller than the provider output cap")
         self.config, self.counter = config, counter
-        self._index = SourceIndex(store, capacity=config.max_units)
+        self._index = SourceIndex(
+            store,
+            capacity=config.max_units,
+            max_passages=config.max_index_passages,
+            max_bytes=config.max_index_bytes,
+        )
 
     async def compile(
         self,
@@ -111,7 +120,24 @@ class SessionContextCompiler:
         if type(max_request_bytes) is not int or max_request_bytes <= 0:
             raise ValueError("request byte budget must be positive")
         if len(turns) + len(records) > self.config.max_units:
-            raise ContextBuildError("context source window exceeds the configured unit bound")
+            forced = set(required_call_ids)
+            if base.feedback:
+                forced.update(c.call_id for c in base.feedback.calls if c.status != "skipped")
+            parents = {r.exchange.action.call_id: r.dependencies for r in records}
+            pending = list(forced)
+            while pending:
+                for parent in parents.get(pending.pop(), ()):
+                    if parent not in forced:
+                        forced.add(parent)
+                        pending.append(parent)
+            required_count = len(forced) + min(2, len(turns))
+            raise ContextCapacityError(
+                "mandatory_units" if required_count > self.config.max_units else "candidate_units",
+                required_count
+                if required_count > self.config.max_units
+                else len(turns) + len(records),
+                self.config.max_units,
+            )
         if len(set(required_call_ids)) != len(required_call_ids):
             raise ContextBuildError("required calls must be unique")
         if focus is not None and focus.task_revision != base.task.revision:
@@ -126,6 +152,12 @@ class SessionContextCompiler:
         ):
             raise ContextBuildError("conversation candidates must be unique prior interactions")
         records = tuple(ToolRecord.model_validate_json(r.model_dump_json()) for r in records)
+        source_bytes = sum(len(t.model_dump_json().encode()) for t in turns) + sum(
+            len(r.model_dump_json().encode()) + (r.artifact.size_bytes if r.artifact else 0)
+            for r in records
+        )
+        if source_bytes > self.config.max_source_bytes:
+            raise ContextCapacityError("source_bytes", source_bytes, self.config.max_source_bytes)
         sources = await self._index.load(run_id, records)
         demands = (
             ContextDemand("current_task", " ".join((base.task.goal, *base.task.constraints))),
@@ -133,15 +165,18 @@ class SessionContextCompiler:
         )
         if len({d.demand_id for d in demands}) != len(demands):
             raise ContextBuildError("context demands collide with the current task identity")
+        indexed_history = await self._index.history_passages(turns)
         passages = tuple(p for source in sources for p in source.passages) + tuple(
-            p for turn in turns for p in conversation_passages(turn)
+            p for entry in indexed_history for p in entry
         )
-        scorer = CoverageScorer(demands, passages)
-        history_units = conversation_units(turns, scorer)
+        scorer = await CoverageScorer.create(
+            demands, passages, max_work=self.config.max_scoring_work
+        )
+        history_units = await conversation_units(turns, scorer, indexed_history)
         mandatory = set(required_call_ids)
         if base.feedback:
             mandatory.update(c.call_id for c in base.feedback.calls if c.status != "skipped")
-        units = history_units + source_units(
+        units = history_units + await source_units(
             sources,
             scorer,
             offset=len(history_units),
@@ -155,7 +190,7 @@ class SessionContextCompiler:
             session_id=session_id,
             through_sequence=sequence,
             omitted_turns=total_turns,
-            policy_version="context-compiler/1",
+            policy_version="context-compiler/2",
         )
         template = SessionRequest.model_construct(conversation=empty, current=base)
         wire = template.model_dump(mode="json")
@@ -204,6 +239,7 @@ class SessionContextCompiler:
             token_limit=self.config.input_tokens,
             byte_limit=max_request_bytes,
             policy=self.config.policy,
+            max_steps=self.config.max_allocation_steps,
         )
 
         def require(cost: AllocationCost) -> None:
@@ -214,23 +250,6 @@ class SessionContextCompiler:
 
         minimum = allocator.mandatory()
         require(await allocator.cost(minimum))
-        # A freshly executed read must be usable even when its value does not
-        # lexically match the question (numbers, IDs, opaque cursor responses).
-        # Receipt-only remains the hard guarantee; offer each latest sibling its
-        # cheapest actual data view before spending on optional older context.
-        if self.config.policy != "full":
-            for i, unit in enumerate(units):
-                if unit.channel != "current" or not unit.required:
-                    continue
-                cheapest: tuple[int, int, int] | None = None
-                for level in range(1, len(unit.variants)):
-                    candidate = allocator.proposal(minimum, i, level)
-                    candidate_cost = await allocator.cost(candidate)
-                    key = (candidate_cost.tokens, candidate_cost.bytes, level)
-                    if allocator.fits(candidate_cost) and (cheapest is None or key < cheapest):
-                        cheapest = key
-                if cheapest is not None:
-                    minimum = allocator.proposal(minimum, i, cheapest[2])
         selected = await allocator.allocate(minimum)
         cost = await allocator.cost(selected)
         require(cost)
@@ -245,7 +264,8 @@ class SessionContextCompiler:
             raise ContextBuildError("token counter returned an invalid byte ceiling")
         covered = coverage(units, selected)
         report = ContextCompilation(
-            policy_version=f"context-compiler/1[{self.config.policy}]",
+            schema_version=2,
+            policy_version=f"context-compiler/2[{self.config.policy}]",
             counter_version=self.counter.version,
             task_revision=base.task.revision,
             source_sha256=digest(json.dumps([(u.identity, u.digest) for u in units])),
@@ -261,6 +281,8 @@ class SessionContextCompiler:
             feedback_budget_bytes=max(1, min(max_request_bytes, ceiling) - overhead),
             utility=allocator.utility(selected),
             evaluations=allocator.evaluations,
+            allocation_steps=allocator.steps,
+            allocation_exhausted=allocator.exhausted,
             choices=tuple(
                 ContextChoice(
                     source_id=unit.identity,

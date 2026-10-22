@@ -2,7 +2,14 @@
 
 from typing import Literal, Self
 
-from pydantic import Field, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    SerializerFunctionWrapHandler,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 from ._schema import ContractModel, NonBlankString
 
@@ -17,8 +24,11 @@ class ContextChoice(ContractModel):
     dependencies: tuple[str, ...] = ()
 
 
-class ContextCompilation(ContractModel):
+class ContextCompilation(BaseModel):
     """Bind allocation diagnostics to the exact complete request sent to a provider."""
+
+    model_config = ContractModel.model_config
+    schema_version: Literal[1, 2] = 1
 
     policy_version: NonBlankString
     counter_version: NonBlankString
@@ -36,11 +46,28 @@ class ContextCompilation(ContractModel):
     feedback_budget_bytes: int = Field(ge=1)
     utility: float = Field(ge=0, allow_inf_nan=False)
     evaluations: int = Field(ge=1)
+    allocation_steps: int = Field(default=0, ge=0)
+    allocation_exhausted: bool = False
     choices: tuple[ContextChoice, ...]
     uncovered_demand_ids: tuple[str, ...] = ()
 
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def validate_version_type(cls, value: object) -> object:
+        return ContractModel.validate_version_type(value)
+
+    @model_serializer(mode="wrap")
+    def preserve_v1_wire(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        data = handler(self)
+        if self.schema_version == 1:
+            data.pop("allocation_steps", None)
+            data.pop("allocation_exhausted", None)
+        return data
+
     @model_validator(mode="after")
     def validate_allocation(self) -> Self:
+        if self.schema_version == 1 and (self.allocation_steps or self.allocation_exhausted):
+            raise ValueError("allocation work diagnostics require compilation v2")
         if self.input_tokens > self.input_budget_tokens:
             raise ValueError("compiled request exceeds its input token budget")
         if self.request_bytes + self.control_reserve_bytes > self.budget_bytes:

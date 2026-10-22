@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from weavria.core import (
     CONTROL_FEEDBACK_BYTES,
     ControlRequest,
+    EvidenceAccessView,
     FeedbackBounds,
     TaskInput,
     TaskObservation,
@@ -39,11 +40,12 @@ def reserve_feedback(
     batch: ToolBatch,
     bounds: FeedbackBounds,
     budget_bytes: int,
+    evidence_access: EvidenceAccessView | None = None,
 ) -> FeedbackReservation:
     """Reserve worst outcome per call, full possible closure and bounded control channel.
 
-    Tools may read any prior successful artifact. Reserving all prior records is
-    deliberately conservative; no host guesses which ones the backend will read.
+    Without a scoped view, tools may read any prior successful artifact. With a
+    view, reserve exactly its validated closure and enforce the same view at dispatch.
     Only minimum views are guaranteed, not full outputs or future task revisions.
     """
     if type(budget_bytes) is not int or budget_bytes <= 0:
@@ -57,6 +59,17 @@ def reserve_feedback(
         if identity in known or not set(record.dependencies) <= known:
             raise ContextBuildError("reservation history is not an ordered dependency graph")
         known.add(identity)
+    if evidence_access is not None:
+        expected = EvidenceAccessView.from_records(
+            records,
+            evidence_access.call_ids,
+            task_revision=task.revision,
+            request_sha256=evidence_access.request_sha256,
+        )
+        if evidence_access != expected:
+            raise ContextBuildError("feedback access view disagrees with accepted evidence")
+        selected = set(evidence_access.call_ids)
+        records = tuple(r for r in records if r.exchange.action.call_id in selected)
     base = ControlRequest(
         instructions=instructions,
         task=task,

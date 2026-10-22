@@ -38,7 +38,7 @@ uv run python examples/progress_control.py
 
 当前设计、源码流程、实验结果和局限见 [执行驱动的模型上下文](docs/model-context-selection.md)、[通用任务理解与能力解析](docs/task-understanding.md)、[ADR 0003](docs/decisions/0003-execution-backed-context.md) 与 [ADR 0009](docs/decisions/0009-task-understanding-capability-resolution.md)。公开端口分别位于 `weavria.core`、`models`、`tools`、`artifacts`、`context`、`runtime`、`sessions` 与 `harness`。
 
-`SessionEngine` 另可显式启用联合上下文编译：每次模型决策前按任务需求，在完整请求的 BPE Token 与字节预算内共同分配历史交互和当前工具证据，保留原文地址，支持精确区间回读。编译报告与发送快照在同一事务提交。运行 `uv run python examples/context_compiler.py` 可比较全量、新近优先、独立相关性和覆盖策略；该实验衡量原文信息交付，未验证真实模型成功率。配置、算法、失败案例与兼容边界见 [上下文编译与信息恢复](docs/上下文编译与信息恢复.md)。
+`SessionEngine` 另可显式启用联合上下文编译：每次模型决策前按任务需求，在完整请求的 BPE Token 与字节预算内共同分配历史交互和当前工具证据，保留原文地址，支持精确区间回读。编译报告与发送快照在同一事务提交。运行 `uv run python examples/context_compiler.py` 可比较全量、新近优先、独立相关性和覆盖策略；该实验衡量原文信息交付，未验证真实模型成功率。配置、算法、失败案例与兼容边界见 [上下文编译与信息恢复](docs/上下文编译与信息恢复.md)。 当前策略支持有界表示交换，并使反馈预留、工具可读来源与回放共享同一证据闭包；容量诊断与百万字符资源探针见 [上下文编译修复与资源边界](docs/上下文编译修复与资源边界.md)。
 
 轮次实验从实际目录内容发现多个资料源，批量读取并依据失败反馈寻找替代资料；在串行与有界并发下核验结果、来源、成本和回放。原有 v2 机制与源码调研见 [轮次与反馈](docs/agent-loop.md)，现在通过 `LegacyAgentLoop` 显式保留。`AgentRun` 和 v1 日志保持兼容。
 

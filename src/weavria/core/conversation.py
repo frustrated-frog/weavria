@@ -167,7 +167,9 @@ class ConversationView(BaseModel):
     through_sequence: int = Field(ge=0)
     turns: tuple[ConversationItem, ...] = ()
     omitted_turns: int = Field(default=0, ge=0)
-    policy_version: Literal["conversation/2", "context-compiler/1"] = "conversation/2"
+    policy_version: Literal["conversation/2", "context-compiler/1", "context-compiler/2"] = (
+        "conversation/2"
+    )
 
     @model_validator(mode="after")
     def validate_order(self) -> Self:

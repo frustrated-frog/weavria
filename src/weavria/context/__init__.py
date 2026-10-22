@@ -1,7 +1,12 @@
 """Public deterministic context policies and inspected model input plans."""
 
 from .admission import FeedbackReservation, reserve_feedback
-from .budget import ContextCompilerConfig, ContextTokenBudgetError, SessionTokenCounter
+from .budget import (
+    ContextCapacityError,
+    ContextCompilerConfig,
+    ContextTokenBudgetError,
+    SessionTokenCounter,
+)
 from .compiler import CompiledSessionContext, ControlContextBuilder, SessionContextCompiler
 from .conversation import ConversationPlan, project_turn, select_conversation
 from .demand import ContextDemand, ContextFocus, EvidenceAnchor
@@ -33,6 +38,7 @@ __all__ = [
     "CompiledSessionContext",
     "ContextBudgetError",
     "ContextBuildError",
+    "ContextCapacityError",
     "ContextCompilerConfig",
     "ContextDemand",
     "ContextFocus",

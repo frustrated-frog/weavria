@@ -27,6 +27,7 @@ from weavria.core import (
     ControlEvent,
     ControlFeedback,
     DecisionDiscarded,
+    EvidenceAccessView,
     ExecutionEvent,
     FinishAction,
     InterventionNotice,
@@ -110,6 +111,8 @@ class RunState:
     intervention_json: str | None = None
     intervention_frontier_sha256: str | None = None
     intervention_reconsiderations: int = 0
+    context_call_ids: tuple[str, ...] = ()
+    context_request_sha256: str | None = None
 
     @property
     def control(self) -> ControlFeedback | None:
@@ -264,7 +267,13 @@ def reduce_event(state: RunState | None, event: JournalEvent) -> RunState:
                 "context omitted latest tool feedback",
             )
         _require(set(state.feedback_call_ids) <= selected, "context omitted turn feedback")
-        return replace(next_state, phase=Phase.CONTEXT, pending_progress_sequence=None)
+        return replace(
+            next_state,
+            phase=Phase.CONTEXT,
+            pending_progress_sequence=None,
+            context_call_ids=data.selected_call_ids,
+            context_request_sha256=data.request_sha256,
+        )
     if isinstance(data, ModelStarted):
         _require(
             state.phase is Phase.CONTEXT and data.task_revision == state.task.revision,
@@ -784,6 +793,20 @@ def _reduce_control(
             readable = tuple(
                 r.exchange.action.call_id for r in state.records if r.artifact is not None
             )
+            if data.evidence_access is not None:
+                _require(state.context_request_sha256 is not None, "access requires model context")
+                assert state.context_request_sha256 is not None
+                expected = EvidenceAccessView.from_records(
+                    state.records,
+                    state.context_call_ids,
+                    task_revision=state.task.revision,
+                    request_sha256=state.context_request_sha256,
+                )
+                _require(
+                    data.evidence_access == expected,
+                    "admission access must match the accepted model context",
+                )
+                readable = tuple(a.call_id for a in expected.artifacts)
             _require(
                 data.readable_call_ids == readable,
                 "reservation must cover the complete readable view",

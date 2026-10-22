@@ -4,11 +4,20 @@ import hashlib
 from datetime import datetime
 from typing import Annotated, Literal, Self
 
-from pydantic import BaseModel, Field, TypeAdapter, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    SerializerFunctionWrapHandler,
+    TypeAdapter,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 from ._schema import ContractModel, NonBlankString
 from .actions import FinishAction
 from .errors import RunError
+from .evidence_access import EvidenceAccessView
 from .execution import (
     ContextSelected,
     DecisionDiscarded,
@@ -261,16 +270,39 @@ class ControlRequest(BaseModel):
         return self
 
 
-class BatchAdmitted(ContractModel):
+class BatchAdmitted(BaseModel):
+    """v1 reserves all accepted evidence; v2 binds an explicit execution access view."""
+
+    model_config = ContractModel.model_config
+    schema_version: Literal[1, 2] = 1
     kind: Literal["batch_admitted"] = "batch_admitted"
     reserved_bytes: int = Field(gt=0)
     budget_bytes: int = Field(gt=0)
     readable_call_ids: tuple[NonBlankString, ...]
     bounds: FeedbackBounds
     action_value_context: ActionValueContext | None = None
+    evidence_access: EvidenceAccessView | None = None
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def validate_version_type(cls, value: object) -> object:
+        return ContractModel.validate_version_type(value)
+
+    @model_serializer(mode="wrap")
+    def preserve_v1_wire(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        data = handler(self)
+        if self.schema_version == 1:
+            data.pop("evidence_access", None)
+        return data
 
     @model_validator(mode="after")
     def validate_budget(self) -> Self:
+        if (self.schema_version == 2) != (self.evidence_access is not None):
+            raise ValueError("only admission v2 requires an evidence access view")
+        if self.evidence_access is not None and self.readable_call_ids != tuple(
+            a.call_id for a in self.evidence_access.artifacts
+        ):
+            raise ValueError("readable identities disagree with the evidence access view")
         if self.reserved_bytes > self.budget_bytes:
             raise ValueError("admission exceeds feedback budget")
         if len(set(self.readable_call_ids)) != len(self.readable_call_ids):

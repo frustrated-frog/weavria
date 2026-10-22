@@ -15,6 +15,7 @@ from pydantic import JsonValue, TypeAdapter
 from weavria.artifacts import ArtifactStore
 from weavria.context import (
     ContextBudgetError,
+    ContextCapacityError,
     ContextTokenBudgetError,
     ControlContextBuilder,
     ControlEvidencePlan,
@@ -43,6 +44,7 @@ from weavria.core import (
     ControlRequest,
     DecisionDiscarded,
     ErrorCategory,
+    EvidenceAccessView,
     ExecutionData,
     ExecutionEvent,
     FeedbackBounds,
@@ -297,6 +299,7 @@ class _AgentKernel:
         self._builder = EvidenceContextBuilder(artifacts, mode=mode)
         self._control_builder = context_builder or self._builder
         self._feedback_budget = self._request_budget
+        self._evidence_access: EvidenceAccessView | None = None
         self._artifacts = artifacts
         self._completion = completion if completion is not None else NoVerification()
         self._bounds = (
@@ -459,7 +462,7 @@ class _AgentKernel:
                             )
                             if self._feedback_budget < 1:
                                 raise ValueError("compiled feedback budget must be positive")
-                    except (ContextBudgetError, ContextTokenBudgetError):
+                    except (ContextBudgetError, ContextTokenBudgetError, ContextCapacityError):
                         if task.revision != self.state.task.revision:
                             continue
                         raise
@@ -607,6 +610,8 @@ class _AgentKernel:
                 return await self._end(RunStatus.BUDGET_EXHAUSTED, "deadline")
             if isinstance(exc, ContextTokenBudgetError):
                 return await self._end(RunStatus.BUDGET_EXHAUSTED, "context_tokens")
+            if isinstance(exc, ContextCapacityError):
+                return await self._end(RunStatus.BUDGET_EXHAUSTED, "context_capacity")
             if isinstance(exc, ContextBudgetError):
                 return await self._end(RunStatus.BUDGET_EXHAUSTED, "context_bytes")
             if isinstance(exc, CompletionCheckError):
@@ -854,6 +859,7 @@ class _AgentKernel:
             batch=batch,
             bounds=self._bounds,
             budget_bytes=self._feedback_budget,
+            evidence_access=self._evidence_access,
         )
         remaining = max(0, self._limits.max_tool_calls - self.state.tool_calls)
         visible = {descriptor.name for descriptor in self._visible_tools.descriptors}
@@ -955,11 +961,13 @@ class _AgentKernel:
             return False, progress.action_identities if progress is not None else ()
         accepted = await self._accept(
             BatchAdmitted(
+                schema_version=2 if self._evidence_access is not None else 1,
                 reserved_bytes=reservation.required_bytes,
                 budget_bytes=reservation.budget_bytes,
                 readable_call_ids=reservation.readable_call_ids,
                 bounds=self._bounds,
                 action_value_context=action_value_context,
+                evidence_access=self._evidence_access,
             ),
             expected_revision=revision,
         )
@@ -1036,6 +1044,10 @@ class _AgentKernel:
         action_identities: tuple[ToolActionIdentity, ...] = (),
     ) -> None:
         accepted = tuple(r.artifact for r in self.state.records if r.artifact is not None)
+        if self._journal_version == 3:
+            admission = self.state.admission
+            if admission is not None and admission.evidence_access is not None:
+                accepted = admission.evidence_access.artifacts
         revision = self.state.model_revision
         if action_identities and len(action_identities) != len(calls):
             raise ValueError("tool action identities must align with the admitted batch")
@@ -1229,6 +1241,16 @@ class _AgentKernel:
                 )
             )
             await self._accept_locked(ModelStarted(task_revision=revision))
+            self._evidence_access = (
+                EvidenceAccessView.from_records(
+                    self.state.records,
+                    self.state.context_call_ids,
+                    task_revision=revision,
+                    request_sha256=hashlib.sha256(plan.request_json.encode()).hexdigest(),
+                )
+                if isinstance(plan, ControlEvidencePlan) and plan.compilation_json is not None
+                else None
+            )
             if isinstance(self._journal, RequestJournal):
                 try:
                     request = plan.request
