@@ -6,6 +6,7 @@ from typing import Literal
 import pytest
 from pydantic import BaseModel, ConfigDict
 
+from weavria.context import ContextCompilerConfig
 from weavria.core import (
     ActionInterventionChecked,
     AdmissionNotice,
@@ -18,6 +19,7 @@ from weavria.core import (
     ProgressNotice,
     RunStatus,
     SessionClarificationChanged,
+    SessionContextCompiled,
     SessionInterrupted,
     SessionRequest,
     SessionRunEvent,
@@ -52,7 +54,13 @@ from weavria.harness import (
     TaskUnderstandingError,
 )
 from weavria.harness.capabilities import CapabilityTrigger
-from weavria.models import FakeModelProvider, FakeSessionProvider, ModelCapabilities
+from weavria.models import (
+    FakeModelProvider,
+    FakeSessionProvider,
+    ModelCapabilities,
+    OpenAICompatibleTokenCounter,
+)
+from weavria.runtime import RunLimits
 from weavria.sessions import SessionEngine
 from weavria.tools import ToolContext, ToolFault, ToolRegistry, TypedTool
 
@@ -1109,3 +1117,39 @@ async def test_preparation_failure_is_persisted_without_starting_runtime_model(
         and event.data.reason == "task_preparation_failure"
         for event in events
     )
+
+
+async def test_joint_compiler_uses_accepted_ledger_progress_without_changing_task_authority(
+    tmp_path: Path,
+    session_counter: OpenAICompatibleTokenCounter,
+) -> None:
+    preparer = TaskAwareSessionPreparer(
+        TaskUnderstandingEngine(
+            ModelTaskInterpreter(FakeModelProvider((_declaration(_execute()),)))
+        )
+    )
+    model = _ExecuteSessionModel()
+    async with SessionEngine(
+        tmp_path / "compiled.db",
+        model=model,
+        tools=_registry(),
+        task_preparation=preparer,
+        limits=RunLimits(max_request_bytes=50000),
+        context_compiler=ContextCompilerConfig(window_tokens=64000, output_tokens=256),
+        token_counter=session_counter,
+    ) as engine:
+        await engine.create("s")
+        result = await engine.send("s", "Read alpha.", input_id="u")
+        events = await engine.store.events("s", limit=256)
+    assert result.report.status is RunStatus.COMPLETED
+    snapshots = [e.data.snapshot for e in events if isinstance(e.data, SessionSemanticCommitted)]
+    before, after = preparer.context_focus(snapshots[0]), preparer.context_focus(snapshots[-1])
+    assert before.demands[0].weight > after.demands[0].weight
+    assert not before.demands[0].anchors and after.demands[0].anchors
+    reports = [e.data.compilation for e in events if isinstance(e.data, SessionContextCompiled)]
+    assert len(reports) == 2
+    assert reports[0].demand_sha256 != reports[1].demand_sha256
+    assert model.requests[0].current.task == model.requests[1].current.task
+    assert reports[1].uncovered_demand_ids == ()
+    with pytest.raises(ValueError, match="accepted semantic snapshot"):
+        preparer.context_focus(snapshots[0].model_copy(update={"work_id": "another-work"}))

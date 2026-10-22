@@ -17,6 +17,7 @@ from weavria.artifacts import ArtifactAccessError, ArtifactSnapshot
 from weavria.core import (
     ApplicationObservation,
     ArtifactRef,
+    ContextCompilation,
     ContextSelected,
     ControlEvent,
     ConversationTurn,
@@ -28,6 +29,7 @@ from weavria.core import (
     SemanticVersion,
     SessionApplicationObserved,
     SessionClarificationChanged,
+    SessionContextCompiled,
     SessionContextPrepared,
     SessionControlDecided,
     SessionEvent,
@@ -362,15 +364,20 @@ class SQLiteSessionStore:
         | SessionSourceRead
         | SessionInterrupted
         | SessionContextPrepared
+        | SessionContextCompiled
         | SessionTaskUpdated
         | SessionControlDecided
         | SessionSemanticCommitted
         | SessionClarificationChanged,
-        # Every new fact uses the latest envelope; old rows retain their original bytes.
+        # Only the new event kind needs v4; existing kinds retain their v3 envelope.
     ) -> None:
         head = conn.execute("SELECT head FROM sessions WHERE id=?", (session_id,)).fetchone()[0]
         event = SessionEvent(
-            session_id=session_id, sequence=head + 1, data=data, occurred_at=self._clock.now()
+            schema_version=4 if isinstance(data, SessionContextCompiled) else 3,
+            session_id=session_id,
+            sequence=head + 1,
+            data=data,
+            occurred_at=self._clock.now(),
         )
         conn.execute(
             "INSERT INTO session_events VALUES(?,?,?)",
@@ -1102,9 +1109,24 @@ class SQLiteSessionStore:
         await self._submit(rebuild)
 
     async def prepare_request(
-        self, session_id: str, run_id: str, request: SessionRequest, budget: int
+        self,
+        session_id: str,
+        run_id: str,
+        request: SessionRequest,
+        budget: int,
+        *,
+        compilation: ContextCompilation | None = None,
     ) -> None:
         encoded = SessionRequest.model_validate(request).model_dump_json()
+        if compilation is not None:
+            compilation = ContextCompilation.model_validate_json(compilation.model_dump_json())
+            if (
+                compilation.request_sha256 != hashlib.sha256(encoded.encode()).hexdigest()
+                or compilation.task_revision != request.current.task.revision
+                or compilation.request_bytes != len(encoded.encode())
+                or compilation.budget_bytes != budget
+            ):
+                raise SessionConflictError("compilation report disagrees with its request")
 
         def prepare() -> None:
             with self._transaction() as conn:
@@ -1148,6 +1170,16 @@ class SQLiteSessionStore:
                     "INSERT INTO request_views VALUES(?,?,?)", (run_id, state.model_calls, encoded)
                 )
                 self._session_event(conn, session_id, notice)
+                if compilation is not None:
+                    self._session_event(
+                        conn,
+                        session_id,
+                        SessionContextCompiled(
+                            run_id=run_id,
+                            model_call=state.model_calls,
+                            compilation=compilation,
+                        ),
+                    )
 
         await self._submit(prepare)
 

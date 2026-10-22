@@ -6,6 +6,7 @@ from typing import Literal, Self
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from ._schema import ContractModel, NonBlankString
+from .context import SessionContextCompiled
 from .control import ControlEvent, ControlRequest, RunReport
 from .errors import ErrorCategory
 from .execution import ArtifactRef, ExecutionEvent
@@ -96,10 +97,39 @@ class TextExcerpt(ContractModel):
         return self
 
 
+class LocatedTextExcerpt(BaseModel):
+    """An exact contiguous original range; unlike v1 it need not start at zero."""
+
+    model_config = ContractModel.model_config
+    schema_version: Literal[2] = 2
+    text: str
+    sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    total_chars: int = Field(ge=0)
+    start: int = Field(ge=0)
+    complete: bool
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def validate_version_type(cls, value: object) -> object:
+        return ContractModel.validate_version_type(value)
+
+    @model_validator(mode="after")
+    def validate_extent(self) -> Self:
+        import hashlib
+
+        if self.start + len(self.text) > self.total_chars or self.complete != (
+            self.start == 0 and len(self.text) == self.total_chars
+        ):
+            raise ValueError("located excerpt contradicts original extent")
+        if self.complete and hashlib.sha256(self.text.encode()).hexdigest() != self.sha256:
+            raise ValueError("complete text does not match its digest")
+        return self
+
+
 class DirectiveView(ContractModel):
     input_id: NonBlankString
     revision: int = Field(ge=2)
-    text: TextExcerpt
+    text: TextExcerpt | LocatedTextExcerpt
 
 
 class ConversationItem(BaseModel):
@@ -113,8 +143,8 @@ class ConversationItem(BaseModel):
 
     run_id: NonBlankString
     ordinal: int = Field(ge=1)
-    user: TextExcerpt
-    assistant: TextExcerpt | None
+    user: TextExcerpt | LocatedTextExcerpt
+    assistant: TextExcerpt | LocatedTextExcerpt | None
     status: Literal["completed", "failed", "cancelled", "budget_exhausted", "interrupted"]
     task_outcome: Literal["verified", "unverified", "unverifiable"]
     calls: tuple[PastCall, ...] = ()
@@ -137,7 +167,7 @@ class ConversationView(BaseModel):
     through_sequence: int = Field(ge=0)
     turns: tuple[ConversationItem, ...] = ()
     omitted_turns: int = Field(default=0, ge=0)
-    policy_version: Literal["conversation/2"] = "conversation/2"
+    policy_version: Literal["conversation/2", "context-compiler/1"] = "conversation/2"
 
     @model_validator(mode="after")
     def validate_order(self) -> Self:
@@ -236,7 +266,7 @@ class SessionControlDecided(ContractModel):
 
 class SessionEvent(BaseModel):
     model_config = ContractModel.model_config
-    schema_version: Literal[1, 2, 3] = 3
+    schema_version: Literal[1, 2, 3, 4] = 3
 
     @field_validator("schema_version", mode="before")
     @classmethod
@@ -259,6 +289,7 @@ class SessionEvent(BaseModel):
         | SessionSourceRead
         | SessionInterrupted
         | SessionContextPrepared
+        | SessionContextCompiled
         | SessionTaskUpdated
         | SessionControlDecided
         | SessionSemanticCommitted
@@ -267,6 +298,8 @@ class SessionEvent(BaseModel):
 
     @model_validator(mode="after")
     def validate_payload_version(self) -> Self:
+        if self.schema_version < 4 and isinstance(self.data, SessionContextCompiled):
+            raise ValueError("context compilation requires session event v4")
         if self.schema_version == 1 and isinstance(
             self.data, (SessionTaskUpdated, SessionControlDecided)
         ):

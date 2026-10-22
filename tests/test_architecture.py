@@ -46,6 +46,11 @@ def test_subsystem_dependencies_stay_within_their_layer(package: str) -> None:
                 allowed = (
                     root in sys.stdlib_module_names
                     or root in {"pydantic", "pydantic_core"}
+                    or (
+                        package == "models"
+                        and source.name == "tokenization.py"
+                        and root == "tiktoken"
+                    )
                     or module in {f"weavria.{dependency}" for dependency in LAYERS[package]}
                     or module == f"weavria.{package}"
                     or module.startswith(f"weavria.{package}.")

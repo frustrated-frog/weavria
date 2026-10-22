@@ -1,0 +1,185 @@
+{
+  "schema_version": 1,
+  "source_version": "bb17ea0",
+  "corpus": {
+    "context": {
+      "source_commit": "bb17ea0",
+      "source_path": "docs/长期研发宪章.md",
+      "sha256": "e83f5f8ab8288baebe036143ce06ab77526ddc76124cb40562e7fcdcc092b4db",
+      "text": "## 9. Context Engineering：不是截断，而是可恢复的信息分配\n\n**研究命题：** 在有限 Token、成本和注意力预算下，把当前任务真正需要的事实交给模型，减少无关内容，同时尽量保护后续可恢复、可核实的信息。\n\n严格区分：\n\n- **Execution History**：事件、工具事实与来源的完整权威记录。\n- **Artifact**：原始成果和数据，可通过身份与范围访问。\n- **Context View**：一次模型调用实际消费的、按预算构造的信息投影。\n- **Compaction**：对部分历史构建更短表示的过程，它通常有损，不能改写权威事实。\n\n持续研究：Tokenizer-aware 成本核算，消息原子组与工具调用—结果配对，任务相关性与语义检索，依赖闭包，重要性/新颖度/时效性排序，多级信息表示（完整、片段、摘要、引用）、大型 Tool Output 卸载、Artifact 按需回取、压缩游标和摘要版本、恢复时的 Context Rehydration。\n\n**最低不变量：** 不让一条 Tool Result 脱离其对应调用而被模型误用；不悄悄删掉刚发生的关键失败反馈；不能让压缩摘要替代原始状态或来源；历史回取必须遵守运行身份和访问权限；超过硬预算时要明确失败或采用声明的降级策略。\n\n**技术问题不能偷换：** `len(text)` 或 UTF-8 字节可以作为早期可验证的近似，但不等于实际 Token 数；简单窗口裁剪、规则摘要、向量召回也不天然等于 Context Engineering 的终态。\n\n**研究路径：** 使用完整上下文、固定窗口、纯摘要、按相关性选择、依赖闭包选择、分层压缩与按需恢复等策略构成可替换实现；根据任务完成率、引用正确性、关键事实保留率、Token/延迟成本和恢复质量比较。不能只追求 Compression Ratio 更高。\n\n---\n\n"
+    },
+    "memory": {
+      "source_commit": "bb17ea0",
+      "source_path": "docs/长期研发宪章.md",
+      "sha256": "6aa73891e789ceb110cbe73f2ce5905d72ab6907d9e5e5125ed33a887eaa680c",
+      "text": "## 10. Memory Engine：不是向量存储，而是有生命周期的事实系统\n\n**研究命题：** 哪些信息值得记住，如何形成、组织、更新、纠错、遗忘和检索，使记忆可靠改善未来任务，而不是把错误累积进 Prompt。\n\n概念上区分 Working、Conversation、Episodic、Semantic 和 Procedural Memory；并明确它们与 Session State、外部知识库 Evidence、Context View 的界限。可以共享存储，但不能混同语义或生命周期。\n\n深入研究：\n\n- 记忆候选提取、事件来源、信息归一化、实体对齐、作用域归属与写入许可。\n- 重复消除、冲突检测、事实修订、版本谱系、失效与撤销、用户明确纠错优先规则。\n- `valid_time`（现实有效时间）与 `recorded_time`（系统获知时间）的双时间语义；面向历史任务的 As-of Retrieval。\n- BM25、Dense、RRF、关系扩展、时间与来源重排序，以及索引重建、过期处理和性能退化方案。\n- 记忆置信度与权威性区分，可信用户陈述、工具结果、模型推断不得无条件互相覆盖。\n- 程序性记忆的适用条件、任务类型、执行效果和反馈；一次成功经验不能直接晋升为全局指令。\n- 遗忘策略、噪声控制、更新成本、敏感信息保护和用户/项目/Agent/租户隔离。\n\n**最低不变量：** 未经确认的推断不会自动变成永久用户事实；新事实不抹掉可审计历史；长期记忆不能突破当前用户或 Agent 的权限；同一事实在不同时间的有效版本可解释；检索返回来源而不只是文本和相似度分数。\n\n**研究验收：** 记忆更新、跨会话时间推理、冲突纠错、应当拒答、长期污染与召回成本；与无记忆、简单历史窗口、BM25、Dense 等朴素策略对比。不能把“成功写入并召回一段文本”当成 Memory Engine 成熟。\n\n---\n\n"
+    },
+    "model": {
+      "source_commit": "bb17ea0",
+      "source_path": "docs/长期研发宪章.md",
+      "sha256": "5b323810910eaa0be2d9cf4093048ffc304a3febaae73d9f34d2829efc44a2c6",
+      "text": "## 12. Model Adapter：模型可替换，但模型差异不可假装不存在\n\n模型供应商只是执行不可信决策的外部系统。其 API、Message Format、Tool Call 语法、结构化输出、流式协议、模型能力与错误行为均需要被规范化，但不能通过归一化掩盖实际能力差异。\n\n具体研究：模型能力协商、Token 估算与真实 usage、结构化输出的严格校验、流式增量 Tool Call 组装、部分输出失败时的结算与回退、参数模式、Timeout/Cancel、模型失败分类、上下文窗口不匹配和供应商特定约束。任何协议修复必须有边界、版本和可观测记录，不得偷偷修改用户语义或绕过预算自动重试。\n\n默认 Fake Provider 负责证明内核正确性；真实模型实验负责证明 Agent 行为。不能由 Scripted Fake 的固定任务成功推断通用决策能力。\n\n---\n\n"
+    },
+    "evaluation": {
+      "source_commit": "bb17ea0",
+      "source_path": "docs/长期研发宪章.md",
+      "sha256": "87f9875086ed28515421ea1ce3ddb5d08b57ed864b25aa9f00a1a97b81714421",
+      "text": "## 14. Evaluation、Observability 与演进闭环\n\n### 14.1 权威事实不等于 Trace\n\nEvent Journal 是恢复与状态判定的权威事实；Trace 是可查询、可聚合、可采样的诊断投影。可以使用 OpenTelemetry 进行跨服务导出，但不能因为一个 Span 成功而认为副作用已持久确认。日志、Trace、Event、Checkpoint 的保留策略和安全级别应明确区分。\n\n### 14.2 测试分层，不以测试替代研究\n\n- **契约/确定性测试**：验证事件顺序、类型与身份、策略授权、状态归约、取消和时间行为。\n- **故障注入**：验证崩溃、网络失效、乱序、Lease 竞争、重复投递、UNKNOWN 副作用、恢复协议。\n- **Agent 行为评测**：验证真实模型的规划、工具选择、纠错、完成、检索和记忆质量。\n- **系统实验**：验证时间、内存、Token、吞吐、延迟、并发度、索引与策略的成本收益。\n- **回归/发布门禁**：将已发生的 Bad Case 冻结为任务、策略与数据版本，防止能力退化。\n\n遵守科学比较原则：明确问题与假设、控制关键变量、完整记录配置、报告样本规模与不确定性、保留失败结果；不要把三五个玩具样例的成功称为达到工业级效果。\n\n### 14.3 技术设计与验证的正确次序\n\nCodex 不应再机械地把“如何证明有效”放在一切讨论的最前面，从而忽略机制和算法深度。更合适的过程是：**理解真实问题 → 深读技术方案与替代机制 → 设计具有深度的可行方案 → 明确不变量与预期收益 → 实现 → 验证正确性 → 评测效果 → 分析失败并演进。**\n\n设计前必须知道怎样识别失败，却不要求先完成大规模实验才准许进行技术探索。实验是技术深度的证据，不是项目追求的唯一内容。\n\n### 14.4 在线持续改进\n\n未来形成 `Build → Evaluate → Gate → Release → Run → Observe → Evolve` 闭环。线上失败轨迹经去敏和授权后进入候选测试集；新版本必须与旧版本进行可追溯比较，证明改进效果与成本，并对退化设置门禁。此时才讨论自动产生候选策略或 Harness 自我改进，不能让未经审查的实验代码直接更改生产内核。\n\n---\n\n"
+    },
+    "tools": {
+      "source_commit": "bb17ea0",
+      "source_path": "docs/长期研发宪章.md",
+      "sha256": "c2e0652173e2a603fd5e23a1ff66df9319460e5b4df698776e2705c939206a38",
+      "text": "## 8. Tool、MCP 与执行安全：工具不是函数表\n\n**研究命题：** 在模型不可信、工具能力各异、调用具有副作用且运行环境可能失败时，如何完成安全、有限、可追溯的能力执行。\n\n工具必须拥有稳定身份与版本、严格输入输出类型、明确的效果类别和幂等承诺、权限与风险分类、超时和资源限制、审计来源、失败归类以及可选择的回放策略。**工具描述与模型可见性不是执行授权**；`ToolRegistry` 发现能力，`Policy` 根据身份及具体参数决定执行，`Executor` 负责尝试，`Effect Ledger` 记录和协调外部效果。\n\n深入研究：\n\n- 工具参数与内容校验、JSON Schema / Typed Contract 演进、Provider 原生 Tool Call 归一化。\n- 并发工具的实际安全性、顺序和依赖，不能仅凭 read-only 名称假定线程安全。\n- `READ` / `WRITE` / `GENERATE` / `EXTERNAL_EFFECT` 及其恢复语义；`REPLAY_SAFE`、`AT_MOST_ONCE`、`REQUIRES_RECONCILIATION` 等策略的适用条件。\n- 同一 Run 内和跨 Attempt 的工具身份、动作指纹、外部幂等键和结果复用。\n- 审批应绑定实际调用主体、工具版本、规范化参数、Policy 版本和批准范围，过时审批不可泛化复用。\n- Tool Output、MCP 元数据、检索资料均为低信任内容，不得借模型上下文提升为系统指令。\n- Agent Identity、User Identity、Credential Handle、最小权限、Network/File Policy、敏感参数与日志脱敏。\n- 不可信代码执行和阻塞插件必须具备隔离途径；协作式异步取消不能冒充进程/容器级硬终止。\n\nMCP 属于扩展能力与互操作协议，不能成为绕过 Weavria Registry、Policy、Ledger 和审计的捷径。研究 MCP 时分别考虑工具发现、授权、长任务、服务侧变更和故障语义，而非仅能调用服务器就算完成。\n\n**验收：** 有明确的工具超时—继续运行问题测试、跨租户权限拒绝测试、重复写入测试、审批过期测试、工具崩溃时 UNKNOWN 状态测试，能够解释系统在不支持外部幂等的情况下究竟保证什么。\n\n---\n\n"
+    },
+    "session": {
+      "source_commit": "bb17ea0",
+      "source_path": "docs/decisions/0007-persistent-conversations.md",
+      "sha256": "542d48d5de0e1267d8dff3966e8ee76af2b96f2df3195f78292b2f0cc40113b1",
+      "text": "# ADR 0007：单用户持久会话、交互投影与历史证据\n\n本文记录 `9e2e663` 第一阶段的范围和观察值。后续 steering、逐轮准备及 Schema 演进见 [ADR 0008](0008-interactive-turn-harness.md)；当前使用契约以[持久会话指南](../persistent-sessions.md)为准。\n\n- 状态：接受，第一阶段实现\n- 日期：2026-10-15\n- 范围：本地单用户、多请求会话、进程重启后接续、真实历史来源读取\n- 前置：[ADR 0006](0006-feedback-admission-completion-control.md)\n\n## 问题与交付边界\n\n此前每个 AgentLoop 只能执行一次；模型仅看到当前 Task 与当前 Run 工具反馈，Artifact 又按生产 Run 隔离。保存聊天文本不能独立解决跨请求指代、成果复用、部分完成与重启后的执行不确定性。\n\n第一阶段交付：一个 Session 包含多个独立 Run；每条请求先持久接受，再执行；后续请求看到有界且有来源的会话视图；旧成果通过实际工具读取；进程结束后可重新打开会话，准确保留完成或中断事实。\n\n不交付自动恢复未完成执行、steering、follow-up、分支会话、模型摘要、长期记忆、多用户、分布式执行和真实模型供应商适配。忙碌请求明确拒绝，未得到接受确认的第二条输入不会被当作已排队。\n\n## 会话层与现有 Runtime\n\n新增 weavria.sessions，依赖公开 Core / Runtime / Models / Context / Tools / Artifacts；Runtime 不依赖会话层或 SQLite。单请求继续运行 AgentLoop，沿用 v3 日志、工具准入、验收与预算；旧 v1 / v2 入口保持不变。\n\n跨请求模型输入使用 SessionRequest v4，外层 conversation 与内层 current: ControlRequest v3 分离。不会把历史消息拼进系统指令，不把旧 ToolRecord 改成新 Run 的执行事实。不同 Run 的同名 call_id 不冲突；历史调用由生产 run_id 与 call_id 共同定位。\n\nSessionResult v1 包含输入身份、运行身份和原有 RunReport v3。SessionEvent v1 是会话顺序日志；其 run_event 载荷仍为 ControlEvent v3，两种日志不混成一个运行日志。\n\n## 事务与可观察事实\n\nSQLiteSessionStore 用标准库 sqlite3、WAL、synchronous=FULL、外键与短事务。阻塞 I/O 位于一个受限队列、明确关闭的工作线程；本地执行引擎持有数据库文件的排他所有权锁。仅面向当前 POSIX 本地场景，不将其包装成分布式租约。\n\n主要数据为：sessions、runs、run_events、session_events、artifacts、outcomes、source_reads、request_views。数据库 Schema 为 1；未知版本拒绝打开，不进行破坏性降级。运行配置也带版本，记录预算、工具契约、模型端口与能力、验收策略和会话工具版本；不保存认证凭据或私有思维链。\n\n接受边界：\n\n1. 输入与 Run 占位、会话活动指针、SessionInput 在同一事务提交，然后确认该请求被接受。\n2. 工具执行前必须确认 ToolStarted 已提交；模型运输前必须确认 ModelStarted 与完整 SessionRequest 快照已提交。\n3. Artifact 内容先持久存储；随后 ToolRecorded 与来源接受登记在一个事务提交。没有 ToolRecorded 的内容仍是未接受快照，不进入后续会话读能力。\n4. RunEnded、最终 RunReport、ConversationTurn 投影及释放会话活动指针一起提交。\n5. 只有提交确认后才更新内存运行投影。提交期间不执行模型或工具。\n\nRunJournal 是有限的事实提交端口；RequestJournal 只能记录已经形成的模型输入，无权转换输入或决定控制流。异步提交锁串行接受工具事实，保留有界并发执行。提交失败立即封住日志，等待同一锁的兄弟调用不能继续派发；并行异常组中的存储失败仍按存储中断处理，不降级成普通工具失败。\n\n取消不能证明底层事务未执行。settle_mutation 持有提交任务直至结果明确，再更新内存、传播取消；关闭引擎会加入所有活动 Run 与存储任务。完成事务先提交时，以该完成事实为准，即使客户端等待已被取消。\n\n输入身份具有幂等边界：同一 session_id / input_id 和相同文本重复提交，返回原终态报告；内容不同则冲突；进行中则忙碌；已中断则要求用新输入明确继续。没有把模型、外部工具或整个工作流宣称为 exactly-once。\n\n## Harness：权威历史与模型视图分开\n\nConversationTurn 保存一项完整交互的原始用户输入、正式答案、终态、验收结论、调用结果、来源关系及未完成/未派发调用。中断和失败不产生伪造的正式回答。\n\n模型看到 ConversationItem：完整交互单元中的调用状态、失败类别、可重试性、来源身份和中断信息保持完整；过长用户/回答文本可以成为精确 UTF-8 前缀，并带完整文本 SHA256、字符长度和 complete 标记。它不是模型生成的摘要，也不能替代原文。\n\n选择过程：\n\n- 从最新最多 64 项交互构建有界候选；最近两项最低投影为硬约束。\n- FULL 保留候选完整文本，装不下明确报告预算耗尽，不能伪称保留全部历史。\n- RECENT 在预算内优先加入近期交互。\n- RELEVANT 用当前请求与历史文本的 BM25 得分，按新增实际字节的收益选择较早交互；保留时间顺序，再用剩余预算升级文本至完整表示。\n- 最低交互也装不下时明确停止，不丢失失败或来源来换取成功输出。\n- 全部原文与候选窗口之外的历史仍在数据库，read_session_history 可分页回查和按身份读取精确字符范围。\n\n会话投影的 JSON 字节开销，从完整 SessionRequest 中精确测量后扣除。当前 Run 在剩余预算内继续进行控制通道和工具反馈预留；实际外层请求在模型调用前再校验并记录字节数与摘要。该保证是 JSON 字节预算，不是供应商 Token 窗口。\n\n当 FULL 原始工具历史整体超预算时，会在最低反馈承诺之上优先给当前必需反馈完整表示，只要它单独能装下。对照实验发现，若只给片段，历史分页工具的结构数据可能不可消费；这个修复有独立回归测试。\n\n## Harness：跨请求证据通过真实读取形成新事实\n\nread_session_source 的输入包含完整 ArtifactRef。读取必须满足：生产 Run 与消费 Run 属于同一 Session、生产顺序早于当前请求、原工具结果已经接受、当前消费调用确实处于执行中，且摘要和完整来源身份一致。\n\n工具返回原来源及实际读取的数据，产生当前 Run 的新结果；原生产身份不变。SourceUse 记录真实消费调用与原来源的关系，接受结果之后才能进入交互投影。失败时也保留实际发生的读取事实。原有 ToolContext 的当前 Run 因果闭包和同轮可见性不被放宽。\n\n该工具是显式的历史证据读取能力。它可以按合法历史身份取回被投影省略的来源，结果经过当前 Run 的工具授权、输出存储和反馈准入；不会要求预算计算预留整个 Session 的所有来源。跨 Session、未接受或身份被替换的来源不能读取。\n\n历史成果是当时取得的不可变快照，不代表外部世界当前状态。需要新状态时仍应调用原始工具。当前会话不会自动升级为全局 Memory。\n\n## 重启与恢复的含义\n\n打开数据库时，在取得独占执行所有权后，将旧 running 请求记录为 SessionInterrupted，并从原接受事件形成交互投影。没有结果的已启动调用显示为 unfinished，未启动的提议显示为 undispatched；不制造普通工具失败或成功。\n\n已经提交的 ToolRecorded 及其成果保留。已提交的最终报告不重跑；按原输入身份重试可以取回。内容已经存储但结果未接受的孤立快照不会升级成证据。\n\nrebuild 可以从 Run 接受事件重建正式报告与会话视图；不重新运行模型、工具或验收策略。现有来源内容和登记仍需存在并通过完整性校验；它不是数据库内容损坏后的自动修复工具。\n\n自动执行恢复属于后续阶段：需要独立的中断尝试、剩余预算、配置兼容和未知外部效果处置协议。第一阶段不会重新执行未知调用，也不通过创建新 Run 假装恢复原 Run。\n\n## 验证与证据强度\n\n- 保留原有全部协议、调度、预算、验收和取消回归。\n- 连续追问、重启后接续、同名局部调用、真实成果重读、跨会话拒绝、来源替换拒绝、输入去重、事件游标、投影重建及完整请求预算。\n- 用真实子进程 os._exit 在输入提交、模型调用、工具开始、内容存储、结果接受和完成提交后退出，重新打开确认持久化边界。\n- 注入持久化失败，验证没有模型运输或后续派发；取消发生在提交期间及完成提交之后，验证接受事实与内存一致。\n- 以独立命令行进程完成 options / second 与 read / reuse，证明不是复用内存对象。\n\nexamples/session_experiment.py 冻结 11 项对话，使用 SQLite backup 创建相同历史的三组对照。解释器只消费实际模型可见内容和工具反馈；参考答案仅在评测器中使用。相同 16,000 字节请求上限和 3,500 字节会话预算下，FULL 预先耗尽预算；RECENT 用 4 次模型决策、3 次历史读取找回目标；RELEVANT 用 1 次决策、0 次工具读取找到同一答案。一次观察总输入分别为 0、41,762、7,543 字节，峰值均在限额内。\n\n它是固定字面解释器的机制实验，不能证明真实 LLM 的成功率、长期规划收益或通用语义检索能力。BM25 的词面局限、前缀丢失与历史分页的成本都应由后续真实任务继续评测。\n\n## 设计证据\n\n以下源码调研于 2026-10-12 完成，本次以固定版本作为设计证据，未进行跨框架同任务性能比较：\n\n- [Pi SessionManager，42705224](https://github.com/earendil-works/pi/blob/4270522473e677ddba7b093caa0064a3df51d459/packages/coding-agent/src/core/session-manager.ts)：独立条目身份、活跃历史投影和压缩边界；当前不照搬分支树。\n- [Codex RolloutRecorder，a9b08151](https://github.com/openai/codex/blob/a9b0815167c27ab13719dd12d13b63e02b70d221/codex-rs/rollout/src/recorder.rs)：规范历史写入与 flush / persist 边界；当前使用 SQLite 的事务边界。\n- [OpenAI Agents SDK SQLiteSession，125efa02](https://github.com/openai/openai-agents-python/blob/125efa029b4bfd84238bd2c4fd69c3406f802663/src/agents/memory/sqlite_session.py)：会话存储、事务与取消的明确处理。\n- [Codex App Server](https://learn.chatgpt.com/docs/app-server)：Thread 与 Turn 的区分、重新打开与运行中输入；后两类运行控制不是本阶段已实现能力。\n- [Claude Code 会话](https://code.claude.com/docs/en/sessions)、[LangGraph Checkpointers](https://docs.langchain.com/oss/python/langgraph/checkpointers)：对话接续、未知工具结果与已完成结果的恢复边界。\n- [SQLite synchronous](https://www.sqlite.org/pragma.html#pragma_synchronous)：本地耐久设置及代价。存储仍依赖文件系统正确工作，不承诺任意硬件故障下的数据存活。\n"
+    },
+    "execution": {
+      "source_commit": "bb17ea0",
+      "source_path": "docs/decisions/0003-execution-backed-context.md",
+      "sha256": "17d5c82c7329d367ec898f2f96b3392131650902ba23155899781b755644d92a",
+      "text": "# ADR 0003：从已接受执行事实重建可回取的任务上下文\n\n- 状态：已采纳并实现\n- 日期：2026-10-11\n\n## 问题\n\nADR 0002 的选择器只消费大小、时间和人工必要性标记，无法发现相关证据；手工构造的 ToolExchange 也不能证明真实执行。此轮完善模型与上下文切片，核心问题是：在有限输入预算下，怎样从真实工具执行中选择当前任务相关的信息，同时保留完整结果、来源与跨调用读取关系。\n\n## 决策\n\n实现串行、有界的模型—工具循环。工具注册时声明类型、版本、行为、超时、重试、风险和审批要求；独立 Policy 决定能否执行。当前默认仅允许无需审批的低风险只读工具，不实施写操作与自动重试。\n\n工具结果经过工具专有 Schema 校验后保存为运行作用域内的内容快照。模型接收结果的投影，完整数据可通过显式工具再次读取。工具执行上下文自动记录读取过的成果，生成跨调用依赖；依赖由执行访问产生，不由模型或宿主预先标注正确证据。\n\n工具可声明结果的 `context_paths`，限制参与打分的内容子树，避免协议元数据遮蔽正文；完整成果不受影响。这是工具布局契约，不是任务答案标签，也不是隐私过滤机制。\n\n使用当前任务的目标与约束检索精确来源片段。采用确定性的词项检索与有预算的依赖闭包选择；保留近期工具反馈，相关内容使用片段表示，依赖来源至少保留可回取引用。完整输入再次编码计量，不允许裁剪后的历史失去调用身份与来源。旧的 required_call_ids API 保持兼容，仅作为显式保留基线。\n\n每份成果提供引用与不同数量的片段候选，小结果优先使用更省空间的完整表示。选择先为最新反馈提供可容纳的最小片段，再按新增相关性与新增字节的比值逐步增加或升级结果表示；成本包含缺失的依赖来源。此顺序来自实验发现：单纯优化相关性可能让旧证据挤掉刚读取出的值，破坏读取反馈闭环。当前采用有明确反馈下限的确定性贪心分配，不宣称求解全局最优。\n\n授权记录绑定工具版本、Policy 版本与独立的归一化参数快照。成功收据必须与成果及允许决策一致。框架端口身份错误终止 Run；参数或后端错误才作为模型可消费的工具反馈。自定义 Policy 不能绕过尚未实现的写操作、未知幂等性与审批流程。\n\n执行事实写入实例内的版本化事件记录，状态通过纯归约器更新；上下文读取状态投影，不自行维护另一份执行事实。事件和成果使用序列化快照防止嵌套修改。取消继续传播，取消终态可从记录观察；时限、模型轮次、工具次数与输入预算都具备明确终止行为。\n\n## 备选方案与取舍\n\n- 继续让宿主标注必要调用：可验证保留契约，但把发现相关证据的难题交给宿主；保留旧接口作历史基线，不作为当前机制。\n- 直接截断工具正文：无法恢复省略内容，缺少可靠来源范围；选择完整成果存储与精确片段投影。\n- 用模型摘要替代原始结果：额外引入摘要失真、调用成本和新的非确定性；当前先用可回取片段验证信息交付，需要语义压缩时再评测收益。\n- 仅按相关性最大化输入：容易忽视刚执行的读取反馈；为最新反馈设置可用性下限，再比较边际收益。\n- 把可变上下文作为执行状态：视图遗漏会丢失事实，任务重排也会污染历史；以事件归约为权威，视图随任务重新构建。\n\n## 当前范围\n\n不引入完整 Agent 框架或新 Runtime 依赖，不实现持久化恢复、分布式运行、长期 Memory、多 Agent、写工具或自动审批。检索提供词项相关性，不保证语义理解、证据真实性或答案正确性；依赖仅表达通过受控成果读取建立的关系，不宣称发现全部语义依赖。当前继续使用归一化 JSON 字节预算，不冒充供应商 Token 预算。\n\n验证采用真实工具执行和依赖输入内容的确定性测试模型；冻结数据与模型行为，对比近期窗口、完整内容和相关片段策略。正确答案与必要来源只由评测端检查，不作为上下文策略输入。测试模型用于证明执行与信息交付的因果关系，不能证明真实 LLM 收益。\n\n## 验证结论与后续条件\n\nFixture / Solver / Evaluator v1 的四个场景、三种策略共 12 次实际运行。相关策略在旧证据被近期噪声挤压的场景中交付可验证答案；近期基线丢失答案，完整历史超预算。大结果尾部与显式成果读取场景也能在有限输入下完成，全部运行保持预算、读取闭包和事件状态回放不变量。源码流程、精确成本与局限见 [当前说明](../model-context-selection.md)。\n\n当前来源枚举由测试模型固定，不能据此接受真实模型能力提升结论。下一步应冻结真实模型配置与领域无关任务，采用供应商实际输入计量，检验遗漏恢复、任务修订和错误反馈的收益；若词项检索暴露同义词、冲突或证据遗漏问题，再根据失败证据调整机制。\n"
+    }
+  },
+  "cases": [
+    {
+      "name": "history_tail",
+      "query": "会话历史回读的权限与原文摘要身份检查是什么？",
+      "history": [
+        "session",
+        "memory",
+        "model",
+        "evaluation"
+      ],
+      "documents": [
+        "tools"
+      ],
+      "expected_phrases": [
+        "同一 Session",
+        "摘要和完整来源身份一致"
+      ]
+    },
+    {
+      "name": "cross_channel",
+      "query": "上下文不足时如何保证工具回执配对，并通过模型 usage 计算 Token？",
+      "history": [
+        "context",
+        "evaluation",
+        "memory"
+      ],
+      "documents": [
+        "model",
+        "tools"
+      ],
+      "expected_phrases": [
+        "Tool Result",
+        "Token 估算与真实 usage"
+      ]
+    },
+    {
+      "name": "distinct_needs",
+      "query": "上下文来源 Context View 与 Memory 条目时间有效性有何区别？",
+      "history": [
+        "evaluation",
+        "model"
+      ],
+      "documents": [
+        "context",
+        "context",
+        "context",
+        "memory"
+      ],
+      "expected_phrases": [
+        "Context View",
+        "valid_time"
+      ]
+    },
+    {
+      "name": "duplicate_pressure",
+      "query": "Context Engineering 来源预算和模型 Token usage",
+      "history": [
+        "tools",
+        "evaluation"
+      ],
+      "documents": [
+        "context",
+        "context",
+        "context",
+        "context",
+        "model"
+      ],
+      "expected_phrases": [
+        "Tokenizer-aware",
+        "Token 估算与真实 usage"
+      ]
+    },
+    {
+      "name": "state_vs_memory",
+      "query": "Execution History 权威事实和记忆撤回或更新的出处版本",
+      "history": [
+        "evaluation",
+        "context",
+        "model"
+      ],
+      "documents": [
+        "memory",
+        "context"
+      ],
+      "expected_phrases": [
+        "Execution History",
+        "版本谱系"
+      ]
+    },
+    {
+      "name": "recovery_boundary",
+      "query": "恢复原始来源和未知调用 自动执行恢复与跨 Session 权限",
+      "history": [
+        "session",
+        "evaluation",
+        "memory"
+      ],
+      "documents": [
+        "execution",
+        "tools"
+      ],
+      "expected_phrases": [
+        "不会重新执行未知调用",
+        "跨 Session"
+      ]
+    },
+    {
+      "name": "evaluation_limits",
+      "query": "确定性测试与真实模型实验的区别，任务收益如何验证？",
+      "history": [
+        "evaluation",
+        "context",
+        "tools"
+      ],
+      "documents": [
+        "model",
+        "model",
+        "model"
+      ],
+      "expected_phrases": [
+        "真实模型实验负责证明 Agent 行为",
+        "Agent 行为评测"
+      ]
+    },
+    {
+      "name": "all_fit",
+      "query": "模型 Structured Output 与 usage 能否证明真实 Agent 任务收益？",
+      "history": [],
+      "documents": [
+        "model"
+      ],
+      "expected_phrases": [
+        "Token 估算与真实 usage",
+        "不能由 Scripted Fake"
+      ]
+    }
+  ]
+}

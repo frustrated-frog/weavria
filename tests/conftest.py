@@ -1,4 +1,5 @@
 import pytest
+import tiktoken
 
 from weavria.core import (
     ModelRequest,
@@ -7,6 +8,31 @@ from weavria.core import (
     ToolExchange,
     ToolSucceededObservation,
 )
+from weavria.models import OpenAICompatibleConfig, OpenAICompatibleTokenCounter
+
+
+@pytest.fixture
+def session_counter(monkeypatch: pytest.MonkeyPatch) -> OpenAICompatibleTokenCounter:
+    """Real byte BPE on a tiny frozen vocabulary; no downloaded encoding or network."""
+    vocabulary = {bytes([i]): i for i in range(256)}
+    for pair in (b"th", b"he", b"re", b"in", b"on", b"at", b"en", b"or", b"st"):
+        vocabulary[pair] = len(vocabulary)
+    encoding = tiktoken.Encoding(
+        name="weavria-test-bpe",
+        pat_str=r"(?s).+",
+        mergeable_ranks=vocabulary,
+        special_tokens={},
+    )
+
+    def load(name: str) -> tiktoken.Encoding:
+        assert name == "weavria-test-bpe"
+        return encoding
+
+    monkeypatch.setattr(tiktoken, "get_encoding", load)
+    return OpenAICompatibleTokenCounter(
+        OpenAICompatibleConfig(model="test", max_output_tokens=256),
+        encoding="weavria-test-bpe",
+    )
 
 
 @pytest.fixture

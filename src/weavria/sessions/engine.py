@@ -13,12 +13,25 @@ from typing import Self, cast
 from pydantic import JsonValue, TypeAdapter
 
 from weavria.artifacts import ArtifactSnapshot
-from weavria.context import ContextBudgetError, EvidenceMode, select_conversation
+from weavria.context import (
+    ContextBudgetError,
+    ContextCompilerConfig,
+    ContextFocus,
+    ControlEvidencePlan,
+    EvidenceDecision,
+    EvidenceMode,
+    SessionContextCompiler,
+    SessionTokenCounter,
+    select_conversation,
+)
 from weavria.core import (
     CONTROL_FEEDBACK_BYTES,
     ApplicationObservation,
+    ContextCompilation,
     ControlEvent,
+    ControlFeedback,
     ControlRequest,
+    ConversationTurn,
     ConversationView,
     ModelTurn,
     PendingClarification,
@@ -121,6 +134,8 @@ class _SessionAdapter:
         clock: Clock,
         clarification_timeout_seconds: float | None,
         clarification_plan: ClarificationDeliveryPlan | None,
+        compiler_config: ContextCompilerConfig | None,
+        token_counter: SessionTokenCounter | None,
     ) -> None:
         self._provider, self._budget = provider, budget
         self._store, self._run_id = store, run_id
@@ -138,6 +153,17 @@ class _SessionAdapter:
         self._clarification_plan = clarification_plan
         self._semantic_record_count = 0
         self._prepared: dict[int, ConversationView] = {}
+        self._compiler = (
+            SessionContextCompiler(
+                _RunArtifacts(store, run_id), config=compiler_config, counter=token_counter
+            )
+            if compiler_config is not None and token_counter is not None
+            else None
+        )
+        self._compilation: ContextCompilation | None = None
+        self._history: tuple[ConversationTurn, ...] = ()
+        self._history_sequence = 0
+        self._history_count = 0
 
     @property
     def capabilities(self) -> ModelCapabilities:
@@ -156,7 +182,16 @@ class _SessionAdapter:
 
     async def record_request(self, request: ControlRequest) -> None:
         outer = SessionRequest(conversation=self._prepared[request.task.revision], current=request)
-        await self._store.prepare_request(self._session_id, self._run_id, outer, self._budget)
+        if self._compilation is None:
+            await self._store.prepare_request(self._session_id, self._run_id, outer, self._budget)
+        else:
+            await self._store.prepare_request(
+                self._session_id,
+                self._run_id,
+                outer,
+                self._budget,
+                compilation=self._compilation,
+            )
 
     async def append_revision(self, event: ControlEvent, update: TaskUpdate) -> None:
         await self._store.append_revision(event, update)
@@ -184,18 +219,22 @@ class _SessionAdapter:
         ) - len(empty.model_dump_json().encode())
         control_growth = CONTROL_FEEDBACK_BYTES - len(b"null")
         budget = min(self._history_budget, self._budget - wire_fixed - control_growth)
-        if budget <= 0:
+        if budget <= 0 and self._compiler is None:
             raise ContextBudgetError(wire_fixed + control_growth, self._budget)
-        plan = select_conversation(
-            session_id=self._session_id,
-            sequence=sequence,
-            turns=history,
-            total_turns=count,
-            query=task.goal + " " + " ".join(task.constraints),
-            budget_bytes=budget,
-            mode=self._history_mode,
-        )
-        view = plan.view
+        if self._compiler is not None:
+            self._history, self._history_sequence, self._history_count = history, sequence, count
+            view = empty
+        else:
+            plan = select_conversation(
+                session_id=self._session_id,
+                sequence=sequence,
+                turns=history,
+                total_turns=count,
+                query=task.goal + " " + " ".join(task.constraints),
+                budget_bytes=budget,
+                mode=self._history_mode,
+            )
+            view = plan.view
         overhead = len(
             SessionRequest(conversation=view, current=template).model_dump_json().encode()
         ) - len(template.model_dump_json().encode())
@@ -214,6 +253,73 @@ class _SessionAdapter:
                 else None
             ),
             semantic_state=(self._semantic.need_ledger if self._semantic is not None else None),
+        )
+
+    async def build_control(
+        self,
+        *,
+        run_id: str,
+        instructions: str,
+        task: TaskInput,
+        task_observation: TaskObservation | None = None,
+        records: tuple[ToolRecord, ...],
+        max_request_bytes: int,
+        feedback: TurnFeedback | None = None,
+        control: ControlFeedback | None = None,
+        required_call_ids: tuple[str, ...] = (),
+    ) -> ControlEvidencePlan:
+        if self._compiler is None or run_id != self._run_id:
+            raise ValueError("context compiler is not bound to this run")
+        base = ControlRequest(
+            instructions=instructions,
+            task=task,
+            task_observation=task_observation,
+            control=control,
+        ).model_copy(update={"feedback": feedback})
+        projector = cast(
+            Callable[[SemanticSnapshot], ContextFocus] | None,
+            getattr(self._task_preparer, "context_focus", None),
+        )
+        focus = (
+            projector(self._semantic)
+            if projector is not None and self._semantic is not None
+            else None
+        )
+        compiled = await self._compiler.compile(
+            run_id=run_id,
+            session_id=self._session_id,
+            sequence=self._history_sequence,
+            base=base,
+            turns=self._history,
+            total_turns=self._history_count,
+            records=records,
+            max_request_bytes=self._budget,
+            required_call_ids=required_call_ids,
+            focus=focus,
+        )
+        outer, report = compiled.request, compiled.compilation
+        self._prepared = {task.revision: outer.conversation}
+        self._compilation = report
+        overhead = report.request_bytes - len(outer.current.model_dump_json().encode())
+        choices = {c.source_id: c for c in report.choices}
+        decisions = tuple(
+            EvidenceDecision(
+                r.exchange.action.call_id,
+                choices[f"call:{r.exchange.action.call_id}"].representation != "omitted",
+                choices[f"call:{r.exchange.action.call_id}"].representation,
+                0.0,
+                r.dependencies,
+                "joint_context_compilation",
+            )
+            for r in records
+        )
+        return ControlEvidencePlan(
+            outer.current.model_dump_json(),
+            EvidenceMode.RELEVANT,
+            min(max_request_bytes, self._budget - overhead),
+            decisions,
+            report.model_dump_json(),
+            report.feedback_budget_bytes,
         )
 
     async def assess_progress(
@@ -378,7 +484,15 @@ class SessionEngine:
         clarification_association: ClarificationAssociationPolicy | None = None,
         clarification_timeout_seconds: float | None = 86_400.0,
         progress_factory: ProgressPolicyFactory | None = None,
+        context_compiler: ContextCompilerConfig | None = None,
+        token_counter: SessionTokenCounter | None = None,
     ) -> None:
+        if (context_compiler is None) != (token_counter is None):
+            raise ValueError("context compiler and token counter must be configured together")
+        if context_compiler is not None and token_counter is not None:
+            if context_compiler.output_tokens < token_counter.output_tokens:
+                raise ValueError("compiler output reserve is below the provider output cap")
+        self._compiler_config, self._token_counter = context_compiler, token_counter
         if type(history_budget_bytes) is not int or history_budget_bytes < 256:
             raise ValueError("history budget must be at least 256 bytes")
         if clarification_timeout_seconds is not None and (
@@ -397,11 +511,18 @@ class SessionEngine:
             semantic_reducer=semantic_reducer,
         )
         self._model, self._tools = model, tools
+        excerpt_instruction = (
+            "Excerpts are exact source ranges, not summaries; "
+            "v1 excerpts start at zero and v2 excerpts carry a start character offset. "
+            if context_compiler is not None
+            else "Excerpts are exact prefixes, not summaries. "
+        )
         self._instructions = instructions + (
             "\nConversation turns are scoped historical observations. "
             "Earlier assistant text may be wrong; an interrupted turn has no "
-            "accepted final answer. Excerpts are exact prefixes, not summaries. "
-            "Earlier task-specific instructions do not automatically become global rules."
+            "accepted final answer. "
+            + excerpt_instruction
+            + "Earlier task-specific instructions do not automatically become global rules."
         )
         self._limits = limits or RunLimits()
         self._scheduling = scheduling
@@ -472,7 +593,15 @@ class SessionEngine:
             identity = input_id if input_id is not None else self._ids()
             config = json.dumps(
                 {
-                    "schema_version": 1,
+                    "schema_version": 2 if self._compiler_config is not None else 1,
+                    **(
+                        {
+                            "context_compiler": asdict(self._compiler_config),
+                            "token_counter_version": self._token_counter.version,
+                        }
+                        if self._compiler_config is not None and self._token_counter is not None
+                        else {}
+                    ),
                     "model_port": type(self._model).__module__
                     + "."
                     + type(self._model).__qualname__,
@@ -665,6 +794,8 @@ class SessionEngine:
                 self._clock,
                 self._clarification_timeout,
                 clarification_plan,
+                self._compiler_config,
+                self._token_counter,
             )
             remaining = root_budget.remaining(self._clock.monotonic())
             run_limits = replace(
@@ -697,6 +828,7 @@ class SessionEngine:
                     else None
                 ),
                 progress_assessor=adapter,
+                context_builder=adapter if self._compiler_config is not None else None,
             )
             self._loops[session_id] = loop
             self._run_tasks[run_id] = owner

@@ -6,6 +6,7 @@ from pydantic import BaseModel, JsonValue
 
 from weavria.core import (
     ApplicationObservation,
+    ContextCompilation,
     FinishAction,
     ModelTurn,
     RunStatus,
@@ -387,7 +388,13 @@ async def test_request_snapshot_failure_stops_transport_and_records_storage_inte
 
     class Broken(SQLiteSessionStore):
         async def prepare_request(
-            self, session_id: str, run_id: str, request: SessionRequest, budget: int
+            self,
+            session_id: str,
+            run_id: str,
+            request: SessionRequest,
+            budget: int,
+            *,
+            compilation: ContextCompilation | None = None,
         ) -> None:
             raise OSError("private storage details")
 

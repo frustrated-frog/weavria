@@ -1,6 +1,7 @@
 """Public, domain-independent data contracts and run lifecycle rules."""
 
 from .actions import AgentAction, FinishAction, ToolCallAction, parse_action
+from .context import ContextChoice, ContextCompilation, SessionContextCompiled
 from .control import (
     COMPLETION_GUIDANCE_JSON_BYTES,
     CONTROL_FEEDBACK_BYTES,
@@ -33,6 +34,7 @@ from .conversation import (
     ConversationTurn,
     ConversationView,
     DirectiveView,
+    LocatedTextExcerpt,
     PastCall,
     SessionApplicationObserved,
     SessionContextPrepared,
@@ -157,6 +159,8 @@ __all__ = [
     "CompletionNotice",
     "CompletionRepair",
     "CompletionUnverifiable",
+    "ContextChoice",
+    "ContextCompilation",
     "ContextSelected",
     "ContinuationSignal",
     "ControlData",
@@ -182,6 +186,7 @@ __all__ = [
     "InvalidStateTransitionError",
     "JournalEvent",
     "JsonPointer",
+    "LocatedTextExcerpt",
     "LoopData",
     "LoopEvent",
     "LoopResult",
@@ -209,6 +214,7 @@ __all__ = [
     "SemanticVersion",
     "SessionApplicationObserved",
     "SessionClarificationChanged",
+    "SessionContextCompiled",
     "SessionContextPrepared",
     "SessionControlDecided",
     "SessionEvent",

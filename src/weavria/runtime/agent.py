@@ -15,6 +15,8 @@ from pydantic import JsonValue, TypeAdapter
 from weavria.artifacts import ArtifactStore
 from weavria.context import (
     ContextBudgetError,
+    ContextTokenBudgetError,
+    ControlContextBuilder,
     ControlEvidencePlan,
     EvidenceContextBuilder,
     EvidenceMode,
@@ -274,6 +276,7 @@ class _AgentKernel:
         progress_assessor: ProgressAssessor | None = None,
         # 候选工具批次的主动控制策略, None 使用默认的 blocked/stop 干预策略。
         intervention: ActionInterventionPolicy | None = None,
+        context_builder: ControlContextBuilder | None = None,
     ) -> None:
         self._journal = journal
         self._preparation = preparation
@@ -292,6 +295,8 @@ class _AgentKernel:
         self._limits = limits if limits is not None else RunLimits()
         self._request_budget = self._limits.max_request_bytes
         self._builder = EvidenceContextBuilder(artifacts, mode=mode)
+        self._control_builder = context_builder or self._builder
+        self._feedback_budget = self._request_budget
         self._artifacts = artifacts
         self._completion = completion if completion is not None else NoVerification()
         self._bounds = (
@@ -442,7 +447,19 @@ class _AgentKernel:
                             self._request_budget = prepared.request_budget_bytes
                             self._apply_turn_preparation(prepared, task)
                         plan = await self._build_context(task)
-                    except ContextBudgetError:
+                        if isinstance(plan, ControlEvidencePlan):
+                            if not 0 < plan.budget_bytes <= self._request_budget:
+                                raise ValueError("compiled context increased the request budget")
+                            self._request_budget = plan.budget_bytes
+                            self._feedback_budget = min(
+                                self._request_budget,
+                                plan.feedback_budget_bytes
+                                if plan.feedback_budget_bytes is not None
+                                else self._request_budget,
+                            )
+                            if self._feedback_budget < 1:
+                                raise ValueError("compiled feedback budget must be positive")
+                    except (ContextBudgetError, ContextTokenBudgetError):
                         if task.revision != self.state.task.revision:
                             continue
                         raise
@@ -588,6 +605,8 @@ class _AgentKernel:
                 or isinstance(exc, _DispatchDeadlineExpired)
             ):
                 return await self._end(RunStatus.BUDGET_EXHAUSTED, "deadline")
+            if isinstance(exc, ContextTokenBudgetError):
+                return await self._end(RunStatus.BUDGET_EXHAUSTED, "context_tokens")
             if isinstance(exc, ContextBudgetError):
                 return await self._end(RunStatus.BUDGET_EXHAUSTED, "context_bytes")
             if isinstance(exc, CompletionCheckError):
@@ -682,7 +701,7 @@ class _AgentKernel:
                     max_request_bytes=self._request_budget,
                 )
             if self._journal_version == 3:
-                return await self._builder.build_control(
+                return await self._control_builder.build_control(
                     run_id=self._run_id,
                     instructions=self._instructions,
                     task=task,
@@ -834,7 +853,7 @@ class _AgentKernel:
             records=self.state.records,
             batch=batch,
             bounds=self._bounds,
-            budget_bytes=self._request_budget,
+            budget_bytes=self._feedback_budget,
         )
         remaining = max(0, self._limits.max_tool_calls - self.state.tool_calls)
         visible = {descriptor.name for descriptor in self._visible_tools.descriptors}
@@ -1449,6 +1468,7 @@ class AgentLoop(_AgentKernel):
         progress_assessor: ProgressAssessor | None = None,
         # 候选工具批次的主动控制策略, None 使用默认的 blocked/stop 干预策略。
         intervention: ActionInterventionPolicy | None = None,
+        context_builder: ControlContextBuilder | None = None,
         # 构造函数只建立依赖、初始状态和首个事件,不在初始化阶段执行模型或工具。
     ) -> None:
         # 把基类的通用“决策”回调适配为 v3 模型调用,同时保留统一的超时边界。
@@ -1510,6 +1530,7 @@ class AgentLoop(_AgentKernel):
             progress=progress,
             progress_assessor=progress_assessor,
             intervention=intervention,
+            context_builder=context_builder,
             # 完成共享内核初始化;此时实例已拥有初始状态,但尚未进入异步执行循环。
         )
 

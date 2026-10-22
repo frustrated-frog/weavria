@@ -14,6 +14,7 @@ from pydantic import JsonValue, TypeAdapter
 from weavria.artifacts import ArtifactSnapshot, ArtifactStore
 from weavria.core import (
     CONTROL_FEEDBACK_BYTES,
+    ContextCompilation,
     ControlFeedback,
     ControlRequest,
     ModelRequest,
@@ -69,16 +70,16 @@ class Passage:
         }
 
 
-def _passages(value: JsonValue, pointer: str = "") -> tuple[Passage, ...]:
+def index_passages(value: JsonValue, pointer: str = "") -> tuple[Passage, ...]:
     """Index lossless source ranges once; no model-generated summaries."""
     result: list[Passage] = []
     if isinstance(value, dict):
         for key, child in value.items():
             escaped = key.replace("~", "~0").replace("/", "~1")
-            result.extend(_passages(child, f"{pointer}/{escaped}"))
+            result.extend(index_passages(child, f"{pointer}/{escaped}"))
     elif isinstance(value, list):
         for index, child in enumerate(value):
-            result.extend(_passages(child, f"{pointer}/{index}"))
+            result.extend(index_passages(child, f"{pointer}/{index}"))
     elif isinstance(value, str):
         # Each chunk bounds its UTF-8 content. Offsets address original Unicode characters.
         start = 0
@@ -178,6 +179,9 @@ class TurnEvidencePlan(_EvidencePlan):
 class ControlEvidencePlan(_EvidencePlan):
     """v3 request; minimum feedback remains available even when full views cannot fit."""
 
+    compilation_json: str | None = None
+    feedback_budget_bytes: int | None = None
+
     @property
     def request(self) -> ControlRequest:
         return ControlRequest.model_validate_json(self.request_json)
@@ -188,6 +192,15 @@ class ControlEvidencePlan(_EvidencePlan):
             "schema_version": 3,
             "request_schema_version": 3,
             "control_padding_bytes": self.control_padding_bytes,
+            **(
+                {
+                    "compilation": ContextCompilation.model_validate_json(
+                        self.compilation_json
+                    ).model_dump(mode="json")
+                }
+                if self.compilation_json
+                else {}
+            ),
         }
 
     @property
@@ -347,7 +360,7 @@ class EvidenceContextBuilder:
                         raise ContextBuildError(
                             "artifact identity disagrees with accepted execution"
                         )
-                    self._index[key] = _IndexedResult(snapshot, _passages(snapshot.value))
+                    self._index[key] = _IndexedResult(snapshot, index_passages(snapshot.value))
                 indexed[index] = self._index[key]
                 if indexed[index].snapshot.reference != reference:
                     raise ContextBuildError("cached artifact disagrees with accepted execution")

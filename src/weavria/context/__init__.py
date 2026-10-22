@@ -1,7 +1,10 @@
 """Public deterministic context policies and inspected model input plans."""
 
 from .admission import FeedbackReservation, reserve_feedback
+from .budget import ContextCompilerConfig, ContextTokenBudgetError, SessionTokenCounter
+from .compiler import CompiledSessionContext, ControlContextBuilder, SessionContextCompiler
 from .conversation import ConversationPlan, project_turn, select_conversation
+from .demand import ContextDemand, ContextFocus, EvidenceAnchor
 from .evidence import (
     ControlEvidencePlan,
     EvidenceContextBuilder,
@@ -27,11 +30,18 @@ from .selection import (
 )
 
 __all__ = [
+    "CompiledSessionContext",
     "ContextBudgetError",
     "ContextBuildError",
+    "ContextCompilerConfig",
+    "ContextDemand",
+    "ContextFocus",
     "ContextPlan",
+    "ContextTokenBudgetError",
+    "ControlContextBuilder",
     "ControlEvidencePlan",
     "ConversationPlan",
+    "EvidenceAnchor",
     "EvidenceContextBuilder",
     "EvidenceDecision",
     "EvidenceMode",
@@ -44,6 +54,8 @@ __all__ = [
     "HistorySelector",
     "RecentHistory",
     "SelectionReason",
+    "SessionContextCompiler",
+    "SessionTokenCounter",
     "TurnEvidencePlan",
     "build_context",
     "project_turn",

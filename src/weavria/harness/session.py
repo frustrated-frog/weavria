@@ -4,6 +4,7 @@ import hashlib
 import json
 from typing import NoReturn
 
+from weavria.context import ContextFocus
 from weavria.core import (
     ConversationTurn,
     Message,
@@ -24,6 +25,7 @@ from weavria.sessions import (
 from .capabilities import CapabilityQuery, CapabilityResolver
 from .clarification import BlockingAmbiguityPolicy, ClarificationPolicy
 from .completion import TaskCompletionEvaluator, TaskObligationCompletionPolicy
+from .context import project_context_focus
 from .progress import NeedProgressEvaluator
 from .requirements import EvidenceResolver, NeedLedger, NeedStatus, stable_identifier
 from .understanding import (
@@ -83,6 +85,10 @@ class TaskAwareSessionPreparer:
     @property
     def progress_assessment_version(self) -> str:
         return self._progress.version
+
+    def context_focus(self, snapshot: SemanticSnapshot) -> ContextFocus:
+        """Project the current accepted ledger into soft retrieval hints."""
+        return project_context_focus(snapshot)
 
     async def assess_progress(self, context: SessionProgressContext) -> ProgressAssessment:
         """Evaluate the just-settled turn against committed before/after semantic heads."""
