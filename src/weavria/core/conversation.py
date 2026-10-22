@@ -126,10 +126,68 @@ class LocatedTextExcerpt(BaseModel):
         return self
 
 
+class TextRange(ContractModel):
+    """A nonempty, exact Unicode character range in one original text field."""
+
+    start: int = Field(ge=0)
+    end: int = Field(gt=0)
+    text: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_extent(self) -> Self:
+        if self.end - self.start != len(self.text):
+            raise ValueError("text range extent disagrees with its content")
+        return self
+
+
+class MultiRangeTextView(BaseModel):
+    """v3 exact disjoint ranges; partial content is verified against the source store."""
+
+    model_config = ContractModel.model_config
+    schema_version: Literal[3] = 3
+    sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    total_chars: int = Field(gt=0)
+    ranges: tuple[TextRange, ...] = Field(min_length=1, max_length=16)
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def validate_version_type(cls, value: object) -> object:
+        return ContractModel.validate_version_type(value)
+
+    @model_validator(mode="after")
+    def validate_extent(self) -> Self:
+        import hashlib
+
+        previous = -1
+        for part in self.ranges:
+            if part.start <= previous or part.end > self.total_chars:
+                raise ValueError("text ranges must be ordered, disjoint and coalesced")
+            previous = part.end
+        if (
+            self.complete
+            and hashlib.sha256(self.ranges[0].text.encode()).hexdigest() != self.sha256
+        ):
+            raise ValueError("complete ranges do not match the original digest")
+        return self
+
+    @property
+    def complete(self) -> bool:
+        return (
+            len(self.ranges) == 1
+            and self.ranges[0].start == 0
+            and self.ranges[0].end == self.total_chars
+        )
+
+    @property
+    def text(self) -> str:
+        """Join fragments for display only; this value has no contiguous source offset."""
+        return "\n…\n".join(part.text for part in self.ranges)
+
+
 class DirectiveView(ContractModel):
     input_id: NonBlankString
     revision: int = Field(ge=2)
-    text: TextExcerpt | LocatedTextExcerpt
+    text: TextExcerpt | LocatedTextExcerpt | MultiRangeTextView
 
 
 class ConversationItem(BaseModel):
@@ -143,8 +201,8 @@ class ConversationItem(BaseModel):
 
     run_id: NonBlankString
     ordinal: int = Field(ge=1)
-    user: TextExcerpt | LocatedTextExcerpt
-    assistant: TextExcerpt | LocatedTextExcerpt | None
+    user: TextExcerpt | LocatedTextExcerpt | MultiRangeTextView
+    assistant: TextExcerpt | LocatedTextExcerpt | MultiRangeTextView | None
     status: Literal["completed", "failed", "cancelled", "budget_exhausted", "interrupted"]
     task_outcome: Literal["verified", "unverified", "unverifiable"]
     calls: tuple[PastCall, ...] = ()
@@ -167,9 +225,9 @@ class ConversationView(BaseModel):
     through_sequence: int = Field(ge=0)
     turns: tuple[ConversationItem, ...] = ()
     omitted_turns: int = Field(default=0, ge=0)
-    policy_version: Literal["conversation/2", "context-compiler/1", "context-compiler/2"] = (
-        "conversation/2"
-    )
+    policy_version: Literal[
+        "conversation/2", "context-compiler/1", "context-compiler/2", "context-compiler/3"
+    ] = "conversation/2"
 
     @model_validator(mode="after")
     def validate_order(self) -> Self:

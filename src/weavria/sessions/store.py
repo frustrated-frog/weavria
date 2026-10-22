@@ -11,9 +11,10 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Self
+from typing import Self, cast
 
 from weavria.artifacts import ArtifactAccessError, ArtifactSnapshot
+from weavria.context import ContextDemand, HistoryRetrievalConfig, RetrievedHistory
 from weavria.core import (
     ApplicationObservation,
     ArtifactRef,
@@ -53,6 +54,16 @@ from weavria.core import (
 from weavria.runtime import Clock, Phase, RunState, SystemClock, reduce_event, settle_mutation
 from weavria.tools import ToolExecutionError
 
+from .history_index import (
+    HistoryCancelled,
+    HistoryIndexError,
+    HistoryWork,
+    create_history_schema,
+    rebuild_index,
+    register_history,
+)
+from .history_search import search_history
+from .history_validation import validate_history_request
 from .preparation import SemanticTransitionReducer
 
 
@@ -237,7 +248,7 @@ class SQLiteSessionStore:
         conn = sqlite3.connect(self.path, timeout=2.0)
         self._connection = conn
         version = conn.execute("PRAGMA user_version").fetchone()[0]
-        if version not in (0, 1, 2, 3, 4, 5):
+        if version not in (0, 1, 2, 3, 4, 5, 6):
             raise SessionConflictError("unsupported session database schema")
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA journal_mode=WAL")
@@ -284,6 +295,13 @@ class SQLiteSessionStore:
             self._migrate_v4()
         if version < 5:
             self._migrate_v5()
+        if version < 6:
+            with self._transaction() as migration:
+                try:
+                    create_history_schema(migration)
+                except HistoryIndexError as exc:
+                    raise SessionConflictError(str(exc)) from exc
+                migration.execute("PRAGMA user_version=6")
         # Only the exclusive DB owner can classify an old live run as interrupted.
         active = conn.execute("SELECT id FROM runs WHERE status='running'").fetchall()
         for row in active:
@@ -875,6 +893,16 @@ class SQLiteSessionStore:
                         "UPDATE sessions SET active_run=NULL WHERE id=? AND active_run=?",
                         (row[0], fact.run_id),
                     )
+                    register_history(
+                        conn,
+                        row[0],
+                        fact.run_id,
+                        row[4],
+                        view.model_dump_json(),
+                        conn.execute("SELECT head FROM sessions WHERE id=?", (row[0],)).fetchone()[
+                            0
+                        ],
+                    )
             if isinstance(fact.data, RunEnded):
                 self._states.pop(fact.run_id, None)
             else:
@@ -975,7 +1003,94 @@ class SQLiteSessionStore:
                 "UPDATE sessions SET active_run=NULL WHERE id=? AND active_run=?", (row[0], run_id)
             )
             self._session_event(conn, row[0], notice)
+            register_history(
+                conn,
+                row[0],
+                run_id,
+                row[3],
+                view.model_dump_json(),
+                conn.execute("SELECT head FROM sessions WHERE id=?", (row[0],)).fetchone()[0],
+            )
         self._states.pop(run_id, None)
+
+    async def retrieve_history(
+        self,
+        session_id: str,
+        *,
+        task_revision: int,
+        before_ordinal: int,
+        through_sequence: int,
+        demands: tuple[ContextDemand, ...],
+        config: HistoryRetrievalConfig,
+        candidate_limit: int | None = None,
+    ) -> RetrievedHistory:
+        """Discover bounded accepted history; cancellation joins the interrupted worker."""
+        limit = config.max_candidates if candidate_limit is None else candidate_limit
+        if type(limit) is not int or not 2 <= limit <= config.max_candidates:
+            raise ValueError("candidate limit must be between two and configured maximum")
+        if (
+            type(task_revision) is not int
+            or task_revision < 1
+            or type(before_ordinal) is not int
+            or before_ordinal < 1
+            or type(through_sequence) is not int
+            or through_sequence < 0
+            or not isinstance(cast(object, demands), tuple)
+            or len(demands) > 129
+            or any(not isinstance(d, ContextDemand) for d in cast(tuple[object, ...], demands))
+            or len({d.demand_id for d in demands}) != len(demands)
+        ):
+            raise ValueError("invalid historical query scope or demands")
+        work = HistoryWork(
+            config, self._clock.monotonic, self._clock.monotonic() + config.max_duration
+        )
+
+        def retrieve() -> RetrievedHistory:
+            try:
+                return search_history(
+                    self._conn(),
+                    session_id=session_id,
+                    task_revision=task_revision,
+                    before_ordinal=before_ordinal,
+                    through_sequence=through_sequence,
+                    demands=demands,
+                    candidate_limit=limit,
+                    work=work,
+                )
+            except HistoryIndexError as exc:
+                raise SessionConflictError(str(exc)) from exc
+
+        if self._closed:
+            raise RuntimeError("session store is closed")
+        async with self._slots:
+            future = asyncio.get_running_loop().run_in_executor(self._executor, retrieve)
+            try:
+                return await asyncio.shield(future)
+            except asyncio.CancelledError:
+                work.cancelled.set()
+                try:
+                    await settle_mutation(future)
+                except HistoryCancelled:
+                    pass
+                except Exception as exc:
+                    # A concurrent backend failure must not turn parent cancellation
+                    # into an ordinary retrieval failure after joining the worker.
+                    raise asyncio.CancelledError from exc
+                raise
+
+    async def rebuild_history_index(self, session_id: str) -> None:
+        """Invalidate derived postings and advance generation; accepted facts remain unchanged."""
+
+        def rebuild() -> None:
+            with self._transaction() as conn:
+                if (
+                    conn.execute("SELECT 1 FROM sessions WHERE id=?", (session_id,)).fetchone()
+                    is None
+                ):
+                    raise SessionConflictError("unknown history Session")
+                rebuild_index(conn, session_id)
+
+        await self._submit(rebuild)
 
     async def history(
         self, session_id: str, *, before_ordinal: int | None = None, limit: int = 64
@@ -1132,7 +1247,7 @@ class SQLiteSessionStore:
             with self._transaction() as conn:
                 state = self._state(run_id)
                 row = conn.execute(
-                    "SELECT session_id,status FROM runs WHERE id=?", (run_id,)
+                    "SELECT session_id,status,ordinal FROM runs WHERE id=?", (run_id,)
                 ).fetchone()
                 if (
                     row is None
@@ -1166,6 +1281,13 @@ class SQLiteSessionStore:
                     request_bytes=len(encoded.encode()),
                     budget_bytes=budget,
                 )
+                if compilation is not None and compilation.retrieval is not None:
+                    try:
+                        validate_history_request(
+                            conn, session_id, row[2], request, compilation.retrieval
+                        )
+                    except HistoryIndexError as exc:
+                        raise SessionConflictError(str(exc)) from exc
                 conn.execute(
                     "INSERT INTO request_views VALUES(?,?,?)", (run_id, state.model_calls, encoded)
                 )

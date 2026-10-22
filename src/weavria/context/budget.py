@@ -61,6 +61,7 @@ class ContextCompilerConfig:
     max_index_passages: int = 65_536
     max_scoring_work: int = 2_000_000
     max_allocation_steps: int = 4096
+    max_history_spans: int = 1
 
     def __post_init__(self) -> None:
         for value in (
@@ -73,6 +74,7 @@ class ContextCompilerConfig:
             self.max_index_passages,
             self.max_scoring_work,
             self.max_allocation_steps,
+            self.max_history_spans,
         ):
             if type(value) is not int or value <= 0:
                 raise ValueError("compiler limits must be positive integers")
@@ -82,7 +84,7 @@ class ContextCompilerConfig:
             raise ValueError("output and safety reserves exhaust the context window")
         if self.policy not in ("coverage", "relevance", "recent", "full"):
             raise ValueError("unknown context allocation policy")
-        if self.max_passages > 32 or self.max_units > 1024:
+        if self.max_passages > 32 or self.max_units > 1024 or self.max_history_spans > 16:
             raise ValueError("compiler candidate limits exceed supported bounds")
 
     @property

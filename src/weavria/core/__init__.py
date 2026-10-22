@@ -35,6 +35,7 @@ from .conversation import (
     ConversationView,
     DirectiveView,
     LocatedTextExcerpt,
+    MultiRangeTextView,
     PastCall,
     SessionApplicationObserved,
     SessionContextPrepared,
@@ -49,6 +50,7 @@ from .conversation import (
     SessionTaskUpdated,
     SourceUse,
     TextExcerpt,
+    TextRange,
 )
 from .errors import ErrorCategory, InvalidActionError, RunError
 from .evidence_access import EvidenceAccessView
@@ -108,6 +110,12 @@ from .progress import (
     InformationGainSignal,
     ObligationProgressSignal,
     ProgressAssessment,
+)
+from .retrieval import (
+    HistoryMatch,
+    HistoryRetrievalReport,
+    HistorySourceAddress,
+    RetrievedHistoryCandidate,
 )
 from .semantics import (
     PendingClarification,
@@ -181,6 +189,9 @@ __all__ = [
     "FeedbackBounds",
     "FinishAction",
     "HistoryEntry",
+    "HistoryMatch",
+    "HistoryRetrievalReport",
+    "HistorySourceAddress",
     "InformationGainSignal",
     "InterventionDecision",
     "InterventionNotice",
@@ -199,6 +210,7 @@ __all__ = [
     "ModelResponse",
     "ModelStarted",
     "ModelTurn",
+    "MultiRangeTextView",
     "ObligationProgressSignal",
     "Observation",
     "PastCall",
@@ -206,6 +218,7 @@ __all__ = [
     "ProgressAssessed",
     "ProgressAssessment",
     "ProgressNotice",
+    "RetrievedHistoryCandidate",
     "RunEnded",
     "RunError",
     "RunReport",
@@ -235,6 +248,7 @@ __all__ = [
     "TaskRevised",
     "TaskUpdate",
     "TextExcerpt",
+    "TextRange",
     "ToolAuthorization",
     "ToolBatch",
     "ToolCallAction",

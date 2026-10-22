@@ -28,6 +28,7 @@ from .demand import ContextDemand
 from .evidence import Passage, index_passages, terms
 from .indexing import bounded_passages
 from .selection import ContextBuildError
+from .spans import complementary_passages, exact_text_view
 
 
 def digest(text: str) -> str:
@@ -393,20 +394,27 @@ async def conversation_units(
     turns: tuple[ConversationTurn, ...],
     scorer: CoverageScorer,
     indexed: tuple[tuple[Passage, ...], ...],
+    *,
+    max_spans: int = 1,
 ) -> tuple[ContextUnit, ...]:
     result: list[ContextUnit] = []
     for i, turn in enumerate(turns):
-        result.append(_conversation_unit(turn, scorer, indexed[i], required=i >= len(turns) - 2))
+        result.append(
+            await _conversation_unit(
+                turn, scorer, indexed[i], required=i >= len(turns) - 2, max_spans=max_spans
+            )
+        )
         await asyncio.sleep(0)
     return tuple(result)
 
 
-def _conversation_unit(
+async def _conversation_unit(
     turn: ConversationTurn,
     scorer: CoverageScorer,
     indexed: tuple[Passage, ...],
     *,
     required: bool,
+    max_spans: int,
 ) -> ContextUnit:
     minimum = project_turn(turn, full=False)
     full = project_turn(turn, full=True)
@@ -474,6 +482,37 @@ def _conversation_unit(
     for radius in (1, 2):
         view = item(radius)
         variants.append(Representation("excerpt", view.model_dump_json(), features(view)))
+    if max_spans > 1:
+        for chosen in await complementary_passages(indexed, scorer.features, max_spans):
+
+            def parts(pointer: str, selection: tuple[Passage, ...] = chosen) -> tuple[Passage, ...]:
+                return tuple(p for p in selection if p.pointer == pointer)
+
+            view = ConversationItem(
+                run_id=turn.run_id,
+                ordinal=turn.ordinal,
+                user=exact_text_view(turn.user, parts("/user")),
+                assistant=exact_text_view(turn.assistant, parts("/assistant"))
+                if turn.assistant is not None
+                else None,
+                status=turn.status,
+                task_outcome=turn.task_outcome,
+                calls=turn.calls,
+                source_uses=turn.source_uses,
+                unfinished_call_ids=turn.unfinished_call_ids,
+                undispatched_call_ids=turn.undispatched_call_ids,
+                updates=tuple(
+                    DirectiveView(
+                        input_id=u.directive.input_id,
+                        revision=u.task.revision,
+                        text=exact_text_view(u.directive.text, parts(f"/updates/{i}")),
+                    )
+                    for i, u in enumerate(turn.updates)
+                ),
+            )
+            variants.append(
+                Representation("excerpt", view.model_dump_json(), scorer.features(chosen))
+            )
     variants.append(Representation("raw", full.model_dump_json(), scorer.features(indexed)))
     return ContextUnit(
         f"turn:{turn.run_id}",

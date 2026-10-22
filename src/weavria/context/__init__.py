@@ -25,6 +25,13 @@ from .policies import (
     HistorySelector,
     RecentHistory,
 )
+from .retrieval import (
+    HistoryRetrievalConfig,
+    RetrievedHistory,
+    history_query_digest,
+    history_text_fields,
+    history_text_passages,
+)
 from .selection import (
     ContextBudgetError,
     ContextBuildError,
@@ -57,13 +64,18 @@ __all__ = [
     "FullHistory",
     "HistoryCandidate",
     "HistoryDecision",
+    "HistoryRetrievalConfig",
     "HistorySelector",
     "RecentHistory",
+    "RetrievedHistory",
     "SelectionReason",
     "SessionContextCompiler",
     "SessionTokenCounter",
     "TurnEvidencePlan",
     "build_context",
+    "history_query_digest",
+    "history_text_fields",
+    "history_text_passages",
     "project_turn",
     "reserve_feedback",
     "select_conversation",

@@ -16,10 +16,12 @@ from weavria.artifacts import ArtifactSnapshot
 from weavria.context import (
     ContextBudgetError,
     ContextCompilerConfig,
+    ContextDemand,
     ContextFocus,
     ControlEvidencePlan,
     EvidenceDecision,
     EvidenceMode,
+    HistoryRetrievalConfig,
     SessionContextCompiler,
     SessionTokenCounter,
     select_conversation,
@@ -136,6 +138,7 @@ class _SessionAdapter:
         clarification_plan: ClarificationDeliveryPlan | None,
         compiler_config: ContextCompilerConfig | None,
         token_counter: SessionTokenCounter | None,
+        history_retrieval: HistoryRetrievalConfig | None,
     ) -> None:
         self._provider, self._budget = provider, budget
         self._store, self._run_id = store, run_id
@@ -164,6 +167,7 @@ class _SessionAdapter:
         self._history: tuple[ConversationTurn, ...] = ()
         self._history_sequence = 0
         self._history_count = 0
+        self._retrieval_config = history_retrieval
 
     @property
     def capabilities(self) -> ModelCapabilities:
@@ -202,7 +206,11 @@ class _SessionAdapter:
     async def prepare_turn(self, task: TaskInput) -> TurnPreparation:
         await self._refresh_semantics(task)
         sequence, count = await self._store.head(self._session_id)
-        history = await self._store.history(self._session_id, before_ordinal=self._ordinal)
+        history = (
+            await self._store.history(self._session_id, before_ordinal=self._ordinal)
+            if self._retrieval_config is None
+            else ()
+        )
         visible = self._tools.select(self._visible_tool_names)
         template = AgentLoop.request_template_for(
             task,
@@ -285,6 +293,27 @@ class _SessionAdapter:
             if projector is not None and self._semantic is not None
             else None
         )
+        retrieval = None
+        if self._retrieval_config is not None:
+            discovered = await self._store.retrieve_history(
+                self._session_id,
+                task_revision=task.revision,
+                before_ordinal=self._ordinal,
+                through_sequence=self._history_sequence,
+                demands=(
+                    ContextDemand("current_task", " ".join((task.goal, *task.constraints))),
+                    *(focus.demands if focus else ()),
+                ),
+                config=self._retrieval_config,
+                candidate_limit=max(
+                    2,
+                    min(
+                        self._retrieval_config.max_candidates,
+                        self._compiler.config.max_units - len(records),
+                    ),
+                ),
+            )
+            self._history, retrieval = discovered.turns, discovered.report
         compiled = await self._compiler.compile(
             run_id=run_id,
             session_id=self._session_id,
@@ -296,6 +325,7 @@ class _SessionAdapter:
             max_request_bytes=self._budget,
             required_call_ids=required_call_ids,
             focus=focus,
+            retrieval=retrieval,
         )
         outer, report = compiled.request, compiled.compilation
         self._prepared = {task.revision: outer.conversation}
@@ -486,6 +516,7 @@ class SessionEngine:
         progress_factory: ProgressPolicyFactory | None = None,
         context_compiler: ContextCompilerConfig | None = None,
         token_counter: SessionTokenCounter | None = None,
+        history_retrieval: HistoryRetrievalConfig | None = None,
     ) -> None:
         if (context_compiler is None) != (token_counter is None):
             raise ValueError("context compiler and token counter must be configured together")
@@ -493,6 +524,9 @@ class SessionEngine:
             if context_compiler.output_tokens < token_counter.output_tokens:
                 raise ValueError("compiler output reserve is below the provider output cap")
         self._compiler_config, self._token_counter = context_compiler, token_counter
+        if history_retrieval is not None and context_compiler is None:
+            raise ValueError("history retrieval requires the context compiler")
+        self._retrieval_config = history_retrieval
         if type(history_budget_bytes) is not int or history_budget_bytes < 256:
             raise ValueError("history budget must be at least 256 bytes")
         if clarification_timeout_seconds is not None and (
@@ -593,7 +627,22 @@ class SessionEngine:
             identity = input_id if input_id is not None else self._ids()
             config = json.dumps(
                 {
-                    "schema_version": 2 if self._compiler_config is not None else 1,
+                    "schema_version": (
+                        3
+                        if self._retrieval_config is not None
+                        or (
+                            self._compiler_config is not None
+                            and self._compiler_config.max_history_spans > 1
+                        )
+                        else 2
+                        if self._compiler_config is not None
+                        else 1
+                    ),
+                    **(
+                        {"history_retrieval": asdict(self._retrieval_config)}
+                        if self._retrieval_config is not None
+                        else {}
+                    ),
                     **(
                         {
                             "context_compiler": asdict(self._compiler_config),
@@ -774,6 +823,11 @@ class SessionEngine:
                     " Read omitted text with read_session_history and prior evidence "
                     "with read_session_source."
                 )
+            if self._compiler_config is not None and self._compiler_config.max_history_spans > 1:
+                run_instructions += (
+                    " Text view v3 contains disjoint exact ranges in one original field."
+                    " Gaps are omitted text; ranges must not be read as contiguous prose."
+                )
             adapter = _SessionAdapter(
                 self._model,
                 self._limits.max_request_bytes,
@@ -796,6 +850,7 @@ class SessionEngine:
                 clarification_plan,
                 self._compiler_config,
                 self._token_counter,
+                self._retrieval_config,
             )
             remaining = root_budget.remaining(self._clock.monotonic())
             run_limits = replace(

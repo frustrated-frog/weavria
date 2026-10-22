@@ -12,6 +12,7 @@ from pydantic import (
 )
 
 from ._schema import ContractModel, NonBlankString
+from .retrieval import HistoryRetrievalReport
 
 
 class ContextChoice(ContractModel):
@@ -28,7 +29,7 @@ class ContextCompilation(BaseModel):
     """Bind allocation diagnostics to the exact complete request sent to a provider."""
 
     model_config = ContractModel.model_config
-    schema_version: Literal[1, 2] = 1
+    schema_version: Literal[1, 2, 3] = 1
 
     policy_version: NonBlankString
     counter_version: NonBlankString
@@ -50,6 +51,7 @@ class ContextCompilation(BaseModel):
     allocation_exhausted: bool = False
     choices: tuple[ContextChoice, ...]
     uncovered_demand_ids: tuple[str, ...] = ()
+    retrieval: HistoryRetrievalReport | None = None
 
     @field_validator("schema_version", mode="before")
     @classmethod
@@ -62,12 +64,18 @@ class ContextCompilation(BaseModel):
         if self.schema_version == 1:
             data.pop("allocation_steps", None)
             data.pop("allocation_exhausted", None)
+        if self.schema_version < 3:
+            data.pop("retrieval", None)
         return data
 
     @model_validator(mode="after")
     def validate_allocation(self) -> Self:
         if self.schema_version == 1 and (self.allocation_steps or self.allocation_exhausted):
             raise ValueError("allocation work diagnostics require compilation v2")
+        if self.retrieval is not None and (
+            self.schema_version < 3 or self.retrieval.task_revision != self.task_revision
+        ):
+            raise ValueError("retrieval diagnostics require compilation v3 and the same revision")
         if self.input_tokens > self.input_budget_tokens:
             raise ValueError("compiled request exceeds its input token budget")
         if self.request_bytes + self.control_reserve_bytes > self.budget_bytes:

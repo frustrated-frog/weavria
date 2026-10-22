@@ -13,6 +13,7 @@ from weavria.core import (
     ControlRequest,
     ConversationTurn,
     ConversationView,
+    HistoryRetrievalReport,
     SessionRequest,
     TaskInput,
     TaskObservation,
@@ -36,6 +37,7 @@ from .compiler_sources import (
 )
 from .demand import ContextDemand, ContextFocus
 from .evidence import ControlEvidencePlan
+from .retrieval import history_query_digest
 from .selection import ContextBudgetError, ContextBuildError
 
 
@@ -111,6 +113,7 @@ class SessionContextCompiler:
         max_request_bytes: int,
         required_call_ids: tuple[str, ...] = (),
         focus: ContextFocus | None = None,
+        retrieval: HistoryRetrievalReport | None = None,
     ) -> CompiledSessionContext:
         """Compile accepted sources, raising on invalid identity or exhausted budgets.
 
@@ -152,6 +155,16 @@ class SessionContextCompiler:
         ):
             raise ContextBuildError("conversation candidates must be unique prior interactions")
         records = tuple(ToolRecord.model_validate_json(r.model_dump_json()) for r in records)
+        if retrieval is not None and (
+            retrieval.session_id != session_id
+            or retrieval.task_revision != base.task.revision
+            or retrieval.through_sequence != sequence
+            or {t.run_id: (t.ordinal, digest(t.model_dump_json())) for t in turns}
+            != {c.run_id: (c.ordinal, c.view_sha256) for c in retrieval.candidates}
+        ):
+            raise ContextBuildError(
+                "retrieval report does not bind the compiler's accepted sources"
+            )
         source_bytes = sum(len(t.model_dump_json().encode()) for t in turns) + sum(
             len(r.model_dump_json().encode()) + (r.artifact.size_bytes if r.artifact else 0)
             for r in records
@@ -165,6 +178,8 @@ class SessionContextCompiler:
         )
         if len({d.demand_id for d in demands}) != len(demands):
             raise ContextBuildError("context demands collide with the current task identity")
+        if retrieval is not None and retrieval.query_sha256 != history_query_digest(demands):
+            raise ContextBuildError("retrieval query differs from compiler demands")
         indexed_history = await self._index.history_passages(turns)
         passages = tuple(p for source in sources for p in source.passages) + tuple(
             p for entry in indexed_history for p in entry
@@ -172,7 +187,9 @@ class SessionContextCompiler:
         scorer = await CoverageScorer.create(
             demands, passages, max_work=self.config.max_scoring_work
         )
-        history_units = await conversation_units(turns, scorer, indexed_history)
+        history_units = await conversation_units(
+            turns, scorer, indexed_history, max_spans=self.config.max_history_spans
+        )
         mandatory = set(required_call_ids)
         if base.feedback:
             mandatory.update(c.call_id for c in base.feedback.calls if c.status != "skipped")
@@ -186,11 +203,12 @@ class SessionContextCompiler:
         padding = CONTROL_FEEDBACK_BYTES - len(
             base.control.model_dump_json().encode() if base.control else b"null"
         )
+        policy_version = 3 if retrieval is not None or self.config.max_history_spans > 1 else 2
         empty = ConversationView(
             session_id=session_id,
             through_sequence=sequence,
             omitted_turns=total_turns,
-            policy_version="context-compiler/2",
+            policy_version="context-compiler/3" if policy_version == 3 else "context-compiler/2",
         )
         template = SessionRequest.model_construct(conversation=empty, current=base)
         wire = template.model_dump(mode="json")
@@ -264,8 +282,8 @@ class SessionContextCompiler:
             raise ContextBuildError("token counter returned an invalid byte ceiling")
         covered = coverage(units, selected)
         report = ContextCompilation(
-            schema_version=2,
-            policy_version=f"context-compiler/2[{self.config.policy}]",
+            schema_version=3 if policy_version == 3 else 2,
+            policy_version=f"context-compiler/{policy_version}[{self.config.policy}]",
             counter_version=self.counter.version,
             task_revision=base.task.revision,
             source_sha256=digest(json.dumps([(u.identity, u.digest) for u in units])),
@@ -298,5 +316,6 @@ class SessionContextCompiler:
                 for d in demands
                 if not any(k.startswith(f"d:{d.demand_id}:") for k in covered)
             ),
+            retrieval=retrieval,
         )
         return CompiledSessionContext(encoded, report.model_dump_json())
