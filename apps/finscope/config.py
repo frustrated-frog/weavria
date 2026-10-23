@@ -18,6 +18,9 @@ class FinScopeSettings:
     model_timeout_seconds: float = 60.0
     request_timeout_seconds: float = 15.0
     json_mode: bool = False
+    model_max_output_tokens: int = 4096
+    context_window_tokens: int = 32_768
+    context_encoding: str = "cl100k_base"
 
     def __post_init__(self) -> None:
         _validate_http_url("model_base_url", self.model_base_url)
@@ -25,6 +28,15 @@ class FinScopeSettings:
         _validate_http_url("allowed_parent_origin", self.allowed_parent_origin, origin_only=True)
         if not self.model_name.strip():
             raise ValueError("model_name is required")
+        if not self.context_encoding.strip():
+            raise ValueError("context_encoding is required")
+        if (
+            type(self.model_max_output_tokens) is not int
+            or type(self.context_window_tokens) is not int
+            or self.model_max_output_tokens <= 0
+            or self.context_window_tokens <= self.model_max_output_tokens + 256
+        ):
+            raise ValueError("context window must leave room beyond output and safety reserves")
         if (
             not math.isfinite(self.model_timeout_seconds)
             or not math.isfinite(self.request_timeout_seconds)
@@ -50,6 +62,9 @@ class FinScopeSettings:
             request_timeout_seconds=float(os.environ.get("WEAVRIA_FINSCOPE_TIMEOUT_SECONDS", "15")),
             json_mode=os.environ.get("WEAVRIA_MODEL_JSON_MODE", "false").lower()
             in {"1", "true", "yes"},
+            model_max_output_tokens=int(os.environ.get("WEAVRIA_MODEL_MAX_OUTPUT_TOKENS", "4096")),
+            context_window_tokens=int(os.environ.get("WEAVRIA_CONTEXT_WINDOW_TOKENS", "32768")),
+            context_encoding=os.environ.get("WEAVRIA_CONTEXT_ENCODING", "cl100k_base").strip(),
         )
 
 

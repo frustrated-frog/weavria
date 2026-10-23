@@ -12,7 +12,8 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
-from weavria.core import ApplicationObservation
+from weavria.context import ContextCompilerConfig, HistoryRetrievalConfig
+from weavria.core import ApplicationObservation, CompletionUnverifiable, RecoveryLimits
 from weavria.harness import (
     EvidenceResolver,
     ModelTaskInterpreter,
@@ -24,6 +25,7 @@ from weavria.models.openai_compatible import (
     OpenAICompatibleConfig,
     OpenAICompatibleProvider,
     OpenAICompatibleSessionProvider,
+    OpenAICompatibleTokenCounter,
 )
 from weavria.models.provider import ModelProvider, SessionModelProvider
 from weavria.runtime import RunLimits
@@ -71,6 +73,7 @@ class MessageOutput(BaseModel):
     task_outcome: str
     answer: str | None
     error: str | None
+    completion_reason: str | None = None
     tools: tuple[ToolTrace, ...]
     clarification_id: str | None = None
 
@@ -106,6 +109,7 @@ def create_app(
             )
         model_config = OpenAICompatibleConfig(
             model=resolved.model_name,
+            max_output_tokens=resolved.model_max_output_tokens,
             json_mode=resolved.json_mode,
         )
         active_provider = provider
@@ -130,6 +134,14 @@ def create_app(
             )
         active_market = market_client or created_market
         assert active_provider is not None and active_market is not None
+        token_counter = (
+            active_provider.token_counter(encoding=resolved.context_encoding)
+            if isinstance(active_provider, OpenAICompatibleSessionProvider)
+            else OpenAICompatibleTokenCounter(
+                model_config,
+                encoding=resolved.context_encoding,
+            )
+        )
         engine = SessionEngine(
             resolved.state_path,
             model=active_provider,
@@ -153,6 +165,13 @@ def create_app(
                 ),
                 evidence=EvidenceResolver((MarketPulseEvidenceExtractor(),)),
             ),
+            context_compiler=ContextCompilerConfig(
+                window_tokens=resolved.context_window_tokens,
+                output_tokens=resolved.model_max_output_tokens,
+            ),
+            token_counter=token_counter,
+            history_retrieval=HistoryRetrievalConfig(),
+            context_recovery=RecoveryLimits(),
         )
         await engine.__aenter__()
         app.state.runtime = _Runtime(engine)
@@ -251,6 +270,12 @@ def create_app(
             for call in (turn.calls if turn else ())
         )
         error = result.report.error.message if result.report.error else None
+        completion_reason = (
+            result.report.assessment.decision.reason
+            if result.report.assessment is not None
+            and isinstance(result.report.assessment.decision, CompletionUnverifiable)
+            else None
+        )
         pending = next(
             (
                 item.pending_clarification
@@ -266,6 +291,7 @@ def create_app(
             task_outcome=result.report.task_outcome,
             answer=result.report.output,
             error=error,
+            completion_reason=completion_reason,
             tools=tools,
             clarification_id=pending.clarification_id if pending is not None else None,
         )

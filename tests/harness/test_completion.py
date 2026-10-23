@@ -2,7 +2,7 @@ from collections.abc import Awaitable, Callable
 
 from pydantic import BaseModel
 
-from weavria.artifacts import InMemoryArtifactStore
+from weavria.artifacts import ArtifactSnapshot, InMemoryArtifactStore
 from weavria.core import (
     COMPLETION_GUIDANCE_JSON_BYTES,
     CompletionAccept,
@@ -19,8 +19,10 @@ from weavria.core import (
 from weavria.harness import (
     CapabilityNeed,
     CompletionCriterion,
+    EvidenceEvaluation,
     EvidenceResolver,
     InformationNeed,
+    InformationRequirement,
     ModelTaskInterpreter,
     TaskCompletionEvaluator,
     TaskFrame,
@@ -139,6 +141,73 @@ async def test_obligation_policy_accepts_grounded_evidence_without_claiming_answ
     assert decision.outcome == "unverified"
 
 
+async def test_model_knowledge_need_is_not_misclassified_as_missing_tool_evidence() -> None:
+    specification = TaskSpecification(
+        route="execute",
+        intent="Use a tool and explain a stable concept",
+        goal="Read alpha and explain it",
+        information_needs=(
+            InformationNeed(
+                description="Stable explanatory background",
+                source="model_knowledge",
+                freshness="stable",
+            ),
+        ),
+        capability_needs=(
+            CapabilityNeed(
+                name="read_value",
+                purpose="Read alpha",
+                necessity="required",
+            ),
+        ),
+        completion_criteria=(
+            CompletionCriterion(
+                kind="capability_result",
+                description="Read alpha",
+                capability="read_value",
+            ),
+            CompletionCriterion(kind="response", description="Explain the result"),
+        ),
+    )
+    registry = _registry()
+    declaration = ModelResponse(
+        action=ToolCallAction(
+            call_id="understand-knowledge",
+            tool_name="declare_task_specification",
+            arguments=specification.model_dump(mode="json"),
+        )
+    )
+    preparation = await TaskUnderstandingEngine(
+        ModelTaskInterpreter(FakeModelProvider((declaration,)))
+    ).prepare(
+        input_id="input-knowledge",
+        task=TaskInput(goal="Read and explain"),
+        history=(),
+        tools=registry,
+    )
+    store = InMemoryArtifactStore()
+    record = await ToolExecutor("run", registry, store, ReadOnlyPolicy()).execute(
+        ToolCallAction(
+            call_id="read-knowledge",
+            tool_name="read_value",
+            arguments={"key": "alpha"},
+        ),
+        max_duration=1,
+    )
+    context = CompletionContext(
+        "run",
+        preparation.task,
+        FinishAction(output="Alpha is a stable example."),
+        (record,),
+        store,
+        preparation.observation,
+    )
+
+    decision = await TaskObligationCompletionPolicy().verify(context)
+
+    assert isinstance(decision, CompletionAccept)
+
+
 async def test_terminal_source_failure_allows_bounded_unverifiable_delivery() -> None:
     async def fail(arguments: _Input, context: ToolContext) -> _Output:
         raise ToolFault(ErrorCategory.TOOL_FAILURE, "source unavailable")
@@ -181,6 +250,52 @@ async def test_missing_or_partial_evidence_requests_repair() -> None:
 
     assert isinstance(decision, CompletionRepair)
     assert decision.issue_codes == ("missing_evidence",)
+
+
+async def test_successful_output_with_no_matching_fields_converges_as_unverifiable() -> None:
+    class MismatchingExtractor:
+        key = "mismatching"
+        version = "1"
+
+        def supports(self, requirement: InformationRequirement, record: object) -> bool:
+            return True
+
+        async def evaluate(
+            self,
+            requirement: InformationRequirement,
+            record: object,
+            snapshot: ArtifactSnapshot,
+        ) -> EvidenceEvaluation:
+            return EvidenceEvaluation(
+                relation="unknown",
+                pointers=(),
+                missing_fields=requirement.required_fields,
+                freshness="valid",
+            )
+
+    registry = _registry()
+    task, _, observation = await _frame(registry)
+    store = InMemoryArtifactStore()
+    record = await ToolExecutor("run", registry, store, ReadOnlyPolicy()).execute(
+        ToolCallAction(call_id="read-1", tool_name="read_value", arguments={"key": "alpha"}),
+        max_duration=1,
+    )
+    context = CompletionContext(
+        "run",
+        task,
+        FinishAction(output="The result cannot be grounded."),
+        (record,),
+        store,
+        observation,
+    )
+    policy = TaskObligationCompletionPolicy(
+        TaskCompletionEvaluator(evidence=EvidenceResolver((MismatchingExtractor(),)))
+    )
+
+    decision = await policy.verify(context)
+
+    assert isinstance(decision, CompletionUnverifiable)
+    assert decision.reason == "evidence_contract_mismatch"
 
 
 def test_completion_guidance_is_bounded_by_encoded_bytes() -> None:

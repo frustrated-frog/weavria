@@ -23,6 +23,9 @@ export WEAVRIA_MODEL_BASE_URL="https://api.deepseek.com"
 export WEAVRIA_MODEL_NAME="deepseek-flash"
 export WEAVRIA_MODEL_API_KEY="..."
 export WEAVRIA_MODEL_JSON_MODE="true"
+export WEAVRIA_MODEL_MAX_OUTPUT_TOKENS="4096"
+export WEAVRIA_CONTEXT_WINDOW_TOKENS="32768"
+export WEAVRIA_CONTEXT_ENCODING="cl100k_base"
 export WEAVRIA_FINSCOPE_BASE_URL="http://127.0.0.1:8080"
 export WEAVRIA_ALLOWED_PARENT_ORIGIN="http://localhost:5173"
 uv run --extra finscope python -m apps.finscope
@@ -42,6 +45,10 @@ http://127.0.0.1:8765/widget
 会话默认持久化到 `.weavria/finscope-sessions.sqlite3`。可以用
 `WEAVRIA_STATE_PATH` 指向另一个本地路径。
 
+Sidecar 默认启用 Weavria 的联合上下文编译、持久历史检索与主动原文恢复。上下文窗口、输出
+预留和分词编码必须与实际模型配置保持一致；若供应商使用不同 tokenizer，应通过上述环境变量
+显式改成兼容编码，不要把默认值当成供应商能力探测结果。
+
 FinScope 前端设置 `VITE_WEAVRIA_AGENT_URL=http://127.0.0.1:8765` 后才显示入口；没有
 设置时不会渲染悬浮窗。
 
@@ -50,6 +57,9 @@ FinScope 前端设置 `VITE_WEAVRIA_AGENT_URL=http://127.0.0.1:8765` 后才显�
 - Task Frame 为 direct / clarify 时不暴露市场工具；execute 时只暴露
   `read_market_pulse`，不会刷新行情、修改 FinScope 或执行交易操作。
 - 页面只传日期、当前标签和质量状态；这些是导航元数据，不是事实证据。
+- 任务理解只接受能够落到工具 `output_schema` 的证据字段；无法匹配的模型提案会在执行前进行
+  一次有界修正。成功工具结果即使零字段匹配也会留下 Evidence Probe，并以契约不匹配收敛，
+  不再重复调用直到耗尽完成预算。
 - execute 回答必须读取 Market Pulse、显示数据质量并包含精确来源标记，否则验收策略要求
   修正；direct / clarify 回答明确标为 unverifiable，不伪装成已验证的市场结论。
 - HTTP Host 当前提供同步消息接口，不提供流式 Token 或实时事件推送。

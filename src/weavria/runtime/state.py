@@ -109,6 +109,8 @@ class RunState:
     verification_version: str | None = None
     assessment_json: str | None = None
     completion_repairs: int = 0
+    last_completion_repair_sha256: str | None = None
+    last_completion_frontier_sha256: str | None = None
     progress_assessment_json: str | None = None
     pending_progress_sequence: int | None = None
     action_intervention_policy_version: str | None = None
@@ -258,6 +260,8 @@ def reduce_event(state: RunState | None, event: JournalEvent) -> RunState:
             intervention_json=None,
             intervention_frontier_sha256=None,
             intervention_reconsiderations=0,
+            last_completion_repair_sha256=None,
+            last_completion_frontier_sha256=None,
             action_value_profiles_json=(),
             recovery_ranges_json=(),
             recovery_seen_json=(),
@@ -948,6 +952,8 @@ def _reduce_control(
         notice = CompletionNotice(
             candidate_sha256=assessment.candidate_sha256, decision=assessment.decision
         )
+        repair_sha256 = completion_repair_sha256(assessment.decision)
+        frontier_sha256 = completion_frontier_sha256(state)
         return replace(
             next_state,
             phase=Phase.READY,
@@ -956,6 +962,8 @@ def _reduce_control(
             assessment_json=None,
             verification_version=None,
             completion_repairs=state.completion_repairs + 1,
+            last_completion_repair_sha256=repair_sha256,
+            last_completion_frontier_sha256=frontier_sha256,
             feedback_call_ids=tuple(
                 dict.fromkeys((*state.feedback_call_ids, *assessment.evidence_call_ids))
             ),
@@ -966,6 +974,18 @@ def _reduce_control(
         assessment_json=assessment.model_dump_json(),
         verification_version=None,
     )
+
+
+def completion_repair_sha256(decision: CompletionRepair) -> str:
+    """Bind stable issue classes independently of candidate-specific guidance wording."""
+    payload = "[" + ",".join(decision.issue_codes) + "]"
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def completion_frontier_sha256(state: RunState) -> str:
+    """Bind the task and accepted execution facts visible to completion policy."""
+    payload = "\n".join((state.task_json, *state.records_json))
+    return hashlib.sha256(payload.encode()).hexdigest()
 
 
 def _reduce_recovery(state: RunState, next_state: RunState, data: RecoveryResolved) -> RunState:

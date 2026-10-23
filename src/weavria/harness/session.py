@@ -27,7 +27,12 @@ from .clarification import BlockingAmbiguityPolicy, ClarificationPolicy
 from .completion import TaskCompletionEvaluator, TaskObligationCompletionPolicy
 from .context import project_context_focus
 from .progress import NeedProgressEvaluator
-from .requirements import EvidenceResolver, NeedLedger, NeedStatus, stable_identifier
+from .requirements import (
+    EvidenceResolver,
+    NeedStatus,
+    load_need_ledger,
+    stable_identifier,
+)
 from .understanding import (
     TaskFrame,
     TaskUnderstandingEngine,
@@ -92,8 +97,8 @@ class TaskAwareSessionPreparer:
 
     async def assess_progress(self, context: SessionProgressContext) -> ProgressAssessment:
         """Evaluate the just-settled turn against committed before/after semantic heads."""
-        before = NeedLedger.model_validate_json(json.dumps(context.before.need_ledger))
-        after = NeedLedger.model_validate_json(json.dumps(context.after.need_ledger))
+        before = load_need_ledger(context.before.need_ledger)
+        after = load_need_ledger(context.after.need_ledger)
         frame = load_task_frame(context.after.observation.payload)
         return self._progress.assess(
             task_revision=context.task.revision,
@@ -174,7 +179,7 @@ class TaskAwareSessionPreparer:
         )
         previous = None
         if context.base_semantic is not None:
-            previous = NeedLedger.model_validate_json(json.dumps(context.base_semantic.need_ledger))
+            previous = load_need_ledger(context.base_semantic.need_ledger)
         ledger = await self._evidence.resolve(
             work_id=preparation.record.frame.work_id,
             task_revision=context.task.revision,
@@ -278,7 +283,7 @@ class TaskAwareSessionPreparer:
                     cause="steering",
                 )
             )
-        previous = NeedLedger.model_validate_json(json.dumps(context.base_semantic.need_ledger))
+        previous = load_need_ledger(context.base_semantic.need_ledger)
         ledger = await self._evidence.resolve(
             work_id=base.work_id,
             task_revision=context.task.revision,

@@ -2,7 +2,7 @@
 
 import hashlib
 import json
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from enum import StrEnum
 from typing import Annotated, Literal, Protocol, Self
 
@@ -30,6 +30,11 @@ class _SemanticContract(BaseModel):
         allow_inf_nan=False,
     )
     schema_version: Literal[1] = 1
+
+
+class _SemanticLedgerContract(BaseModel):
+    model_config = _SemanticContract.model_config
+    schema_version: Literal[2] = 2
 
 
 class NeedStatus(StrEnum):
@@ -141,13 +146,14 @@ class NeedState(_SemanticContract):
         return self
 
 
-class NeedLedger(_SemanticContract):
+class NeedLedger(_SemanticLedgerContract):
     work_id: _Identifier
     task_revision: int = Field(ge=1)
     frame_revision: int = Field(ge=1)
     evidence_revision: int = Field(ge=1)
     states: tuple[NeedState, ...]
     bindings: tuple[EvidenceBinding, ...] = ()
+    probes: tuple["EvidenceProbe", ...] = ()
 
     @model_validator(mode="after")
     def validate_ledger(self) -> Self:
@@ -159,6 +165,11 @@ class NeedLedger(_SemanticContract):
             raise ValueError("evidence binding identities must be unique")
         if any(binding.need_id not in need_ids for binding in self.bindings):
             raise ValueError("evidence binding references an unknown need")
+        probe_ids = [probe.probe_id for probe in self.probes]
+        if len(probe_ids) != len(set(probe_ids)):
+            raise ValueError("evidence probe identities must be unique")
+        if any(probe.need_id not in need_ids for probe in self.probes):
+            raise ValueError("evidence probe references an unknown need")
         return self
 
     def state_for(self, need_id: str) -> NeedState:
@@ -168,7 +179,9 @@ class NeedLedger(_SemanticContract):
             raise KeyError(need_id) from exc
 
     def mandatory_satisfied(self, requirements: tuple[InformationRequirement, ...]) -> bool:
-        required = {need.need_id for need in requirements if need.required}
+        required = {
+            need.need_id for need in requirements if need.required and need.source == "external"
+        }
         return all(self.state_for(need_id).status is NeedStatus.SATISFIED for need_id in required)
 
     def progress_sha256(self) -> str:
@@ -176,43 +189,98 @@ class NeedLedger(_SemanticContract):
         bindings = {item.binding_id: item for item in self.bindings}
         payload: list[dict[str, object]] = []
         for state in self.states:
-            payload.append(
-                {
-                    "need_id": state.need_id,
-                    "status": state.status.value,
-                    "missing_fields": state.missing_fields,
-                    "can_retry": state.can_retry,
-                    "failures": sorted(
-                        {
-                            (item.tool_name, item.category.value, item.retryable)
-                            for item in state.failures
-                        }
-                    ),
-                    "evidence": sorted(
-                        {
-                            (
-                                bindings[identity].relation,
-                                bindings[identity].freshness,
-                                bindings[identity].missing_fields,
-                                tuple(
-                                    sorted(
-                                        {
-                                            address.source_identity_sha256
-                                            for address in bindings[identity].addresses
-                                            if address.source_identity_sha256 is not None
-                                        }
-                                    )
-                                ),
-                            )
-                            for identity in state.evidence_binding_ids
-                            if identity in bindings
-                        }
-                    ),
-                }
-            )
+            state_payload: dict[str, object] = {
+                "need_id": state.need_id,
+                "status": state.status.value,
+                "missing_fields": state.missing_fields,
+                "can_retry": state.can_retry,
+                "failures": sorted(
+                    {
+                        (item.tool_name, item.category.value, item.retryable)
+                        for item in state.failures
+                    }
+                ),
+                "evidence": sorted(
+                    {
+                        (
+                            bindings[identity].relation,
+                            bindings[identity].freshness,
+                            bindings[identity].missing_fields,
+                            tuple(
+                                sorted(
+                                    {
+                                        address.source_identity_sha256
+                                        for address in bindings[identity].addresses
+                                        if address.source_identity_sha256 is not None
+                                    }
+                                )
+                            ),
+                        )
+                        for identity in state.evidence_binding_ids
+                        if identity in bindings
+                    }
+                ),
+            }
+            state_probes = tuple(probe for probe in self.probes if probe.need_id == state.need_id)
+            if state_probes:
+                state_payload["probes"] = sorted(
+                    {
+                        (
+                            probe.tool_name,
+                            probe.status,
+                            probe.evaluator_key,
+                            probe.evaluator_version,
+                            probe.matched_fields,
+                            probe.missing_fields,
+                            probe.freshness,
+                            probe.reason_code,
+                        )
+                        for probe in state_probes
+                    }
+                )
+            payload.append(state_payload)
         return hashlib.sha256(
             json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
+
+
+class EvidenceProbe(_SemanticContract):
+    """One auditable attempt to match a Need against an accepted producer result."""
+
+    probe_id: _Identifier
+    need_id: _Identifier
+    producer_call_id: _Reference
+    tool_name: _Identifier
+    artifact_id: _Reference | None = None
+    artifact_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    evaluator_key: _Identifier | None = None
+    evaluator_version: _Reference | None = None
+    status: Literal["matched", "partial", "schema_mismatch", "unsupported", "unavailable", "stale"]
+    matched_fields: tuple[str, ...] = ()
+    missing_fields: tuple[str, ...] = ()
+    freshness: Literal["valid", "stale", "unknown"] = "unknown"
+    reason_code: _Identifier
+
+    @model_validator(mode="after")
+    def validate_probe(self) -> Self:
+        if (self.artifact_id is None) != (self.artifact_sha256 is None):
+            raise ValueError("probe artifact identity must be complete")
+        if (self.evaluator_key is None) != (self.evaluator_version is None):
+            raise ValueError("probe evaluator identity must be complete")
+        if self.status == "matched" and self.missing_fields:
+            raise ValueError("matched probe cannot retain missing fields")
+        return self
+
+
+def load_need_ledger(value: str | Mapping[str, object]) -> NeedLedger:
+    """Load the current ledger or explicitly upcast the v1 shape with no probes."""
+    payload = json.loads(value) if isinstance(value, str) else json.loads(json.dumps(value))
+    if payload.get("schema_version") == 1:
+        payload["schema_version"] = 2
+        payload.setdefault("probes", [])
+    return NeedLedger.model_validate_json(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    )
 
 
 class EvidenceEvaluation(_SemanticContract):
@@ -300,7 +368,7 @@ class EvidenceResolver:
     @property
     def version(self) -> str:
         strategies = ",".join(f"{item.key}@{item.version}" for item in self._extractors)
-        return f"evidence-resolver/2[{strategies}]"
+        return f"evidence-resolver/3[{strategies}]"
 
     async def resolve(
         self,
@@ -315,9 +383,11 @@ class EvidenceResolver:
     ) -> NeedLedger:
         _validate_requirement_graph(requirements)
         bindings: list[EvidenceBinding] = []
+        probes: list[EvidenceProbe] = []
         states: list[NeedState] = []
         for requirement in requirements:
             requirement_bindings: list[EvidenceBinding] = []
+            requirement_probes: list[EvidenceProbe] = []
             failures: list[NeedFailure] = []
             for record in records:
                 tool_name = record.exchange.action.tool_name
@@ -333,8 +403,24 @@ class EvidenceResolver:
                             retryable=observation.error.retryable,
                         )
                     )
+                    requirement_probes.append(
+                        _probe(
+                            requirement=requirement,
+                            record=record,
+                            status="unavailable",
+                            reason_code="tool_failure",
+                        )
+                    )
                     continue
                 if record.artifact is None:
+                    requirement_probes.append(
+                        _probe(
+                            requirement=requirement,
+                            record=record,
+                            status="unavailable",
+                            reason_code="artifact_missing",
+                        )
+                    )
                     continue
                 snapshot = await read_artifact(record.artifact.artifact_id)
                 extractor = next(
@@ -346,8 +432,30 @@ class EvidenceResolver:
                     None,
                 )
                 if extractor is None:
+                    requirement_probes.append(
+                        _probe(
+                            requirement=requirement,
+                            record=record,
+                            status="unsupported",
+                            reason_code="extractor_unsupported",
+                        )
+                    )
                     continue
                 evaluation = await extractor.evaluate(requirement, record, snapshot)
+                probe_status, reason_code = _probe_result(evaluation)
+                requirement_probes.append(
+                    _probe(
+                        requirement=requirement,
+                        record=record,
+                        status=probe_status,
+                        reason_code=reason_code,
+                        evaluator_key=extractor.key,
+                        evaluator_version=extractor.version,
+                        matched_fields=evaluation.pointers,
+                        missing_fields=evaluation.missing_fields,
+                        freshness=evaluation.freshness,
+                    )
+                )
                 addresses = tuple(
                     EvidenceAddress(
                         producer_run_id=record.artifact.run_id,
@@ -403,7 +511,15 @@ class EvidenceResolver:
                         for failure in prior_state.failures
                         if failure.call_id not in current_failure_ids
                     )
+                    current_probe_ids = {probe.probe_id for probe in requirement_probes}
+                    requirement_probes.extend(
+                        probe
+                        for probe in previous.probes
+                        if probe.need_id == requirement.need_id
+                        and probe.probe_id not in current_probe_ids
+                    )
             bindings.extend(requirement_bindings)
+            probes.extend(requirement_probes)
             states.append(_reduce_need(requirement, requirement_bindings, failures))
 
         revision = 1
@@ -416,6 +532,7 @@ class EvidenceResolver:
                 evidence_revision=1,
                 states=tuple(states),
                 bindings=tuple(bindings),
+                probes=tuple(probes),
             )
             revision = (
                 previous.evidence_revision
@@ -429,7 +546,68 @@ class EvidenceResolver:
             evidence_revision=revision,
             states=tuple(states),
             bindings=tuple(bindings),
+            probes=tuple(probes),
         )
+
+
+def _probe_result(
+    evaluation: EvidenceEvaluation,
+) -> tuple[
+    Literal["matched", "partial", "schema_mismatch", "unsupported", "unavailable", "stale"],
+    str,
+]:
+    if evaluation.freshness == "stale":
+        return "stale", "evidence_stale"
+    if evaluation.relation == "contradicts":
+        return "matched", "evidence_contradicted"
+    if evaluation.relation == "supports" and not evaluation.missing_fields:
+        return "matched", "evidence_matched"
+    if evaluation.pointers:
+        return "partial", "evidence_partial"
+    if evaluation.missing_fields:
+        return "schema_mismatch", "evidence_schema_mismatch"
+    return "unsupported", "evidence_unsupported"
+
+
+def _probe(
+    *,
+    requirement: InformationRequirement,
+    record: ToolRecord,
+    status: Literal["matched", "partial", "schema_mismatch", "unsupported", "unavailable", "stale"],
+    reason_code: str,
+    evaluator_key: str | None = None,
+    evaluator_version: str | None = None,
+    matched_fields: tuple[str, ...] = (),
+    missing_fields: tuple[str, ...] = (),
+    freshness: Literal["valid", "stale", "unknown"] = "unknown",
+) -> EvidenceProbe:
+    artifact = record.artifact
+    seed = json.dumps(
+        {
+            "need_id": requirement.need_id,
+            "call_id": record.exchange.action.call_id,
+            "status": status,
+            "reason_code": reason_code,
+            "evaluator": [evaluator_key, evaluator_version],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return EvidenceProbe(
+        probe_id=f"probe-{hashlib.sha256(seed.encode()).hexdigest()[:24]}",
+        need_id=requirement.need_id,
+        producer_call_id=record.exchange.action.call_id,
+        tool_name=record.exchange.action.tool_name,
+        artifact_id=artifact.artifact_id if artifact is not None else None,
+        artifact_sha256=artifact.sha256 if artifact is not None else None,
+        evaluator_key=evaluator_key,
+        evaluator_version=evaluator_version,
+        status=status,
+        matched_fields=matched_fields,
+        missing_fields=missing_fields,
+        freshness=freshness,
+        reason_code=reason_code,
+    )
 
 
 def _reduce_need(

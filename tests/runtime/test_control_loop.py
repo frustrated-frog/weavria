@@ -1659,20 +1659,20 @@ async def test_unverifiable_is_distinct_from_verified_and_retains_explanation() 
     replay(agent)
 
 
-async def test_repeated_unsatisfied_finish_consumes_repair_budget_without_accepting_output() -> (
-    None
-):
+async def test_repeated_unsatisfied_finish_without_new_evidence_converges_unverifiable() -> None:
     agent = make_loop(
         FakeControlProvider((batch(call("source")), finish("bad"), finish("still bad"))),
         completion=ValueVerifier(),
         limits=RunLimits(max_completion_repairs=1),
     )
     result = await agent.execute()
-    assert result.status is RunStatus.BUDGET_EXHAUSTED and result.output is None
-    assert result.task_outcome == "unverified" and result.assessment is None
+    assert result.status is RunStatus.COMPLETED and result.output == "still bad"
+    assert result.task_outcome == "unverifiable" and result.assessment is not None
+    assert isinstance(result.assessment.decision, CompletionUnverifiable)
+    assert result.assessment.decision.reason == "completion_repair_stalled"
     assert (
         isinstance(agent.events[-1].data, RunEnded)
-        and agent.events[-1].data.reason == "completion_repairs"
+        and agent.events[-1].data.reason == "completion_checked"
     )
     replay(agent)
 

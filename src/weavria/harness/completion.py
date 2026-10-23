@@ -1,6 +1,5 @@
 """Task-aware completion decisions grounded in Need and obligation state."""
 
-import json
 from typing import Annotated, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, StringConstraints
@@ -15,7 +14,7 @@ from weavria.core import (
 )
 from weavria.runtime import CompletionContext
 
-from .requirements import EvidenceResolver, NeedLedger, NeedStatus
+from .requirements import EvidenceResolver, NeedLedger, NeedStatus, load_need_ledger
 from .understanding import TaskFrame, load_task_frame
 
 _Identifier = Annotated[
@@ -136,7 +135,7 @@ class TaskCompletionEvaluator:
 
         if context.semantic_state is not None:
             try:
-                ledger = NeedLedger.model_validate_json(json.dumps(context.semantic_state))
+                ledger = load_need_ledger(context.semantic_state)
             except ValueError:
                 return CompletionEvaluation(
                     disposition="cannot_proceed",
@@ -168,7 +167,9 @@ class TaskCompletionEvaluator:
             )
         verdicts = _verdicts(frame, ledger, context.records)
         required_states = tuple(
-            ledger.state_for(item.need_id) for item in frame.requirements if item.required
+            ledger.state_for(item.need_id)
+            for item in frame.requirements
+            if item.required and item.source == "external"
         )
         if any(item.status is NeedStatus.CONTRADICTED for item in required_states):
             return CompletionEvaluation(
@@ -195,6 +196,31 @@ class TaskCompletionEvaluator:
         )
         if incomplete:
             retryable = any(item.can_retry for item in incomplete)
+            terminal_contract_gap = any(
+                any(
+                    probe.status in {"schema_mismatch", "unsupported"}
+                    for probe in ledger.probes
+                    if probe.need_id == item.need_id
+                )
+                and not any(
+                    probe.status in {"matched", "partial"}
+                    for probe in ledger.probes
+                    if probe.need_id == item.need_id
+                )
+                and not item.can_retry
+                for item in incomplete
+            )
+            if terminal_contract_gap:
+                return CompletionEvaluation(
+                    disposition="cannot_proceed",
+                    verdicts=verdicts,
+                    next_required_actions=(
+                        "Report that the accepted capability output cannot satisfy the "
+                        "declared evidence selectors",
+                    ),
+                    outcome="unverifiable",
+                    reason_code="evidence_contract_mismatch",
+                )
             return CompletionEvaluation(
                 disposition="repair",
                 verdicts=verdicts,

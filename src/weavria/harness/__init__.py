@@ -57,6 +57,7 @@ from .requirements import (
     EvidenceBinding,
     EvidenceEvaluation,
     EvidenceExtractor,
+    EvidenceProbe,
     EvidenceResolver,
     InformationRequirement,
     NeedFailure,
@@ -64,6 +65,7 @@ from .requirements import (
     NeedState,
     NeedStatus,
     StructuralEvidenceExtractor,
+    load_need_ledger,
 )
 from .session import TaskAwareSessionPreparer
 from .understanding import (
@@ -128,6 +130,7 @@ __all__ = [
     "EvidenceBinding",
     "EvidenceEvaluation",
     "EvidenceExtractor",
+    "EvidenceProbe",
     "EvidenceResolver",
     "InformationNeed",
     "InformationRequirement",
@@ -170,6 +173,7 @@ __all__ = [
     "canonicalize_task_frame",
     "create_frame_patch",
     "intent_uncertainty_sha256",
+    "load_need_ledger",
     "load_task_frame",
     "load_task_frame_patch",
     "reduce_frame_patch",

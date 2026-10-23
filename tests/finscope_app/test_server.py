@@ -10,6 +10,7 @@ from weavria.core import (
     FinishAction,
     ModelResponse,
     ModelTurn,
+    SessionContextCompiled,
     ToolBatch,
     ToolCallAction,
     ToolExchange,
@@ -49,6 +50,7 @@ def _market_execution() -> TaskSpecification:
                 description="Current market stage",
                 source="external",
                 freshness="current",
+                required_fields=("/data/regime",),
             ),
         ),
         capability_needs=(
@@ -218,6 +220,7 @@ async def test_widget_session_executes_real_runtime_and_reports_tool_trace(
                     },
                 },
             )
+            events = await app.state.runtime.engine.store.events(created.session_id, limit=256)
 
     assert response.status_code == 200
     payload = MessageOutput.model_validate(response.json())
@@ -240,6 +243,106 @@ async def test_widget_session_executes_real_runtime_and_reports_tool_trace(
     runtime_frame = TaskFrame.model_validate_json(json.dumps(runtime_observation.payload))
     assert provider.requests[0].current.task.goal == "今天是什么市场阶段?"
     assert runtime_frame.application_context[0].payload["business_date"] == "2026-10-15"
+    assert any(isinstance(event.data, SessionContextCompiled) for event in events)
+    await market_http.aclose()
+
+
+async def test_finscope_retries_ungrounded_model_evidence_path_before_execution(
+    tmp_path: Path,
+) -> None:
+    invalid = _market_execution().model_copy(
+        update={
+            "information_needs": (
+                InformationNeed(
+                    description="Current market stage",
+                    source="external",
+                    freshness="current",
+                    required_fields=("/regime",),
+                ),
+            )
+        }
+    )
+    interpreter = FakeModelProvider((_declaration(invalid), _declaration(_market_execution())))
+    provider = FakeSessionProvider(
+        (
+            ModelTurn(
+                decision=ToolBatch(
+                    calls=(
+                        ToolCallAction(
+                            call_id="market-read-grounded",
+                            tool_name="read_market_pulse",
+                            arguments={"business_date": "2026-10-15", "focus": "overview"},
+                        ),
+                    )
+                )
+            ),
+            ModelTurn(
+                decision=FinishAction(
+                    output="当前为震荡轮动。数据质量: READY。[来源:market-pulse:2026-10-15]"
+                )
+            ),
+        )
+    )
+    market_http = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                200,
+                json={
+                    "success": True,
+                    "data": {
+                        "businessDate": "2026-10-15",
+                        "generatedAt": "2026-10-15T15:40:00",
+                        "qualityStatus": "READY",
+                        "warnings": [],
+                        "regime": {"marketStage": "RANGE_ROTATION"},
+                    },
+                },
+            )
+        )
+    )
+    app = create_app(
+        FinScopeSettings(
+            model_base_url="http://model.test",
+            model_name="fake",
+            model_api_key="",
+            state_path=tmp_path / "sessions.sqlite3",
+        ),
+        provider=provider,
+        interpreter_provider=interpreter,
+        market_client=MarketPulseClient("http://finscope.test", client=market_http),
+    )
+
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://sidecar.test"
+        ) as client:
+            created = SessionCreated.model_validate((await client.post("/api/sessions")).json())
+            response = await client.post(
+                f"/api/sessions/{created.session_id}/messages",
+                json={
+                    "input_id": "ground-selector-1",
+                    "text": "今天是什么市场阶段?",
+                    "context": {
+                        "schema_version": 1,
+                        "surface": "market_pulse",
+                        "business_date": "2026-10-15",
+                        "current_view": "panorama",
+                        "quality_status": "READY",
+                        "generated_at": "2026-10-15T15:40:00",
+                    },
+                },
+            )
+
+    payload = MessageOutput.model_validate(response.json())
+    assert payload.status == "completed"
+    assert payload.task_outcome == "unverified"
+    assert len(interpreter.requests) == 2
+    assert "one or more selectors are unsupported" in interpreter.requests[1].instructions
+    assert "/regime" not in interpreter.requests[1].instructions
+    observation = provider.requests[0].current.task_observation
+    assert observation is not None
+    frame = TaskFrame.model_validate_json(json.dumps(observation.payload))
+    assert frame.requirements[0].required_fields == ("/data/regime",)
     await market_http.aclose()
 
 
@@ -425,6 +528,7 @@ async def test_market_source_failure_finishes_unverifiable_without_completion_lo
     assert payload.status == "completed"
     assert payload.task_outcome == "unverifiable"
     assert payload.answer == "市场数据源暂时不可用, 本次无法判断市场阶段。"
+    assert payload.completion_reason == "mandatory_evidence_unavailable"
     assert [tool.model_dump() for tool in payload.tools] == [
         {
             "call_id": "market-read-failed",
@@ -530,5 +634,6 @@ async def test_widget_has_parent_and_script_restrictions(tmp_path: Path) -> None
     assert script.status_code == 200
     assert "send.addEventListener('click'" in script.text
     assert "void submitQuestion();" in script.text
-    assert "result.task_outcome === 'verified' ? '已核验' : '已完成'" in script.text
+    assert "result.task_outcome === 'unverifiable'" in script.text
+    assert "'未能核验'" in script.text
     await market_http.aclose()

@@ -58,7 +58,11 @@ async function submitQuestion() {
     const result = await sendMessage(text, false);
     state.clarificationId = null;
     appendMessage('agent', result.answer || result.error || '本次运行没有生成可交付答案。', result.tools, result.clarification_id);
-    const completedLabel = result.task_outcome === 'verified' ? '已核验' : '已完成';
+    const completedLabel = result.task_outcome === 'verified'
+      ? '已核验'
+      : result.task_outcome === 'unverifiable'
+        ? '未能核验'
+        : '已完成';
     setStatus(result.status === 'completed' ? completedLabel : result.status, result.status === 'completed' ? '' : 'error');
   } catch (error) {
     appendMessage('agent', error instanceof Error ? error.message : 'Agent 暂时不可用。');

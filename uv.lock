@@ -740,6 +740,7 @@ dependencies = [
 finscope = [
     { name = "fastapi" },
     { name = "httpx" },
+    { name = "tiktoken" },
     { name = "uvicorn" },
 ]
 openai-compatible = [
@@ -767,6 +768,7 @@ requires-dist = [
     { name = "httpx", marker = "extra == 'finscope'", specifier = ">=0.28,<1" },
     { name = "httpx", marker = "extra == 'openai-compatible'", specifier = ">=0.28,<1" },
     { name = "pydantic", specifier = ">=2.10,<3" },
+    { name = "tiktoken", marker = "extra == 'finscope'", specifier = ">=0.9,<1" },
     { name = "tiktoken", marker = "extra == 'tokenization'", specifier = ">=0.9,<1" },
     { name = "uvicorn", marker = "extra == 'finscope'", specifier = ">=0.34,<1" },
 ]

@@ -1,4 +1,5 @@
 import hashlib
+import json
 from typing import Literal
 
 import pytest
@@ -18,6 +19,7 @@ from weavria.harness import (
     EvidenceResolver,
     InformationRequirement,
     NeedStatus,
+    load_need_ledger,
 )
 from weavria.tools import (
     ReadOnlyPolicy,
@@ -293,6 +295,81 @@ async def test_resolver_preserves_partial_fields_and_retryable_failures() -> Non
     failed = unavailable.state_for("need-a")
     assert failed.status is NeedStatus.UNAVAILABLE
     assert failed.can_retry and failed.failures[0].retryable
+
+
+async def test_zero_field_match_is_preserved_as_schema_mismatch_probe() -> None:
+    store, record = await _success_record()
+    resolver = EvidenceResolver()
+    requirement = _requirement(required_fields=("/missing",))
+
+    first = await resolver.resolve(
+        work_id="work-a",
+        task_revision=1,
+        frame_revision=1,
+        requirements=(requirement,),
+        records=(record,),
+        read_artifact=lambda artifact_id: store.get("run-1", artifact_id),
+    )
+    repeated = await resolver.resolve(
+        work_id="work-a",
+        task_revision=1,
+        frame_revision=1,
+        requirements=(requirement,),
+        records=(record,),
+        read_artifact=lambda artifact_id: store.get("run-1", artifact_id),
+        previous=first,
+    )
+
+    assert first.bindings == ()
+    assert first.state_for("need-a").status is NeedStatus.PENDING
+    assert len(first.probes) == 1
+    assert first.probes[0].status == "schema_mismatch"
+    assert first.probes[0].missing_fields == ("/missing",)
+    assert repeated.evidence_revision == first.evidence_revision
+    assert repeated.progress_sha256() == first.progress_sha256()
+
+
+def test_v1_need_ledger_is_explicitly_upcast_without_inventing_probes() -> None:
+    legacy: dict[str, object] = {
+        "schema_version": 1,
+        "work_id": "work-a",
+        "task_revision": 1,
+        "frame_revision": 1,
+        "evidence_revision": 1,
+        "states": [
+            {
+                "schema_version": 1,
+                "need_id": "need-a",
+                "status": "pending",
+                "evidence_binding_ids": [],
+                "missing_fields": [],
+                "failures": [],
+                "can_retry": False,
+            }
+        ],
+        "bindings": [],
+    }
+
+    ledger = load_need_ledger(legacy)
+
+    assert ledger.schema_version == 2
+    assert ledger.probes == ()
+    legacy_progress: list[dict[str, object]] = [
+        {
+            "need_id": "need-a",
+            "status": "pending",
+            "missing_fields": (),
+            "can_retry": False,
+            "failures": [],
+            "evidence": [],
+        }
+    ]
+    assert (
+        ledger.progress_sha256()
+        == hashlib.sha256(
+            json.dumps(legacy_progress, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+    )
 
 
 async def test_resolver_keeps_satisfied_prior_evidence_when_a_later_attempt_fails() -> None:

@@ -1,18 +1,16 @@
 """Translate accepted task semantics into soft, domain-neutral retrieval demands."""
 
-import json
-
 from weavria.context import ContextDemand, ContextFocus, EvidenceAnchor
 from weavria.core import SemanticSnapshot
 
-from .requirements import NeedLedger, NeedStatus
+from .requirements import NeedStatus, load_need_ledger
 from .understanding import load_task_frame
 
 
 def project_context_focus(snapshot: SemanticSnapshot) -> ContextFocus:
     """Keep original task authority; ledger state changes allocation priority only."""
     frame = load_task_frame(snapshot.observation.payload)
-    ledger = NeedLedger.model_validate_json(json.dumps(snapshot.need_ledger))
+    ledger = load_need_ledger(snapshot.need_ledger)
     if (
         ledger.work_id != snapshot.work_id
         or frame.work_id != snapshot.work_id

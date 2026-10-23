@@ -40,6 +40,8 @@ from weavria.core import (
     CompletionAssessment,
     CompletionChecked,
     CompletionDiscarded,
+    CompletionRepair,
+    CompletionUnverifiable,
     ContextCompilation,
     ContextSelected,
     ControlData,
@@ -140,7 +142,14 @@ from .journal import (
 )
 from .progress import ProgressPolicy, SemanticProgressPolicy
 from .scheduling import ToolScheduling, dispatch_batch
-from .state import EventAcceptanceError, Phase, RunState, reduce_event
+from .state import (
+    EventAcceptanceError,
+    Phase,
+    RunState,
+    completion_frontier_sha256,
+    completion_repair_sha256,
+    reduce_event,
+)
 
 
 class Clock(Protocol):
@@ -1130,6 +1139,16 @@ class _AgentKernel:
         if self.state.task.revision != task.revision:
             await self._accept(CompletionDiscarded())
             return None
+        if isinstance(assessment.decision, CompletionRepair):
+            repair_sha256 = completion_repair_sha256(assessment.decision)
+            frontier_sha256 = completion_frontier_sha256(self.state)
+            if (
+                self.state.last_completion_repair_sha256 == repair_sha256
+                and self.state.last_completion_frontier_sha256 == frontier_sha256
+            ):
+                assessment = assessment.model_copy(
+                    update={"decision": CompletionUnverifiable(reason="completion_repair_stalled")}
+                )
         if not await self._accept(
             CompletionChecked(assessment=assessment), expected_revision=task.revision
         ):

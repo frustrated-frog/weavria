@@ -33,6 +33,7 @@ from weavria.core import (
 from weavria.models import ModelCallError, ModelProvider, call_model
 from weavria.tools import ToolDescriptor, ToolRegistry
 
+from .evidence_contract import unsupported_evidence_fields
 from .intent import (
     BeliefUpdater,
     ClarificationDecision,
@@ -679,6 +680,7 @@ class CapabilityView(_Contract):
     behavior: Literal["read_only", "side_effect"]
     risk: Literal["low", "medium", "high"]
     approval_required: bool
+    output_schema: dict[str, JsonValue] = Field(default_factory=dict)
 
 
 class TaskUnderstandingInput(_Contract):
@@ -817,7 +819,11 @@ class ModelTaskInterpreter:
             "capabilities, required external information or ambiguities; clarify has at least "
             "one blocking ambiguity and no selected capabilities; execute has at least one "
             "selected capability and no blocking ambiguities. Record only ambiguities that "
-            "prevent safe progress, not harmless context limitations or optional detail."
+            "prevent safe progress, not harmless context limitations or optional detail. "
+            "For external information, required_fields are JSON Pointers into the selected "
+            "capability output_schema, never names inferred from the user's wording. Use only "
+            "paths supported by that schema; for free-form nested objects, keep their declared "
+            "container prefix. Omit required_fields when the whole typed result is sufficient."
             " For every clarify route, include structured uncertainty with two to four "
             "mutually exclusive actionable hypotheses and one to four candidate questions. "
             "support_weight must be from 1 to 100 and is relative plausibility, not a calibrated "
@@ -900,9 +906,9 @@ class ModelTaskInterpreter:
 
             specification, feedback, cause, failure_message = _validate_model_specification(
                 response.action,
-                available_capabilities=frozenset(
-                    capability.name for capability in request.capabilities
-                ),
+                capability_catalogue={
+                    capability.name: capability.output_schema for capability in request.capabilities
+                },
             )
             if specification is not None:
                 return specification
@@ -933,8 +939,9 @@ class ModelTaskInterpreter:
 def _validate_model_specification(
     action: FinishAction | ToolCallAction,
     *,
-    available_capabilities: frozenset[str],
+    capability_catalogue: dict[str, dict[str, JsonValue]],
 ) -> tuple[TaskSpecification | None, str, ValidationError | ValueError | None, str]:
+    available_capabilities = frozenset(capability_catalogue)
     if not isinstance(action, ToolCallAction) or action.tool_name != _SPECIFICATION_TOOL:
         kind = "finish" if isinstance(action, FinishAction) else "unexpected_tool"
         return (
@@ -1003,7 +1010,53 @@ def _validate_model_specification(
             None,
             "Task interpreter proposed unavailable capabilities",
         )
+    selector_feedback = _evidence_selector_feedback(specification, capability_catalogue)
+    if selector_feedback is not None:
+        return (
+            None,
+            selector_feedback,
+            None,
+            "Task interpreter selected fields outside capability output contracts",
+        )
     return specification, "", None, ""
+
+
+def _evidence_selector_feedback(
+    specification: TaskSpecification,
+    capability_catalogue: dict[str, dict[str, JsonValue]],
+) -> str | None:
+    actions: tuple[tuple[tuple[InformationNeed, ...], tuple[CapabilityNeed, ...]], ...] = (
+        (specification.information_needs, specification.capability_needs),
+    )
+    if specification.action_proposal is not None:
+        actions = (
+            *actions,
+            (
+                specification.action_proposal.information_needs,
+                specification.action_proposal.capability_needs,
+            ),
+        )
+    for information_needs, capability_needs in actions:
+        required_names = tuple(
+            item.name for item in capability_needs if item.necessity == "required"
+        )
+        selected_names = tuple(item.name for item in capability_needs)
+        for need in information_needs:
+            if need.source != "external" or not need.required_fields:
+                continue
+            candidate_names = required_names if need.required else selected_names
+            schemas = tuple(
+                capability_catalogue[name]
+                for name in candidate_names
+                if name in capability_catalogue
+            )
+            unsupported = unsupported_evidence_fields(need.required_fields, schemas)
+            if unsupported:
+                return (
+                    "information_needs.required_fields: selectors must address at least one "
+                    "selected capability output schema; one or more selectors are unsupported"
+                )
+    return None
 
 
 def _validation_feedback(error: ValidationError | ValueError) -> str:
@@ -1210,6 +1263,17 @@ class TaskUnderstandingEngine:
                 RunError(
                     category=ErrorCategory.INVALID_MODEL_RESPONSE,
                     message="Task interpreter proposed unavailable capabilities",
+                )
+            )
+        selector_feedback = _evidence_selector_feedback(
+            specification,
+            {item.name: item.output_schema for item in snapshot.capabilities},
+        )
+        if selector_feedback is not None:
+            raise TaskUnderstandingError(
+                RunError(
+                    category=ErrorCategory.INVALID_MODEL_RESPONSE,
+                    message="Task interpreter selected fields outside capability output contracts",
                 )
             )
         interpreted_specification = specification
@@ -1452,6 +1516,7 @@ def _capability_view(descriptor: ToolDescriptor) -> CapabilityView:
         behavior=descriptor.behavior,
         risk=descriptor.risk,
         approval_required=descriptor.approval_required,
+        output_schema=descriptor.output_schema,
     )
 
 

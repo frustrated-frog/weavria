@@ -466,6 +466,54 @@ async def test_model_interpreter_repairs_one_invalid_specification_with_bounded_
     assert "SENSITIVE-RAW-MODEL-VALUE" not in repair
 
 
+async def test_model_interpreter_repairs_evidence_selector_outside_output_contract() -> None:
+    invalid = _execute().model_copy(
+        update={
+            "information_needs": (
+                InformationNeed(
+                    description="Document title",
+                    source="external",
+                    freshness="stable",
+                    required_fields=("/title",),
+                ),
+            )
+        }
+    )
+    corrected = invalid.model_copy(
+        update={
+            "information_needs": (
+                InformationNeed(
+                    description="Document contents",
+                    source="external",
+                    freshness="stable",
+                    required_fields=("/text",),
+                ),
+            )
+        }
+    )
+    provider = FakeModelProvider((_declaration(invalid), _declaration(corrected)))
+
+    preparation = await TaskUnderstandingEngine(ModelTaskInterpreter(provider)).prepare(
+        input_id="selector-input",
+        task=TaskInput(goal="Read the report"),
+        history=(),
+        tools=_tools(),
+    )
+
+    assert preparation.record.frame.requirements[0].required_fields == ("/text",)
+    assert len(provider.requests) == 2
+    repair = provider.requests[1].instructions
+    assert "selectors must address" in repair
+    assert "/title" not in repair
+    catalogue = next(
+        value
+        for value in provider.requests[0].task.constraints
+        if value.startswith("Available capability catalogue")
+    )
+    assert '"output_schema"' in catalogue
+    assert '"text"' in catalogue
+
+
 async def test_model_interpreter_retries_one_malformed_supplier_response() -> None:
     class MalformedThenValidProvider:
         capabilities = ModelCapabilities(tool_calls=True)

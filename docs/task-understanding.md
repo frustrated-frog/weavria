@@ -10,6 +10,9 @@
 > 和 [ADR 0020](decisions/0020-持久化意图信念与确定性更新.md)。当前 Frame v5 与风险感知
 > Ask-or-Act 见[询问或行动决策](intent-understanding-evolution/11-风险感知的询问或行动决策.md)
 > 和 [ADR 0021](decisions/0021-风险感知的询问或行动决策.md)。
+> 当前输出 Schema 约束、Evidence Probe 与完成收敛见
+> [证据契约与完成收敛](证据契约与完成收敛.md)和
+> [ADR 0033](decisions/0033-基于输出契约的证据探测与完成收敛.md)。
 
 Weavria 的任务理解位于 Harness 层。它不是业务意图分类器，而是把原始请求、会话证据和
 宿主能力目录编译成一份版本化、低信任的 `TaskFrame`。Runtime 仍只接受宿主拥有的原始
@@ -71,6 +74,10 @@ AgentLoop v3
 如果第一次解释违反 Schema、跨字段不变量、合成工具协议或能力目录边界，解释器会在原有
 总时限内追加一次经过裁剪的主机校验反馈并重新生成；反馈不包含原始模型参数。第二次仍不
 合法就按 `INVALID_MODEL_RESPONSE` 终止，不启动执行模型或业务工具。
+
+能力目录现在同时携带输入与输出 Schema。外部信息需求中的 `required_fields` 是模型提出的
+低信任 JSON Pointer，必须至少落到一个已选工具的输出契约。动态对象保留其声明的容器前缀；
+例如工具只声明根字段 `data` 时，可以选择 `/data/regime`，不能把业务词猜成根字段 `/regime`。
 
 同一份 revision-bound `TaskObservation` 也会进入 `CompletionContext`。验收策略可以据此区分
 direct、clarify 与 execute 的验收义务，但它仍是模型推断而非事实证据；是否接受及如何验证
