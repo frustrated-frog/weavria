@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+from collections import defaultdict
 from datetime import datetime
 
 from weavria.memory import (
@@ -22,6 +23,9 @@ from weavria.memory import (
     MemoryReview,
     MemoryVersion,
 )
+
+from .memory_alignment import align_candidate
+from .memory_partition import partition_mutations
 
 
 class MemoryFormationError(MemoryError):
@@ -79,7 +83,7 @@ class ConservativeMemoryAdmission:
     conditions and interval mechanics; they cannot establish truth from language.
     """
 
-    version = "conservative-memory-admission/1"
+    version = "conservative-memory-admission/2"
 
     def compile(
         self,
@@ -99,9 +103,15 @@ class ConservativeMemoryAdmission:
         targets = {v.assertion.memory_id: v for v in snapshot.versions}
         decisions: dict[int, MemoryAdmission] = {}
         proposed: dict[int, MemoryMutation] = {}
+        eligible: dict[int, MemoryCandidate] = {}
+        alignments = {a.candidate_index: a for a in review.alignments}
+        judgments = {j.candidate_index: j for j in review.judgments}
+        groups: dict[str, list[int]] = defaultdict(list)
         for judgment in review.judgments:
             i = judgment.candidate_index
             candidate = extraction.candidates[i]
+            if judgment.target_id is not None:
+                groups[judgment.target_id].append(i)
             reason = self._rejection(request, candidate, judgment)
             if reason is not None:
                 decisions[i] = MemoryAdmission(candidate_index=i, status="rejected", reason=reason)
@@ -115,6 +125,81 @@ class ConservativeMemoryAdmission:
                     candidate_index=i, status="deferred", reason="unresolved"
                 )
                 continue
+            target = targets.get(judgment.target_id or "")
+            if target is not None and review.schema_version == 2 and i not in alignments:
+                decisions[i] = MemoryAdmission(
+                    candidate_index=i, status="deferred", reason="different_conditions"
+                )
+                continue
+            if i in alignments:
+                aligned = (
+                    align_candidate(
+                        request,
+                        candidate,
+                        target,
+                        alignments[i],
+                        equivalent=judgment.relation == "equivalent",
+                    )
+                    if target is not None
+                    else None
+                )
+                if aligned is None:
+                    decisions[i] = MemoryAdmission(
+                        candidate_index=i, status="deferred", reason="different_conditions"
+                    )
+                    continue
+                candidate = aligned
+            elif target is not None and candidate.qualifiers == target.assertion.qualifiers:
+                candidate = candidate.model_copy(
+                    update={
+                        "subject": target.assertion.subject,
+                        "predicate": target.assertion.predicate,
+                    }
+                )
+            eligible[i] = candidate
+
+        consumed: set[int] = set()
+        joint: list[tuple[set[int], MemoryMutation]] = []
+        for target_id, indices in groups.items():
+            if len(indices) < 2:
+                continue
+            consumed.update(indices)
+            target = targets.get(target_id)
+            partition = (
+                partition_mutations(request, {i: eligible[i] for i in indices}, judgments, target)
+                if target is not None and all(i in eligible for i in indices)
+                else None
+            )
+            if partition is not None and any(
+                v.assertion.memory_id != target_id
+                and mutation.assertion is not None
+                and _key(v.assertion) == _key(mutation.assertion)
+                and _overlap(v.assertion, mutation.assertion)
+                for v in snapshot.versions
+                for mutation in partition[1:]
+            ):
+                partition = None
+            if partition is None:
+                for i in indices:
+                    decisions.setdefault(
+                        i,
+                        MemoryAdmission(
+                            candidate_index=i, status="deferred", reason="batch_target_collision"
+                        ),
+                    )
+                continue
+            joint.append((set(indices), partition[0]))
+            by_id = {m.assertion.memory_id: m for m in partition[1:] if m.assertion is not None}
+            for i in indices:
+                proposed[i] = by_id[f"formed:{request.identity()}:{i}"]
+                decisions[i] = MemoryAdmission(
+                    candidate_index=i, status="admitted", reason="accepted"
+                )
+
+        for i, candidate in eligible.items():
+            if i in consumed:
+                continue
+            judgment = judgments[i]
             mutation, deferred = self._mutation(request, candidate, judgment, targets, i)
             if mutation is not None and mutation.assertion is not None:
                 if any(
@@ -148,6 +233,10 @@ class ConservativeMemoryAdmission:
                 )
                 if shared_target or overlapping_claim:
                     collisions.update((i, j))
+        # Reject an entire joint partition if any sibling collides with another proposal.
+        for members, _ in joint:
+            if members & collisions:
+                collisions.update(members)
         for i in collisions:
             del proposed[i]
             decisions[i] = MemoryAdmission(
@@ -155,7 +244,10 @@ class ConservativeMemoryAdmission:
                 status="deferred",
                 reason="batch_target_collision",
             )
-        mutations = tuple(proposed[i] for i in sorted(proposed))
+        mutations = (
+            *(retraction for members, retraction in joint if not members & collisions),
+            *(proposed[i] for i in sorted(proposed)),
+        )
         used = {s for m in mutations for s in m.source_ids}
         used.update(s for m in mutations if m.assertion is not None for s in m.assertion.source_ids)
         identity = hashlib.sha256(

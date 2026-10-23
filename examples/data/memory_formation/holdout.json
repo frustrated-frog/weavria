@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "dataset_version": "memory-formation-holdout/1",
+  "cases": [
+    {"id":"21","inputs":["本项目从今天起将 UTC 作为日志时间的标准时区。","从2026年1月10日零点起，本项目日志时区改为 Asia/Shanghai，此前仍为 UTC。"],"checks":[{"day":5,"values":["utc"],"qualified":0},{"day":15,"values":["asia/shanghai"],"qualified":0}]},
+    {"id":"22","inputs":["本项目从今天起选择 PostgreSQL 作为主数据库。","纠正上一条，我说错了。本项目自2026年1月1日起选定的主数据库一直是 SQLite，从未改动。"],"checks":[{"day":1,"values":["sqlite"],"qualified":0},{"day":3,"values":["sqlite"],"qualified":0}]},
+    {"id":"23","inputs":["请为本次展示虚构一个 Redis 缓存方案，仅用于示范，不是本项目的选择，也不要记住。"],"checks":[{"day":3,"values":[],"qualified":0}]},
+    {"id":"24","inputs":["我个人在所有项目都更喜欢 pytest。这是全局个人偏好，不是本项目的测试框架约定。"],"checks":[{"day":3,"values":[],"qualified":0}]},
+    {"id":"25","inputs":["本项目从今天起默认使用 zsh 运行维护脚本。","以后也许会评估 bash，但尚未决定，现有脚本运行环境的约定不变。"],"checks":[{"day":3,"values":["zsh"],"qualified":0}]},
+    {"id":"26","inputs":["本项目在2026年1月1日零点到1月10日零点期间的默认日志级别为 DEBUG。该约定在1月10日零点失效，之后尚未决定。"],"checks":[{"day":5,"values":["debug"],"qualified":0},{"day":15,"values":[],"qualified":0}]}
+  ]
+}

@@ -105,7 +105,7 @@ class ModelMemoryReviewer:
 
     def __init__(self, provider: ModelProvider, *, configuration_id: str) -> None:
         self.provider = provider
-        self.version = f"model-memory-reviewer/1:{configuration_id}"
+        self.version = f"model-memory-reviewer/2:{configuration_id}"
 
     async def review(
         self,
@@ -115,7 +115,7 @@ class ModelMemoryReviewer:
         *,
         max_duration: float,
     ) -> MemoryReview:
-        return await _structured(
+        result = await _structured(
             self.provider,
             MemoryReview,
             "review_memory",
@@ -133,7 +133,20 @@ class ModelMemoryReviewer:
             "Target must denote the same subject, predicate and conditions, even if words "
             "differ. A conditional exception must not overwrite the general fact. If multiple "
             "targets would need joint revision, return unresolved. New evidence is not "
-            "automatically more authoritative. Never choose a winner merely by recency.",
+            "automatically more authoritative. Never choose a winner merely by recency. "
+            "Return schema_version=2. For every target relationship, provide an alignment "
+            "binding candidate_index, target_id and target_revision from the snapshot. "
+            "Each match has candidate_path, target_path and literal citations from the focal "
+            "source (already cited by the candidate). Paths are /subject, /predicate, /value "
+            "or /qualifiers/<JSON-pointer-escaped-key>. Match /subject only to /subject. "
+            "Cover /predicate and EVERY qualifier on BOTH sides; repeated paths are allowed "
+            "when a predicate already includes a condition, but do not erase a real condition. "
+            "Supply /value to /value only for equivalent values, including translations. "
+            "Do not align genuinely different applicability (e.g. a general rule and an "
+            "exception). If you cannot establish all correspondences, return unresolved. "
+            "Several candidates may target one fact when they explicitly partition its whole "
+            "valid interval: an unchanged prefix is equivalent, and a changed later segment "
+            "is change. The host validates the complete partition atomically.",
             {
                 "input": request.model_dump(mode="json"),
                 "proposals": extraction.model_dump(mode="json"),
@@ -141,3 +154,6 @@ class ModelMemoryReviewer:
             },
             max_duration,
         )
+        if result.schema_version != 2:
+            raise MemoryFormationError("memory reviewer requires the v2 review protocol")
+        return result

@@ -373,6 +373,15 @@ async def evaluate(
                                 "review_seconds_extra": review_seconds,
                                 "checks": checks,
                                 "transport_observations": transport.observations[wire_start:],
+                                "trial_context": {
+                                    "started_at": started_at,
+                                    "dataset_sha256": hashlib.sha256(raw).hexdigest(),
+                                    "configuration": asdict(config),
+                                    "transport_options": options,
+                                    "timeout_seconds": timeout,
+                                    "extractor": extractor.version,
+                                    "reviewer": reviewer.version,
+                                },
                             }
                         )
                         if on_trial is not None:
@@ -392,7 +401,7 @@ async def evaluate(
         "repeats": repeats,
         "extractor": extractor.version,
         "reviewer": reviewer.version,
-        "scope": "12 narrow language-policy cases; not general task-benefit evidence",
+        "scope": "bounded formation cases; not general task-benefit evidence",
         "rows": rows,
         "summary": summarize(rows),
     }
@@ -439,14 +448,26 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument(
+        "--dataset",
+        type=Path,
+        default=Path(__file__).parent / "data" / "memory_formation" / "cases.json",
+    )
+    parser.add_argument(
         "--output", type=Path, default=Path(".weavria/memory-formation-results.json")
     )
     args = parser.parse_args()
     if not 1 <= args.repeats <= 20:
         parser.error("repeats must be between 1 and 20")
-    dataset = Path(__file__).parent / "data" / "memory_formation" / "cases.json"
+    dataset = args.dataset
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    journal = args.output.with_suffix(".jsonl")
 
     def progress(row: dict[str, object]) -> None:
+        # Retain each finished trial even if a later paid call is interrupted.
+        with journal.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(row, ensure_ascii=False) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
         print(
             f"repeat={row['repeat']} case={row['case']} complete={row['complete_trial']} "
             f"errors={row['errors']}",

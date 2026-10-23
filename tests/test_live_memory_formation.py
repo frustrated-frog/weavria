@@ -1,7 +1,10 @@
 """Exercise the real model adapter/evaluation wiring using a local HTTP fixture."""
 
+import asyncio
 import hashlib
 import json
+import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
 
@@ -77,6 +80,7 @@ async def test_live_runner_shares_extraction_and_never_sends_expected_answers(
         else:
             name = "review_memory"
             output = {
+                "schema_version": 2,
                 "judgments": [
                     {
                         "candidate_index": 0,
@@ -86,7 +90,7 @@ async def test_live_runner_shares_extraction_and_never_sends_expected_answers(
                         "time_supported": True,
                         "relation": "new",
                     }
-                ]
+                ],
             }
         content = json.dumps(
             {
@@ -191,3 +195,35 @@ async def test_transport_records_only_usage_and_failure_metadata() -> None:
     outer = RuntimeError("raw-provider-body")
     outer.__cause__ = cause
     assert experiment.failure_kind(outer) == "RuntimeError <- ValueError"
+
+
+def test_interrupted_evaluation_retains_finished_trials(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / "interrupted.json"
+    row: dict[str, object] = {
+        "repeat": 0,
+        "case": "01",
+        "complete_trial": True,
+        "errors": [],
+    }
+
+    async def interrupted(
+        repeats: int,
+        *,
+        dataset_path: Path,
+        on_trial: Callable[[dict[str, object]], None] | None = None,
+    ) -> dict[str, object]:
+        assert on_trial is not None
+        on_trial(row)
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(experiment, "evaluate", interrupted)
+    monkeypatch.setattr(sys, "argv", ["evaluation", "--output", str(output)])
+    with pytest.raises(asyncio.CancelledError):
+        experiment.main()
+    assert not output.exists()
+    assert [json.loads(line) for line in output.with_suffix(".jsonl").read_text().splitlines()] == [
+        row
+    ]

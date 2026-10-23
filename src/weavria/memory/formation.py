@@ -6,7 +6,15 @@ from datetime import datetime
 from typing import Literal, Self
 from zoneinfo import ZoneInfo
 
-from pydantic import ConfigDict, Field, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializerFunctionWrapHandler,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 from .contracts import (
     Identifier,
@@ -189,8 +197,56 @@ class MemoryJudgment(MemoryModel):
         return self
 
 
-class MemoryReview(MemoryModel):
+class MemoryFieldMatch(MemoryModel):
+    """Fallible semantic correspondence, grounded in literal accepted evidence."""
+
+    candidate_path: Identifier
+    target_path: Identifier
+    citations: tuple[MemoryCitation, ...] = Field(min_length=1, max_length=8)
+
+
+class MemoryAlignment(MemoryModel):
+    candidate_index: int = Field(ge=0, lt=8)
+    target_id: Identifier
+    target_revision: int = Field(ge=1)
+    matches: tuple[MemoryFieldMatch, ...] = Field(min_length=2, max_length=40)
+
+
+class MemoryReview(BaseModel):
+    """Versioned semantic review; v1 wire bytes remain unchanged."""
+
+    model_config = MemoryModel.model_config
+    schema_version: Literal[1, 2] = 1
     judgments: tuple[MemoryJudgment, ...] = Field(default=(), max_length=8)
+    alignments: tuple[MemoryAlignment, ...] = Field(default=(), max_length=8)
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def validate_version(cls, value: object) -> object:
+        return MemoryModel.validate_version(value)
+
+    @model_validator(mode="after")
+    def validate_alignments(self) -> Self:
+        if self.schema_version == 1 and self.alignments:
+            raise ValueError("field alignment requires review v2")
+        indices = [a.candidate_index for a in self.alignments]
+        if len(indices) != len(set(indices)):
+            raise ValueError("one alignment per candidate is required")
+        judgments = {j.candidate_index: j for j in self.judgments}
+        if any(
+            a.candidate_index not in judgments
+            or judgments[a.candidate_index].target_id != a.target_id
+            for a in self.alignments
+        ):
+            raise ValueError("alignment must bind its judgment target")
+        return self
+
+    @model_serializer(mode="wrap")
+    def preserve_v1(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        data = handler(self)
+        if self.schema_version == 1:
+            data.pop("alignments", None)
+        return data
 
 
 type MemoryAdmissionReason = Literal[
