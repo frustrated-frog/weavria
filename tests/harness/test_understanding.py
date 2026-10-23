@@ -410,6 +410,11 @@ async def test_model_interpreter_keeps_capability_data_out_of_host_instructions(
     assert "execute has at least one selected capability and no blocking ambiguities" in (
         sent.instructions
     )
+    assert (
+        "Direct and execute top-level routes must omit both uncertainty and action_proposal"
+        in sent.instructions
+    )
+    assert "For a clarify route, when one most plausible hypothesis" in sent.instructions
     assert sent.history == request.history
 
 
