@@ -93,6 +93,20 @@ def test_compilation_fact_requires_explicit_v4_envelope() -> None:
     assert ContextCompilation.model_validate_json(current.model_dump_json()) == current
     with pytest.raises(ValueError, match="v2"):
         ContextCompilation.model_validate(report.model_copy(update={"allocation_steps": 7}))
+    reserved = ContextCompilation.model_validate(
+        report.model_copy(
+            update={
+                "schema_version": 5,
+                "input_tokens": 10,
+                "next_step_reserve_bytes": 20,
+            }
+        )
+    )
+    assert ContextCompilation.model_validate_json(reserved.model_dump_json()) == reserved
+    with pytest.raises(ValueError, match="v5"):
+        ContextCompilation.model_validate(
+            report.model_copy(update={"schema_version": 4, "next_step_reserve_bytes": 1})
+        )
 
 
 def test_legacy_admission_roundtrips_without_new_access_field_and_v2_requires_scope() -> None:

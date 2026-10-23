@@ -30,7 +30,7 @@ class ContextCompilation(BaseModel):
     """Bind allocation diagnostics to the exact complete request sent to a provider."""
 
     model_config = ContractModel.model_config
-    schema_version: Literal[1, 2, 3, 4] = 1
+    schema_version: Literal[1, 2, 3, 4, 5] = 1
 
     policy_version: NonBlankString
     counter_version: NonBlankString
@@ -45,6 +45,7 @@ class ContextCompilation(BaseModel):
     output_reserve_tokens: int = Field(gt=0)
     safety_tokens: int = Field(ge=0)
     control_reserve_bytes: int = Field(ge=0)
+    next_step_reserve_bytes: int = Field(default=0, ge=0)
     feedback_budget_bytes: int = Field(ge=1)
     utility: float = Field(ge=0, allow_inf_nan=False)
     evaluations: int = Field(ge=1)
@@ -70,6 +71,8 @@ class ContextCompilation(BaseModel):
             data.pop("retrieval", None)
         if self.schema_version < 4:
             data.pop("recovery_ranges", None)
+        if self.schema_version < 5:
+            data.pop("next_step_reserve_bytes", None)
         return data
 
     @model_validator(mode="after")
@@ -82,6 +85,8 @@ class ContextCompilation(BaseModel):
             raise ValueError("retrieval diagnostics require compilation v3 and the same revision")
         if self.recovery_ranges and self.schema_version < 4:
             raise ValueError("recovery ranges require compilation v4")
+        if self.next_step_reserve_bytes and self.schema_version < 5:
+            raise ValueError("next-step reserve requires compilation v5")
         choices = {c.source_id: c for c in self.choices}
         for part in self.recovery_ranges:
             choice = choices.get(f"call:{part.call_id}")
@@ -91,9 +96,17 @@ class ContextCompilation(BaseModel):
                 or choice.representation not in ("raw", "excerpt")
             ):
                 raise ValueError("recovery range must remain readable and mandatory")
-        if self.input_tokens > self.input_budget_tokens:
+        token_reserve = (
+            self.control_reserve_bytes + self.next_step_reserve_bytes
+            if self.schema_version >= 5
+            else 0
+        )
+        if self.input_tokens + token_reserve > self.input_budget_tokens:
             raise ValueError("compiled request exceeds its input token budget")
-        if self.request_bytes + self.control_reserve_bytes > self.budget_bytes:
+        if (
+            self.request_bytes + self.control_reserve_bytes + self.next_step_reserve_bytes
+            > self.budget_bytes
+        ):
             raise ValueError("compiled request omits its control byte reserve")
         sources = {choice.source_id for choice in self.choices}
         selected = {

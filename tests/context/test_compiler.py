@@ -17,14 +17,17 @@ from weavria.context import (
     ContextTokenBudgetError,
     EvidenceAnchor,
     SessionContextCompiler,
+    reserve_feedback,
 )
 from weavria.core import (
     CallFeedback,
     ControlRequest,
     ConversationTurn,
     ErrorCategory,
+    FeedbackBounds,
     LocatedTextExcerpt,
     TaskInput,
+    ToolBatch,
     ToolCallAction,
     ToolExchange,
     ToolFailedObservation,
@@ -148,6 +151,78 @@ async def test_joint_selection_recovers_exact_old_tail_and_current_evidence(
     assert plan.compilation.request_sha256 == hashlib.sha256(plan.request_json.encode()).hexdigest()
     assert plan.compilation.request_bytes + plan.compilation.control_reserve_bytes <= 5600
     assert plan.compilation.input_tokens == session_counter.count(request)
+
+
+async def test_feedback_reservation_counts_stable_instructions_exactly(
+    session_counter: OpenAICompatibleTokenCounter,
+) -> None:
+    config = ContextCompilerConfig(
+        window_tokens=24_000,
+        output_tokens=256,
+        safety_tokens=64,
+        policy="full",
+    )
+    instructions = "the trusted instruction " * 650
+    request_base = ControlRequest(
+        instructions=instructions,
+        task=TaskInput(goal="explain current market state"),
+    )
+    turns = tuple(
+        ConversationTurn(
+            run_id=f"past-{ordinal}",
+            input_id=f"input-{ordinal}",
+            ordinal=ordinal,
+            user="explain market",
+            assistant="current market state evidence " * 15,
+            status="completed",
+        )
+        for ordinal in range(1, 7)
+    )
+    plan = await SessionContextCompiler(
+        InMemoryArtifactStore(),
+        config=config,
+        counter=session_counter,
+    ).compile(
+        run_id="run",
+        session_id="s",
+        sequence=6,
+        base=request_base,
+        turns=turns,
+        total_turns=6,
+        records=(),
+        max_request_bytes=32_000,
+        next_step_reserve_bytes=config.next_step_reserve_bytes,
+    )
+    reservation = reserve_feedback(
+        instructions=instructions,
+        task=request_base.task,
+        records=(),
+        batch=ToolBatch(
+            calls=(
+                ToolCallAction(
+                    call_id="read-current",
+                    tool_name="read",
+                    arguments={"focus": "overview"},
+                ),
+            )
+        ),
+        bounds=FeedbackBounds(),
+        budget_bytes=plan.compilation.feedback_budget_bytes,
+    )
+    request = plan.request
+    overhead = len(request.model_dump_json().encode()) - len(
+        request.current.model_dump_json().encode()
+    )
+    legacy_budget = max(
+        1,
+        min(32_000, session_counter.request_byte_ceiling(config.input_tokens)) - overhead,
+    )
+
+    assert reservation.required_bytes > legacy_budget
+    assert reservation.fits
+    assert plan.compilation.feedback_budget_bytes > legacy_budget
+    assert plan.compilation.schema_version == 5
+    assert plan.compilation.next_step_reserve_bytes == config.next_step_reserve_bytes
 
 
 async def test_focus_and_revision_rerank_original_instead_of_previous_projection(

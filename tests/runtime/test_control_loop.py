@@ -465,6 +465,38 @@ async def test_tool_budget_rejects_whole_batch_and_model_can_change_plan() -> No
     replay(agent)
 
 
+async def test_repeated_identical_hard_rejection_stops_before_model_budget_exhaustion() -> None:
+    repeated = tuple(batch(call(f"repeat-{index}", "x" * 4000)) for index in range(5))
+    provider = FakeControlProvider(repeated)
+    budget = reserve_feedback(
+        instructions=await sizing_instructions(),
+        task=TaskInput(goal="Read and report the value"),
+        records=(),
+        batch=ToolBatch(calls=(call("small", "x" * 50),)),
+        bounds=FeedbackBounds(),
+        budget_bytes=99_999,
+    ).required_bytes
+    agent = make_loop(
+        provider,
+        limits=RunLimits(
+            max_model_calls=10,
+            max_request_bytes=budget,
+            max_no_progress_rejections=2,
+        ),
+    )
+
+    result = await agent.execute()
+
+    assert result.status is RunStatus.FAILED
+    assert result.error is not None and result.error.category is ErrorCategory.NO_PROGRESS
+    assert agent.state.model_calls == 3
+    assert agent.state.tool_calls == 0
+    rejected = [event.data for event in agent.events if isinstance(event.data, BatchRejected)]
+    assert len(rejected) == 2
+    assert all(event.notice.reason == "feedback_budget" for event in rejected)
+    replay(agent)
+
+
 async def test_progress_assessment_is_persisted_projected_and_drives_resolution() -> None:
     provider = FakeControlProvider((batch(call("read-1")), finish("grounded")))
     agent = make_loop(provider, progress_assessor=_ReadyProgressAssessor())

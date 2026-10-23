@@ -147,6 +147,7 @@ class SessionContextCompiler:
         focus: ContextFocus | None = None,
         retrieval: HistoryRetrievalReport | None = None,
         recovery_ranges: tuple[RecoveryRange, ...] = (),
+        next_step_reserve_bytes: int = 0,
     ) -> CompiledSessionContext:
         """Compile accepted sources, raising on invalid identity or exhausted budgets.
 
@@ -160,6 +161,11 @@ class SessionContextCompiler:
         )
         if type(max_request_bytes) is not int or max_request_bytes <= 0:
             raise ValueError("request byte budget must be positive")
+        if (
+            type(next_step_reserve_bytes) is not int
+            or not 0 <= next_step_reserve_bytes <= self.config.next_step_reserve_bytes
+        ):
+            raise ValueError("next-step reserve exceeds the configured bound")
         if len(turns) + len(records) > self.config.max_units:
             forced = set(required_call_ids)
             if base.feedback:
@@ -243,7 +249,9 @@ class SessionContextCompiler:
             base.control.model_dump_json().encode() if base.control else b"null"
         )
         policy_version = (
-            4
+            5
+            if next_step_reserve_bytes
+            else 4
             if base.schema_version == 4
             else 3
             if retrieval is not None or self.config.max_history_spans > 1
@@ -253,7 +261,9 @@ class SessionContextCompiler:
             session_id=session_id,
             through_sequence=sequence,
             omitted_turns=total_turns,
-            policy_version="context-compiler/4"
+            policy_version="context-compiler/5"
+            if policy_version == 5
+            else "context-compiler/4"
             if policy_version == 4
             else "context-compiler/3"
             if policy_version == 3
@@ -289,10 +299,10 @@ class SessionContextCompiler:
 
         def measure(selected: dict[int, int]) -> AllocationCost:
             request = render(selected)
-            size = len(request.model_dump_json().encode()) + padding
+            size = len(request.model_dump_json().encode()) + padding + next_step_reserve_bytes
             # No expensive BPE evaluation of obviously byte-infeasible candidates.
             tokens = (
-                self.counter.count(request)
+                self.counter.count(request) + padding + next_step_reserve_bytes
                 if size <= max_request_bytes
                 else self.config.input_tokens + 1
             )
@@ -323,10 +333,13 @@ class SessionContextCompiler:
         request = render(selected)
         encoded = request.model_dump_json()
         actual_tokens = self.counter.count(request)
-        if actual_tokens != cost.tokens:
+        if actual_tokens + padding + next_step_reserve_bytes != cost.tokens:
             raise ContextBuildError("token counter changed within one compilation")
         overhead = len(encoded.encode()) - len(request.current.model_dump_json().encode())
-        ceiling = self.counter.request_byte_ceiling(self.config.input_tokens)
+        ceiling = self.counter.request_byte_ceiling(
+            self.config.input_tokens,
+            request=request,
+        )
         if type(ceiling) is not int or ceiling < 0:
             raise ContextBuildError("token counter returned an invalid byte ceiling")
         covered = coverage(units, selected)
@@ -345,6 +358,7 @@ class SessionContextCompiler:
             output_reserve_tokens=self.config.output_tokens,
             safety_tokens=self.config.safety_tokens,
             control_reserve_bytes=padding,
+            next_step_reserve_bytes=next_step_reserve_bytes,
             feedback_budget_bytes=max(1, min(max_request_bytes, ceiling) - overhead),
             utility=allocator.utility(selected),
             evaluations=allocator.evaluations,

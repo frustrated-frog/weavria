@@ -232,6 +232,88 @@ async def test_token_feedback_reservation_rejects_before_tool_effect(
         assert rejected[0].notice.required_bytes > rejected[0].notice.budget_bytes
 
 
+async def test_long_history_keeps_one_productive_tool_feedback_slot(
+    tmp_path: Path,
+    session_counter: OpenAICompatibleTokenCounter,
+) -> None:
+    path = tmp_path / "feedback-headroom.db"
+    seeded = FakeSessionProvider(
+        tuple(finish("current market state evidence " * 15) for _ in range(6))
+    )
+    async with SessionEngine(path, model=seeded, tools=ToolRegistry(())) as engine:
+        await engine.create("s")
+        for _ in range(6):
+            await engine.send("s", "explain market")
+
+    calls: list[str] = []
+
+    class Input(BaseModel):
+        focus: str
+
+    async def execute(arguments: Input, context: ToolContext) -> Input:
+        calls.append(arguments.focus)
+        return arguments
+
+    registry = ToolRegistry(
+        (
+            TypedTool(
+                name="read",
+                version="1",
+                description="Read current state",
+                input_type=Input,
+                output_type=Input,
+                execute=execute,
+            ),
+        )
+    )
+    model = FakeSessionProvider(
+        (
+            ModelTurn(
+                decision=ToolBatch(
+                    calls=(
+                        ToolCallAction(
+                            call_id="read-current",
+                            tool_name="read",
+                            arguments={"focus": "overview"},
+                        ),
+                    )
+                )
+            ),
+            finish("done"),
+        )
+    )
+    compiler = ContextCompilerConfig(
+        window_tokens=24_000,
+        output_tokens=256,
+        safety_tokens=64,
+        policy="full",
+    )
+    async with SessionEngine(
+        path,
+        model=model,
+        tools=registry,
+        instructions="the trusted instruction " * 300,
+        limits=RunLimits(max_request_bytes=32_000),
+        context_compiler=compiler,
+        token_counter=session_counter,
+    ) as engine:
+        result = await engine.send("s", "explain current market state")
+        reports = [
+            event.data.compilation
+            for event in await engine.store.events("s")
+            if isinstance(event.data, SessionContextCompiled)
+        ]
+
+    assert result.report.execution.status is RunStatus.COMPLETED
+    assert result.report.output == "done"
+    assert calls == ["overview"]
+    assert reports[-2].schema_version == 5
+    assert reports[-2].next_step_reserve_bytes == min(
+        compiler.next_step_reserve_bytes,
+        32_000 // 8,
+    )
+
+
 async def test_compilation_persistence_failure_rolls_back_snapshot_and_stops_transport(
     tmp_path: Path,
     session_counter: OpenAICompatibleTokenCounter,

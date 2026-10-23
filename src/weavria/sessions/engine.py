@@ -133,6 +133,7 @@ class _SessionAdapter:
         tools: ToolRegistry,
         task_observation: TaskObservation | None,
         visible_tool_names: tuple[str, ...],
+        reserve_next_step: bool,
         capability_epoch: int,
         task_preparer: SessionTaskPreparer | None,
         semantic: SemanticSnapshot | None,
@@ -152,6 +153,7 @@ class _SessionAdapter:
         self._instructions, self._tools = instructions, tools
         self._task_observation = task_observation
         self._visible_tool_names = visible_tool_names
+        self._reserve_next_step = reserve_next_step
         self._capability_epoch = capability_epoch
         self._task_preparer = task_preparer
         self._semantic = semantic
@@ -385,6 +387,14 @@ class _SessionAdapter:
             focus=focus,
             retrieval=retrieval,
             recovery_ranges=recovery_ranges,
+            next_step_reserve_bytes=(
+                min(
+                    self._compiler.config.next_step_reserve_bytes,
+                    self._budget // 8,
+                )
+                if self._reserve_next_step
+                else 0
+            ),
         )
         outer, report = compiled.request, compiled.compilation
         self._prepared = {task.revision: outer.conversation}
@@ -915,6 +925,7 @@ class SessionEngine:
                 registry,
                 task_observation,
                 visible_tool_names,
+                bool(selected.descriptors),
                 capability_epoch,
                 self._task_preparation,
                 semantic if self._task_preparation is not None else None,

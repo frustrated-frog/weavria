@@ -1300,7 +1300,7 @@ class SQLiteSessionStore:
                 if state.journal_version == 4:
                     if (
                         compilation is None
-                        or compilation.schema_version != 4
+                        or compilation.schema_version < 4
                         or compilation.recovery_ranges != state.recovery_ranges
                     ):
                         raise SessionConflictError(

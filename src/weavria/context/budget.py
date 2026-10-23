@@ -23,7 +23,19 @@ class SessionTokenCounter(Protocol):
 
     def count(self, request: SessionRequest) -> int: ...
 
-    def request_byte_ceiling(self, input_tokens: int) -> int: ...
+    def request_byte_ceiling(
+        self,
+        input_tokens: int,
+        *,
+        request: SessionRequest | None = None,
+    ) -> int:
+        """Return a sufficient serialized-request ceiling for future feedback.
+
+        When ``request`` is provided, implementations may account exactly for
+        trusted, invariant transport content while keeping unknown future data
+        on a conservative byte-per-token bound.
+        """
+        ...
 
 
 class ContextTokenBudgetError(ContextBuildError):
@@ -62,6 +74,7 @@ class ContextCompilerConfig:
     max_scoring_work: int = 2_000_000
     max_allocation_steps: int = 4096
     max_history_spans: int = 1
+    next_step_reserve_bytes: int = 4096
 
     def __post_init__(self) -> None:
         for value in (
@@ -75,6 +88,7 @@ class ContextCompilerConfig:
             self.max_scoring_work,
             self.max_allocation_steps,
             self.max_history_spans,
+            self.next_step_reserve_bytes,
         ):
             if type(value) is not int or value <= 0:
                 raise ValueError("compiler limits must be positive integers")
@@ -84,7 +98,12 @@ class ContextCompilerConfig:
             raise ValueError("output and safety reserves exhaust the context window")
         if self.policy not in ("coverage", "relevance", "recent", "full"):
             raise ValueError("unknown context allocation policy")
-        if self.max_passages > 32 or self.max_units > 1024 or self.max_history_spans > 16:
+        if (
+            self.max_passages > 32
+            or self.max_units > 1024
+            or self.max_history_spans > 16
+            or self.next_step_reserve_bytes > 1_048_576
+        ):
             raise ValueError("compiler candidate limits exceed supported bounds")
 
     @property

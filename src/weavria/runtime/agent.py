@@ -364,8 +364,8 @@ class _AgentKernel:
             if journal_version >= 3
             else None
         )
-        self._no_progress_rejections = 0
-        self._no_progress_frontier: str | None = None
+        self._rejection_repetitions = 0
+        self._rejection_frontier: str | None = None
         self._events_json: list[str] = []
         self._plans: list[EvidencePlan | TurnEvidencePlan | ControlEvidencePlan] = []
         self._state: RunState | None = None
@@ -834,7 +834,7 @@ class _AgentKernel:
                         raise ValueError("recovery preflight requires a compilation receipt")
                     validate_recovery_view(preflight.request, result.ranges)
                     report = ContextCompilation.model_validate_json(preflight.compilation_json)
-                    if report.schema_version != 4 or report.recovery_ranges != result.ranges:
+                    if report.schema_version < 4 or report.recovery_ranges != result.ranges:
                         raise ValueError("recovery preflight changed the planned ranges")
                     requested = preflight.request_bytes + preflight.control_padding_bytes
                     if requested > preflight.budget_bytes:
@@ -1037,14 +1037,21 @@ class _AgentKernel:
                     "tool action identity changed between intervention and admission"
                 )
             if progress.blocked:
-                if self._no_progress_frontier != progress.fingerprint_sha256:
-                    self._no_progress_frontier = progress.fingerprint_sha256
-                    self._no_progress_rejections = 0
-                self._no_progress_rejections += 1
-                if self._no_progress_rejections > self._limits.max_no_progress_rejections:
-                    raise _NoProgressExhausted
                 reason = "no_progress"
         if reason is not None:
+            rejection_frontier = (
+                progress.fingerprint_sha256
+                if reason == "no_progress" and progress is not None
+                else hashlib.sha256(
+                    (f"{revision}:{reason}:{action_value_context.value_key_sha256}").encode()
+                ).hexdigest()
+            )
+            if self._rejection_frontier != rejection_frontier:
+                self._rejection_frontier = rejection_frontier
+                self._rejection_repetitions = 0
+            self._rejection_repetitions += 1
+            if self._rejection_repetitions > self._limits.max_no_progress_rejections:
+                raise _NoProgressExhausted
             await self._accept(
                 BatchRejected(
                     notice=AdmissionNotice(
@@ -1102,6 +1109,8 @@ class _AgentKernel:
         )
         if accepted:
             assert progress is not None
+            self._rejection_frontier = None
+            self._rejection_repetitions = 0
             self._progress.record_admission(progress)
         return accepted, progress.action_identities if progress is not None else ()
 
@@ -1376,7 +1385,7 @@ class _AgentKernel:
                 validate_recovery_view(plan.request, self.state.recovery_ranges)
                 compilation = ContextCompilation.model_validate_json(plan.compilation_json)
                 if (
-                    compilation.schema_version != 4
+                    compilation.schema_version < 4
                     or compilation.recovery_ranges != self.state.recovery_ranges
                 ):
                     raise ValueError("compiled ranges differ from accepted recovery")

@@ -324,7 +324,7 @@ class OpenAICompatibleTokenCounter:
 
     @property
     def version(self) -> str:
-        return f"openai-compatible-session/1[{self._tokenizer.version};frame={self._framing}]"
+        return f"openai-compatible-session/2[{self._tokenizer.version};frame={self._framing}]"
 
     @property
     def output_tokens(self) -> int:
@@ -337,11 +337,35 @@ class OpenAICompatibleTokenCounter:
             self._tokenizer.count(message["content"]) for message in body["messages"]
         )
 
-    def request_byte_ceiling(self, input_tokens: int) -> int:
-        """Sufficient normalized JSON byte ceiling for unknown future feedback.
+    def request_byte_ceiling(
+        self,
+        input_tokens: int,
+        *,
+        request: SessionRequest | None = None,
+    ) -> int:
+        """Bound future serialized requests without charging known instructions twice.
 
-        Ordinary byte BPE uses at most one token per UTF-8 byte. Moving trusted
-        instructions out of JSON only removes escaping; the fixed prefix and
-        framing are separately reserved. The bound is intentionally conservative.
+        Byte BPE uses at most one token per UTF-8 byte. Without a request, keep
+        the legacy whole-payload bound. With a request, count the invariant
+        system protocol and trusted instructions exactly, then reserve one token
+        for every unknown user-payload byte. The returned value remains in the
+        serialized ``SessionRequest`` byte domain used by context admission.
+        Future requests must retain the same instructions and schema.
         """
-        return max(0, input_tokens - len(_SESSION_PROTOCOL.encode()) - self._framing)
+        if type(input_tokens) is not int or input_tokens < 0:
+            raise ValueError("input token allowance must be a nonnegative integer")
+        if request is None:
+            return max(0, input_tokens - len(_SESSION_PROTOCOL.encode()) - self._framing)
+        validated = SessionRequest.model_validate(request)
+        body = _session_request_body(self._config, validated)
+        system = body["messages"][0]["content"]
+        user = body["messages"][1]["content"]
+        assert isinstance(system, str) and isinstance(user, str)
+        lifted_instruction_bytes = len(validated.model_dump_json().encode()) - len(user.encode())
+        if lifted_instruction_bytes < 0:
+            raise ValueError("transport payload exceeds its normalized request")
+        user_budget = max(
+            0,
+            input_tokens - self._framing - self._tokenizer.count(system),
+        )
+        return user_budget + lifted_instruction_bytes
