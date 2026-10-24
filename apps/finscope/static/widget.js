@@ -4,6 +4,7 @@ const state = {
   clarificationId: null,
   sessionId: window.localStorage.getItem('weavria.marketPulse.sessionId')
 };
+const WIDGET_ASSET_VERSION = 3;
 const markdownReady = ensureMarkdownRenderer();
 
 const conversation = document.querySelector('#conversation');
@@ -79,7 +80,7 @@ function ensureMarkdownRenderer() {
   if (window.WeavriaMarkdown) return Promise.resolve(true);
   return new Promise((resolve) => {
     const script = document.createElement('script');
-    script.src = '/widget-assets/markdown.js';
+    script.src = `/widget-assets/markdown.js?v=${WIDGET_ASSET_VERSION}`;
     script.addEventListener('load', () => resolve(Boolean(window.WeavriaMarkdown)), {
       once: true
     });

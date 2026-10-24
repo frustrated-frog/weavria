@@ -654,8 +654,9 @@ async def test_widget_has_parent_and_script_restrictions(tmp_path: Path) -> None
     assert response.status_code == 200
     assert "frame-ancestors http://localhost:5173" in response.headers["content-security-policy"]
     assert response.headers["cache-control"] == "no-store"
-    assert '<script src="/widget-assets/markdown.js" defer></script>' in response.text
-    assert '<script src="/widget-assets/widget.js" defer></script>' in response.text
+    assert '<link rel="stylesheet" href="/widget-assets/widget.css?v=3" />' in response.text
+    assert '<script src="/widget-assets/markdown.js?v=3" defer></script>' in response.text
+    assert '<script src="/widget-assets/widget.js?v=3" defer></script>' in response.text
     assert '<button type="button" id="send">发送</button>' in response.text
     assert markdown_script.status_code == 200
     assert markdown_script.headers["cache-control"] == "no-store"
@@ -665,8 +666,9 @@ async def test_widget_has_parent_and_script_restrictions(tmp_path: Path) -> None
     assert script.headers["cache-control"] == "no-store"
     assert "send.addEventListener('click'" in script.text
     assert "void submitQuestion();" in script.text
+    assert "const WIDGET_ASSET_VERSION = 3;" in script.text
     assert "const markdownReady = ensureMarkdownRenderer();" in script.text
-    assert "script.src = '/widget-assets/markdown.js';" in script.text
+    assert "script.src = `/widget-assets/markdown.js?v=${WIDGET_ASSET_VERSION}`;" in script.text
     assert "window.WeavriaMarkdown.renderMarkdown(content, text);" in script.text
     assert "result.task_outcome === 'unverifiable'" in script.text
     assert "'未能核验'" in script.text
