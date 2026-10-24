@@ -53,6 +53,7 @@ from weavria.core import (
     ExecutionData,
     ExecutionEvent,
     FeedbackBounds,
+    FeedbackEnvelopeBound,
     FinishAction,
     JournalEvent,
     LoopData,
@@ -1006,6 +1007,14 @@ class _AgentKernel:
         action_value_context: ActionValueContext,
     ) -> tuple[bool, tuple[ToolActionIdentity, ...]]:
         revision = self.state.model_revision
+        feedback_envelopes = tuple(
+            self._tool_ceiling.feedback_envelope(
+                call,
+                identity=identity,
+                bounds=self._bounds,
+            )
+            for call, identity in zip(batch.calls, checked_identities, strict=True)
+        )
         reservation = reserve_feedback(
             instructions=self._instructions,
             task=self.state.task,
@@ -1020,6 +1029,7 @@ class _AgentKernel:
             bounds=self._bounds,
             budget_bytes=self._feedback_budget,
             evidence_access=self._evidence_access,
+            feedback_envelopes=feedback_envelopes,
         )
         remaining = max(0, self._limits.max_tool_calls - self.state.tool_calls)
         visible = {descriptor.name for descriptor in self._visible_tools.descriptors}
@@ -1128,13 +1138,14 @@ class _AgentKernel:
             return False, progress.action_identities if progress is not None else ()
         accepted = await self._accept(
             BatchAdmitted(
-                schema_version=2 if self._evidence_access is not None else 1,
+                schema_version=3,
                 reserved_bytes=reservation.required_bytes,
                 budget_bytes=reservation.budget_bytes,
                 readable_call_ids=reservation.readable_call_ids,
                 bounds=self._bounds,
                 action_value_context=action_value_context,
                 evidence_access=self._evidence_access,
+                feedback_envelopes=reservation.feedback_envelopes,
             ),
             expected_revision=revision,
         )
@@ -1238,6 +1249,11 @@ class _AgentKernel:
             if action_identities
             else {}
         )
+        envelopes: dict[str, FeedbackEnvelopeBound] = {}
+        if self._journal_version >= 3:
+            admission = self.state.admission
+            if admission is not None:
+                envelopes = {item.call_id: item for item in admission.feedback_envelopes}
 
         async def execute(call: ToolCallAction) -> None:
             if self.state.task.revision != revision:
@@ -1249,6 +1265,7 @@ class _AgentKernel:
                 accepted,
                 expected_revision=revision,
                 expected_identity=identities.get(call.call_id),
+                feedback_envelope=envelopes.get(call.call_id),
             )
 
         async def skip(call: ToolCallAction) -> None:
@@ -1280,6 +1297,7 @@ class _AgentKernel:
         *,
         expected_revision: int | None = None,
         expected_identity: ToolActionIdentity | None = None,
+        feedback_envelope: FeedbackEnvelopeBound | None = None,
     ) -> None:
         remaining = self._remaining(deadline)
         if remaining <= 0:
@@ -1296,6 +1314,7 @@ class _AgentKernel:
             max_duration=remaining,
             accepted_artifacts=accepted,
             expected_identity=expected_identity,
+            feedback_envelope=feedback_envelope,
         )
         self._check_cancel(owner, cancellations)
         await self._accept(ToolRecorded(record=record))

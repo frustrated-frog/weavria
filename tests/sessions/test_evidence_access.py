@@ -216,7 +216,8 @@ async def test_session_access_matches_selected_context_and_replay_rejects_scope_
             if isinstance(e.data, SessionRunEvent)
         )
     admissions = [e.data for e in events if isinstance(e.data, BatchAdmitted)]
-    assert all(a.schema_version == 2 for a in admissions)
+    assert all(a.schema_version == 3 for a in admissions)
+    assert all(a.feedback_envelopes for a in admissions)
     assert admissions[-1].readable_call_ids == ("second",)
     records = {
         e.data.record.exchange.action.call_id: e.data.record

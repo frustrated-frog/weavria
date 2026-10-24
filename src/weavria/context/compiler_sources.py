@@ -19,6 +19,7 @@ from weavria.core import (
     ToolExchange,
     ToolRecord,
     ToolSucceededObservation,
+    complete_exchange,
     minimum_exchange,
 )
 
@@ -319,10 +320,11 @@ async def source_units(
             }
             complete = Representation(
                 "raw",
-                _exchange_view(
-                    record.exchange,
-                    {**common, "representation": "full", "data": source.snapshot.value},
-                ),
+                complete_exchange(
+                    record.exchange.action,
+                    reference,
+                    source.snapshot.value,
+                ).model_dump_json(),
                 scorer.features(source.passages, source=source),
             )
 

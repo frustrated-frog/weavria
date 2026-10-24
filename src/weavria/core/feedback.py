@@ -1,9 +1,11 @@
-"""Minimum observation projections and deterministic upper bounds; no execution facts created."""
+"""Observation projections and deterministic upper bounds; no execution facts created."""
+
+from pydantic import JsonValue
 
 from .actions import ToolCallAction
 from .control import FeedbackBounds
 from .errors import ErrorCategory, RunError
-from .execution import ToolRecord
+from .execution import ArtifactRef, ToolRecord
 from .model_io import ToolExchange
 from .outcomes import ToolFailedObservation, ToolSucceededObservation
 
@@ -69,3 +71,54 @@ def maximum_exchange_bytes(action: ToolCallAction, bounds: FeedbackBounds) -> in
     # the same Pydantic encoder as the final request, including Unicode escapes.
     wrapper = len(b'{"schema_version":1,"kind":"tool_exchange","action":,"observation":}')
     return wrapper + len(action.model_dump_json().encode()) + max(sizes)
+
+
+def complete_exchange(
+    action: ToolCallAction,
+    artifact: ArtifactRef,
+    data: JsonValue,
+) -> ToolExchange:
+    """Build the one canonical full-feedback representation consumed by context compilation."""
+    if artifact.call_id != action.call_id:
+        raise ValueError("complete feedback artifact must belong to its action")
+    return ToolExchange(
+        action=action,
+        observation=ToolSucceededObservation(
+            call_id=action.call_id,
+            tool_name=action.tool_name,
+            output={
+                "artifact_id": artifact.artifact_id,
+                "sha256": artifact.sha256,
+                "size_bytes": artifact.size_bytes,
+                "representation": "full",
+                "data": data,
+            },
+        ),
+    )
+
+
+def maximum_complete_exchange_bytes(
+    action: ToolCallAction,
+    bounds: FeedbackBounds,
+    max_data_json_bytes: int,
+) -> int:
+    """Bound a complete exchange from a trusted input-dependent data bound.
+
+    The tool estimator owns only the serialized ``data`` value. Framework-owned
+    metadata, the exact proposed action and every classified failure are added here,
+    so tools cannot accidentally omit protocol overhead from their promise.
+    """
+    if type(max_data_json_bytes) is not int or max_data_json_bytes <= 0:
+        raise ValueError("complete feedback data bound must be a positive integer")
+    reference = ArtifactRef(
+        artifact_id="x" * (bounds.max_artifact_id_json_bytes - 2),
+        run_id="bound",
+        call_id=action.call_id,
+        sha256="0" * 64,
+        size_bytes=bounds.max_result_bytes,
+    )
+    template = complete_exchange(action, reference, None).model_dump_json().encode()
+    # ``data:null`` contributes four bytes. Keeping those four bytes when the
+    # promised value is smaller is deliberately conservative.
+    success = len(template) + max(0, max_data_json_bytes - len(b"null"))
+    return max(success, maximum_exchange_bytes(action, bounds))

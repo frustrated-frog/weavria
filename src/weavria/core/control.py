@@ -22,6 +22,7 @@ from .execution import (
     ContextSelected,
     DecisionDiscarded,
     ExecutionEvent,
+    FeedbackDelivery,
     ModelStarted,
     RunEnded,
     RunStarted,
@@ -65,6 +66,18 @@ class FeedbackBounds(ContractModel):
 
     max_artifact_id_json_bytes: int = Field(default=130, ge=3, le=4096)
     max_result_bytes: int = Field(default=4_000_000, ge=1, le=1_000_000_000)
+
+
+class FeedbackEnvelopeBound(ContractModel):
+    """An admitted, action-bound ceiling for one next-turn tool exchange."""
+
+    call_id: NonBlankString
+    tool_name: NonBlankString
+    tool_version: NonBlankString
+    delivery: FeedbackDelivery
+    estimator_version: NonBlankString
+    action_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    max_exchange_bytes: int = Field(gt=0)
 
 
 class AdmissionNotice(ContractModel):
@@ -294,10 +307,10 @@ class ControlRequest(BaseModel):
 
 
 class BatchAdmitted(BaseModel):
-    """v1 reserves all accepted evidence; v2 binds an explicit execution access view."""
+    """Admit a batch with readable evidence and, in v3, per-call feedback proofs."""
 
     model_config = ContractModel.model_config
-    schema_version: Literal[1, 2] = 1
+    schema_version: Literal[1, 2, 3] = 1
     kind: Literal["batch_admitted"] = "batch_admitted"
     reserved_bytes: int = Field(gt=0)
     budget_bytes: int = Field(gt=0)
@@ -305,6 +318,7 @@ class BatchAdmitted(BaseModel):
     bounds: FeedbackBounds
     action_value_context: ActionValueContext | None = None
     evidence_access: EvidenceAccessView | None = None
+    feedback_envelopes: tuple[FeedbackEnvelopeBound, ...] = ()
 
     @field_validator("schema_version", mode="before")
     @classmethod
@@ -312,16 +326,24 @@ class BatchAdmitted(BaseModel):
         return ContractModel.validate_version_type(value)
 
     @model_serializer(mode="wrap")
-    def preserve_v1_wire(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+    def preserve_legacy_wire(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
         data = handler(self)
         if self.schema_version == 1:
             data.pop("evidence_access", None)
+        if self.schema_version < 3:
+            data.pop("feedback_envelopes", None)
         return data
 
     @model_validator(mode="after")
     def validate_budget(self) -> Self:
-        if (self.schema_version == 2) != (self.evidence_access is not None):
-            raise ValueError("only admission v2 requires an evidence access view")
+        if self.schema_version == 1 and self.evidence_access is not None:
+            raise ValueError("admission v1 cannot carry an evidence access view")
+        if self.schema_version == 2 and self.evidence_access is None:
+            raise ValueError("admission v2 requires an evidence access view")
+        if self.schema_version < 3 and self.feedback_envelopes:
+            raise ValueError("legacy admission cannot carry feedback envelopes")
+        if self.schema_version == 3 and not self.feedback_envelopes:
+            raise ValueError("admission v3 requires feedback envelopes")
         if self.evidence_access is not None and self.readable_call_ids != tuple(
             a.call_id for a in self.evidence_access.artifacts
         ):
@@ -330,6 +352,11 @@ class BatchAdmitted(BaseModel):
             raise ValueError("admission exceeds feedback budget")
         if len(set(self.readable_call_ids)) != len(self.readable_call_ids):
             raise ValueError("readable identities must be unique")
+        envelope_ids = tuple(item.call_id for item in self.feedback_envelopes)
+        if len(set(envelope_ids)) != len(envelope_ids):
+            raise ValueError("feedback envelope identities must be unique")
+        if any(item.max_exchange_bytes > self.reserved_bytes for item in self.feedback_envelopes):
+            raise ValueError("feedback envelope exceeds the admitted reservation")
         return self
 
 

@@ -226,6 +226,75 @@ async def test_feedback_reservation_counts_stable_instructions_exactly(
     assert plan.compilation.next_step_reserve_bytes == config.next_step_reserve_bytes
 
 
+def test_complete_feedback_batch_is_rejected_before_execution_when_only_one_page_fits() -> None:
+    registry = ToolRegistry((artifact_read_tool(),))
+    bounds = FeedbackBounds()
+    calls = tuple(
+        ToolCallAction(
+            call_id=f"page-{index}",
+            tool_name="read_artifact",
+            arguments={
+                "artifact_id": "a" * 64,
+                "pointer": f"/section/{index}",
+                "start": 0,
+                "length": 3000,
+            },
+        )
+        for index in range(2)
+    )
+    envelopes = tuple(
+        registry.feedback_envelope(
+            proposed,
+            identity=registry.action_identity(proposed),
+            bounds=bounds,
+        )
+        for proposed in calls
+    )
+    task = TaskInput(goal="Summarize the available sources")
+    one = reserve_feedback(
+        instructions="Use accepted evidence",
+        task=task,
+        records=(),
+        batch=ToolBatch(calls=(calls[0],)),
+        bounds=bounds,
+        budget_bytes=100_000,
+        feedback_envelopes=(envelopes[0],),
+    )
+    complete_batch = reserve_feedback(
+        instructions="Use accepted evidence",
+        task=task,
+        records=(),
+        batch=ToolBatch(calls=calls),
+        bounds=bounds,
+        budget_bytes=one.required_bytes,
+        feedback_envelopes=envelopes,
+    )
+    legacy_minimum = reserve_feedback(
+        instructions="Use accepted evidence",
+        task=task,
+        records=(),
+        batch=ToolBatch(calls=calls),
+        bounds=bounds,
+        budget_bytes=one.required_bytes,
+    )
+
+    assert one.fits
+    assert legacy_minimum.fits
+    assert not complete_batch.fits
+    assert complete_batch.required_bytes > complete_batch.budget_bytes
+    assert complete_batch.feedback_envelopes == envelopes
+    with pytest.raises(ContextBuildError, match="classified failure"):
+        reserve_feedback(
+            instructions="Use accepted evidence",
+            task=task,
+            records=(),
+            batch=ToolBatch(calls=(calls[0],)),
+            bounds=bounds,
+            budget_bytes=100_000,
+            feedback_envelopes=(envelopes[0].model_copy(update={"max_exchange_bytes": 1}),),
+        )
+
+
 async def test_focus_and_revision_rerank_original_instead_of_previous_projection(
     session_counter: OpenAICompatibleTokenCounter,
 ) -> None:

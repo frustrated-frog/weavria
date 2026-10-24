@@ -5,7 +5,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, TypeAdapter
 
 from weavria.artifacts import resolve_pointer as resolve_pointer
-from weavria.core import ErrorCategory
+from weavria.core import ErrorCategory, FeedbackBounds
 
 from .execution import ToolContext, ToolFault, TypedTool
 
@@ -13,7 +13,7 @@ _JSON = TypeAdapter[JsonValue](JsonValue)
 
 
 class ArtifactReadInput(BaseModel):
-    """A bounded pointer and text range or structured child page."""
+    """A pointer, cursor and maximum serialized-payload byte count."""
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
     artifact_id: str = Field(min_length=1)
@@ -70,8 +70,11 @@ async def _read(arguments: ArtifactReadInput, context: ToolContext) -> ArtifactR
             raise ToolFault(
                 ErrorCategory.INVALID_TOOL_ARGUMENTS, "Artifact range is outside the source"
             )
-        end = min(len(value), arguments.start + arguments.length)
-        selected = value[arguments.start : end]
+        selected, end, page_bytes = _text_page(
+            value,
+            start=arguments.start,
+            budget=arguments.length,
+        )
         return ArtifactReadOutput(
             source_artifact=arguments.artifact_id,
             source_sha256=snapshot.reference.sha256,
@@ -81,7 +84,7 @@ async def _read(arguments: ArtifactReadInput, context: ToolContext) -> ArtifactR
             end=end,
             total=len(value),
             has_more=end < len(value),
-            page_bytes=len(_JSON.dump_json(selected)),
+            page_bytes=page_bytes,
             value=selected,
         )
     if isinstance(value, (list, dict)):
@@ -175,6 +178,56 @@ def _structured_page(
     return tuple(accepted), start + len(accepted), page_bytes
 
 
+def _text_page(value: str, *, start: int, budget: int) -> tuple[str, int, int]:
+    """Return the longest Unicode-character range whose JSON payload fits the byte budget."""
+    if start > len(value):
+        raise ToolFault(
+            ErrorCategory.INVALID_TOOL_ARGUMENTS, "Artifact range is outside the source"
+        )
+    low, high = start, len(value)
+    accepted_end: int | None = None
+    accepted_bytes = 0
+    while low <= high:
+        middle = (low + high) // 2
+        encoded_bytes = len(_JSON.dump_json(value[start:middle]))
+        if encoded_bytes <= budget:
+            accepted_end = middle
+            accepted_bytes = encoded_bytes
+            low = middle + 1
+        else:
+            high = middle - 1
+    if accepted_end is None or (accepted_end == start and start < len(value)):
+        raise ToolFault(
+            ErrorCategory.INVALID_TOOL_ARGUMENTS,
+            "Artifact length is too small for the next text character",
+        )
+    return value[start:accepted_end], accepted_end, accepted_bytes
+
+
+def _feedback_data_bound(arguments: ArtifactReadInput, bounds: FeedbackBounds) -> int:
+    """Bound the complete ArtifactReadOutput JSON without opening the source artifact."""
+    numeric_ceiling = max(
+        1,
+        bounds.max_result_bytes,
+        arguments.start + arguments.length,
+    )
+    template = ArtifactReadOutput(
+        source_artifact=arguments.artifact_id,
+        source_sha256="0" * 64,
+        pointer=arguments.pointer,
+        value_kind="boolean",
+        start=numeric_ceiling,
+        end=numeric_ceiling,
+        total=numeric_ceiling,
+        has_more=False,
+        page_bytes=arguments.length,
+    )
+    base = len(template.model_dump_json().encode())
+    value_bound = base + max(0, arguments.length - len(b"null"))
+    items_bound = base + max(0, arguments.length - len(b"[]"))
+    return max(value_bound, items_bound)
+
+
 def _child_pointer(parent: str, key: str | int) -> str:
     escaped = str(key).replace("~", "~0").replace("/", "~1")
     return f"{parent}/{escaped}" if parent else f"/{escaped}"
@@ -200,14 +253,16 @@ def artifact_read_tool() -> TypedTool[ArtifactReadInput, ArtifactReadOutput]:
     """Register exact scalar/text reads and resumable immediate-child pages."""
     return TypedTool(
         name="read_artifact",
-        version="3",
+        version="4",
         description=(
-            "Read a JSON Pointer; strings use character ranges, arrays/objects use start as "
-            "a child cursor and return end to continue."
+            "Read a JSON Pointer under a serialized-payload byte budget; start/end remain "
+            "Unicode character offsets for strings and child cursors for arrays/objects."
         ),
         input_type=ArtifactReadInput,
         output_type=ArtifactReadOutput,
         execute=_read,
         context_paths=("",),
         feedback_delivery="complete",
+        feedback_bound_version="artifact-read-output/1",
+        feedback_data_bound=_feedback_data_bound,
     )

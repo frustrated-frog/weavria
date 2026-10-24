@@ -22,6 +22,7 @@ from .control import (
     ControlFeedback,
     ControlRequest,
     FeedbackBounds,
+    FeedbackEnvelopeBound,
     InterventionNotice,
     ModelOutputRejected,
     ModelOutputRepairNotice,
@@ -74,7 +75,12 @@ from .execution import (
     ToolRecorded,
     ToolStarted,
 )
-from .feedback import maximum_exchange_bytes, minimum_exchange
+from .feedback import (
+    complete_exchange,
+    maximum_complete_exchange_bytes,
+    maximum_exchange_bytes,
+    minimum_exchange,
+)
 from .intervention import (
     ActionGainEstimate,
     ActionValueContext,
@@ -191,6 +197,7 @@ __all__ = [
     "ExecutionEvent",
     "FeedbackBounds",
     "FeedbackDelivery",
+    "FeedbackEnvelopeBound",
     "FinishAction",
     "HistoryEntry",
     "HistoryMatch",
@@ -278,8 +285,10 @@ __all__ = [
     "TurnSettled",
     "VerificationStarted",
     "WorkStatus",
+    "complete_exchange",
     "decode_event",
     "fit_completion_guidance",
+    "maximum_complete_exchange_bytes",
     "maximum_exchange_bytes",
     "minimum_exchange",
     "parse_action",

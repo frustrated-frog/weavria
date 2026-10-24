@@ -6,7 +6,13 @@ import pytest
 from pydantic import BaseModel, ConfigDict, JsonValue, field_validator
 
 from weavria.artifacts import InMemoryArtifactStore
-from weavria.core import ErrorCategory, ToolCallAction, ToolFailedObservation
+from weavria.core import (
+    ErrorCategory,
+    FeedbackBounds,
+    ToolCallAction,
+    ToolFailedObservation,
+    complete_exchange,
+)
 from weavria.tools import (
     PolicyDecision,
     ReadOnlyPolicy,
@@ -220,8 +226,10 @@ def test_complete_feedback_delivery_is_an_explicit_versioned_tool_contract() -> 
 
     assert adaptive.schema_version == 2 and adaptive.feedback_delivery == "adaptive"
     assert "feedback_delivery" not in adaptive.model_dump_json()
-    assert complete.schema_version == 3 and complete.feedback_delivery == "complete"
+    assert complete.schema_version == 4 and complete.feedback_delivery == "complete"
+    assert complete.feedback_bound_version == "artifact-read-output/1"
     assert '"feedback_delivery":"complete"' in complete.model_dump_json()
+    assert '"feedback_bound_version":"artifact-read-output/1"' in complete.model_dump_json()
 
 
 def test_action_identity_uses_validated_defaults_and_tool_normalization() -> None:
@@ -551,6 +559,114 @@ async def test_structured_artifact_page_exposes_pointer_for_one_oversized_child(
     item = output.items[0]
     assert item.pointer == "/large"
     assert item.included is False and item.value is None
+
+
+async def test_text_artifact_page_uses_encoded_bytes_and_preserves_character_cursor() -> None:
+    store = InMemoryArtifactStore()
+    text = '中文"换行\n' * 20
+    source = await store.put("run", "source", {"text": text})
+    executor = ToolExecutor("run", ToolRegistry((artifact_read_tool(),)), store, ReadOnlyPolicy())
+
+    record = await executor.execute(
+        action(
+            {
+                "artifact_id": source.reference.artifact_id,
+                "pointer": "/text",
+                "start": 0,
+                "length": 31,
+            },
+            "read_artifact",
+            "text-page",
+        ),
+        max_duration=1,
+    )
+
+    assert record.artifact is not None
+    output = ArtifactReadOutput.model_validate_json(
+        json.dumps((await store.get("run", record.artifact.artifact_id)).value)
+    )
+    assert 0 < output.end < len(text)
+    assert output.value == text[: output.end]
+    assert output.page_bytes <= 31
+    assert output.has_more is True
+
+
+async def test_complete_feedback_estimate_covers_the_exact_delivered_exchange() -> None:
+    bounds = FeedbackBounds()
+    store = InMemoryArtifactStore()
+    source = await store.put(
+        "run",
+        "source",
+        {"entries": [{"label": "通用记录", "ordinal": index} for index in range(12)]},
+    )
+    registry = ToolRegistry((artifact_read_tool(),))
+    proposed = action(
+        {
+            "artifact_id": source.reference.artifact_id,
+            "pointer": "/entries",
+            "start": 0,
+            "length": 700,
+        },
+        "read_artifact",
+        "bounded-read",
+    )
+    identity = registry.action_identity(proposed)
+    envelope = registry.feedback_envelope(proposed, identity=identity, bounds=bounds)
+    record = await ToolExecutor(
+        "run", registry, store, ReadOnlyPolicy(), feedback_bounds=bounds
+    ).execute(
+        proposed,
+        max_duration=1,
+        expected_identity=identity,
+        feedback_envelope=envelope,
+    )
+
+    assert envelope.delivery == "complete"
+    assert envelope.estimator_version == "artifact-read-output/1"
+    assert record.artifact is not None
+    snapshot = await store.get("run", record.artifact.artifact_id)
+    delivered = complete_exchange(proposed, record.artifact, snapshot.value)
+    assert len(delivered.model_dump_json().encode()) <= envelope.max_exchange_bytes
+
+
+async def test_underestimated_complete_feedback_fails_before_artifact_storage() -> None:
+    class CountingStore(InMemoryArtifactStore):
+        puts = 0
+
+        async def put(self, run_id: str, call_id: str, value: JsonValue):
+            self.puts += 1
+            return await super().put(run_id, call_id, value)
+
+    backend = TypedTool(
+        name="bounded",
+        version="1",
+        description="Expose an invalid trusted estimator",
+        input_type=Input,
+        output_type=Output,
+        execute=lambda arguments, context: asyncio.sleep(
+            0, result=Output(doubled=arguments.value * 2)
+        ),
+        feedback_delivery="complete",
+        feedback_bound_version="test-underestimate/1",
+        feedback_data_bound=lambda arguments, bounds: 1,
+    )
+    bounds = FeedbackBounds()
+    registry = ToolRegistry((backend,))
+    proposed = action({"value": 7}, "bounded", "underestimated")
+    identity = registry.action_identity(proposed)
+    envelope = registry.feedback_envelope(proposed, identity=identity, bounds=bounds)
+    store = CountingStore()
+
+    with pytest.raises(ToolExecutionError, match="complete-feedback bound"):
+        await ToolExecutor(
+            "run", registry, store, ReadOnlyPolicy(), feedback_bounds=bounds
+        ).execute(
+            proposed,
+            max_duration=1,
+            expected_identity=identity,
+            feedback_envelope=envelope,
+        )
+    assert store.puts == 0
 
 
 @pytest.mark.parametrize("blocking", [False, True])

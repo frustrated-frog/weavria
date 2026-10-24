@@ -76,7 +76,7 @@ Pydantic 的 `frozen` 不会递归冻结字典，因此运行日志、状态嵌�
 
 ## 读取关系如何建立
 
-`read_artifact` 使用成果 ID、JSON Pointer、字符串起点和长度读取原始内容。字符串读取得到精确字符范围；结构化读取受到 JSON 字节上限约束，过大时要求选择更细的 Pointer。读取不能跨越 Run 作用域，调用结束后读取上下文关闭。
+`read_artifact` 使用成果 ID、JSON Pointer、起点和长度读取原始内容。`length` 是统一的 JSON 载荷字节预算；字符串的 `start/end` 仍为 Unicode 字符位置，结构化值使用直属子节点游标，过大时提供更细的 Pointer。读取不能跨越 Run 作用域，调用结束后读取上下文关闭。
 
 后端经 `ToolContext.read_artifact()` 读取成果时，框架自动记录生产调用。假设 B 读取了 A，C 又读取 B，选择 C 必须同时保留 B 与 A 的可回取引用。依赖由实际受控读取产生；模型参数里提到某个 ID，本身不会自动建立依赖。
 

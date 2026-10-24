@@ -9,6 +9,7 @@ from weavria.core import (
     ConversationItem,
     EvidenceAccessView,
     FeedbackBounds,
+    FeedbackEnvelopeBound,
     LocatedTextExcerpt,
     SessionContextCompiled,
     SessionEvent,
@@ -131,3 +132,23 @@ def test_legacy_admission_roundtrips_without_new_access_field_and_v2_requires_sc
         )
     )
     assert BatchAdmitted.model_validate_json(current.model_dump_json()) == current
+    envelope = FeedbackEnvelopeBound(
+        call_id="call",
+        tool_name="read",
+        tool_version="1",
+        delivery="complete",
+        estimator_version="read-output/1",
+        action_sha256="1" * 64,
+        max_exchange_bytes=80,
+    )
+    proven = BatchAdmitted(
+        schema_version=3,
+        reserved_bytes=100,
+        budget_bytes=200,
+        readable_call_ids=(),
+        bounds=FeedbackBounds(),
+        feedback_envelopes=(envelope,),
+    )
+    assert BatchAdmitted.model_validate_json(proven.model_dump_json()) == proven
+    with pytest.raises(ValueError, match="requires feedback envelopes"):
+        BatchAdmitted.model_validate(proven.model_copy(update={"feedback_envelopes": ()}))

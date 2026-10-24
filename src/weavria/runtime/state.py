@@ -577,6 +577,25 @@ def _reduce_turn(
                     and artifact.size_bytes <= admission.bounds.max_result_bytes,
                     "artifact exceeded admitted feedback bounds",
                 )
+            if admission.schema_version == 3:
+                envelope = next(
+                    (item for item in admission.feedback_envelopes if item.call_id == call_id),
+                    None,
+                )
+                _require(envelope is not None, "tool feedback lacks its admitted envelope")
+                assert envelope is not None
+                _require(
+                    envelope.tool_name == data.record.exchange.action.tool_name,
+                    "tool feedback changed its admitted tool",
+                )
+                if artifact is not None:
+                    authorization = data.record.authorization
+                    _require(
+                        data.record.feedback_delivery == envelope.delivery
+                        and authorization is not None
+                        and authorization.tool_version == envelope.tool_version,
+                        "successful tool feedback changed its admitted contract",
+                    )
         _require(
             artifact is None or artifact.run_id == state.run_id, "artifact belongs to another run"
         )
@@ -905,6 +924,12 @@ def _reduce_control(
                 data.readable_call_ids == readable,
                 "reservation must cover the complete readable view",
             )
+            if data.schema_version == 3:
+                _require(
+                    tuple((item.call_id, item.tool_name) for item in data.feedback_envelopes)
+                    == tuple((call.call_id, call.tool_name) for call in turn.decision.calls),
+                    "feedback envelopes must align with the admitted proposal",
+                )
             if state.action_value_ledger_version is not None:
                 intervention = state.intervention
                 _require(

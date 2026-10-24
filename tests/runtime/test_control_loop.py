@@ -60,6 +60,7 @@ from weavria.core import (
     ToolFailedObservation,
     ToolRecord,
     ToolStarted,
+    ToolSucceededObservation,
     TurnFeedback,
     TurnResolution,
     VerificationStarted,
@@ -102,6 +103,33 @@ async def echo(arguments: Input, context: ToolContext) -> Output:
     return Output(value=arguments.value)
 
 
+def echo_tool(
+    execute: Callable[[Input, ToolContext], Awaitable[Output]] = echo,
+    *,
+    feedback_delivery: Literal["adaptive", "complete"] = "adaptive",
+) -> TypedTool[Input, Output]:
+    complete = feedback_delivery == "complete"
+    feedback_data_bound: Callable[[Input, FeedbackBounds], int] | None = None
+    if complete:
+
+        def bound(arguments: Input, bounds: FeedbackBounds) -> int:
+            del bounds
+            return len(Output(value=arguments.value).model_dump_json().encode())
+
+        feedback_data_bound = bound
+    return TypedTool(
+        name="echo",
+        version="2" if complete else "1",
+        description="Read a value",
+        input_type=Input,
+        output_type=Output,
+        execute=execute,
+        feedback_delivery=feedback_delivery,
+        feedback_bound_version="test-echo-output/1" if complete else None,
+        feedback_data_bound=feedback_data_bound,
+    )
+
+
 def call(
     identity: str, value: str = "data", *, name: str = "echo", parent: str | None = None
 ) -> ToolCallAction:
@@ -132,6 +160,7 @@ def make_loop(
     progress_assessor: ProgressAssessor | None = None,
     intervention: ActionInterventionPolicy | None = None,
     loop_type: type[AgentLoop] = AgentLoop,
+    feedback_delivery: Literal["adaptive", "complete"] = "adaptive",
 ) -> AgentLoop:
     return loop_type(
         run_id="run",
@@ -140,18 +169,7 @@ def make_loop(
         model=model,
         artifacts=store or InMemoryArtifactStore(),
         completion=completion,
-        tools=ToolRegistry(
-            (
-                TypedTool(
-                    name="echo",
-                    version="1",
-                    description="Read a value",
-                    input_type=Input,
-                    output_type=Output,
-                    execute=execute,
-                ),
-            )
-        ),
+        tools=ToolRegistry((echo_tool(execute, feedback_delivery=feedback_delivery),)),
         limits=limits or RunLimits(max_request_bytes=budget),
         mode=mode,
         feedback_bounds=bounds,
@@ -545,6 +563,66 @@ async def test_rejected_batch_has_zero_effects_then_smaller_batch_receives_feedb
     assert result.task_outcome == "unverifiable"
     assert two.call_id not in agent.state.consumed_call_ids
     replay(agent)
+
+
+async def test_complete_feedback_batch_replans_before_any_oversized_effect() -> None:
+    first = call("page-a", "x" * 2500)
+    second = call("page-b", "y" * 2500)
+    registry = ToolRegistry((echo_tool(feedback_delivery="complete"),))
+    bounds = FeedbackBounds()
+    identity = registry.action_identity(first)
+    envelope = registry.feedback_envelope(first, identity=identity, bounds=bounds)
+    probe = make_loop(
+        FakeControlProvider((finish(),)),
+        feedback_delivery="complete",
+    )
+    await probe.execute()
+    reservation = reserve_feedback(
+        instructions=probe.plans[0].request.instructions,
+        task=TaskInput(goal="Read and report the value"),
+        records=(),
+        batch=ToolBatch(calls=(first,)),
+        bounds=bounds,
+        budget_bytes=100_000,
+        feedback_envelopes=(envelope,),
+    )
+    provider = FakeControlProvider(
+        (batch(first, second), batch(call("page-one", "z" * 2500)), finish("delivered"))
+    )
+    agent = make_loop(
+        provider,
+        budget=reservation.required_bytes + 256,
+        feedback_delivery="complete",
+    )
+
+    result = await agent.execute()
+
+    assert result.status is RunStatus.COMPLETED
+    rejected = [event.data for event in agent.events if isinstance(event.data, BatchRejected)]
+    assert len(rejected) == 1 and rejected[0].notice.reason == "feedback_budget"
+    assert rejected[0].notice.required_bytes > rejected[0].notice.budget_bytes
+    started = [event.data.call_id for event in agent.events if isinstance(event.data, ToolStarted)]
+    assert started == ["page-one"]
+    admitted = [event.data for event in agent.events if isinstance(event.data, BatchAdmitted)]
+    assert admitted[-1].schema_version == 3
+    assert admitted[-1].feedback_envelopes[0].delivery == "complete"
+    final_exchange = provider.requests[-1].history[-1]
+    assert isinstance(final_exchange, ToolExchange)
+    assert isinstance(final_exchange.observation, ToolSucceededObservation)
+    output = final_exchange.observation.output
+    assert isinstance(output, dict) and output["representation"] == "full"
+    replay(agent)
+    state = None
+    with pytest.raises(EventAcceptanceError, match="feedback envelopes"):
+        for event in agent.events:
+            if isinstance(event.data, BatchAdmitted):
+                envelope = event.data.feedback_envelopes[0].model_copy(update={"call_id": "forged"})
+                event = event.model_copy(
+                    update={
+                        "data": event.data.model_copy(update={"feedback_envelopes": (envelope,)})
+                    }
+                )
+            state = reduce_event(state, event)
 
 
 async def test_tool_budget_rejects_whole_batch_and_model_can_change_plan() -> None:
@@ -2145,7 +2223,7 @@ async def test_store_substitution_cannot_supply_verification_evidence() -> None:
 
 @pytest.mark.parametrize("artifact_id", ["a" * 128, '中文"\\\n' * 8])
 async def test_success_projection_size_bounds_encoded_source_identity(artifact_id: str) -> None:
-    from weavria.core import ArtifactRef, ToolAuthorization, ToolRecord, ToolSucceededObservation
+    from weavria.core import ArtifactRef, ToolAuthorization, ToolRecord
 
     action = call('中文"\\\n', "☃" * 30)
     size = 9999999

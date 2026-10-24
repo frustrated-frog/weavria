@@ -7,6 +7,7 @@ from weavria.core import (
     ControlRequest,
     EvidenceAccessView,
     FeedbackBounds,
+    FeedbackEnvelopeBound,
     TaskInput,
     TaskObservation,
     ToolBatch,
@@ -25,6 +26,7 @@ class FeedbackReservation:
     required_bytes: int
     budget_bytes: int
     readable_call_ids: tuple[str, ...]
+    feedback_envelopes: tuple[FeedbackEnvelopeBound, ...] = ()
 
     @property
     def fits(self) -> bool:
@@ -41,12 +43,14 @@ def reserve_feedback(
     bounds: FeedbackBounds,
     budget_bytes: int,
     evidence_access: EvidenceAccessView | None = None,
+    feedback_envelopes: tuple[FeedbackEnvelopeBound, ...] | None = None,
 ) -> FeedbackReservation:
     """Reserve worst outcome per call, full possible closure and bounded control channel.
 
     Without a scoped view, tools may read any prior successful artifact. With a
     view, reserve exactly its validated closure and enforce the same view at dispatch.
-    Only minimum views are guaranteed, not full outputs or future task revisions.
+    Current Runtime callers provide action-bound envelopes; omission retains the
+    legacy minimum-feedback calculation for compatibility and standalone sizing.
     """
     if type(budget_bytes) is not int or budget_bytes <= 0:
         raise ValueError("budget_bytes must be a positive integer")
@@ -77,7 +81,21 @@ def reserve_feedback(
     )
     size = len(base.model_dump_json().encode())
     parent_sizes = [len(minimum_exchange(r).model_dump_json().encode()) for r in records]
-    new_sizes = [maximum_exchange_bytes(c, bounds) for c in batch.calls]
+    if feedback_envelopes is None:
+        envelopes: tuple[FeedbackEnvelopeBound, ...] = ()
+        new_sizes = [maximum_exchange_bytes(c, bounds) for c in batch.calls]
+    else:
+        envelopes = tuple(FeedbackEnvelopeBound.model_validate(item) for item in feedback_envelopes)
+        if tuple((item.call_id, item.tool_name) for item in envelopes) != tuple(
+            (call.call_id, call.tool_name) for call in batch.calls
+        ):
+            raise ContextBuildError("feedback envelopes do not align with the proposed batch")
+        if any(
+            item.max_exchange_bytes < maximum_exchange_bytes(call, bounds)
+            for item, call in zip(envelopes, batch.calls, strict=True)
+        ):
+            raise ContextBuildError("feedback envelope cannot cover classified failure feedback")
+        new_sizes = [item.max_exchange_bytes for item in envelopes]
     size += sum(parent_sizes) + sum(new_sizes) + max(0, len(parent_sizes) + len(new_sizes) - 1)
     # TurnFeedback status lengths and call identities are known at proposal time.
     # A succeeded status is the longest; skipped calls need no paired exchange.
@@ -93,4 +111,5 @@ def reserve_feedback(
         size,
         budget_bytes,
         tuple(r.exchange.action.call_id for r in records if r.artifact is not None),
+        envelopes,
     )

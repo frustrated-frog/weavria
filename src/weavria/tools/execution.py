@@ -28,6 +28,7 @@ from weavria.core import (
     ErrorCategory,
     FeedbackBounds,
     FeedbackDelivery,
+    FeedbackEnvelopeBound,
     JsonPointer,
     RunError,
     ToolAuthorization,
@@ -36,6 +37,10 @@ from weavria.core import (
     ToolFailedObservation,
     ToolRecord,
     ToolSucceededObservation,
+    complete_exchange,
+    maximum_complete_exchange_bytes,
+    maximum_exchange_bytes,
+    minimum_exchange,
 )
 
 
@@ -50,7 +55,7 @@ class ToolDescriptor(BaseModel):
         validate_default=True,
         revalidate_instances="always",
     )
-    schema_version: Literal[2, 3] = 2
+    schema_version: Literal[2, 3, 4] = 2
     name: str = Field(min_length=1, pattern=r"^[a-zA-Z][a-zA-Z0-9_]*$")
     version: str = Field(min_length=1)
     description: str = Field(min_length=1)
@@ -66,6 +71,7 @@ class ToolDescriptor(BaseModel):
     sensitivity: Literal["public", "private"] = "public"
     context_paths: tuple[JsonPointer, ...] = ()
     feedback_delivery: FeedbackDelivery = "adaptive"
+    feedback_bound_version: str | None = Field(default=None, min_length=1)
 
     @field_validator("schema_version", "max_attempts", mode="before")
     @classmethod
@@ -75,16 +81,26 @@ class ToolDescriptor(BaseModel):
         return value
 
     @model_serializer(mode="wrap")
-    def preserve_v2_wire(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+    def preserve_legacy_wire(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
         data = handler(self)
         if self.schema_version == 2:
             data.pop("feedback_delivery", None)
+        if self.schema_version < 4:
+            data.pop("feedback_bound_version", None)
         return data
 
     @model_validator(mode="after")
     def validate_feedback_delivery_version(self) -> "ToolDescriptor":
         if self.schema_version == 2 and self.feedback_delivery != "adaptive":
             raise ValueError("complete feedback delivery requires descriptor schema version 3")
+        if self.schema_version < 4 and self.feedback_bound_version is not None:
+            raise ValueError("feedback bound metadata requires descriptor schema version 4")
+        if self.schema_version == 4 and (
+            self.feedback_delivery != "complete" or self.feedback_bound_version is None
+        ):
+            raise ValueError("descriptor schema version 4 requires a complete feedback bound")
+        if self.feedback_delivery == "adaptive" and self.feedback_bound_version is not None:
+            raise ValueError("adaptive feedback cannot declare a complete-data bound")
         return self
 
 
@@ -182,6 +198,10 @@ class RegisteredTool(Protocol):
 
     def validate_arguments(self, arguments: dict[str, JsonValue]) -> BaseModel: ...
 
+    def estimate_feedback_data_json_bytes(
+        self, arguments: BaseModel, bounds: FeedbackBounds
+    ) -> int | None: ...
+
     async def invoke(self, arguments: BaseModel, context: ToolContext) -> JsonValue: ...
 
 
@@ -206,12 +226,21 @@ class TypedTool[Input: BaseModel, Output: BaseModel]:
         sensitivity: Literal["public", "private"] = "public",
         context_paths: tuple[str, ...] = (),
         feedback_delivery: FeedbackDelivery = "adaptive",
+        feedback_bound_version: str | None = None,
+        feedback_data_bound: Callable[[Input, FeedbackBounds], int] | None = None,
     ) -> None:
         if isinstance(timeout_seconds, bool) or not math.isfinite(timeout_seconds):
             raise ValueError("tool timeout must be finite")
+        has_bound = feedback_bound_version is not None and feedback_data_bound is not None
+        if feedback_delivery == "complete" and not has_bound:
+            raise ValueError("complete feedback delivery requires a versioned data bound")
+        if feedback_delivery == "adaptive" and (
+            feedback_bound_version is not None or feedback_data_bound is not None
+        ):
+            raise ValueError("adaptive feedback cannot declare a complete-data bound")
         adapter = TypeAdapter[dict[str, JsonValue]](dict[str, JsonValue])
         descriptor = ToolDescriptor(
-            schema_version=3 if feedback_delivery != "adaptive" else 2,
+            schema_version=4 if feedback_delivery != "adaptive" else 2,
             name=name,
             version=version,
             description=description,
@@ -226,11 +255,13 @@ class TypedTool[Input: BaseModel, Output: BaseModel]:
             sensitivity=sensitivity,
             context_paths=context_paths,
             feedback_delivery=feedback_delivery,
+            feedback_bound_version=feedback_bound_version,
         )
         self._descriptor_json = descriptor.model_dump_json()
         self._input_type = input_type
         self._output_type = output_type
         self._execute = execute
+        self._feedback_data_bound = feedback_data_bound
 
     @property
     def descriptor(self) -> ToolDescriptor:
@@ -243,6 +274,17 @@ class TypedTool[Input: BaseModel, Output: BaseModel]:
             raise ToolFault(
                 ErrorCategory.INVALID_TOOL_ARGUMENTS, "Tool arguments are invalid"
             ) from exc
+
+    def estimate_feedback_data_json_bytes(
+        self, arguments: BaseModel, bounds: FeedbackBounds
+    ) -> int | None:
+        if self._feedback_data_bound is None:
+            return None
+        normalized = self._input_type.model_validate(arguments.model_dump(), strict=True)
+        estimated = self._feedback_data_bound(normalized, FeedbackBounds.model_validate(bounds))
+        if type(estimated) is not int or estimated <= 0:
+            raise ToolExecutionError("tool feedback estimator returned an invalid byte bound")
+        return estimated
 
     async def invoke(self, arguments: BaseModel, context: ToolContext) -> JsonValue:
         normalized = self._input_type.model_validate(arguments.model_dump(), strict=True)
@@ -358,6 +400,50 @@ class ToolRegistry:
             arguments=identity_arguments,
         )
 
+    def feedback_envelope(
+        self,
+        action: ToolCallAction,
+        *,
+        identity: ToolActionIdentity,
+        bounds: FeedbackBounds,
+    ) -> FeedbackEnvelopeBound:
+        """Bind a deterministic next-turn feedback ceiling to one normalized proposal."""
+        action = ToolCallAction.model_validate_json(
+            ToolCallAction.model_validate(action).model_dump_json()
+        )
+        bounds = FeedbackBounds.model_validate(bounds)
+        if self.action_identity(action) != identity:
+            raise ToolExecutionError("tool normalization changed while sizing feedback")
+        tool = self._tools.get(action.tool_name)
+        delivery: FeedbackDelivery = "adaptive"
+        estimator_version = "minimum-feedback/1"
+        maximum = maximum_exchange_bytes(action, bounds)
+        if tool is not None and identity.normalization == "validated":
+            descriptor = tool.descriptor
+            if descriptor.feedback_delivery == "complete":
+                if descriptor.schema_version != 4 or descriptor.feedback_bound_version is None:
+                    raise ToolExecutionError(
+                        "complete feedback tool does not provide a versioned bound"
+                    )
+                arguments = tool.validate_arguments(action.arguments)
+                data_bound = tool.estimate_feedback_data_json_bytes(arguments, bounds)
+                if data_bound is None:
+                    raise ToolExecutionError("complete feedback tool omitted its data bound")
+                delivery = "complete"
+                estimator_version = descriptor.feedback_bound_version
+                maximum = maximum_complete_exchange_bytes(
+                    action, bounds, min(data_bound, bounds.max_result_bytes)
+                )
+        return FeedbackEnvelopeBound(
+            call_id=action.call_id,
+            tool_name=action.tool_name,
+            tool_version=identity.tool_version,
+            delivery=delivery,
+            estimator_version=estimator_version,
+            action_sha256=identity.canonical_action_sha256,
+            max_exchange_bytes=maximum,
+        )
+
     def select(self, names: tuple[str, ...]) -> "ToolRegistry":
         """Return an ordered least-capability view; unknown or duplicate names fail closed."""
         if len(names) != len(set(names)):
@@ -369,7 +455,7 @@ class ToolRegistry:
 
 
 class ToolExecutor:
-    """Dispatch one attempt; publish a result receipt, never raw oversized data."""
+    """Dispatch one attempt and enforce any admission-time feedback promise."""
 
     def __init__(
         self,
@@ -396,6 +482,7 @@ class ToolExecutor:
         max_duration: float,
         accepted_artifacts: tuple[ArtifactRef, ...] | None = None,
         expected_identity: ToolActionIdentity | None = None,
+        feedback_envelope: FeedbackEnvelopeBound | None = None,
     ) -> ToolRecord:
         """Return a classified exchange; external cancellation always propagates."""
         if isinstance(max_duration, bool) or not math.isfinite(max_duration) or max_duration <= 0:
@@ -403,6 +490,10 @@ class ToolExecutor:
         action = ToolCallAction.model_validate_json(
             ToolCallAction.model_validate(action).model_dump_json()
         )
+        if feedback_envelope is not None:
+            if expected_identity is None:
+                raise ToolExecutionError("feedback envelope requires an admitted action identity")
+            _validate_feedback_envelope(action, expected_identity, feedback_envelope)
         owner = asyncio.current_task()
         cancellations = owner.cancelling() if owner is not None else 0
         context = ToolContext(self._run_id, self._store, accepted_artifacts, call_id=action.call_id)
@@ -420,6 +511,11 @@ class ToolExecutor:
         try:
             tool = self._registry.get(action.tool_name)
             descriptor = tool.descriptor
+            if (
+                expected_identity is not None
+                and descriptor.version != expected_identity.tool_version
+            ):
+                raise ToolExecutionError("tool version changed after admission")
             if (
                 descriptor.behavior != "read_only"
                 or descriptor.idempotency != "replay_safe"
@@ -452,6 +548,15 @@ class ToolExecutor:
                 )
                 if expected_identity is not None and actual_identity != expected_identity:
                     raise ToolExecutionError("tool normalization changed after progress admission")
+                if feedback_envelope is not None and (
+                    feedback_envelope.delivery != descriptor.feedback_delivery
+                    or feedback_envelope.tool_version != descriptor.version
+                    or (
+                        feedback_envelope.delivery == "complete"
+                        and feedback_envelope.estimator_version != descriptor.feedback_bound_version
+                    )
+                ):
+                    raise ToolExecutionError("tool feedback contract changed after admission")
                 policy_input = _normalized_argument_object(arguments)
                 decision = await self._policy.authorize(self._run_id, descriptor, policy_input)
                 authorization = ToolAuthorization(
@@ -468,6 +573,23 @@ class ToolExecutor:
                     raise asyncio.CancelledError
                 if attempt_expired():
                     raise TimeoutError("tool backend returned after its deadline")
+                if feedback_envelope is not None and feedback_envelope.delivery == "complete":
+                    if self._bounds is None:
+                        raise ToolExecutionError(
+                            "complete feedback execution requires enforced feedback bounds"
+                        )
+                    data_bytes = len(TypeAdapter[JsonValue](JsonValue).dump_json(value))
+                    if data_bytes > self._bounds.max_result_bytes:
+                        raise ToolExecutionError(
+                            "tool result exceeded the admitted artifact ceiling"
+                        )
+                    if (
+                        maximum_complete_exchange_bytes(action, self._bounds, data_bytes)
+                        > feedback_envelope.max_exchange_bytes
+                    ):
+                        raise ToolExecutionError(
+                            "tool result exceeded its admitted complete-feedback bound"
+                        )
                 snapshot = await self._store.put(self._run_id, action.call_id, value)
             if attempt_expired():
                 raise TimeoutError("tool returned after its deadline")
@@ -488,7 +610,7 @@ class ToolExecutor:
                 "size_bytes": reference.size_bytes,
                 "policy_version": decision.policy_version,
             }
-            return ToolRecord(
+            record = ToolRecord(
                 schema_version=2 if descriptor.feedback_delivery != "adaptive" else 1,
                 exchange=ToolExchange(
                     action=action,
@@ -504,6 +626,15 @@ class ToolExecutor:
                 context_paths=descriptor.context_paths,
                 feedback_delivery=descriptor.feedback_delivery,
             )
+            if feedback_envelope is not None:
+                projected = (
+                    complete_exchange(action, reference, value)
+                    if feedback_envelope.delivery == "complete"
+                    else minimum_exchange(record)
+                )
+                if len(projected.model_dump_json().encode()) > feedback_envelope.max_exchange_bytes:
+                    raise ToolExecutionError("tool feedback exceeded its admitted envelope")
+            return record
         except ToolExecutionError:
             raise
         except ToolFault as exc:
@@ -531,7 +662,7 @@ class ToolExecutor:
             raise asyncio.CancelledError
         if cause is not None:
             self._failures[action.call_id] = cause
-        return ToolRecord(
+        record = ToolRecord(
             exchange=ToolExchange(
                 action=action,
                 observation=ToolFailedObservation(
@@ -548,6 +679,26 @@ class ToolExecutor:
             dependencies=context.dependencies,
             authorization=authorization,
         )
+        if feedback_envelope is not None and (
+            len(minimum_exchange(record).model_dump_json().encode())
+            > feedback_envelope.max_exchange_bytes
+        ):
+            raise ToolExecutionError("tool failure feedback exceeded its admitted envelope")
+        return record
+
+
+def _validate_feedback_envelope(
+    action: ToolCallAction,
+    identity: ToolActionIdentity,
+    envelope: FeedbackEnvelopeBound,
+) -> None:
+    if (
+        envelope.call_id != action.call_id
+        or envelope.tool_name != action.tool_name
+        or envelope.tool_version != identity.tool_version
+        or envelope.action_sha256 != identity.canonical_action_sha256
+    ):
+        raise ToolExecutionError("feedback envelope does not bind the dispatched action")
 
 
 def _normalized_argument_object(arguments: BaseModel) -> dict[str, JsonValue]:
