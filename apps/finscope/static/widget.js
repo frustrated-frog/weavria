@@ -4,6 +4,7 @@ const state = {
   clarificationId: null,
   sessionId: window.localStorage.getItem('weavria.marketPulse.sessionId')
 };
+const markdownReady = ensureMarkdownRenderer();
 
 const conversation = document.querySelector('#conversation');
 const form = document.querySelector('#composer');
@@ -57,6 +58,7 @@ async function submitQuestion() {
   try {
     const result = await sendMessage(text, false);
     state.clarificationId = null;
+    await markdownReady;
     appendMessage('agent', result.answer || result.error || '本次运行没有生成可交付答案。', result.tools, result.clarification_id);
     const completedLabel = result.task_outcome === 'verified'
       ? '已核验'
@@ -65,11 +67,25 @@ async function submitQuestion() {
         : '已完成';
     setStatus(result.status === 'completed' ? completedLabel : result.status, result.status === 'completed' ? '' : 'error');
   } catch (error) {
+    await markdownReady;
     appendMessage('agent', error instanceof Error ? error.message : 'Agent 暂时不可用。');
     setStatus('连接失败', 'error');
   } finally {
     setBusy(false, false);
   }
+}
+
+function ensureMarkdownRenderer() {
+  if (window.WeavriaMarkdown) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const script = document.createElement('script');
+    script.src = '/widget-assets/markdown.js';
+    script.addEventListener('load', () => resolve(Boolean(window.WeavriaMarkdown)), {
+      once: true
+    });
+    script.addEventListener('error', () => resolve(false), { once: true });
+    document.head.append(script);
+  });
 }
 
 async function sendMessage(text, retried) {

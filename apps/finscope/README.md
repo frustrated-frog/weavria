@@ -63,8 +63,8 @@ FinScope 前端设置 `VITE_WEAVRIA_AGENT_URL=http://127.0.0.1:8765` 后才显�
 - execute 回答必须读取 Market Pulse、显示数据质量并包含精确来源标记，否则验收策略要求
   修正；direct / clarify 回答明确标为 unverifiable，不伪装成已验证的市场结论。
 - HTTP Host 当前提供同步消息接口，不提供流式 Token 或实时事件推送。
-- Widget 以本地受限 Markdown 渲染 Agent 回答，支持标题、列表、强调、代码与安全的 HTTP(S)
-  链接；原始 HTML 始终作为文本处理，不执行模型返回的脚本或标签。
+- Widget 以本地受限 Markdown 渲染 Agent 回答，支持标题、列表、表格、强调、代码与安全的
+  HTTP(S) 链接；原始 HTML 始终作为文本处理，不执行模型返回的脚本或标签。
 - Sidecar 面向本机单用户实验，没有远程部署所需的认证、TLS 和多租户隔离。
 
 ## 验证

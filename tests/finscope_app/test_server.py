@@ -633,15 +633,20 @@ async def test_widget_has_parent_and_script_restrictions(tmp_path: Path) -> None
 
     assert response.status_code == 200
     assert "frame-ancestors http://localhost:5173" in response.headers["content-security-policy"]
+    assert response.headers["cache-control"] == "no-store"
     assert '<script src="/widget-assets/markdown.js" defer></script>' in response.text
     assert '<script src="/widget-assets/widget.js" defer></script>' in response.text
     assert '<button type="button" id="send">发送</button>' in response.text
     assert markdown_script.status_code == 200
+    assert markdown_script.headers["cache-control"] == "no-store"
     assert "document.createTextNode" in markdown_script.text
     assert "innerHTML" not in markdown_script.text
     assert script.status_code == 200
+    assert script.headers["cache-control"] == "no-store"
     assert "send.addEventListener('click'" in script.text
     assert "void submitQuestion();" in script.text
+    assert "const markdownReady = ensureMarkdownRenderer();" in script.text
+    assert "script.src = '/widget-assets/markdown.js';" in script.text
     assert "window.WeavriaMarkdown.renderMarkdown(content, text);" in script.text
     assert "result.task_outcome === 'unverifiable'" in script.text
     assert "'未能核验'" in script.text
@@ -655,6 +660,10 @@ def test_widget_markdown_parser_preserves_format_and_rejects_active_links() -> N
 
     markdown_path = Path(__file__).parents[2] / "apps/finscope/static/markdown.js"
     source = """**推断**
+
+| 日期 | 质量 |
+|---|---:|
+| 10-23 | **PARTIAL** |
 
 - 结论包含 **重点**
 - <script>alert('x')</script>
@@ -687,12 +696,26 @@ process.stdin.on('end', () => {
         "type": "paragraph",
         "lines": [[{"type": "strong", "text": "推断"}]],
     }
-    assert parsed["blocks"][1]["type"] == "unordered_list"
-    assert {token["type"] for token in parsed["blocks"][1]["items"][0]} == {
+    assert parsed["blocks"][1] == {
+        "type": "table",
+        "headers": [
+            [{"type": "text", "text": "日期"}],
+            [{"type": "text", "text": "质量"}],
+        ],
+        "alignments": ["left", "right"],
+        "rows": [
+            [
+                [{"type": "text", "text": "10-23"}],
+                [{"type": "strong", "text": "PARTIAL"}],
+            ]
+        ],
+    }
+    assert parsed["blocks"][2]["type"] == "unordered_list"
+    assert {token["type"] for token in parsed["blocks"][2]["items"][0]} == {
         "text",
         "strong",
     }
-    assert parsed["blocks"][1]["items"][1] == [
+    assert parsed["blocks"][2]["items"][1] == [
         {"type": "text", "text": "<script>alert('x')</script>"}
     ]
     assert [token for token in parsed["links"] if token["type"] == "link"] == [

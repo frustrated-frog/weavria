@@ -37,6 +37,46 @@
     return result;
   }
 
+  function splitTableRow(value) {
+    let source = String(value ?? '').trim();
+    if (!source.includes('|')) return null;
+    if (source.startsWith('|')) source = source.slice(1);
+    if (source.endsWith('|')) source = source.slice(0, -1);
+
+    const cells = [];
+    let cell = '';
+    for (let index = 0; index < source.length; index += 1) {
+      const character = source[index];
+      if (character === '\\' && source[index + 1] === '|') {
+        cell += '|';
+        index += 1;
+      } else if (character === '|') {
+        cells.push(cell.trim());
+        cell = '';
+      } else {
+        cell += character;
+      }
+    }
+    cells.push(cell.trim());
+    return cells.length > 1 ? cells : null;
+  }
+
+  function parseTable(value, delimiter) {
+    const headers = splitTableRow(value);
+    const delimiters = splitTableRow(delimiter);
+    if (!headers || !delimiters || headers.length !== delimiters.length) return null;
+
+    const alignments = delimiters.map((cell) => {
+      const marker = cell.trim();
+      if (!/^:?-{3,}:?$/.test(marker)) return null;
+      if (marker.startsWith(':') && marker.endsWith(':')) return 'center';
+      if (marker.endsWith(':')) return 'right';
+      return 'left';
+    });
+    if (alignments.includes(null)) return null;
+    return { headers: headers.map(parseInline), alignments };
+  }
+
   function parseMarkdown(value) {
     const lines = String(value ?? '').replace(/\r\n?/g, '\n').split('\n');
     const blocks = [];
@@ -66,7 +106,8 @@
       flushQuote();
     };
 
-    for (const line of lines) {
+    for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+      const line = lines[lineIndex];
       if (code !== null) {
         if (/^ {0,3}```\s*$/.test(line)) {
           blocks.push({ type: 'code_block', text: code.join('\n') });
@@ -84,6 +125,29 @@
       }
       if (!line.trim()) {
         flushOpenBlocks();
+        continue;
+      }
+
+      const table = lineIndex + 1 < lines.length
+        ? parseTable(line, lines[lineIndex + 1])
+        : null;
+      if (table) {
+        flushOpenBlocks();
+        const rows = [];
+        lineIndex += 2;
+        while (lineIndex < lines.length) {
+          const cells = splitTableRow(lines[lineIndex]);
+          if (!cells || cells.length !== table.headers.length) break;
+          rows.push(cells.map(parseInline));
+          lineIndex += 1;
+        }
+        blocks.push({
+          type: 'table',
+          headers: table.headers,
+          alignments: table.alignments,
+          rows
+        });
+        lineIndex -= 1;
         continue;
       }
 
@@ -162,6 +226,14 @@
     });
   }
 
+  function appendTableCell(row, tag, content, alignment) {
+    const cell = document.createElement(tag);
+    cell.className = `align-${alignment}`;
+    if (tag === 'th') cell.scope = 'col';
+    appendInline(cell, content);
+    row.append(cell);
+  }
+
   function renderMarkdown(container, value) {
     const fragment = document.createDocumentFragment();
     parseMarkdown(value).forEach((block) => {
@@ -176,6 +248,27 @@
           appendInline(entry, item);
           element.append(entry);
         });
+      } else if (block.type === 'table') {
+        element = document.createElement('div');
+        element.className = 'table-scroll';
+        const table = document.createElement('table');
+        const head = document.createElement('thead');
+        const headerRow = document.createElement('tr');
+        block.headers.forEach((header, index) => {
+          appendTableCell(headerRow, 'th', header, block.alignments[index]);
+        });
+        head.append(headerRow);
+        table.append(head);
+        const body = document.createElement('tbody');
+        block.rows.forEach((cells) => {
+          const row = document.createElement('tr');
+          cells.forEach((cell, index) => {
+            appendTableCell(row, 'td', cell, block.alignments[index]);
+          });
+          body.append(row);
+        });
+        table.append(body);
+        element.append(table);
       } else if (block.type === 'blockquote') {
         element = document.createElement('blockquote');
         appendLines(element, block.lines);

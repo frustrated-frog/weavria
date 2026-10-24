@@ -63,6 +63,13 @@ button { cursor: pointer; }
 .message .markdown pre code { padding: 0; white-space: pre; }
 .message .markdown a { color: var(--blue); text-decoration-thickness: 1px; text-underline-offset: 2px; }
 .message .markdown hr { margin: .75em 0; border: 0; border-top: 1px solid var(--line); }
+.message .markdown .table-scroll { max-width: 100%; overflow-x: auto; margin: .7em 0; }
+.message .markdown table { min-width: 100%; border-spacing: 0; border-collapse: collapse; font-size: .92em; white-space: nowrap; }
+.message .markdown th,
+.message .markdown td { border: 1px solid var(--line); padding: .42em .55em; text-align: left; vertical-align: top; }
+.message .markdown th { background: #edf2f5; font-weight: 700; }
+.message .markdown .align-center { text-align: center; }
+.message .markdown .align-right { text-align: right; }
 .trace { display: flex; flex-wrap: wrap; gap: 5px; }
 .trace i { border: 1px solid var(--line); border-radius: 99px; background: #f7f9fa; color: var(--muted); padding: 3px 6px; font: 10px ui-monospace, monospace; }
 .trace i.failed { border-color: #e3c5c5; color: #a43a35; }

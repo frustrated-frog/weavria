@@ -210,6 +210,8 @@ def create_app(
         )
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Referrer-Policy"] = "no-referrer"
+        if request.url.path == "/widget" or request.url.path.startswith("/widget-assets/"):
+            response.headers["Cache-Control"] = "no-store"
         return response
 
     @app.exception_handler(SessionConflictError)
