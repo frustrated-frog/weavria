@@ -39,5 +39,15 @@
     "answer": "AMBER",
     "budget": 2800,
     "recover": true
+  },
+  {
+    "name": "explicit-recovery-fit",
+    "topic": "Aurora",
+    "sources": [
+      "small.txt"
+    ],
+    "answer": "AMBER",
+    "budget": 3200,
+    "recover": true
   }
 ]

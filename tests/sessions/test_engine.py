@@ -20,6 +20,7 @@ from weavria.core import (
     ToolCallAction,
     ToolExchange,
     ToolFailedObservation,
+    ToolSucceededObservation,
 )
 from weavria.models import ModelCapabilities, ModelOutputError
 from weavria.sessions import SessionBusyError, SessionConflictError, SessionEngine
@@ -119,6 +120,104 @@ class RejectOnce:
                 diagnostic=ModelOutputDiagnostic(code="invalid_json"),
             )
         return finish("recovered")
+
+
+async def test_session_delivers_complete_bounded_read_before_the_next_decision(
+    tmp_path: Path,
+) -> None:
+    class CollectionInput(BaseModel):
+        count: int
+
+    class CollectionOutput(BaseModel):
+        entries: tuple[dict[str, JsonValue], ...]
+
+    async def collect(arguments: CollectionInput, context: ToolContext) -> CollectionOutput:
+        return CollectionOutput(
+            entries=tuple(
+                {"position": index, "label": f"entry-{index}", "detail": "content " * 8}
+                for index in range(arguments.count)
+            )
+        )
+
+    class CompletePageReader:
+        capabilities = ModelCapabilities(True, True)
+
+        def __init__(self) -> None:
+            self.requests: list[SessionRequest] = []
+
+        async def generate_session(self, request: SessionRequest) -> ModelTurn:
+            request = SessionRequest.model_validate_json(request.model_dump_json())
+            self.requests.append(request)
+            exchanges = {
+                exchange.action.call_id: exchange
+                for exchange in request.current.history
+                if isinstance(exchange, ToolExchange)
+            }
+            if "source" not in exchanges:
+                return ModelTurn(
+                    decision=ToolBatch(
+                        calls=(
+                            ToolCallAction(
+                                call_id="source",
+                                tool_name="collect_entries",
+                                arguments={"count": 8},
+                            ),
+                        )
+                    )
+                )
+            if "page" not in exchanges:
+                source = exchanges["source"].observation
+                assert isinstance(source, ToolSucceededObservation)
+                output = source.output
+                assert isinstance(output, dict)
+                artifact_id = output["artifact_id"]
+                assert isinstance(artifact_id, str)
+                return ModelTurn(
+                    decision=ToolBatch(
+                        calls=(
+                            ToolCallAction(
+                                call_id="page",
+                                tool_name="read_artifact",
+                                arguments={
+                                    "artifact_id": artifact_id,
+                                    "pointer": "/entries",
+                                    "start": 0,
+                                    "length": 4000,
+                                },
+                            ),
+                        )
+                    )
+                )
+            page = exchanges["page"].observation
+            assert isinstance(page, ToolSucceededObservation)
+            output = page.output
+            assert isinstance(output, dict) and output["representation"] == "full"
+            data = output["data"]
+            assert isinstance(data, dict)
+            items = data["items"]
+            assert isinstance(items, list) and len(items) == 8
+            return finish("All eight entries were delivered.")
+
+    backend = TypedTool(
+        name="collect_entries",
+        version="1",
+        description="Collect generic entries",
+        input_type=CollectionInput,
+        output_type=CollectionOutput,
+        execute=collect,
+    )
+    model = CompletePageReader()
+    async with SessionEngine(
+        tmp_path / "complete-feedback.db",
+        model=model,
+        tools=ToolRegistry((backend,)),
+    ) as engine:
+        await engine.create("session")
+        result = await engine.send("session", "Summarize every entry", input_id="input")
+
+    assert result.report.status is RunStatus.COMPLETED
+    assert result.report.output == "All eight entries were delivered."
+    assert len(model.requests) == 3
 
 
 async def test_session_persists_model_output_rejection_and_repair_request(tmp_path: Path) -> None:

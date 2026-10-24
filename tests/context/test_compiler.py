@@ -43,6 +43,7 @@ from weavria.tools import (
     ToolFault,
     ToolRegistry,
     TypedTool,
+    artifact_read_tool,
 )
 
 
@@ -483,6 +484,111 @@ async def test_latest_opaque_value_survives_zero_lexical_relevance(
     assert "74931" in plan.request.current.history[0].model_dump_json()
     assert plan.compilation.choices[0].required
     assert plan.compilation.uncovered_demand_ids == ("current_task",)
+
+
+async def test_complete_feedback_page_is_not_re_excerpted_and_fails_closed_on_budget(
+    session_counter: OpenAICompatibleTokenCounter,
+) -> None:
+    class CollectionInput(BaseModel):
+        count: int
+
+    class CollectionOutput(BaseModel):
+        entries: tuple[dict[str, JsonValue], ...]
+
+    async def collect(arguments: CollectionInput, context: ToolContext) -> CollectionOutput:
+        return CollectionOutput(
+            entries=tuple(
+                {"position": index, "label": f"entry-{index}", "detail": "payload " * 8}
+                for index in range(arguments.count)
+            )
+        )
+
+    store = InMemoryArtifactStore()
+    registry = ToolRegistry(
+        (
+            TypedTool(
+                name="collect",
+                version="1",
+                description="Collect generic records",
+                input_type=CollectionInput,
+                output_type=CollectionOutput,
+                execute=collect,
+            ),
+            artifact_read_tool(),
+        )
+    )
+    executor = ToolExecutor("run", registry, store, ReadOnlyPolicy())
+    source = await executor.execute(
+        ToolCallAction(call_id="source", tool_name="collect", arguments={"count": 8}),
+        max_duration=1,
+    )
+    assert source.artifact is not None
+    page = await executor.execute(
+        ToolCallAction(
+            call_id="page",
+            tool_name="read_artifact",
+            arguments={
+                "artifact_id": source.artifact.artifact_id,
+                "pointer": "/entries",
+                "start": 0,
+                "length": 4000,
+            },
+        ),
+        max_duration=1,
+    )
+    feedback = TurnFeedback(
+        task_revision=1,
+        calls=(CallFeedback(call_id="page", status="succeeded"),),
+    )
+    request_base = base("Summarize every collected entry").model_copy(update={"feedback": feedback})
+    engine = compiler(store, session_counter)
+    plan = await engine.compile(
+        run_id="run",
+        session_id="s",
+        sequence=0,
+        base=request_base,
+        turns=(),
+        total_turns=0,
+        records=(source, page),
+        max_request_bytes=12_000,
+    )
+
+    delivered = next(
+        exchange
+        for exchange in plan.request.current.history
+        if isinstance(exchange, ToolExchange) and exchange.action.call_id == "page"
+    )
+    assert isinstance(delivered.observation, ToolSucceededObservation)
+    output = delivered.observation.output
+    assert isinstance(output, dict) and output["representation"] == "full"
+    data = output["data"]
+    assert isinstance(data, dict)
+    items = data["items"]
+    assert isinstance(items, list) and len(items) == 8
+    labels: list[str] = []
+    for item in items:
+        assert isinstance(item, dict)
+        value = item["value"]
+        assert isinstance(value, dict)
+        label = value["label"]
+        assert isinstance(label, str)
+        labels.append(label)
+    assert labels == [f"entry-{index}" for index in range(8)]
+    choice = next(c for c in plan.compilation.choices if c.source_id == "call:page")
+    assert choice.required and choice.representation == "raw"
+
+    minimum_budget = plan.compilation.request_bytes + plan.compilation.control_reserve_bytes
+    with pytest.raises(ContextBudgetError):
+        await engine.compile(
+            run_id="run",
+            session_id="s",
+            sequence=0,
+            base=request_base,
+            turns=(),
+            total_turns=0,
+            records=(source, page),
+            max_request_bytes=minimum_budget - 1,
+        )
 
 
 async def test_latest_failure_preserves_category_and_retryability_when_details_do_not_fit(

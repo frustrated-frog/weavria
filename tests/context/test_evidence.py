@@ -16,6 +16,7 @@ from weavria.core import (
     ToolExchange,
     ToolRecord,
     ToolSucceededObservation,
+    minimum_exchange,
 )
 from weavria.tools import (
     ReadOnlyPolicy,
@@ -145,6 +146,22 @@ async def test_artifact_read_establishes_causal_closure_without_manual_dependenc
     )
     assert all(d.selected for d in plan.decisions)
     assert plan.decisions[1].dependencies == ("c0",)
+    assert plan.decisions[1].representation == "full"
+    page = json.loads(plan.request_json)["history"][1]["observation"]["output"]
+    assert page["representation"] == "full"
+    assert page["data"]["value"] == "Aurora password is amber."
+    minimum = plan.request.model_copy(
+        update={"history": (minimum_exchange(records[0]), plan.request.history[1])}
+    )
+    minimum_bytes = len(minimum.model_dump_json().encode())
+    with pytest.raises(ContextBudgetError):
+        await EvidenceContextBuilder(store).build(
+            run_id="run",
+            instructions="Read",
+            task=TaskInput(goal="Aurora password"),
+            records=(*records, child),
+            max_request_bytes=minimum_bytes - 1,
+        )
     with pytest.raises(ContextBuildError, match="graph"):
         await EvidenceContextBuilder(store).build(
             run_id="run",

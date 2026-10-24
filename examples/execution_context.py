@@ -259,7 +259,7 @@ async def experiment() -> dict[str, JsonValue]:
     return TypeAdapter(dict[str, JsonValue]).validate_python(
         {
             "schema_version": 1,
-            "dataset_version": "1",
+            "dataset_version": "2",
             "solver_version": "1",
             "evaluator_version": "1",
             "scope": "deterministic information delivery; not LLM task quality",
@@ -277,7 +277,7 @@ def main() -> None:
     if args.json:
         print(json.dumps(report, ensure_ascii=False, indent=2))
     else:
-        print("Fixture / solver / evaluator v1; byte budget includes the tool catalogue.")
+        print("Dataset v2; solver / evaluator v1; byte budget includes the tool catalogue.")
         print(
             "case                 policy    status             correct grounded "
             "model tools reads peak bytes"

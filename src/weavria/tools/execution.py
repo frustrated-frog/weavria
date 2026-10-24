@@ -13,9 +13,12 @@ from pydantic import (
     ConfigDict,
     Field,
     JsonValue,
+    SerializerFunctionWrapHandler,
     TypeAdapter,
     ValidationError,
     field_validator,
+    model_serializer,
+    model_validator,
 )
 from pydantic_core import PydanticSerializationError
 
@@ -24,6 +27,7 @@ from weavria.core import (
     ArtifactRef,
     ErrorCategory,
     FeedbackBounds,
+    FeedbackDelivery,
     JsonPointer,
     RunError,
     ToolAuthorization,
@@ -46,7 +50,7 @@ class ToolDescriptor(BaseModel):
         validate_default=True,
         revalidate_instances="always",
     )
-    schema_version: Literal[2] = 2
+    schema_version: Literal[2, 3] = 2
     name: str = Field(min_length=1, pattern=r"^[a-zA-Z][a-zA-Z0-9_]*$")
     version: str = Field(min_length=1)
     description: str = Field(min_length=1)
@@ -61,6 +65,7 @@ class ToolDescriptor(BaseModel):
     max_attempts: Literal[1] = 1
     sensitivity: Literal["public", "private"] = "public"
     context_paths: tuple[JsonPointer, ...] = ()
+    feedback_delivery: FeedbackDelivery = "adaptive"
 
     @field_validator("schema_version", "max_attempts", mode="before")
     @classmethod
@@ -68,6 +73,19 @@ class ToolDescriptor(BaseModel):
         if type(value) is not int:
             raise ValueError("version and attempts must be integers")
         return value
+
+    @model_serializer(mode="wrap")
+    def preserve_v2_wire(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        data = handler(self)
+        if self.schema_version == 2:
+            data.pop("feedback_delivery", None)
+        return data
+
+    @model_validator(mode="after")
+    def validate_feedback_delivery_version(self) -> "ToolDescriptor":
+        if self.schema_version == 2 and self.feedback_delivery != "adaptive":
+            raise ValueError("complete feedback delivery requires descriptor schema version 3")
+        return self
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,11 +205,13 @@ class TypedTool[Input: BaseModel, Output: BaseModel]:
         timeout_seconds: float = 10.0,
         sensitivity: Literal["public", "private"] = "public",
         context_paths: tuple[str, ...] = (),
+        feedback_delivery: FeedbackDelivery = "adaptive",
     ) -> None:
         if isinstance(timeout_seconds, bool) or not math.isfinite(timeout_seconds):
             raise ValueError("tool timeout must be finite")
         adapter = TypeAdapter[dict[str, JsonValue]](dict[str, JsonValue])
         descriptor = ToolDescriptor(
+            schema_version=3 if feedback_delivery != "adaptive" else 2,
             name=name,
             version=version,
             description=description,
@@ -205,6 +225,7 @@ class TypedTool[Input: BaseModel, Output: BaseModel]:
             timeout_seconds=timeout_seconds,
             sensitivity=sensitivity,
             context_paths=context_paths,
+            feedback_delivery=feedback_delivery,
         )
         self._descriptor_json = descriptor.model_dump_json()
         self._input_type = input_type
@@ -468,6 +489,7 @@ class ToolExecutor:
                 "policy_version": decision.policy_version,
             }
             return ToolRecord(
+                schema_version=2 if descriptor.feedback_delivery != "adaptive" else 1,
                 exchange=ToolExchange(
                     action=action,
                     observation=ToolSucceededObservation(
@@ -480,6 +502,7 @@ class ToolExecutor:
                 dependencies=context.dependencies,
                 authorization=authorization,
                 context_paths=descriptor.context_paths,
+                feedback_delivery=descriptor.feedback_delivery,
             )
         except ToolExecutionError:
             raise

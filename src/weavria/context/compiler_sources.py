@@ -317,8 +317,21 @@ async def source_units(
                 "sha256": reference.sha256,
                 "size_bytes": reference.size_bytes,
             }
+            complete = Representation(
+                "raw",
+                _exchange_view(
+                    record.exchange,
+                    {**common, "representation": "full", "data": source.snapshot.value},
+                ),
+                scorer.features(source.passages, source=source),
+            )
 
-            if protected:
+            if record.feedback_delivery == "complete" and call_id in mandatory:
+                # A bounded recovery/read result is useful only if its complete payload reaches
+                # the immediately following model turn. Failing the minimum allocation is safer
+                # than silently changing a successful read into a lossy excerpt.
+                variants = [complete]
+            elif protected:
                 variants = [
                     Representation(
                         "excerpt",
@@ -333,34 +346,28 @@ async def source_units(
                         scorer.features(protected, source=source),
                     )
                 ]
-            ranked = await scorer.rank(source, max_passages)
-            for size in sorted({1, min(2, len(ranked)), min(4, len(ranked)), len(ranked)} - {0}):
-                chosen = tuple(dict.fromkeys((*protected, *ranked[:size])))
-                variants.append(
-                    Representation(
-                        "excerpt",
-                        _exchange_view(
-                            record.exchange,
-                            {
-                                **common,
-                                "representation": "excerpts",
-                                "passages": [p.view() for p in chosen],
-                            },
-                        ),
-                        scorer.features(chosen, source=source),
+            if not (record.feedback_delivery == "complete" and call_id in mandatory):
+                ranked = await scorer.rank(source, max_passages)
+                for size in sorted(
+                    {1, min(2, len(ranked)), min(4, len(ranked)), len(ranked)} - {0}
+                ):
+                    chosen = tuple(dict.fromkeys((*protected, *ranked[:size])))
+                    variants.append(
+                        Representation(
+                            "excerpt",
+                            _exchange_view(
+                                record.exchange,
+                                {
+                                    **common,
+                                    "representation": "excerpts",
+                                    "passages": [p.view() for p in chosen],
+                                },
+                            ),
+                            scorer.features(chosen, source=source),
+                        )
                     )
-                )
-            # context_paths select scoring subtrees, not an authorization boundary.
-            variants.append(
-                Representation(
-                    "raw",
-                    _exchange_view(
-                        record.exchange,
-                        {**common, "representation": "full", "data": source.snapshot.value},
-                    ),
-                    scorer.features(source.passages, source=source),
-                )
-            )
+                # context_paths select scoring subtrees, not an authorization boundary.
+                variants.append(complete)
         else:
             variants.append(
                 Representation(

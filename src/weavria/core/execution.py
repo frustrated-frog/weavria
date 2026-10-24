@@ -20,6 +20,7 @@ from .outcomes import AgentResult, ToolSucceededObservation
 from .recovery import RecoveryLimits
 
 type JsonPointer = Annotated[str, Field(pattern=r"^(?:|/(?:[^~]|~[01])*)$")]
+type FeedbackDelivery = Literal["adaptive", "complete"]
 
 
 class ArtifactRef(ContractModel):
@@ -42,17 +43,34 @@ class ToolAuthorization(ContractModel):
     normalized_arguments: dict[str, JsonValue]
 
 
-class ToolRecord(ContractModel):
+class ToolRecord(BaseModel):
     """An executed exchange plus the results it actually read."""
 
+    model_config = ContractModel.model_config
+    schema_version: Literal[1, 2] = 1
     exchange: ToolExchange
     artifact: ArtifactRef | None = None
     dependencies: tuple[NonBlankString, ...] = ()
     authorization: ToolAuthorization | None = None
     context_paths: tuple[JsonPointer, ...] = ()
+    feedback_delivery: FeedbackDelivery = "adaptive"
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def validate_version_type(cls, value: object) -> object:
+        return ContractModel.validate_version_type(value)
+
+    @model_serializer(mode="wrap")
+    def preserve_v1_wire(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        data = handler(self)
+        if self.schema_version == 1:
+            data.pop("feedback_delivery", None)
+        return data
 
     @model_validator(mode="after")
     def validate_result(self) -> Self:
+        if self.schema_version == 1 and self.feedback_delivery != "adaptive":
+            raise ValueError("complete feedback delivery requires ToolRecord schema version 2")
         if isinstance(self.exchange.observation, ToolSucceededObservation):
             if self.artifact is None or self.artifact.call_id != self.exchange.action.call_id:
                 raise ValueError("successful execution requires its own artifact")

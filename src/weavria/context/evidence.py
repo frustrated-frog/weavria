@@ -486,14 +486,23 @@ class EvidenceContextBuilder:
             ):
                 raise ContextBuildError("feedback references unaccepted or duplicate calls")
             mandatory = tuple(identities[c] for c in feedback_call_ids)
+        complete_feedback = {
+            index for index in mandatory if records[index].feedback_delivery == "complete"
+        }
         for index in mandatory:
-            selected = proposal(index, references[index])
+            selected = proposal(
+                index,
+                full[index] if index in complete_feedback else references[index],
+            )
         reasons = dict.fromkeys(selected, "dependency")
         reasons.update(dict.fromkeys(mandatory, "latest_feedback"))
+        reasons.update(dict.fromkeys(complete_feedback, "complete_feedback"))
         if total(selected) > max_request_bytes:
             raise ContextBudgetError(total(selected), max_request_bytes)
         initial_levels: dict[int, int] = {}
         for index in mandatory:
+            if index in complete_feedback:
+                continue
             # Each sibling keeps a receipt; offer one useful view before older evidence.
             candidate = proposal(index, alternatives[index][0][0])
             if total(candidate) <= max_request_bytes:
@@ -517,6 +526,8 @@ class EvidenceContextBuilder:
                 reasons.update(dict.fromkeys(selected, "full_budget_fallback"))
         elif self._mode is EvidenceMode.RECENT:
             for index in reversed(range(len(records))):
+                if index in complete_feedback:
+                    continue
                 fitting = [
                     proposal(index, view)
                     for view, _ in alternatives[index]
@@ -536,6 +547,8 @@ class EvidenceContextBuilder:
             while True:
                 feasible: list[tuple[float, float, int, int, dict[int, ToolExchange]]] = []
                 for index in range(len(records)):
+                    if index in complete_feedback:
+                        continue
                     for level in range(levels[index] + 1, len(alternatives[index])):
                         view, utility = alternatives[index][level]
                         candidate = proposal(index, view)
@@ -562,6 +575,8 @@ class EvidenceContextBuilder:
                 selected = candidate
                 levels[index] = level
                 utilities[index] = score
+
+        reasons.update(dict.fromkeys(complete_feedback, "complete_feedback"))
 
         needed = total(selected)
         if needed > max_request_bytes:

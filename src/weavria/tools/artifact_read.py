@@ -200,7 +200,7 @@ def artifact_read_tool() -> TypedTool[ArtifactReadInput, ArtifactReadOutput]:
     """Register exact scalar/text reads and resumable immediate-child pages."""
     return TypedTool(
         name="read_artifact",
-        version="2",
+        version="3",
         description=(
             "Read a JSON Pointer; strings use character ranges, arrays/objects use start as "
             "a child cursor and return end to continue."
@@ -209,4 +209,5 @@ def artifact_read_tool() -> TypedTool[ArtifactReadInput, ArtifactReadOutput]:
         output_type=ArtifactReadOutput,
         execute=_read,
         context_paths=("",),
+        feedback_delivery="complete",
     )

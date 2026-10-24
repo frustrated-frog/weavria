@@ -62,6 +62,8 @@ async def test_validated_result_is_stored_and_read_dependencies_are_recorded() -
         "run", ToolRegistry((tool(), artifact_read_tool())), store, ReadOnlyPolicy()
     )
     result = await executor.execute(action({"value": 3}), max_duration=1)
+    assert result.schema_version == 1 and result.feedback_delivery == "adaptive"
+    assert "feedback_delivery" not in result.model_dump_json()
     assert result.artifact is not None
     assert (await store.get("run", result.artifact.artifact_id)).value == {"doubled": 6}
     child = await executor.execute(
@@ -73,6 +75,9 @@ async def test_validated_result_is_stored_and_read_dependencies_are_recorded() -
         max_duration=1,
     )
     assert child.dependencies == ("call",)
+    assert child.schema_version == 2
+    assert child.feedback_delivery == "complete"
+    assert '"feedback_delivery":"complete"' in child.model_dump_json()
     assert child.artifact is not None
     raw = (await store.get("run", child.artifact.artifact_id)).value
     assert isinstance(raw, dict) and raw["value"] == 6
@@ -207,6 +212,16 @@ def test_registry_rejects_duplicate_names_and_descriptor_copies_are_independent(
     descriptor = registered.descriptor
     descriptor.input_schema.clear()
     assert registered.descriptor.input_schema
+
+
+def test_complete_feedback_delivery_is_an_explicit_versioned_tool_contract() -> None:
+    adaptive = tool().descriptor
+    complete = artifact_read_tool().descriptor
+
+    assert adaptive.schema_version == 2 and adaptive.feedback_delivery == "adaptive"
+    assert "feedback_delivery" not in adaptive.model_dump_json()
+    assert complete.schema_version == 3 and complete.feedback_delivery == "complete"
+    assert '"feedback_delivery":"complete"' in complete.model_dump_json()
 
 
 def test_action_identity_uses_validated_defaults_and_tool_normalization() -> None:
@@ -458,8 +473,8 @@ async def test_structured_artifact_read_returns_a_resumable_page_instead_of_fail
         "source",
         {
             "data": {
-                "historyPoints": [
-                    {"date": f"2026-10-{day:02d}", "summary": "上涨" * 120} for day in range(1, 13)
+                "entries": [
+                    {"sequence": index, "summary": "通用记录" * 120} for index in range(1, 13)
                 ]
             }
         },
@@ -470,7 +485,7 @@ async def test_structured_artifact_read_returns_a_resumable_page_instead_of_fail
         action(
             {
                 "artifact_id": source.reference.artifact_id,
-                "pointer": "/data/historyPoints",
+                "pointer": "/data/entries",
                 "start": 0,
                 "length": 3000,
             },
@@ -491,14 +506,14 @@ async def test_structured_artifact_read_returns_a_resumable_page_instead_of_fail
     assert first_value.has_more is True
     assert first_value.page_bytes <= 3000
     assert first_value.items
-    assert all(item.pointer.startswith("/data/historyPoints/") for item in first_value.items)
+    assert all(item.pointer.startswith("/data/entries/") for item in first_value.items)
     assert all(item.included for item in first_value.items)
 
     second = await executor.execute(
         action(
             {
                 "artifact_id": source.reference.artifact_id,
-                "pointer": "/data/historyPoints",
+                "pointer": "/data/entries",
                 "start": first_value.end,
                 "length": 3000,
             },
