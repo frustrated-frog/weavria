@@ -45,6 +45,24 @@ button { cursor: pointer; }
 .message.user { justify-items: end; }
 .message.user p { max-width: 88%; border-radius: 12px 12px 3px 12px; background: var(--blue); color: white; padding: 10px 12px; }
 .message.agent { border-left: 2px solid var(--blue); background: var(--paper); padding: 12px 13px; }
+.message .markdown { min-width: 0; overflow-wrap: anywhere; font-size: 13px; line-height: 1.68; }
+.message .markdown > :first-child { margin-top: 0; }
+.message .markdown > :last-child { margin-bottom: 0; }
+.message .markdown p { margin: .5em 0; white-space: normal; }
+.message .markdown h2,
+.message .markdown h3,
+.message .markdown h4,
+.message .markdown h5 { margin: .75em 0 .35em; color: var(--ink); font-size: 1em; line-height: 1.45; }
+.message .markdown strong { font-weight: 780; }
+.message .markdown ul,
+.message .markdown ol { margin: .45em 0; padding-left: 1.35em; }
+.message .markdown li { margin: .22em 0; padding-left: .12em; }
+.message .markdown blockquote { margin: .55em 0; border-left: 2px solid #bdd0dc; color: var(--muted); padding-left: .8em; }
+.message .markdown code { border-radius: 4px; background: #edf2f5; padding: .08em .3em; font: .9em ui-monospace, SFMono-Regular, Menlo, monospace; }
+.message .markdown pre { overflow-x: auto; margin: .65em 0; border-radius: 7px; background: #edf2f5; padding: .7em .8em; }
+.message .markdown pre code { padding: 0; white-space: pre; }
+.message .markdown a { color: var(--blue); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+.message .markdown hr { margin: .75em 0; border: 0; border-top: 1px solid var(--line); }
 .trace { display: flex; flex-wrap: wrap; gap: 5px; }
 .trace i { border: 1px solid var(--line); border-radius: 99px; background: #f7f9fa; color: var(--muted); padding: 3px 6px; font: 10px ui-monospace, monospace; }
 .trace i.failed { border-color: #e3c5c5; color: #a43a35; }

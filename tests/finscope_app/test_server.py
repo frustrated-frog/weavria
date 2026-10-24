@@ -1,7 +1,10 @@
 import json
+import shutil
+import subprocess
 from pathlib import Path
 
 import httpx
+import pytest
 
 from apps.finscope.config import FinScopeSettings
 from apps.finscope.market import MarketPulseClient
@@ -625,15 +628,74 @@ async def test_widget_has_parent_and_script_restrictions(tmp_path: Path) -> None
             transport=httpx.ASGITransport(app=app), base_url="http://sidecar.test"
         ) as client:
             response = await client.get("/widget")
+            markdown_script = await client.get("/widget-assets/markdown.js")
             script = await client.get("/widget-assets/widget.js")
 
     assert response.status_code == 200
     assert "frame-ancestors http://localhost:5173" in response.headers["content-security-policy"]
+    assert '<script src="/widget-assets/markdown.js" defer></script>' in response.text
     assert '<script src="/widget-assets/widget.js" defer></script>' in response.text
     assert '<button type="button" id="send">发送</button>' in response.text
+    assert markdown_script.status_code == 200
+    assert "document.createTextNode" in markdown_script.text
+    assert "innerHTML" not in markdown_script.text
     assert script.status_code == 200
     assert "send.addEventListener('click'" in script.text
     assert "void submitQuestion();" in script.text
+    assert "window.WeavriaMarkdown.renderMarkdown(content, text);" in script.text
     assert "result.task_outcome === 'unverifiable'" in script.text
     assert "'未能核验'" in script.text
     await market_http.aclose()
+
+
+def test_widget_markdown_parser_preserves_format_and_rejects_active_links() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required to exercise the browser-side Markdown parser")
+
+    markdown_path = Path(__file__).parents[2] / "apps/finscope/static/markdown.js"
+    source = """**推断**
+
+- 结论包含 **重点**
+- <script>alert('x')</script>
+
+[安全链接](https://example.com) [危险链接](javascript:alert(1))
+"""
+    program = """
+const parser = require(process.argv[1]);
+let source = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', (chunk) => { source += chunk; });
+process.stdin.on('end', () => {
+  process.stdout.write(JSON.stringify({
+    blocks: parser.parseMarkdown(source),
+    links: parser.parseInline('[安全](https://example.com) [危险](javascript:alert(1))')
+  }));
+});
+"""
+    completed = subprocess.run(
+        [node, "-e", program, str(markdown_path)],
+        input=source,
+        capture_output=True,
+        check=True,
+        text=True,
+        timeout=5,
+    )
+    parsed = json.loads(completed.stdout)
+
+    assert parsed["blocks"][0] == {
+        "type": "paragraph",
+        "lines": [[{"type": "strong", "text": "推断"}]],
+    }
+    assert parsed["blocks"][1]["type"] == "unordered_list"
+    assert {token["type"] for token in parsed["blocks"][1]["items"][0]} == {
+        "text",
+        "strong",
+    }
+    assert parsed["blocks"][1]["items"][1] == [
+        {"type": "text", "text": "<script>alert('x')</script>"}
+    ]
+    assert [token for token in parsed["links"] if token["type"] == "link"] == [
+        {"type": "link", "text": "安全", "href": "https://example.com"}
+    ]
+    assert "javascript:alert(1)" in "".join(token["text"] for token in parsed["links"])

@@ -114,8 +114,13 @@ function appendMessage(role, text, tools = [], clarificationId = null) {
   item.className = `message ${role}`;
   const label = document.createElement('span');
   label.textContent = role === 'user' ? '你的问题' : 'AGENT 回答';
-  const content = document.createElement('p');
-  content.textContent = text;
+  const content = document.createElement(role === 'agent' ? 'div' : 'p');
+  if (role === 'agent' && window.WeavriaMarkdown) {
+    content.className = 'markdown';
+    window.WeavriaMarkdown.renderMarkdown(content, text);
+  } else {
+    content.textContent = text;
+  }
   item.append(label, content);
   if (tools.length) {
     const trace = document.createElement('div');
