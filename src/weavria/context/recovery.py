@@ -48,6 +48,7 @@ class RecoveryContextBuilder(ControlContextBuilder, Protocol):
         max_request_bytes: int,
         required_call_ids: tuple[str, ...],
         ranges: tuple[RecoveryRange, ...],
+        feedback_reserve_floor_bytes: int = 0,
     ) -> ControlEvidencePlan: ...
 
 

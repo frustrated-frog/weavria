@@ -337,6 +337,8 @@ class _AgentKernel:
         self._builder = EvidenceContextBuilder(artifacts, mode=mode)
         self._control_builder = context_builder or self._builder
         self._feedback_budget = self._request_budget
+        self._feedback_reserve_floor = 0
+        self._feedback_reserve_revision: int | None = None
         self._evidence_access: EvidenceAccessView | None = None
         self._artifacts = artifacts
         self._completion = completion if completion is not None else NoVerification()
@@ -793,6 +795,11 @@ class _AgentKernel:
                     max_request_bytes=self._request_budget,
                     required_call_ids=self.state.feedback_call_ids,
                     ranges=recovery.ranges if recovery is not None else self.state.recovery_ranges,
+                    feedback_reserve_floor_bytes=(
+                        self._feedback_reserve_floor
+                        if self._feedback_reserve_revision == task.revision
+                        else 0
+                    ),
                 )
             if self._journal_version >= 3:
                 return await self._control_builder.build_control(
@@ -805,6 +812,11 @@ class _AgentKernel:
                     feedback=self.state.feedback,
                     control=self.state.control,
                     required_call_ids=self.state.feedback_call_ids,
+                    feedback_reserve_floor_bytes=(
+                        self._feedback_reserve_floor
+                        if self._feedback_reserve_revision == task.revision
+                        else 0
+                    ),
                 )
             return await self._builder.build_turn(
                 run_id=self._run_id,
@@ -1080,6 +1092,13 @@ class _AgentKernel:
             if progress.blocked:
                 reason = "no_progress"
         if reason is not None:
+            if reason == "feedback_budget" and reservation.required_bytes <= self._request_budget:
+                if self._feedback_reserve_revision != revision:
+                    self._feedback_reserve_floor = 0
+                self._feedback_reserve_revision = revision
+                self._feedback_reserve_floor = max(
+                    self._feedback_reserve_floor, reservation.required_bytes
+                )
             rejection_frontier = (
                 progress.fingerprint_sha256
                 if reason == "no_progress" and progress is not None
@@ -1151,6 +1170,8 @@ class _AgentKernel:
         )
         if accepted:
             assert progress is not None
+            self._feedback_reserve_floor = 0
+            self._feedback_reserve_revision = None
             self._rejection_frontier = None
             self._rejection_repetitions = 0
             self._progress.record_admission(progress)

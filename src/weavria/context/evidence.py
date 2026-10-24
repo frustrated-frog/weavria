@@ -298,7 +298,13 @@ class EvidenceContextBuilder:
         feedback: TurnFeedback | None = None,
         control: ControlFeedback | None = None,
         required_call_ids: tuple[str, ...] = (),
+        feedback_reserve_floor_bytes: int = 0,
     ) -> ControlEvidencePlan:
+        if (
+            type(feedback_reserve_floor_bytes) is not int
+            or not 0 <= feedback_reserve_floor_bytes <= max_request_bytes
+        ):
+            raise ValueError("feedback reserve floor exceeds the request budget")
         feedback = (
             TurnFeedback.model_validate_json(
                 TurnFeedback.model_validate(feedback).model_dump_json()

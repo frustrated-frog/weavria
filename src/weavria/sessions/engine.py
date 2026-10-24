@@ -14,10 +14,12 @@ from pydantic import JsonValue, TypeAdapter
 
 from weavria.artifacts import ArtifactSnapshot
 from weavria.context import (
+    CompiledSessionContext,
     ContextBudgetError,
     ContextCompilerConfig,
     ContextDemand,
     ContextFocus,
+    ContextTokenBudgetError,
     ControlEvidencePlan,
     EvidenceDecision,
     EvidenceMode,
@@ -305,6 +307,7 @@ class _SessionAdapter:
         max_request_bytes: int,
         required_call_ids: tuple[str, ...],
         ranges: tuple[RecoveryRange, ...],
+        feedback_reserve_floor_bytes: int = 0,
     ) -> ControlEvidencePlan:
         if self._recovery_limits is None or base.schema_version != 4:
             raise ValueError("recovery is not enabled")
@@ -319,6 +322,7 @@ class _SessionAdapter:
             control=base.control,
             required_call_ids=required_call_ids,
             recovery_ranges=ranges,
+            feedback_reserve_floor_bytes=feedback_reserve_floor_bytes,
         )
 
     async def build_control(
@@ -334,9 +338,11 @@ class _SessionAdapter:
         control: ControlFeedback | None = None,
         required_call_ids: tuple[str, ...] = (),
         recovery_ranges: tuple[RecoveryRange, ...] = (),
+        feedback_reserve_floor_bytes: int = 0,
     ) -> ControlEvidencePlan:
         if self._compiler is None or run_id != self._run_id:
             raise ValueError("context compiler is not bound to this run")
+        compiler = self._compiler
         base = ControlRequest(
             schema_version=4 if self._recovery_limits is not None else 3,
             instructions=instructions,
@@ -374,28 +380,41 @@ class _SessionAdapter:
                 ),
             )
             self._history, retrieval = discovered.turns, discovered.report
-        compiled = await self._compiler.compile(
-            run_id=run_id,
-            session_id=self._session_id,
-            sequence=self._history_sequence,
-            base=base,
-            turns=self._history,
-            total_turns=self._history_count,
-            records=records,
-            max_request_bytes=self._budget,
-            required_call_ids=required_call_ids,
-            focus=focus,
-            retrieval=retrieval,
-            recovery_ranges=recovery_ranges,
-            next_step_reserve_bytes=(
-                min(
-                    self._compiler.config.next_step_reserve_bytes,
-                    self._budget // 8,
-                )
-                if self._reserve_next_step
-                else 0
-            ),
-        )
+
+        async def compile_with_floor(floor: int) -> CompiledSessionContext:
+            return await compiler.compile(
+                run_id=run_id,
+                session_id=self._session_id,
+                sequence=self._history_sequence,
+                base=base,
+                turns=self._history,
+                total_turns=self._history_count,
+                records=records,
+                max_request_bytes=self._budget,
+                required_call_ids=required_call_ids,
+                focus=focus,
+                retrieval=retrieval,
+                recovery_ranges=recovery_ranges,
+                next_step_reserve_bytes=(
+                    min(
+                        compiler.config.next_step_reserve_bytes,
+                        self._budget // 8,
+                    )
+                    if self._reserve_next_step
+                    else 0
+                ),
+                feedback_reserve_floor_bytes=floor,
+            )
+
+        try:
+            compiled = await compile_with_floor(feedback_reserve_floor_bytes)
+        except (ContextBudgetError, ContextTokenBudgetError):
+            if not feedback_reserve_floor_bytes:
+                raise
+            # The adaptive floor may be impossible even after every optional
+            # source is removed. Preserve the original rejection-and-replan
+            # path instead of converting that condition into Run exhaustion.
+            compiled = await compile_with_floor(0)
         outer, report = compiled.request, compiled.compilation
         self._prepared = {task.revision: outer.conversation}
         self._compilation = report

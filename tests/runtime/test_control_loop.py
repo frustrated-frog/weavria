@@ -10,7 +10,12 @@ import pytest
 from pydantic import BaseModel, ConfigDict, JsonValue, TypeAdapter, ValidationError
 
 from weavria.artifacts import ArtifactAccessError, ArtifactSnapshot, InMemoryArtifactStore
-from weavria.context import EvidenceMode, reserve_feedback
+from weavria.context import (
+    ControlEvidencePlan,
+    EvidenceContextBuilder,
+    EvidenceMode,
+    reserve_feedback,
+)
 from weavria.core import (
     ActionCostSignal,
     ActionInterventionChecked,
@@ -31,6 +36,7 @@ from weavria.core import (
     CompletionUnverifiable,
     ContinuationSignal,
     ControlEvent,
+    ControlFeedback,
     ControlRequest,
     ErrorCategory,
     EvidenceCoverageSignal,
@@ -563,6 +569,74 @@ async def test_rejected_batch_has_zero_effects_then_smaller_batch_receives_feedb
     assert result.task_outcome == "unverifiable"
     assert two.call_id not in agent.state.consumed_call_ids
     replay(agent)
+
+
+async def test_feedback_rejection_requests_more_capacity_from_the_next_context() -> None:
+    floors: list[int] = []
+    artifacts = InMemoryArtifactStore()
+    base_builder = EvidenceContextBuilder(artifacts)
+
+    class AdaptiveBuilder:
+        async def build_control(
+            self,
+            *,
+            run_id: str,
+            instructions: str,
+            task: TaskInput,
+            task_observation: TaskObservation | None = None,
+            records: tuple[ToolRecord, ...],
+            max_request_bytes: int,
+            feedback: TurnFeedback | None = None,
+            control: ControlFeedback | None = None,
+            required_call_ids: tuple[str, ...] = (),
+            feedback_reserve_floor_bytes: int = 0,
+        ) -> ControlEvidencePlan:
+            floors.append(feedback_reserve_floor_bytes)
+            plan = await base_builder.build_control(
+                run_id=run_id,
+                instructions=instructions,
+                task=task,
+                task_observation=task_observation,
+                records=records,
+                max_request_bytes=max_request_bytes,
+                feedback=feedback,
+                control=control,
+                required_call_ids=required_call_ids,
+            )
+            return ControlEvidencePlan(
+                plan.request_json,
+                plan.mode,
+                plan.budget_bytes,
+                plan.decisions,
+                plan.compilation_json,
+                min(max_request_bytes, feedback_reserve_floor_bytes + 1024)
+                if feedback_reserve_floor_bytes
+                else 1,
+            )
+
+    provider = FakeControlProvider(
+        (batch(call("first", "x" * 50)), batch(call("second", "x" * 50)), finish())
+    )
+    tools = ToolRegistry((echo_tool(),))
+    agent = AgentLoop(
+        run_id="run",
+        task=TaskInput(goal="Read and report the value"),
+        instructions="Use evidence",
+        model=provider,
+        tools=tools,
+        artifacts=artifacts,
+        limits=RunLimits(max_request_bytes=12_000),
+        context_builder=AdaptiveBuilder(),
+    )
+
+    result = await agent.execute()
+
+    rejected = [event.data for event in agent.events if isinstance(event.data, BatchRejected)]
+    assert result.status is RunStatus.COMPLETED
+    assert len(rejected) == 1 and rejected[0].notice.reason == "feedback_budget"
+    assert floors[:2] == [0, rejected[0].notice.required_bytes]
+    started = [event.data.call_id for event in agent.events if isinstance(event.data, ToolStarted)]
+    assert started == ["second"]
 
 
 async def test_complete_feedback_batch_replans_before_any_oversized_effect() -> None:

@@ -226,6 +226,55 @@ async def test_feedback_reservation_counts_stable_instructions_exactly(
     assert plan.compilation.next_step_reserve_bytes == config.next_step_reserve_bytes
 
 
+async def test_feedback_floor_drops_optional_history_until_the_batch_can_fit(
+    session_counter: OpenAICompatibleTokenCounter,
+) -> None:
+    config = ContextCompilerConfig(
+        window_tokens=24_000,
+        output_tokens=256,
+        safety_tokens=64,
+        policy="coverage",
+    )
+    request_base = ControlRequest(
+        instructions="trusted instruction " * 120,
+        task=TaskInput(goal="summarize repeated market evidence"),
+    )
+    turns = tuple(turn(ordinal, "repeated market evidence " * 180) for ordinal in range(1, 13))
+    context_compiler = SessionContextCompiler(
+        InMemoryArtifactStore(),
+        config=config,
+        counter=session_counter,
+    )
+    initial = await context_compiler.compile(
+        run_id="run",
+        session_id="s",
+        sequence=12,
+        base=request_base,
+        turns=turns,
+        total_turns=12,
+        records=(),
+        max_request_bytes=48_000,
+    )
+    floor = 20_000
+    assert initial.compilation.feedback_budget_bytes < floor
+    adapted = await context_compiler.compile(
+        run_id="run",
+        session_id="s",
+        sequence=12,
+        base=request_base,
+        turns=turns,
+        total_turns=12,
+        records=(),
+        max_request_bytes=48_000,
+        feedback_reserve_floor_bytes=floor,
+    )
+
+    assert adapted.compilation.schema_version == 6
+    assert adapted.compilation.feedback_reserve_floor_bytes == floor
+    assert adapted.compilation.feedback_budget_bytes >= floor
+    assert adapted.compilation.request_bytes < initial.compilation.request_bytes
+
+
 def test_complete_feedback_batch_is_rejected_before_execution_when_only_one_page_fits() -> None:
     registry = ToolRegistry((artifact_read_tool(),))
     bounds = FeedbackBounds()
