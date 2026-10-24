@@ -1,5 +1,6 @@
 import json
 import shutil
+import sqlite3
 import subprocess
 from pathlib import Path
 
@@ -225,6 +226,11 @@ async def test_widget_session_executes_real_runtime_and_reports_tool_trace(
             )
             events = await app.state.runtime.engine.store.events(created.session_id, limit=256)
 
+    with sqlite3.connect(settings.state_path) as database:
+        stored_config = json.loads(
+            database.execute("SELECT config FROM runs ORDER BY ordinal DESC LIMIT 1").fetchone()[0]
+        )
+
     assert response.status_code == 200
     payload = MessageOutput.model_validate(response.json())
     assert payload.status == "completed", payload.model_dump_json()
@@ -247,6 +253,20 @@ async def test_widget_session_executes_real_runtime_and_reports_tool_trace(
     assert provider.requests[0].current.task.goal == "今天是什么市场阶段?"
     assert runtime_frame.application_context[0].payload["business_date"] == "2026-10-15"
     assert any(isinstance(event.data, SessionContextCompiled) for event in events)
+    assert stored_config["limits"] == {
+        "max_model_calls": 20,
+        "max_tool_calls": 20,
+        "max_request_bytes": 64_000,
+        "max_duration": 180.0,
+        "max_model_duration": 60.0,
+        "max_completion_duration": 5.0,
+        "max_intervention_duration": 5.0,
+        "max_completion_repairs": 2,
+        "max_model_output_repairs": 2,
+        "max_intervention_reconsiderations": 2,
+        "max_no_progress_rejections": 2,
+        "max_stagnant_actions_per_family": 3,
+    }
     await market_http.aclose()
 
 

@@ -21,6 +21,10 @@ class FinScopeSettings:
     model_max_output_tokens: int = 4096
     context_window_tokens: int = 32_768
     context_encoding: str = "cl100k_base"
+    run_max_model_calls: int = 20
+    run_max_tool_calls: int = 20
+    run_max_request_bytes: int = 64_000
+    run_max_duration_seconds: float = 180.0
 
     def __post_init__(self) -> None:
         _validate_http_url("model_base_url", self.model_base_url)
@@ -37,11 +41,22 @@ class FinScopeSettings:
             or self.context_window_tokens <= self.model_max_output_tokens + 256
         ):
             raise ValueError("context window must leave room beyond output and safety reserves")
+        if any(
+            type(value) is not int or value <= 0
+            for value in (
+                self.run_max_model_calls,
+                self.run_max_tool_calls,
+                self.run_max_request_bytes,
+            )
+        ):
+            raise ValueError("run counter and request limits must be positive integers")
         if (
             not math.isfinite(self.model_timeout_seconds)
             or not math.isfinite(self.request_timeout_seconds)
+            or not math.isfinite(self.run_max_duration_seconds)
             or self.model_timeout_seconds <= 0
             or self.request_timeout_seconds <= 0
+            or self.run_max_duration_seconds <= 0
         ):
             raise ValueError("timeouts must be positive")
 
@@ -65,6 +80,12 @@ class FinScopeSettings:
             model_max_output_tokens=int(os.environ.get("WEAVRIA_MODEL_MAX_OUTPUT_TOKENS", "4096")),
             context_window_tokens=int(os.environ.get("WEAVRIA_CONTEXT_WINDOW_TOKENS", "32768")),
             context_encoding=os.environ.get("WEAVRIA_CONTEXT_ENCODING", "cl100k_base").strip(),
+            run_max_model_calls=int(os.environ.get("WEAVRIA_RUN_MAX_MODEL_CALLS", "20")),
+            run_max_tool_calls=int(os.environ.get("WEAVRIA_RUN_MAX_TOOL_CALLS", "20")),
+            run_max_request_bytes=int(os.environ.get("WEAVRIA_RUN_MAX_REQUEST_BYTES", "64000")),
+            run_max_duration_seconds=float(
+                os.environ.get("WEAVRIA_RUN_MAX_DURATION_SECONDS", "180")
+            ),
         )
 
 

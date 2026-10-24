@@ -26,6 +26,10 @@ export WEAVRIA_MODEL_JSON_MODE="true"
 export WEAVRIA_MODEL_MAX_OUTPUT_TOKENS="4096"
 export WEAVRIA_CONTEXT_WINDOW_TOKENS="32768"
 export WEAVRIA_CONTEXT_ENCODING="cl100k_base"
+export WEAVRIA_RUN_MAX_MODEL_CALLS="20"
+export WEAVRIA_RUN_MAX_TOOL_CALLS="20"
+export WEAVRIA_RUN_MAX_REQUEST_BYTES="64000"
+export WEAVRIA_RUN_MAX_DURATION_SECONDS="180"
 export WEAVRIA_FINSCOPE_BASE_URL="http://127.0.0.1:8080"
 export WEAVRIA_ALLOWED_PARENT_ORIGIN="http://localhost:5173"
 uv run --extra finscope python -m apps.finscope
@@ -48,6 +52,10 @@ http://127.0.0.1:8765/widget
 Sidecar 默认启用 Weavria 的联合上下文编译、持久历史检索与主动原文恢复。上下文窗口、输出
 预留和分词编码必须与实际模型配置保持一致；若供应商使用不同 tokenizer，应通过上述环境变量
 显式改成兼容编码，不要把默认值当成供应商能力探测结果。
+
+本地真实模型验证默认允许 20 次模型调用、20 次工具调用、64,000 字节单次请求预算和 180 秒
+总运行时间。它们是宿主运行策略而不是金融业务规则，可通过 `WEAVRIA_RUN_MAX_*` 环境变量调整；
+Context Compiler 仍会独立遵守模型上下文窗口和输出预留。
 
 FinScope 前端设置 `VITE_WEAVRIA_AGENT_URL=http://127.0.0.1:8765` 后才显示入口；没有
 设置时不会渲染悬浮窗。

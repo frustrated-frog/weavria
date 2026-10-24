@@ -1,3 +1,5 @@
+from collections.abc import Callable
+
 import pytest
 
 from apps.finscope.config import FinScopeSettings
@@ -32,3 +34,37 @@ def test_context_encoding_is_required() -> None:
             model_api_key="",
             context_encoding=" ",
         )
+
+
+@pytest.mark.parametrize(
+    "factory",
+    (
+        lambda: FinScopeSettings(
+            model_base_url="https://model.example/v1",
+            model_name="model",
+            model_api_key="",
+            run_max_model_calls=0,
+        ),
+        lambda: FinScopeSettings(
+            model_base_url="https://model.example/v1",
+            model_name="model",
+            model_api_key="",
+            run_max_tool_calls=0,
+        ),
+        lambda: FinScopeSettings(
+            model_base_url="https://model.example/v1",
+            model_name="model",
+            model_api_key="",
+            run_max_request_bytes=0,
+        ),
+        lambda: FinScopeSettings(
+            model_base_url="https://model.example/v1",
+            model_name="model",
+            model_api_key="",
+            run_max_duration_seconds=0.0,
+        ),
+    ),
+)
+def test_run_budgets_must_be_positive(factory: Callable[[], FinScopeSettings]) -> None:
+    with pytest.raises(ValueError, match=r"run counter|timeouts"):
+        factory()
