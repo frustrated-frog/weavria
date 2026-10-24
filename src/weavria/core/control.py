@@ -16,7 +16,7 @@ from pydantic import (
 
 from ._schema import ContractModel, NonBlankString
 from .actions import FinishAction
-from .errors import RunError
+from .errors import ModelOutputDiagnostic, RunError
 from .evidence_access import EvidenceAccessView
 from .execution import (
     ContextSelected,
@@ -182,6 +182,21 @@ class ProgressNotice(ContractModel):
         )
 
 
+class ModelOutputRepairNotice(ContractModel):
+    """Bounded host feedback after one rejected supplier response."""
+
+    kind: Literal["model_output_repair"] = "model_output_repair"
+    failure_ordinal: int = Field(ge=1)
+    diagnostic: ModelOutputDiagnostic
+    required_action: Literal["return_concise_valid_json"] = "return_concise_valid_json"
+
+    @model_validator(mode="after")
+    def bound_notice(self) -> Self:
+        if len(self.model_dump_json().encode()) > CONTROL_FEEDBACK_BYTES:
+            raise ValueError("model-output repair notice exceeds its reserved channel")
+        return self
+
+
 class InterventionNotice(BaseModel):
     """Bounded explanation emitted only when the exact proposal must be replaced."""
 
@@ -237,7 +252,12 @@ class InterventionNotice(BaseModel):
 
 
 type ControlFeedback = Annotated[
-    AdmissionNotice | CompletionNotice | ProgressNotice | InterventionNotice | RecoveryNotice,
+    AdmissionNotice
+    | CompletionNotice
+    | ProgressNotice
+    | ModelOutputRepairNotice
+    | InterventionNotice
+    | RecoveryNotice,
     Field(discriminator="kind"),
 ]
 
@@ -318,6 +338,16 @@ class BatchRejected(ContractModel):
     notice: AdmissionNotice
 
 
+class ModelOutputRejected(ContractModel):
+    """Persist a rejected response without retaining its private model content."""
+
+    kind: Literal["model_output_rejected"] = "model_output_rejected"
+    task_revision: int = Field(ge=1)
+    failure_ordinal: int = Field(ge=1)
+    disposition: Literal["retry", "terminate"]
+    diagnostic: ModelOutputDiagnostic
+
+
 class VerificationStarted(ContractModel):
     kind: Literal["verification_started"] = "verification_started"
     policy_version: NonBlankString
@@ -394,6 +424,7 @@ type ControlData = Annotated[
     | TaskRevised
     | ContextSelected
     | ModelStarted
+    | ModelOutputRejected
     | DecisionDiscarded
     | TurnDecided
     | RecoveryResolved

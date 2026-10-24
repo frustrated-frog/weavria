@@ -34,6 +34,8 @@ from weavria.core import (
     JournalEvent,
     LoopEvent,
     ModelDecided,
+    ModelOutputRejected,
+    ModelOutputRepairNotice,
     ModelStarted,
     ModelTurn,
     ProgressAssessed,
@@ -91,6 +93,7 @@ class RunState:
     phase: Phase
     task_json: str
     model_calls: int = 0
+    model_output_failures: int = 0
     tool_calls: int = 0
     model_revision: int | None = None
     pending_json: str | None = None
@@ -263,6 +266,7 @@ def reduce_event(state: RunState | None, event: JournalEvent) -> RunState:
             last_completion_repair_sha256=None,
             last_completion_frontier_sha256=None,
             action_value_profiles_json=(),
+            model_output_failures=0,
             recovery_ranges_json=(),
             recovery_seen_json=(),
             recovery_attempts=(),
@@ -332,6 +336,28 @@ def reduce_event(state: RunState | None, event: JournalEvent) -> RunState:
             model_calls=state.model_calls + 1,
             model_revision=data.task_revision,
         )
+    if isinstance(data, ModelOutputRejected):
+        _require(
+            state.phase is Phase.MODEL
+            and state.model_revision == state.task.revision == data.task_revision,
+            "only the active model response can be rejected",
+        )
+        _require(
+            data.failure_ordinal == state.model_output_failures + 1,
+            "model-output failure ordinal is not replayable",
+        )
+        if data.disposition == "retry":
+            notice = ModelOutputRepairNotice(
+                failure_ordinal=data.failure_ordinal,
+                diagnostic=data.diagnostic,
+            )
+            return replace(
+                next_state,
+                phase=Phase.READY,
+                control_json=notice.model_dump_json(),
+                model_output_failures=data.failure_ordinal,
+            )
+        return replace(next_state, model_output_failures=data.failure_ordinal)
     if isinstance(data, DecisionDiscarded):
         _require(
             state.phase is Phase.MODEL and state.model_revision != state.task.revision,
@@ -352,6 +378,7 @@ def reduce_event(state: RunState | None, event: JournalEvent) -> RunState:
             next_state,
             pending_json=data.action.model_dump_json(),
             phase=Phase.FINISH if isinstance(data.action, FinishAction) else Phase.ACTION,
+            model_output_failures=0,
         )
     if isinstance(data, RecoveryResolved):
         return _reduce_recovery(state, next_state, data)
@@ -439,7 +466,7 @@ def _reduce_turn(
             state.phase is Phase.MODEL and state.model_revision == state.task.revision,
             "turn is out of phase or belongs to an obsolete task",
         )
-        next_state = replace(next_state, recovery_ranges_json=())
+        next_state = replace(next_state, recovery_ranges_json=(), model_output_failures=0)
         decision = data.turn.decision
         if isinstance(decision, RecoverContext):
             _require(

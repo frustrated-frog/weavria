@@ -5,11 +5,17 @@ import logging
 import math
 from dataclasses import dataclass
 from hashlib import sha256
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol, cast
 
-from pydantic import BaseModel, ConfigDict, JsonValue, TypeAdapter
+from pydantic import BaseModel, ConfigDict, JsonValue, TypeAdapter, ValidationError
 
-from weavria.core import ModelRequest, ModelResponse, ModelTurn, SessionRequest
+from weavria.core import (
+    ModelOutputDiagnostic,
+    ModelRequest,
+    ModelResponse,
+    ModelTurn,
+    SessionRequest,
+)
 
 from .provider import ModelCapabilities, ModelOutputError
 
@@ -60,16 +66,31 @@ class OpenAICompatibleProvider:
         """Request one normalized action; transport and parsing failures remain provider errors."""
         validated = ModelRequest.model_validate(request)
         body = self._request_body(validated)
+        payload = await self._transport.complete(body)
         try:
-            payload = await self._transport.complete(body)
             content, finish_reason = _message_generation(payload)
+        except ModelOutputError as exc:
+            raise ModelOutputError(
+                "model response did not contain one valid JSON action",
+                diagnostic=exc.diagnostic,
+            ) from exc
+        try:
             decoded = _JSON_OBJECT.validate_json(_unwrap_json(content, finish_reason))
+        except (ValidationError, ValueError, json.JSONDecodeError) as exc:
+            raise ModelOutputError(
+                "model response did not contain one valid JSON action",
+                diagnostic=_content_diagnostic("invalid_json", content, finish_reason),
+            ) from exc
+        try:
             normalized = _assign_call_id(decoded, validated)
             return ModelResponse.model_validate_json(
                 json.dumps(normalized, ensure_ascii=False, separators=(",", ":"))
             )
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise ModelOutputError("model response did not contain one valid JSON action") from exc
+        except (KeyError, TypeError, ValidationError, ValueError, json.JSONDecodeError) as exc:
+            raise ModelOutputError(
+                "model response did not contain one valid JSON action",
+                diagnostic=_content_diagnostic("schema_mismatch", content, finish_reason),
+            ) from exc
 
     def _request_body(self, request: ModelRequest) -> dict[str, Any]:
         observations = request.model_dump(mode="json")
@@ -164,16 +185,31 @@ class OpenAICompatibleSessionProvider:
         """Request a JSON decision; transport and schema failures remain model failures."""
         validated = SessionRequest.model_validate(request)
         body = _session_request_body(self._config, validated)
+        payload = await self._transport.complete(body)
         try:
-            payload = await self._transport.complete(body)
             content, finish_reason = _message_generation(payload)
+        except ModelOutputError as exc:
+            raise ModelOutputError(
+                "model response did not contain one valid JSON turn",
+                diagnostic=exc.diagnostic,
+            ) from exc
+        try:
             decoded = _JSON_OBJECT.validate_json(_unwrap_json(content, finish_reason))
+        except (ValidationError, ValueError, json.JSONDecodeError) as exc:
+            raise ModelOutputError(
+                "model response did not contain one valid JSON turn",
+                diagnostic=_content_diagnostic("invalid_json", content, finish_reason),
+            ) from exc
+        try:
             normalized = _assign_call_ids(decoded, validated)
             return ModelTurn.model_validate_json(
                 json.dumps(normalized, ensure_ascii=False, separators=(",", ":"))
             )
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise ModelOutputError("model response did not contain one valid JSON turn") from exc
+        except (KeyError, TypeError, ValidationError, ValueError, json.JSONDecodeError) as exc:
+            raise ModelOutputError(
+                "model response did not contain one valid JSON turn",
+                diagnostic=_content_diagnostic("schema_mismatch", content, finish_reason),
+            ) from exc
 
 
 class _ContentPart(BaseModel):
@@ -198,17 +234,25 @@ class _CompletionResponse(BaseModel):
 
 
 def _message_generation(payload: object) -> tuple[str, str | None]:
-    parsed = _CompletionResponse.model_validate(payload)
+    try:
+        parsed = _CompletionResponse.model_validate(payload)
+    except ValidationError as exc:
+        raise ModelOutputError(
+            "model response has an invalid completion envelope",
+            diagnostic=ModelOutputDiagnostic(code="invalid_envelope"),
+        ) from exc
     if not parsed.choices:
-        raise ValueError("model response has no choices")
+        raise ModelOutputError(
+            "model response has no choices",
+            diagnostic=ModelOutputDiagnostic(code="empty_choices"),
+        )
     choice = parsed.choices[0]
     finish_reason = choice.finish_reason
-    if finish_reason in {"length", "content_filter"}:
-        raise ValueError(f"model response ended with {finish_reason}")
     content = choice.message.content
+    text: str | None = None
     if isinstance(content, str) and content.strip():
-        return content, finish_reason
-    if isinstance(content, tuple):
+        text = content
+    elif isinstance(content, tuple):
         parts: list[str] = []
         for item in content:
             if isinstance(item, str):
@@ -217,8 +261,58 @@ def _message_generation(payload: object) -> tuple[str, str | None]:
                 parts.append(item.text)
         joined = "".join(parts)
         if joined.strip():
-            return joined, finish_reason
-    raise ValueError("model response has no final message content")
+            text = joined
+    if finish_reason == "length":
+        raise ModelOutputError(
+            "model response ended because its output budget was exhausted",
+            diagnostic=_content_diagnostic("output_truncated", text, finish_reason),
+        )
+    if finish_reason == "content_filter":
+        raise ModelOutputError(
+            "model response was filtered by its provider",
+            diagnostic=_content_diagnostic(
+                "content_filtered", text, finish_reason, repairable=False
+            ),
+        )
+    if text is None:
+        raise ModelOutputError(
+            "model response has no final message content",
+            diagnostic=ModelOutputDiagnostic(
+                code="empty_content",
+                finish_reason=_normalize_finish_reason(finish_reason),
+            ),
+        )
+    return text, finish_reason
+
+
+def _content_diagnostic(
+    code: Literal[
+        "output_truncated",
+        "content_filtered",
+        "invalid_json",
+        "schema_mismatch",
+    ],
+    content: str | None,
+    finish_reason: str | None,
+    *,
+    repairable: bool = True,
+) -> ModelOutputDiagnostic:
+    encoded = content.encode("utf-8") if content else b""
+    return ModelOutputDiagnostic(
+        code=code,
+        response_bytes=len(encoded),
+        response_sha256=sha256(encoded).hexdigest() if encoded else None,
+        finish_reason=_normalize_finish_reason(finish_reason),
+        repairable=repairable,
+    )
+
+
+def _normalize_finish_reason(
+    value: str | None,
+) -> Literal["stop", "length", "content_filter", "other"] | None:
+    if value in {"stop", "length", "content_filter"}:
+        return cast(Literal["stop", "length", "content_filter"], value)
+    return "other" if value is not None else None
 
 
 def _unwrap_json(content: str, finish_reason: str | None) -> str:

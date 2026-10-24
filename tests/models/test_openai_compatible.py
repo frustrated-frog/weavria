@@ -118,8 +118,11 @@ async def test_adapter_rejects_truncated_output_before_json_recovery() -> None:
         ),
     )
 
-    with pytest.raises(ModelOutputError, match="valid JSON action"):
+    with pytest.raises(ModelOutputError, match="valid JSON action") as raised:
         await provider.generate(_request())
+    assert raised.value.diagnostic.code == "output_truncated"
+    assert raised.value.diagnostic.finish_reason == "length"
+    assert raised.value.diagnostic.response_bytes > 0
 
 
 async def test_adapter_does_not_recover_without_a_normal_finish_signal() -> None:
@@ -192,8 +195,25 @@ async def test_session_provider_rejects_non_json_final_content() -> None:
         transport=Transport(_response("not json")),
     )
 
-    with pytest.raises(ModelOutputError, match="valid JSON turn"):
+    with pytest.raises(ModelOutputError, match="valid JSON turn") as raised:
         await provider.generate_session(_session_request())
+    assert raised.value.diagnostic.code == "invalid_json"
+    assert raised.value.diagnostic.response_sha256 is not None
+
+
+async def test_session_provider_classifies_filtered_output_as_not_automatically_repairable() -> (
+    None
+):
+    provider = OpenAICompatibleSessionProvider(
+        OpenAICompatibleConfig(model="model"),
+        transport=Transport(_response(None, finish_reason="content_filter")),
+    )
+
+    with pytest.raises(ModelOutputError, match="valid JSON turn") as raised:
+        await provider.generate_session(_session_request())
+
+    assert raised.value.diagnostic.code == "content_filtered"
+    assert raised.value.diagnostic.repairable is False
 
 
 async def test_session_provider_joins_text_content_parts() -> None:

@@ -59,6 +59,7 @@ from weavria.core import (
     LoopEvent,
     LoopResult,
     ModelDecided,
+    ModelOutputRejected,
     ModelRequest,
     ModelResponse,
     ModelStarted,
@@ -198,6 +199,7 @@ class RunLimits:
     max_completion_duration: float = 10.0
     max_intervention_duration: float = 5.0
     max_completion_repairs: int = 3
+    max_model_output_repairs: int = 2
     max_intervention_reconsiderations: int = 2
     max_no_progress_rejections: int = 2
     max_stagnant_actions_per_family: int = 3
@@ -208,6 +210,8 @@ class RunLimits:
                 raise ValueError("run counter and input limits must be positive integers")
         if type(self.max_completion_repairs) is not int or self.max_completion_repairs < 0:
             raise ValueError("completion repair limit must be a nonnegative integer")
+        if type(self.max_model_output_repairs) is not int or self.max_model_output_repairs < 0:
+            raise ValueError("model-output repair limit must be a nonnegative integer")
         if (
             type(self.max_intervention_reconsiderations) is not int
             or self.max_intervention_reconsiderations < 1
@@ -508,10 +512,37 @@ class _AgentKernel:
                         return await self._end(RunStatus.BUDGET_EXHAUSTED, "deadline")
                     if not await self._prepare_model(plan, task.revision):
                         continue
-                    response = await self._decide(
-                        plan.request,
-                        min(self._limits.max_model_duration, max(0, self._remaining(deadline))),
-                    )
+                    try:
+                        response = await self._decide(
+                            plan.request,
+                            min(
+                                self._limits.max_model_duration,
+                                max(0, self._remaining(deadline)),
+                            ),
+                        )
+                    except ModelCallError as exc:
+                        self._check_cancel(owner, cancellation_count)
+                        if task.revision != self.state.task.revision:
+                            await self._accept(DecisionDiscarded())
+                            continue
+                        disposition = await self._handle_invalid_model_response(
+                            exc,
+                            task_revision=task.revision,
+                            deadline=deadline,
+                        )
+                        if disposition == "retry":
+                            continue
+                        if disposition == "terminate":
+                            diagnostic = exc.output_diagnostic
+                            self._failure_cause = exc
+                            return await self._end(
+                                RunStatus.FAILED,
+                                "model_output_repair_exhausted"
+                                if diagnostic is not None and diagnostic.repairable
+                                else "model_output_rejected",
+                                error=exc.error,
+                            )
+                        raise
                     self._check_cancel(owner, cancellation_count)
                     if self._journal_version >= 3 and not (
                         isinstance(response, ModelTurn)
@@ -1276,7 +1307,7 @@ class _AgentKernel:
             number = self.state.model_calls + (isinstance(data, (ContextSelected, ModelStarted)))
             if number:
                 step = f"{self._run_id}/step/{number}"
-            if isinstance(data, ModelStarted):
+            if isinstance(data, (ModelStarted, ModelOutputRejected)):
                 attempt = f"{step}/model/1"
             elif isinstance(data, (VerificationStarted, CompletionChecked, CompletionDiscarded)):
                 attempt = f"{step}/verification/1"
@@ -1475,6 +1506,42 @@ class _AgentKernel:
         ):
             return result
         return None
+
+    async def _handle_invalid_model_response(
+        self,
+        error: ModelCallError,
+        *,
+        task_revision: int,
+        deadline: float,
+    ) -> Literal["retry", "terminate"] | None:
+        """Record one safe rejection and retry only inside explicit Run budgets."""
+        diagnostic = error.output_diagnostic
+        if (
+            self._journal_version < 3
+            or error.error.category is not ErrorCategory.INVALID_MODEL_RESPONSE
+            or diagnostic is None
+        ):
+            return None
+        ordinal = self.state.model_output_failures + 1
+        retry = (
+            diagnostic.repairable
+            and self.state.model_output_failures < self._limits.max_model_output_repairs
+            and self.state.model_calls < self._limits.max_model_calls
+            and self._remaining(deadline) > 0
+        )
+        accepted = await self._accept(
+            ModelOutputRejected(
+                task_revision=task_revision,
+                failure_ordinal=ordinal,
+                disposition="retry" if retry else "terminate",
+                diagnostic=diagnostic,
+            ),
+            expected_revision=task_revision,
+        )
+        if not accepted:
+            await self._accept(DecisionDiscarded())
+            return "retry"
+        return "retry" if retry else "terminate"
 
     async def _end(
         self,

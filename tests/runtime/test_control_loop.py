@@ -39,6 +39,9 @@ from weavria.core import (
     InformationGainSignal,
     InterventionDecision,
     InterventionNotice,
+    ModelOutputDiagnostic,
+    ModelOutputRejected,
+    ModelOutputRepairNotice,
     ModelTurn,
     ObligationProgressSignal,
     ProgressAssessed,
@@ -64,7 +67,7 @@ from weavria.core import (
     maximum_exchange_bytes,
     minimum_exchange,
 )
-from weavria.models import FakeControlProvider
+from weavria.models import FakeControlProvider, ModelOutputError
 from weavria.runtime import (
     ActionInterventionContext,
     ActionInterventionPolicy,
@@ -415,6 +418,98 @@ async def sizing_instructions() -> str:
     probe = make_loop(FakeControlProvider((finish(),)))
     await probe.execute()
     return probe.plans[0].request.instructions
+
+
+class _RejectOnceProvider(FakeControlProvider):
+    def __init__(self) -> None:
+        super().__init__((finish("recovered"),))
+        self.rejected = False
+
+    async def generate_turn(self, request: ControlRequest) -> ModelTurn:
+        if not self.rejected:
+            self.rejected = True
+            raise ModelOutputError(
+                "malformed supplier JSON",
+                diagnostic=ModelOutputDiagnostic(
+                    code="invalid_json",
+                    response_bytes=7,
+                    response_sha256=hashlib.sha256(b"invalid").hexdigest(),
+                    finish_reason="stop",
+                ),
+            )
+        return await super().generate_turn(request)
+
+
+async def test_invalid_model_output_is_repaired_as_a_new_budgeted_model_step() -> None:
+    provider = _RejectOnceProvider()
+    agent = make_loop(provider)
+
+    result = await agent.execute()
+
+    assert result.status is RunStatus.COMPLETED and result.output == "recovered"
+    assert agent.state.model_calls == 2 and agent.state.model_output_failures == 0
+    rejected = [event.data for event in agent.events if isinstance(event.data, ModelOutputRejected)]
+    assert len(rejected) == 1
+    assert rejected[0].disposition == "retry"
+    assert rejected[0].diagnostic.code == "invalid_json"
+    assert "malformed supplier JSON" not in "".join(
+        event.model_dump_json() for event in agent.events
+    )
+    assert len(provider.requests) == 1
+    control = provider.requests[0].control
+    assert isinstance(control, ModelOutputRepairNotice)
+    assert control.failure_ordinal == 1 and control.diagnostic.response_bytes == 7
+    assert control.required_action == "return_concise_valid_json"
+    replay(agent)
+
+
+class _AlwaysInvalidProvider(FakeControlProvider):
+    def __init__(self, *, repairable: bool = True) -> None:
+        super().__init__(())
+        self.repairable = repairable
+
+    async def generate_turn(self, request: ControlRequest) -> ModelTurn:
+        del request
+        raise ModelOutputError(
+            "supplier response rejected",
+            diagnostic=ModelOutputDiagnostic(
+                code="invalid_json" if self.repairable else "content_filtered",
+                repairable=self.repairable,
+            ),
+        )
+
+
+async def test_repeated_invalid_model_output_terminates_without_unbounded_retry() -> None:
+    agent = make_loop(
+        _AlwaysInvalidProvider(),
+        limits=RunLimits(max_model_calls=8, max_model_output_repairs=1),
+    )
+
+    result = await agent.execute()
+
+    assert result.status is RunStatus.FAILED
+    assert result.execution.error is not None
+    assert result.execution.error.category is ErrorCategory.INVALID_MODEL_RESPONSE
+    assert agent.state.model_calls == 2
+    assert agent.failure_cause is not None
+    rejected = [event.data for event in agent.events if isinstance(event.data, ModelOutputRejected)]
+    assert [item.disposition for item in rejected] == ["retry", "terminate"]
+    assert isinstance(agent.events[-1].data, RunEnded)
+    assert agent.events[-1].data.reason == "model_output_repair_exhausted"
+    replay(agent)
+
+
+async def test_unrepairable_model_output_is_recorded_and_not_retried() -> None:
+    agent = make_loop(_AlwaysInvalidProvider(repairable=False))
+
+    result = await agent.execute()
+
+    assert result.status is RunStatus.FAILED and agent.state.model_calls == 1
+    rejected = [event.data for event in agent.events if isinstance(event.data, ModelOutputRejected)]
+    assert len(rejected) == 1 and rejected[0].disposition == "terminate"
+    assert isinstance(agent.events[-1].data, RunEnded)
+    assert agent.events[-1].data.reason == "model_output_rejected"
+    replay(agent)
 
 
 @pytest.mark.parametrize("mode", list(EvidenceMode))

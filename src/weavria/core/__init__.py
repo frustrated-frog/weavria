@@ -23,6 +23,8 @@ from .control import (
     ControlRequest,
     FeedbackBounds,
     InterventionNotice,
+    ModelOutputRejected,
+    ModelOutputRepairNotice,
     ProgressAssessed,
     ProgressNotice,
     RunReport,
@@ -52,7 +54,7 @@ from .conversation import (
     TextExcerpt,
     TextRange,
 )
-from .errors import ErrorCategory, InvalidActionError, RunError
+from .errors import ErrorCategory, InvalidActionError, ModelOutputDiagnostic, RunError
 from .evidence_access import EvidenceAccessView
 from .execution import (
     ArtifactRef,
@@ -206,6 +208,9 @@ __all__ = [
     "Message",
     "MessageRole",
     "ModelDecided",
+    "ModelOutputDiagnostic",
+    "ModelOutputRejected",
+    "ModelOutputRepairNotice",
     "ModelRequest",
     "ModelResponse",
     "ModelStarted",

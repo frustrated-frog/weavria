@@ -7,6 +7,7 @@ from pydantic import ValidationError
 from weavria.core import (
     ErrorCategory,
     FinishAction,
+    ModelOutputDiagnostic,
     ModelRequest,
     ModelResponse,
     ToolCallAction,
@@ -89,13 +90,17 @@ async def test_malformed_supplier_output_is_not_misclassified_as_provider_failur
             try:
                 raise ValueError("supplier returned malformed JSON")
             except ValueError as exc:
-                raise ModelOutputError("response normalization failed") from exc
+                raise ModelOutputError(
+                    "response normalization failed",
+                    diagnostic=ModelOutputDiagnostic(code="invalid_json"),
+                ) from exc
 
     with pytest.raises(ModelCallError) as raised:
         await call_model(MalformedOutputProvider(), model_request)
 
     assert raised.value.error.category is ErrorCategory.INVALID_MODEL_RESPONSE
     assert raised.value.error.cause_type == "ModelOutputError"
+    assert raised.value.output_diagnostic == ModelOutputDiagnostic(code="invalid_json")
     assert isinstance(raised.value.__cause__, ModelOutputError)
     assert isinstance(raised.value.__cause__.__cause__, ValueError)
 

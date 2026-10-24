@@ -12,6 +12,7 @@ from pydantic import BaseModel, ValidationError
 from weavria.core import (
     ControlRequest,
     ErrorCategory,
+    ModelOutputDiagnostic,
     ModelRequest,
     ModelResponse,
     ModelTurn,
@@ -60,14 +61,25 @@ class ModelCallError(Exception):
         error: RunError,
         *,
         timeout_origin: ModelTimeoutOrigin | None = None,
+        output_diagnostic: ModelOutputDiagnostic | None = None,
     ) -> None:
         self.error = error
         self.timeout_origin = timeout_origin
+        self.output_diagnostic = output_diagnostic
         super().__init__(error.message)
 
 
 class ModelOutputError(ValueError):
     """A supplier response was received but could not be normalized safely."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        diagnostic: ModelOutputDiagnostic | None = None,
+    ) -> None:
+        self.diagnostic = diagnostic or ModelOutputDiagnostic(code="unknown")
+        super().__init__(message)
 
 
 class TurnModelProvider(Protocol):
@@ -149,7 +161,10 @@ async def call_model(
             RunError(
                 category=ErrorCategory.INVALID_MODEL_RESPONSE,
                 message="Model provider returned an unsupported tool call",
-            )
+            ),
+            output_diagnostic=ModelOutputDiagnostic(
+                code="unsupported_capability", repairable=False
+            ),
         )
     return result
 
@@ -180,7 +195,10 @@ def _validate_batch_capabilities(result: ModelTurn, capabilities: ModelCapabilit
             RunError(
                 category=ErrorCategory.INVALID_MODEL_RESPONSE,
                 message="Model proposed a batch without declaring its capabilities",
-            )
+            ),
+            output_diagnostic=ModelOutputDiagnostic(
+                code="unsupported_capability", repairable=False
+            ),
         )
 
 
@@ -256,7 +274,8 @@ async def _invoke_model[Input: BaseModel, Response: BaseModel](
                 category=ErrorCategory.INVALID_MODEL_RESPONSE,
                 message="Model provider returned an invalid response",
                 cause_type=type(exc).__name__,
-            )
+            ),
+            output_diagnostic=exc.diagnostic,
         ) from exc
     except Exception as exc:
         if owner is not None and owner.cancelling() > cancellation_count:
@@ -288,7 +307,8 @@ async def _invoke_model[Input: BaseModel, Response: BaseModel](
                 category=ErrorCategory.INVALID_MODEL_RESPONSE,
                 message="Model provider returned an invalid response",
                 cause_type=type(exc).__name__,
-            )
+            ),
+            output_diagnostic=ModelOutputDiagnostic(code="schema_mismatch"),
         ) from exc
     return result, capabilities
 
@@ -299,5 +319,6 @@ def _validate_recovery(result: ModelTurn, enabled: bool) -> None:
             RunError(
                 category=ErrorCategory.INVALID_MODEL_RESPONSE,
                 message="Context recovery protocol is not enabled",
-            )
+            ),
+            output_diagnostic=ModelOutputDiagnostic(code="unsupported_recovery", repairable=False),
         )

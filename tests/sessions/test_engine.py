@@ -8,6 +8,9 @@ from weavria.core import (
     ApplicationObservation,
     ContextCompilation,
     FinishAction,
+    ModelOutputDiagnostic,
+    ModelOutputRejected,
+    ModelOutputRepairNotice,
     ModelTurn,
     RunStatus,
     SessionApplicationObserved,
@@ -18,7 +21,7 @@ from weavria.core import (
     ToolExchange,
     ToolFailedObservation,
 )
-from weavria.models import ModelCapabilities
+from weavria.models import ModelCapabilities, ModelOutputError
 from weavria.sessions import SessionBusyError, SessionConflictError, SessionEngine
 from weavria.tools import ToolContext, ToolRegistry, TypedTool
 
@@ -100,6 +103,46 @@ class Reader:
                 )
             )
         return finish(goal)
+
+
+class RejectOnce:
+    capabilities = ModelCapabilities(True, True)
+
+    def __init__(self) -> None:
+        self.requests: list[SessionRequest] = []
+
+    async def generate_session(self, request: SessionRequest) -> ModelTurn:
+        self.requests.append(SessionRequest.model_validate_json(request.model_dump_json()))
+        if len(self.requests) == 1:
+            raise ModelOutputError(
+                "invalid JSON",
+                diagnostic=ModelOutputDiagnostic(code="invalid_json"),
+            )
+        return finish("recovered")
+
+
+async def test_session_persists_model_output_rejection_and_repair_request(tmp_path: Path) -> None:
+    model = RejectOnce()
+    async with SessionEngine(
+        tmp_path / "session.db", model=model, tools=ToolRegistry(())
+    ) as engine:
+        await engine.create("session")
+        result = await engine.send("session", "question", input_id="input")
+        events = await engine.store.events("session")
+
+    assert result.report.status is RunStatus.COMPLETED
+    assert result.report.output == "recovered"
+    assert len(model.requests) == 2
+    notice = model.requests[1].current.control
+    assert isinstance(notice, ModelOutputRepairNotice)
+    assert notice.failure_ordinal == 1 and notice.diagnostic.code == "invalid_json"
+    rejected = [
+        event.data.event.data
+        for event in events
+        if isinstance(event.data, SessionRunEvent)
+        and isinstance(event.data.event.data, ModelOutputRejected)
+    ]
+    assert len(rejected) == 1 and rejected[0].disposition == "retry"
 
 
 async def test_multiturn_reopens_and_reads_real_prior_sources_with_colliding_local_ids(

@@ -1,4 +1,5 @@
 import asyncio
+import json
 from typing import Literal
 
 import pytest
@@ -18,6 +19,7 @@ from weavria.tools import (
     TypedTool,
     artifact_read_tool,
 )
+from weavria.tools.artifact_read import ArtifactReadOutput
 
 
 class Input(BaseModel):
@@ -447,6 +449,93 @@ async def test_invalid_artifact_pointer_has_actionable_feedback_and_preserves_re
         max_duration=1,
     )
     assert valid.artifact and (await store.get("run", valid.artifact.artifact_id)).value
+
+
+async def test_structured_artifact_read_returns_a_resumable_page_instead_of_failing() -> None:
+    store = InMemoryArtifactStore()
+    source = await store.put(
+        "run",
+        "source",
+        {
+            "data": {
+                "historyPoints": [
+                    {"date": f"2026-10-{day:02d}", "summary": "上涨" * 120} for day in range(1, 13)
+                ]
+            }
+        },
+    )
+    executor = ToolExecutor("run", ToolRegistry((artifact_read_tool(),)), store, ReadOnlyPolicy())
+
+    first = await executor.execute(
+        action(
+            {
+                "artifact_id": source.reference.artifact_id,
+                "pointer": "/data/historyPoints",
+                "start": 0,
+                "length": 3000,
+            },
+            "read_artifact",
+            "page-1",
+        ),
+        max_duration=1,
+    )
+
+    assert first.artifact is not None
+    assert first.dependencies == ("source",)
+    first_value = ArtifactReadOutput.model_validate_json(
+        json.dumps((await store.get("run", first.artifact.artifact_id)).value)
+    )
+    assert first_value.value_kind == "array"
+    assert first_value.start == 0
+    assert 0 < first_value.end < first_value.total == 12
+    assert first_value.has_more is True
+    assert first_value.page_bytes <= 3000
+    assert first_value.items
+    assert all(item.pointer.startswith("/data/historyPoints/") for item in first_value.items)
+    assert all(item.included for item in first_value.items)
+
+    second = await executor.execute(
+        action(
+            {
+                "artifact_id": source.reference.artifact_id,
+                "pointer": "/data/historyPoints",
+                "start": first_value.end,
+                "length": 3000,
+            },
+            "read_artifact",
+            "page-2",
+        ),
+        max_duration=1,
+    )
+    assert second.artifact is not None
+    second_value = ArtifactReadOutput.model_validate_json(
+        json.dumps((await store.get("run", second.artifact.artifact_id)).value)
+    )
+    assert second_value.start == first_value.end
+
+
+async def test_structured_artifact_page_exposes_pointer_for_one_oversized_child() -> None:
+    store = InMemoryArtifactStore()
+    source = await store.put("run", "source", {"large": {"text": "x" * 5000}})
+    executor = ToolExecutor("run", ToolRegistry((artifact_read_tool(),)), store, ReadOnlyPolicy())
+
+    record = await executor.execute(
+        action(
+            {"artifact_id": source.reference.artifact_id, "length": 500},
+            "read_artifact",
+            "outline",
+        ),
+        max_duration=1,
+    )
+
+    assert record.artifact is not None
+    output = ArtifactReadOutput.model_validate_json(
+        json.dumps((await store.get("run", record.artifact.artifact_id)).value)
+    )
+    assert output.has_more is False and len(output.items) == 1
+    item = output.items[0]
+    assert item.pointer == "/large"
+    assert item.included is False and item.value is None
 
 
 @pytest.mark.parametrize("blocking", [False, True])
