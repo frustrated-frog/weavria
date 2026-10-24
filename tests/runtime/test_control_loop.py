@@ -242,6 +242,49 @@ class _ReadyProgressAssessor:
         )
 
 
+class _ReadyThenNeutralProgressAssessor(_ReadyProgressAssessor):
+    def __init__(self) -> None:
+        self._assessments = 0
+
+    async def assess_progress(
+        self,
+        *,
+        task: TaskInput,
+        records: tuple[ToolRecord, ...],
+        feedback: TurnFeedback,
+        remaining_model_calls: int,
+        remaining_tool_calls: int,
+    ) -> ProgressAssessment:
+        self._assessments += 1
+        ready = await super().assess_progress(
+            task=task,
+            records=records,
+            feedback=feedback,
+            remaining_model_calls=remaining_model_calls,
+            remaining_tool_calls=remaining_tool_calls,
+        )
+        if self._assessments == 1:
+            return ready
+        return ready.model_copy(
+            update={
+                "before_state_sha256": "b" * 64,
+                "after_state_sha256": "b" * 64,
+                "obligations": ObligationProgressSignal(
+                    observable_total=1,
+                    open_before=0,
+                    open_after=0,
+                ),
+                "coverage": EvidenceCoverageSignal(
+                    total_units=1,
+                    covered_before=1,
+                    covered_after=1,
+                ),
+                "quality": "neutral",
+                "material_progress": False,
+            }
+        )
+
+
 class _FailingProgressAssessor:
     async def assess_progress(
         self,
@@ -778,6 +821,37 @@ async def test_progress_assessment_is_persisted_projected_and_drives_resolution(
                 reduce_event(state, forged)
             break
         state = reduce_event(state, event)
+    replay(agent)
+
+
+async def test_ready_to_verify_blocks_more_tools_and_converges_to_finish() -> None:
+    provider = FakeControlProvider(
+        (
+            batch(call("read-1")),
+            batch(call("verification")),
+            batch(call("unnecessary")),
+            finish("grounded"),
+        )
+    )
+    agent = make_loop(provider, progress_assessor=_ReadyThenNeutralProgressAssessor())
+
+    result = await agent.execute()
+
+    assert result.status is RunStatus.COMPLETED
+    assert result.output == "grounded"
+    assert [
+        event.data.call_id for event in agent.events if isinstance(event.data, ToolStarted)
+    ] == [
+        "read-1",
+        "verification",
+    ]
+    decisions = [
+        event.data.decision
+        for event in agent.events
+        if isinstance(event.data, ActionInterventionChecked)
+    ]
+    assert decisions[-1].disposition == "reconsider"
+    assert decisions[-1].trigger == "completion_recommended"
     replay(agent)
 
 

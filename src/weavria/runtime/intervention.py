@@ -221,8 +221,10 @@ class ProgressActionInterventionPolicy:
     ``continue``, ``repair`` and ``replan`` describe how the model should choose its
     next proposal. For those objectives the policy groups prior settled turns by the
     normalized tool-family multiset and accepted open obligations, then estimates
-    gain rates and regression risk after a cold-start period. ``verify``
-    remains advisory; ``blocked / stop`` remains an immediate hard contradiction.
+    gain rates and regression risk after a cold-start period. ``verify`` rejects
+    one productive transition into verification, then rejects further effects
+    once the accepted assessment is stagnant; ``blocked / stop`` remains an
+    immediate hard contradiction.
     """
 
     def __init__(
@@ -258,7 +260,7 @@ class ProgressActionInterventionPolicy:
     @property
     def version(self) -> str:
         return (
-            "progress-action-intervention/3["
+            "progress-action-intervention/4["
             f"min_observations={self._minimum_observations};"
             f"min_expected_yield={self._minimum_yield:g};"
             f"max_pessimistic_regression={self._maximum_regression:g};"
@@ -275,9 +277,15 @@ class ProgressActionInterventionPolicy:
             )
         recommendation = assessment.continuation.recommended_action
         if recommendation == "verify":
+            if assessment.material_progress:
+                return InterventionDecision(
+                    disposition="allow",
+                    trigger="verification_advisory",
+                    reason_codes=assessment.continuation.reason_codes,
+                )
             return InterventionDecision(
-                disposition="allow",
-                trigger="verification_advisory",
+                disposition="reconsider",
+                trigger="completion_recommended",
                 reason_codes=assessment.continuation.reason_codes,
             )
         if recommendation == "stop":

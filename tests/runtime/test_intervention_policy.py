@@ -51,7 +51,7 @@ def _context() -> ActionInterventionContext:
 
 def _assessment(
     quality: Literal["positive", "neutral", "regressed"],
-    recommendation: Literal["continue", "repair", "replan"],
+    recommendation: Literal["continue", "repair", "replan", "verify"],
 ) -> ProgressAssessment:
     return ProgressAssessment(
         task_revision=1,
@@ -89,7 +89,13 @@ def _assessment(
             remaining_tool_calls=4,
         ),
         continuation=ContinuationSignal(
-            feasibility="viable" if recommendation == "continue" else "constrained",
+            feasibility=(
+                "ready"
+                if recommendation == "verify"
+                else "viable"
+                if recommendation == "continue"
+                else "constrained"
+            ),
             recommended_action=recommendation,
             reason_codes=("test_recommendation",),
         ),
@@ -191,6 +197,65 @@ async def test_bayesian_action_value_keeps_cold_start_then_rejects_low_yield() -
     assert decision.value_estimate.observations == 8
     assert all(item.upper < 0.25 for item in decision.value_estimate.gain_estimates)
     assert decision.value_estimate.expected_progress_per_call < 0.25
+
+
+async def test_verify_recommendation_rejects_further_tool_effects() -> None:
+    context = _context()
+    assessment = _assessment("neutral", "verify").model_copy(
+        update={
+            "obligations": ObligationProgressSignal(
+                observable_total=1,
+                open_before=0,
+                open_after=0,
+            ),
+            "coverage": EvidenceCoverageSignal(
+                total_units=1,
+                covered_before=1,
+                covered_after=1,
+            ),
+        }
+    )
+
+    decision = await ProgressActionInterventionPolicy().evaluate(
+        ActionInterventionContext(
+            task=context.task,
+            proposal=context.proposal,
+            progress_assessment=assessment,
+            remaining_model_calls=2,
+            remaining_tool_calls=3,
+        )
+    )
+
+    assert decision.disposition == "reconsider"
+    assert decision.trigger == "completion_recommended"
+    assert decision.reason_codes == ("test_recommendation",)
+
+
+async def test_productive_transition_to_verify_keeps_one_advisory_step() -> None:
+    context = _context()
+    assessment = _assessment("positive", "verify").model_copy(
+        update={
+            "obligations": ObligationProgressSignal(
+                observable_total=1,
+                open_before=1,
+                open_after=0,
+                newly_satisfied_ids=("obligation-a",),
+            )
+        }
+    )
+
+    decision = await ProgressActionInterventionPolicy().evaluate(
+        ActionInterventionContext(
+            task=context.task,
+            proposal=context.proposal,
+            progress_assessment=assessment,
+            remaining_model_calls=2,
+            remaining_tool_calls=3,
+        )
+    )
+
+    assert decision.disposition == "allow"
+    assert decision.trigger == "verification_advisory"
 
 
 async def test_action_value_separates_productive_yield_from_regression_risk() -> None:
