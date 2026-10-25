@@ -903,21 +903,25 @@ async def test_frame_revision_preserves_need_identity_and_rejects_stale_patch() 
         cause="steering",
     )
 
-    assert first.record.frame.schema_version == 5
-    assert first.observation.payload_schema == "weavria.task-frame/5"
-    legacy_v4_payload: dict[str, JsonValue] = first.record.frame.model_dump(mode="json")
+    assert first.record.frame.schema_version == 6
+    assert first.observation.payload_schema == "weavria.task-frame/6"
+    legacy_v5_payload: dict[str, JsonValue] = first.record.frame.model_dump(mode="json")
+    legacy_v5_payload["schema_version"] = 5
+    legacy_v5_payload.pop("requirement_coverage")
+    assert load_task_frame(legacy_v5_payload).schema_version == 6
+    legacy_v4_payload: dict[str, JsonValue] = dict(legacy_v5_payload)
     legacy_v4_payload["schema_version"] = 4
     legacy_v4_payload.pop("intent_decision")
     legacy_v4_payload.pop("decision_uncertainty")
-    assert load_task_frame(legacy_v4_payload).schema_version == 5
+    assert load_task_frame(legacy_v4_payload).schema_version == 6
     legacy_v3_payload: dict[str, JsonValue] = dict(legacy_v4_payload)
     legacy_v3_payload["schema_version"] = 3
     legacy_v3_payload.pop("intent_belief")
-    assert load_task_frame(legacy_v3_payload).schema_version == 5
+    assert load_task_frame(legacy_v3_payload).schema_version == 6
     legacy_v2_payload: dict[str, JsonValue] = dict(legacy_v3_payload)
     legacy_v2_payload["schema_version"] = 2
     legacy_v2_payload.pop("clarification_decision")
-    assert load_task_frame(legacy_v2_payload).schema_version == 5
+    assert load_task_frame(legacy_v2_payload).schema_version == 6
     assert second.record.frame.revision == 2
     assert second.record.frame.capability_epoch == first.record.frame.capability_epoch
     assert second.record.frame.requirements[0].need_id == first.record.frame.requirements[0].need_id
@@ -926,19 +930,23 @@ async def test_frame_revision_preserves_need_identity_and_rejects_stale_patch() 
         == first.record.frame.requirements[0].origin_ref
     )
     assert second.patch is not None and second.patch.cause == "steering"
-    legacy_v4_patch: dict[str, JsonValue] = second.patch.model_dump(mode="json")
+    legacy_v5_patch: dict[str, JsonValue] = second.patch.model_dump(mode="json")
+    legacy_v5_patch["schema_version"] = 5
+    legacy_v5_patch.pop("requirement_coverage")
+    assert load_task_frame_patch(legacy_v5_patch).schema_version == 6
+    legacy_v4_patch: dict[str, JsonValue] = dict(legacy_v5_patch)
     legacy_v4_patch["schema_version"] = 4
     legacy_v4_patch.pop("intent_decision")
     legacy_v4_patch.pop("decision_uncertainty")
-    assert load_task_frame_patch(legacy_v4_patch).schema_version == 5
+    assert load_task_frame_patch(legacy_v4_patch).schema_version == 6
     legacy_v3_patch: dict[str, JsonValue] = dict(legacy_v4_patch)
     legacy_v3_patch["schema_version"] = 3
     legacy_v3_patch.pop("intent_belief")
-    assert load_task_frame_patch(legacy_v3_patch).schema_version == 5
+    assert load_task_frame_patch(legacy_v3_patch).schema_version == 6
     legacy_v2_patch: dict[str, JsonValue] = dict(legacy_v3_patch)
     legacy_v2_patch["schema_version"] = 2
     legacy_v2_patch.pop("clarification_decision")
-    assert load_task_frame_patch(legacy_v2_patch).schema_version == 5
+    assert load_task_frame_patch(legacy_v2_patch).schema_version == 6
     assert (
         apply_frame_patch(first.record.frame, second.patch, second.record.frame)
         == second.record.frame

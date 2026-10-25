@@ -4,7 +4,10 @@ import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal, cast
 from urllib.parse import urlsplit
+
+UnderstandingReasoningEffort = Literal["none", "low", "medium", "high", "max"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -16,9 +19,12 @@ class FinScopeSettings:
     allowed_parent_origin: str = "http://localhost:5173"
     state_path: Path = Path(".weavria/finscope-sessions.sqlite3")
     model_timeout_seconds: float = 60.0
+    understanding_max_duration_seconds: float = 180.0
     request_timeout_seconds: float = 15.0
     json_mode: bool = False
     model_max_output_tokens: int = 4096
+    understanding_model_max_output_tokens: int = 8192
+    understanding_reasoning_effort: UnderstandingReasoningEffort | None = None
     context_window_tokens: int = 32_768
     context_encoding: str = "cl100k_base"
     run_max_model_calls: int = 20
@@ -34,11 +40,27 @@ class FinScopeSettings:
             raise ValueError("model_name is required")
         if not self.context_encoding.strip():
             raise ValueError("context_encoding is required")
+        if self.understanding_reasoning_effort not in {
+            None,
+            "none",
+            "low",
+            "medium",
+            "high",
+            "max",
+        }:
+            raise ValueError("understanding reasoning effort is unsupported")
         if (
             type(self.model_max_output_tokens) is not int
+            or type(self.understanding_model_max_output_tokens) is not int
             or type(self.context_window_tokens) is not int
             or self.model_max_output_tokens <= 0
-            or self.context_window_tokens <= self.model_max_output_tokens + 256
+            or self.understanding_model_max_output_tokens <= 0
+            or self.context_window_tokens
+            <= max(
+                self.model_max_output_tokens,
+                self.understanding_model_max_output_tokens,
+            )
+            + 256
         ):
             raise ValueError("context window must leave room beyond output and safety reserves")
         if any(
@@ -52,9 +74,11 @@ class FinScopeSettings:
             raise ValueError("run counter and request limits must be positive integers")
         if (
             not math.isfinite(self.model_timeout_seconds)
+            or not math.isfinite(self.understanding_max_duration_seconds)
             or not math.isfinite(self.request_timeout_seconds)
             or not math.isfinite(self.run_max_duration_seconds)
             or self.model_timeout_seconds <= 0
+            or self.understanding_max_duration_seconds <= 0
             or self.request_timeout_seconds <= 0
             or self.run_max_duration_seconds <= 0
         ):
@@ -74,10 +98,19 @@ class FinScopeSettings:
                 os.environ.get("WEAVRIA_STATE_PATH", ".weavria/finscope-sessions.sqlite3")
             ),
             model_timeout_seconds=float(os.environ.get("WEAVRIA_MODEL_TIMEOUT_SECONDS", "60")),
+            understanding_max_duration_seconds=float(
+                os.environ.get("WEAVRIA_UNDERSTANDING_MAX_DURATION_SECONDS", "180")
+            ),
             request_timeout_seconds=float(os.environ.get("WEAVRIA_FINSCOPE_TIMEOUT_SECONDS", "15")),
             json_mode=os.environ.get("WEAVRIA_MODEL_JSON_MODE", "false").lower()
             in {"1", "true", "yes"},
             model_max_output_tokens=int(os.environ.get("WEAVRIA_MODEL_MAX_OUTPUT_TOKENS", "4096")),
+            understanding_model_max_output_tokens=int(
+                os.environ.get("WEAVRIA_UNDERSTANDING_MAX_OUTPUT_TOKENS", "8192")
+            ),
+            understanding_reasoning_effort=_reasoning_effort_from_env(
+                "WEAVRIA_UNDERSTANDING_REASONING_EFFORT"
+            ),
             context_window_tokens=int(os.environ.get("WEAVRIA_CONTEXT_WINDOW_TOKENS", "32768")),
             context_encoding=os.environ.get("WEAVRIA_CONTEXT_ENCODING", "cl100k_base").strip(),
             run_max_model_calls=int(os.environ.get("WEAVRIA_RUN_MAX_MODEL_CALLS", "20")),
@@ -94,6 +127,15 @@ def _required(name: str) -> str:
     if not value:
         raise ValueError(f"{name} is required")
     return value
+
+
+def _reasoning_effort_from_env(name: str) -> UnderstandingReasoningEffort | None:
+    value = os.environ.get(name, "").strip().lower()
+    if not value:
+        return None
+    if value not in {"none", "low", "medium", "high", "max"}:
+        raise ValueError(f"{name} is unsupported")
+    return cast(UnderstandingReasoningEffort, value)
 
 
 def _validate_http_url(name: str, value: str, *, origin_only: bool = False) -> None:

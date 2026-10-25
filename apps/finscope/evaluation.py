@@ -10,6 +10,9 @@ from weavria.harness import (
     CapabilityNeed,
     CompletionCriterion,
     InformationNeed,
+    ObligationCoverage,
+    RequirementCoverageAssessment,
+    SemanticObligation,
     TaskSpecification,
 )
 
@@ -84,24 +87,28 @@ def weekly_summary_specification() -> TaskSpecification:
                 source="external",
                 freshness="current",
                 required_fields=("/data/regime",),
+                capability_names=("read_market_pulse",),
             ),
             InformationNeed(
                 description="Recent market regimes for the week",
                 source="external",
                 freshness="current",
                 required_fields=("/data/recentRegimes",),
+                capability_names=("read_market_pulse",),
             ),
             InformationNeed(
                 description="Current market breadth",
                 source="external",
                 freshness="current",
                 required_fields=("/data/breadth",),
+                capability_names=("read_market_pulse",),
             ),
             InformationNeed(
                 description="Daily review supporting the weekly summary",
                 source="external",
                 freshness="current",
                 required_fields=("/data/dailyReview",),
+                capability_names=("read_market_pulse",),
             ),
         ),
         capability_needs=(
@@ -118,6 +125,86 @@ def weekly_summary_specification() -> TaskSpecification:
                 capability="read_market_pulse",
             ),
             CompletionCriterion(kind="response", description="Deliver the weekly summary"),
+        ),
+    )
+
+
+def broad_weekly_summary_specification() -> TaskSpecification:
+    """Return a legal but semantically weak candidate for repair-path diagnostics."""
+    return TaskSpecification(
+        route="execute",
+        intent="Summarize the weekly market snapshot",
+        goal="Summarize this week's market conditions",
+        information_needs=(
+            InformationNeed(
+                description="The weekly market snapshot",
+                source="external",
+                freshness="current",
+                required_fields=("/data",),
+                capability_names=("read_market_pulse",),
+            ),
+        ),
+        capability_needs=(
+            CapabilityNeed(
+                name="read_market_pulse",
+                purpose="Read the authoritative market snapshot",
+                necessity="required",
+            ),
+        ),
+        completion_criteria=(
+            CompletionCriterion(
+                kind="capability_result",
+                description="Read the market snapshot",
+                capability="read_market_pulse",
+            ),
+            CompletionCriterion(kind="response", description="Deliver the weekly summary"),
+        ),
+    )
+
+
+def weekly_summary_coverage_assessment() -> RequirementCoverageAssessment:
+    """Return the frozen independent obligation map for the deterministic baseline."""
+    obligation_data = (
+        ("market_regime", "Summarize the market regime", "market.regime"),
+        ("regime_history", "Summarize the weekly regime history", "market.regime_history"),
+        ("market_breadth", "Summarize market breadth", "market.breadth"),
+        ("daily_review", "Use the daily review conclusion", "market.daily_review"),
+    )
+    return RequirementCoverageAssessment(
+        obligations=(
+            *(
+                SemanticObligation(
+                    obligation_id=identity,
+                    description=description,
+                    kind="information",
+                    origin="task_goal",
+                )
+                for identity, description, _surface in obligation_data
+            ),
+            SemanticObligation(
+                obligation_id="weekly_answer",
+                description="Deliver the weekly market summary",
+                kind="deliverable",
+                origin="task_goal",
+            ),
+        ),
+        findings=(
+            *(
+                ObligationCoverage(
+                    obligation_id=identity,
+                    status="covered",
+                    information_need_indices=(index,),
+                    evidence_surface_ids=(surface,),
+                    reason_code="covered_by_need",
+                )
+                for index, (identity, _description, surface) in enumerate(obligation_data)
+            ),
+            ObligationCoverage(
+                obligation_id="weekly_answer",
+                status="covered",
+                completion_criterion_indices=(1,),
+                reason_code="covered_by_completion",
+            ),
         ),
     )
 

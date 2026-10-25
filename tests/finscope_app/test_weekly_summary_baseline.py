@@ -15,6 +15,7 @@ from apps.finscope.evaluation import (
     grade_weekly_answer,
     load_weekly_summary_case,
     unrelated_direct_specification,
+    weekly_summary_coverage_assessment,
     weekly_summary_specification,
 )
 from apps.finscope.market import MarketPulseClient
@@ -65,6 +66,8 @@ class _ScenarioInterpreter:
 
     async def generate(self, request: ModelRequest) -> ModelResponse:
         self.requests.append(ModelRequest.model_validate_json(request.model_dump_json()))
+        if "declare_requirement_coverage" in request.instructions:
+            return _weekly_coverage_declaration()
         specification = (
             weekly_summary_specification()
             if request.task.goal == self._prompt
@@ -78,6 +81,16 @@ class _ScenarioInterpreter:
                 arguments=specification.model_dump(mode="json"),
             )
         )
+
+
+def _weekly_coverage_declaration() -> ModelResponse:
+    return ModelResponse(
+        action=ToolCallAction(
+            call_id="coverage-weekly",
+            tool_name="declare_requirement_coverage",
+            arguments=weekly_summary_coverage_assessment().model_dump(mode="json"),
+        )
+    )
 
 
 class _EvidenceAwareScenarioModel:
@@ -270,6 +283,9 @@ async def test_weekly_summary_closes_every_observable_layer(
 
     frame = load_task_frame(semantic[-1].observation.payload)
     ledger = load_need_ledger(semantic[-1].need_ledger)
+    assert frame.requirement_coverage is not None
+    assert frame.requirement_coverage.verdict == "sufficient"
+    assert frame.requirement_coverage.repair_count == 0
     assert {
         field for need in frame.requirements for field in need.required_fields
     } == WEEKLY_SUMMARY_REQUIRED_FIELDS

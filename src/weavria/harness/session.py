@@ -82,7 +82,7 @@ class TaskAwareSessionPreparer:
     @property
     def version(self) -> str:
         return (
-            "task-aware-session/5["
+            "task-aware-session/6["
             f"{self._understanding.version};{self._evidence.version};"
             f"{self._capabilities.version};{self._clarification.version}]"
         )
@@ -221,7 +221,7 @@ class TaskAwareSessionPreparer:
                 task_revision=context.task.revision,
                 frame_revision=frame.revision,
                 producer_version=frame.interpreter_version,
-                payload_schema="weavria.task-frame/5",
+                payload_schema="weavria.task-frame/6",
                 payload=frame.model_dump(mode="json"),
             )
         if base is not None:
@@ -349,7 +349,7 @@ class TaskAwareSessionPreparer:
             task_revision=context.task.revision,
             frame_revision=frame.revision,
             producer_version=frame.interpreter_version,
-            payload_schema="weavria.task-frame/5",
+            payload_schema="weavria.task-frame/6",
             payload=frame.model_dump(mode="json"),
         )
         return SessionTaskPreparation(
@@ -460,6 +460,6 @@ class TaskFrameSemanticReducer:
             task_revision=target.request_anchor.task_revision,
             frame_revision=target.revision,
             producer_version=target.interpreter_version,
-            payload_schema="weavria.task-frame/5",
+            payload_schema="weavria.task-frame/6",
             payload=target.model_dump(mode="json"),
         )

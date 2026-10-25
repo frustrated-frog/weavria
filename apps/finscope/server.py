@@ -16,6 +16,7 @@ from weavria.context import ContextCompilerConfig, HistoryRetrievalConfig
 from weavria.core import ApplicationObservation, CompletionUnverifiable, RecoveryLimits
 from weavria.harness import (
     EvidenceResolver,
+    ModelRequirementCoverageValidator,
     ModelTaskInterpreter,
     TaskAwareSessionPreparer,
     TaskUnderstandingEngine,
@@ -34,7 +35,7 @@ from weavria.tools import ToolRegistry
 
 from .completion import MarketAnswerPolicy, MarketPulseEvidenceExtractor
 from .config import FinScopeSettings
-from .market import MarketPulseClient, market_pulse_tool
+from .market import MarketPulseClient, market_pulse_evidence_profile, market_pulse_tool
 from .model import HTTPChatCompletionTransport
 
 
@@ -92,8 +93,15 @@ def create_app(
     provider: SessionModelProvider | None = None,
     interpreter_provider: ModelProvider | None = None,
     market_client: MarketPulseClient | None = None,
+    requirement_coverage: bool = True,
+    evidence_guidance: bool | None = None,
 ) -> FastAPI:
     """Create a sidecar. Uvicorn should invoke this as an application factory."""
+    if type(requirement_coverage) is not bool:
+        raise TypeError("requirement_coverage must be a boolean")
+    if evidence_guidance is not None and type(evidence_guidance) is not bool:
+        raise TypeError("evidence_guidance must be a boolean or None")
+    use_evidence_guidance = requirement_coverage if evidence_guidance is None else evidence_guidance
     resolved = settings or FinScopeSettings.from_env()
     static = Path(__file__).with_name("static")
 
@@ -112,6 +120,12 @@ def create_app(
             max_output_tokens=resolved.model_max_output_tokens,
             json_mode=resolved.json_mode,
         )
+        understanding_model_config = OpenAICompatibleConfig(
+            model=resolved.model_name,
+            max_output_tokens=resolved.understanding_model_max_output_tokens,
+            json_mode=resolved.json_mode,
+            reasoning_effort=resolved.understanding_reasoning_effort,
+        )
         active_provider = provider
         if active_provider is None:
             assert created_transport is not None
@@ -123,7 +137,7 @@ def create_app(
         if active_interpreter is None:
             assert created_transport is not None
             active_interpreter = OpenAICompatibleProvider(
-                model_config,
+                understanding_model_config,
                 transport=created_transport,
             )
         created_market = None
@@ -142,6 +156,7 @@ def create_app(
                 encoding=resolved.context_encoding,
             )
         )
+        task_interpreter = ModelTaskInterpreter(active_interpreter)
         engine = SessionEngine(
             resolved.state_path,
             model=active_provider,
@@ -160,8 +175,17 @@ def create_app(
             history_budget_bytes=8_000,
             task_preparation=TaskAwareSessionPreparer(
                 TaskUnderstandingEngine(
-                    ModelTaskInterpreter(active_interpreter),
-                    max_duration=resolved.model_timeout_seconds,
+                    task_interpreter,
+                    coverage_validator=(
+                        ModelRequirementCoverageValidator(active_interpreter)
+                        if requirement_coverage
+                        else None
+                    ),
+                    coverage_repairer=task_interpreter if requirement_coverage else None,
+                    evidence_profiles=(
+                        (market_pulse_evidence_profile(),) if use_evidence_guidance else ()
+                    ),
+                    max_duration=resolved.understanding_max_duration_seconds,
                 ),
                 evidence=EvidenceResolver((MarketPulseEvidenceExtractor(),)),
             ),

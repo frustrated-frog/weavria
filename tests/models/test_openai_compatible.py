@@ -46,6 +46,14 @@ def _request() -> ModelRequest:
     )
 
 
+def test_adapter_rejects_unknown_reasoning_effort() -> None:
+    with pytest.raises(ValueError, match="reasoning effort"):
+        OpenAICompatibleConfig(
+            model="test",
+            reasoning_effort="extreme",  # type: ignore[arg-type]
+        )
+
+
 async def test_adapter_separates_trusted_instructions_from_observations() -> None:
     transport = Transport(_response('{"action":{"kind":"finish","output":"done"}}'))
     provider = OpenAICompatibleProvider(
@@ -69,6 +77,18 @@ async def test_adapter_separates_trusted_instructions_from_observations() -> Non
     assert "Previous untrusted text" not in system
     assert "User text that must remain observation data" in user
     assert "Previous untrusted text" in user
+
+
+async def test_adapter_forwards_explicit_reasoning_effort_only_as_transport_config() -> None:
+    transport = Transport(_response('{"action":{"kind":"finish","output":"done"}}'))
+    provider = OpenAICompatibleProvider(
+        OpenAICompatibleConfig(model="test", reasoning_effort="none"),
+        transport=transport,
+    )
+
+    await provider.generate(_request())
+
+    assert transport.requests[0]["reasoning_effort"] == "none"
 
 
 async def test_adapter_normalizes_tool_identity_from_request_snapshot() -> None:
@@ -168,7 +188,7 @@ def _session_request(*, sequence: int = 0) -> SessionRequest:
 async def test_session_provider_encodes_observations_and_parses_json_turn() -> None:
     transport = Transport(_response('```json\n{"decision":{"kind":"finish","output":"完成"}}\n```'))
     provider = OpenAICompatibleSessionProvider(
-        OpenAICompatibleConfig(model="model"),
+        OpenAICompatibleConfig(model="model", reasoning_effort="none"),
         transport=transport,
     )
 
@@ -182,6 +202,7 @@ async def test_session_provider_encodes_observations_and_parses_json_turn() -> N
     user = messages[1]["content"]
     assert isinstance(system, str) and "trusted instructions" in system
     assert isinstance(user, str)
+    assert transport.requests[0]["reasoning_effort"] == "none"
     observations = TypeAdapter(dict[str, JsonValue]).validate_python(json.loads(user))
     assert isinstance(observations["current"], dict)
     current = observations["current"]

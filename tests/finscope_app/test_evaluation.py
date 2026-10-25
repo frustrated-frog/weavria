@@ -2,7 +2,11 @@ from pathlib import Path
 
 import pytest
 
-from apps.finscope.evaluation import grade_weekly_answer, load_weekly_summary_case
+from apps.finscope.evaluation import (
+    broad_weekly_summary_specification,
+    grade_weekly_answer,
+    load_weekly_summary_case,
+)
 
 
 def _fixture(version: int) -> Path:
@@ -21,3 +25,11 @@ def test_weekly_summary_v2_grades_quality_fields_without_punctuation_overfit() -
 def test_weekly_summary_loader_rejects_a_different_frozen_version() -> None:
     with pytest.raises(ValueError, match="dataset digest changed"):
         load_weekly_summary_case(_fixture(1))
+
+
+def test_broad_weekly_specification_is_legal_but_not_the_frozen_target() -> None:
+    specification = broad_weekly_summary_specification()
+
+    assert specification.route == "execute"
+    assert specification.information_needs[0].required_fields == ("/data",)
+    assert len(specification.information_needs) == 1

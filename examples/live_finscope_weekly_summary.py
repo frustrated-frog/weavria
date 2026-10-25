@@ -18,10 +18,12 @@ from apps.finscope.config import FinScopeSettings
 from apps.finscope.evaluation import (
     FROZEN_WEEKLY_SUMMARY_V2_SHA256,
     WEEKLY_SUMMARY_REQUIRED_FIELDS,
+    broad_weekly_summary_specification,
     expanded_market_data,
     grade_weekly_answer,
     load_weekly_summary_case,
     unrelated_direct_specification,
+    weekly_summary_coverage_assessment,
     weekly_summary_specification,
 )
 from apps.finscope.market import MarketPulseClient
@@ -54,13 +56,17 @@ from weavria.models import (
 from weavria.sessions import SQLiteSessionStore
 
 _MODEL_TIMEOUT_SECONDS = 60.0
+_UNDERSTANDING_MAX_DURATION_SECONDS = 180.0
 _MODEL_MAX_OUTPUT_TOKENS = 4_096
+_UNDERSTANDING_MODEL_MAX_OUTPUT_TOKENS = 8_192
+_UNDERSTANDING_REASONING_EFFORT: Literal["none"] = "none"
 _CONTEXT_WINDOW_TOKENS = 32_768
 _MAX_MODEL_CALLS = 20
 _MAX_TOOL_CALLS = 20
 _MAX_REQUEST_BYTES = 64_000
 _MAX_DURATION_SECONDS = 180.0
-UnderstandingMode = Literal["fixed", "live"]
+UnderstandingMode = Literal["fixed", "live", "forced-broad"]
+CoverageMode = Literal["off", "profile", "model"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,6 +153,14 @@ class FixedWeeklyInterpreter:
 
     async def generate(self, request: ModelRequest) -> ModelResponse:
         self.calls += 1
+        if "declare_requirement_coverage" in request.instructions:
+            return ModelResponse(
+                action=ToolCallAction(
+                    call_id=f"fixed-coverage-{self.calls}",
+                    tool_name="declare_requirement_coverage",
+                    arguments=weekly_summary_coverage_assessment().model_dump(mode="json"),
+                )
+            )
         specification = (
             weekly_summary_specification()
             if request.task.goal == self._prompt
@@ -159,6 +173,30 @@ class FixedWeeklyInterpreter:
                 arguments=specification.model_dump(mode="json"),
             )
         )
+
+
+class ForcedBroadPlanningProvider:
+    """Inject one weak initial plan, then delegate audit and repair to a live model."""
+
+    capabilities = ModelCapabilities(tool_calls=True)
+
+    def __init__(self, delegate: ModelProvider) -> None:
+        self._delegate = delegate
+        self._injected = False
+
+    async def generate(self, request: ModelRequest) -> ModelResponse:
+        is_specification = "declare_task_specification" in request.instructions
+        is_repair = "single semantic repair attempt" in request.instructions
+        if is_specification and not is_repair and not self._injected:
+            self._injected = True
+            return ModelResponse(
+                action=ToolCallAction(
+                    call_id="forced-broad-plan",
+                    tool_name="declare_task_specification",
+                    arguments=broad_weekly_summary_specification().model_dump(mode="json"),
+                )
+            )
+        return await self._delegate.generate(request)
 
 
 def usage_from_payload(payload: object) -> TokenUsage:
@@ -322,8 +360,14 @@ def _semantic_metrics(events: tuple[SessionEvent, ...], run_id: str | None) -> d
             "route": None,
             "required_fields": [],
             "required_field_coverage": 0.0,
+            "required_field_precision": 0.0,
+            "required_field_exact": False,
+            "unexpected_required_fields": [],
             "requirements": [],
             "need_statuses": {},
+            "coverage_verdict": None,
+            "coverage_repair_count": None,
+            "coverage_obligations": [],
         }
     frame = load_task_frame(snapshots[-1].observation.payload)
     ledger = load_need_ledger(snapshots[-1].need_ledger)
@@ -331,11 +375,16 @@ def _semantic_metrics(events: tuple[SessionEvent, ...], run_id: str | None) -> d
         {field for requirement in frame.requirements for field in requirement.required_fields}
     )
     matched = len(set(fields) & WEEKLY_SUMMARY_REQUIRED_FIELDS)
+    unexpected = sorted(set(fields) - WEEKLY_SUMMARY_REQUIRED_FIELDS)
     statuses = Counter(state.status.value for state in ledger.states)
+    coverage = frame.requirement_coverage
     return {
         "route": frame.specification.route,
         "required_fields": fields,
         "required_field_coverage": matched / len(WEEKLY_SUMMARY_REQUIRED_FIELDS),
+        "required_field_precision": matched / len(fields) if fields else 0.0,
+        "required_field_exact": set(fields) == set(WEEKLY_SUMMARY_REQUIRED_FIELDS),
+        "unexpected_required_fields": unexpected,
         "requirements": [
             {
                 "description": requirement.description,
@@ -348,11 +397,34 @@ def _semantic_metrics(events: tuple[SessionEvent, ...], run_id: str | None) -> d
             for requirement in frame.requirements
         ],
         "need_statuses": dict(sorted(statuses.items())),
+        "coverage_verdict": coverage.verdict if coverage is not None else None,
+        "coverage_repair_count": coverage.repair_count if coverage is not None else None,
+        "coverage_obligations": (
+            [
+                {
+                    "obligation_id": obligation.obligation_id,
+                    "description": obligation.description,
+                    "kind": obligation.kind,
+                    "required": obligation.required,
+                    "status": next(
+                        item.status
+                        for item in coverage.findings
+                        if item.obligation_id == obligation.obligation_id
+                    ),
+                }
+                for obligation in coverage.obligations
+            ]
+            if coverage is not None
+            else []
+        ),
     }
 
 
 async def evaluate(
-    *, history_turns: Literal[0, 8], understanding: UnderstandingMode
+    *,
+    history_turns: Literal[0, 8],
+    understanding: UnderstandingMode,
+    coverage: CoverageMode,
 ) -> dict[str, object]:
     repository = Path(__file__).parents[1]
     fixture = repository / "tests" / "fixtures" / "finscope_weekly_summary_v2.json"
@@ -375,13 +447,26 @@ async def evaluate(
         max_output_tokens=_MODEL_MAX_OUTPUT_TOKENS,
         json_mode=json_mode,
     )
+    understanding_model_config = OpenAICompatibleConfig(
+        model=model_name,
+        temperature=0.0,
+        max_output_tokens=_UNDERSTANDING_MODEL_MAX_OUTPUT_TOKENS,
+        json_mode=json_mode,
+        reasoning_effort=_UNDERSTANDING_REASONING_EFFORT,
+    )
     understanding_transport = RecordingHTTPTransport(
         base_url, api_key, timeout_seconds=timeout_seconds
     )
     execution_transport = RecordingHTTPTransport(base_url, api_key, timeout_seconds=timeout_seconds)
+    live_understanding_provider = OpenAICompatibleProvider(
+        understanding_model_config,
+        transport=understanding_transport,
+    )
     understanding_provider: ModelProvider = (
-        OpenAICompatibleProvider(model_config, transport=understanding_transport)
+        live_understanding_provider
         if understanding == "live"
+        else ForcedBroadPlanningProvider(live_understanding_provider)
+        if understanding == "forced-broad"
         else FixedWeeklyInterpreter(case.prompt)
     )
     execution_provider = OpenAICompatibleSessionProvider(
@@ -400,6 +485,7 @@ async def evaluate(
     events: tuple[SessionEvent, ...] = ()
     response_status: int | None = None
     harness_error_type: str | None = None
+    harness_error_message: str | None = None
     started = time.perf_counter()
     try:
         with tempfile.TemporaryDirectory(prefix="weavria-finscope-live-") as directory:
@@ -410,9 +496,12 @@ async def evaluate(
                 finscope_base_url="http://finscope.test",
                 state_path=Path(directory) / "session.sqlite3",
                 model_timeout_seconds=timeout_seconds,
+                understanding_max_duration_seconds=_UNDERSTANDING_MAX_DURATION_SECONDS,
                 request_timeout_seconds=15.0,
                 json_mode=json_mode,
                 model_max_output_tokens=_MODEL_MAX_OUTPUT_TOKENS,
+                understanding_model_max_output_tokens=(_UNDERSTANDING_MODEL_MAX_OUTPUT_TOKENS),
+                understanding_reasoning_effort=_UNDERSTANDING_REASONING_EFFORT,
                 context_window_tokens=_CONTEXT_WINDOW_TOKENS,
                 context_encoding="cl100k_base",
                 run_max_model_calls=_MAX_MODEL_CALLS,
@@ -425,6 +514,8 @@ async def evaluate(
                 provider=execution_provider,
                 interpreter_provider=understanding_provider,
                 market_client=MarketPulseClient("http://finscope.test", client=market_http),
+                requirement_coverage=coverage == "model",
+                evidence_guidance=coverage != "off",
             )
             async with app.router.lifespan_context(app):
                 async with httpx.AsyncClient(
@@ -456,6 +547,13 @@ async def evaluate(
                     response.raise_for_status()
                     payload = MessageOutput.model_validate(response.json())
                     events = await _events(app.state.runtime.engine.store, created.session_id)
+    except httpx.HTTPStatusError as exc:
+        harness_error_type = type(exc).__name__
+        try:
+            detail = exc.response.json().get("detail")
+            harness_error_message = detail if isinstance(detail, str) else None
+        except ValueError:
+            harness_error_message = None
     except Exception as exc:
         harness_error_type = type(exc).__name__
     finally:
@@ -468,22 +566,26 @@ async def evaluate(
     return {
         "schema_version": 1,
         "dataset_version": "finscope-weekly-summary/2",
-        "evaluator_version": "finscope-weekly-live/3",
+        "evaluator_version": "finscope-weekly-live/5",
         "dataset_sha256": FROZEN_WEEKLY_SUMMARY_V2_SHA256,
         "model": model_name,
         "configuration": {
             "temperature": 0.0,
             "json_mode": json_mode,
             "max_output_tokens": _MODEL_MAX_OUTPUT_TOKENS,
+            "understanding_max_output_tokens": (_UNDERSTANDING_MODEL_MAX_OUTPUT_TOKENS),
+            "understanding_reasoning_effort": _UNDERSTANDING_REASONING_EFFORT,
             "context_window_tokens": _CONTEXT_WINDOW_TOKENS,
             "context_encoding": "cl100k_base",
             "model_timeout_seconds": timeout_seconds,
+            "understanding_max_duration_seconds": _UNDERSTANDING_MAX_DURATION_SECONDS,
             "max_model_calls": _MAX_MODEL_CALLS,
             "max_tool_calls": _MAX_TOOL_CALLS,
             "max_request_bytes": _MAX_REQUEST_BYTES,
             "max_duration_seconds": _MAX_DURATION_SECONDS,
             "history_turns": history_turns,
             "understanding": understanding,
+            "requirement_coverage": coverage,
         },
         "response_status": response_status,
         "execution_status": payload.status if payload is not None else None,
@@ -495,6 +597,7 @@ async def evaluate(
         "error": payload.error if payload is not None else None,
         "completion_reason": payload.completion_reason if payload is not None else None,
         "harness_error_type": harness_error_type,
+        "harness_error_message": harness_error_message,
         "latency_ms": round((time.perf_counter() - started) * 1000, 3),
         "market_http_calls": len(market_requests),
         "market_http_requests": market_requests,
@@ -515,13 +618,33 @@ def _required(name: str) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--history-turns", type=int, choices=(0, 8), default=0)
-    parser.add_argument("--understanding", choices=("fixed", "live"), default="live")
+    parser.add_argument(
+        "--understanding",
+        choices=("fixed", "live", "forced-broad"),
+        default="live",
+    )
+    parser.add_argument("--coverage", choices=("off", "profile", "model"), default="model")
     args = parser.parse_args()
     history_turns = 8 if args.history_turns == 8 else 0
-    understanding: UnderstandingMode = "fixed" if args.understanding == "fixed" else "live"
+    understanding: UnderstandingMode = (
+        "fixed"
+        if args.understanding == "fixed"
+        else "forced-broad"
+        if args.understanding == "forced-broad"
+        else "live"
+    )
+    coverage: CoverageMode = (
+        "off" if args.coverage == "off" else "profile" if args.coverage == "profile" else "model"
+    )
     print(
         json.dumps(
-            asyncio.run(evaluate(history_turns=history_turns, understanding=understanding)),
+            asyncio.run(
+                evaluate(
+                    history_turns=history_turns,
+                    understanding=understanding,
+                    coverage=coverage,
+                )
+            ),
             ensure_ascii=False,
             indent=2,
         )

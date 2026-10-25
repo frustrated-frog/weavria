@@ -6,6 +6,11 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, TypeAdapter
 
 from weavria.core import ErrorCategory
+from weavria.harness import (
+    CapabilityEvidenceProfile,
+    EvidenceParameterConstraint,
+    EvidenceSurface,
+)
 from weavria.tools import ToolContext, ToolFault, TypedTool
 
 
@@ -121,6 +126,65 @@ def market_pulse_tool(client: MarketPulseClient) -> TypedTool[MarketPulseInput, 
         timeout_seconds=20.0,
         sensitivity="public",
         context_paths=("/source_id", "/business_date", "/quality_status", "/focus", "/data"),
+    )
+
+
+def market_pulse_evidence_profile() -> CapabilityEvidenceProfile:
+    """Declare FinScope semantics without teaching the generic Harness financial fields."""
+
+    def focus(*values: str) -> tuple[EvidenceParameterConstraint, ...]:
+        return (
+            EvidenceParameterConstraint(
+                input_pointer="/focus",
+                allowed_values=values,
+            ),
+        )
+
+    return CapabilityEvidenceProfile(
+        capability_name="read_market_pulse",
+        capability_version="1",
+        profile_version="finscope-market-evidence/1",
+        surfaces=(
+            EvidenceSurface(
+                surface_id="market.regime",
+                description="Current market regime or stage",
+                demand_policy="broad_or_explicit",
+                required_fields=("/data/regime",),
+                parameter_constraints=focus("overview", "opportunities", "breadth", "review"),
+            ),
+            EvidenceSurface(
+                surface_id="market.regime_history",
+                description="Recent regime sequence and historical transitions for a time range",
+                demand_policy="broad_or_explicit",
+                required_fields=("/data/recentRegimes",),
+                parameter_constraints=focus("history"),
+            ),
+            EvidenceSurface(
+                surface_id="market.breadth",
+                description="Market breadth, participation, return distribution and turnover",
+                demand_policy="broad_or_explicit",
+                required_fields=("/data/breadth",),
+                parameter_constraints=focus("breadth", "review"),
+            ),
+            EvidenceSurface(
+                surface_id="market.daily_review",
+                description="Daily market review and evidence-backed conclusion",
+                demand_policy="broad_or_explicit",
+                required_fields=("/data/dailyReview",),
+                parameter_constraints=focus("overview", "review"),
+            ),
+            EvidenceSurface(
+                surface_id="market.opportunities",
+                description="Sector leadership, event confirmation and research candidates",
+                demand_policy="explicit_only",
+                required_fields=(
+                    "/data/sectors",
+                    "/data/eventConfirmations",
+                    "/data/candidates",
+                ),
+                parameter_constraints=focus("opportunities"),
+            ),
+        ),
     )
 
 

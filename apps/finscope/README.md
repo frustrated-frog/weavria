@@ -24,6 +24,9 @@ export WEAVRIA_MODEL_NAME="deepseek-flash"
 export WEAVRIA_MODEL_API_KEY="..."
 export WEAVRIA_MODEL_JSON_MODE="true"
 export WEAVRIA_MODEL_MAX_OUTPUT_TOKENS="4096"
+export WEAVRIA_UNDERSTANDING_MAX_OUTPUT_TOKENS="8192"
+export WEAVRIA_UNDERSTANDING_REASONING_EFFORT="none"
+export WEAVRIA_UNDERSTANDING_MAX_DURATION_SECONDS="180"
 export WEAVRIA_CONTEXT_WINDOW_TOKENS="32768"
 export WEAVRIA_CONTEXT_ENCODING="cl100k_base"
 export WEAVRIA_RUN_MAX_MODEL_CALLS="20"
@@ -65,9 +68,17 @@ FinScope 前端设置 `VITE_WEAVRIA_AGENT_URL=http://127.0.0.1:8765` 后才显�
 - Task Frame 为 direct / clarify 时不暴露市场工具；execute 时只暴露
   `read_market_pulse`，不会刷新行情、修改 FinScope 或执行交易操作。
 - 页面只传日期、当前标签和质量状态；这些是导航元数据，不是事实证据。
-- 任务理解只接受能够落到工具 `output_schema` 的证据字段；无法匹配的模型提案会在执行前进行
-  一次有界修正。成功工具结果即使零字段匹配也会留下 Evidence Probe，并以契约不匹配收敛，
-  不再重复调用直到耗尽完成预算。
+- 任务理解默认执行“规格规划—独立义务覆盖审计—主机校验—至多一次语义修复—再次审计”。
+  FinScope 只在适配器中声明版本化市场证据面；通用 Harness 不理解金融字段。规划、审计与修复
+  共享同一理解阶段时限，覆盖仍不足时不会进入 Runtime。单次供应商请求继续受
+  `WEAVRIA_MODEL_TIMEOUT_SECONDS` 限制；多阶段总预算由
+  `WEAVRIA_UNDERSTANDING_MAX_DURATION_SECONDS` 独立限制。结构化理解输出也使用独立的
+  `WEAVRIA_UNDERSTANDING_MAX_OUTPUT_TOKENS`，避免大型规格或覆盖图与最终回答争用同一输出预留。
+  对默认开启思考的兼容端点，可显式设置 `WEAVRIA_UNDERSTANDING_REASONING_EFFORT=none`；未设置时
+  不向供应商发送该参数，避免按模型名称猜测能力。
+- 任务理解只接受能够落到显式生产能力 `output_schema` 的证据字段；Profile 参数值也必须与工具
+  输入 Schema 相容。成功工具结果即使零字段匹配也会留下 Evidence Probe，并以契约不匹配
+  收敛，不再重复调用直到耗尽完成预算。
 - execute 回答必须读取 Market Pulse、显示数据质量并包含精确来源标记，否则验收策略要求
   修正；direct / clarify 回答明确标为 unverifiable，不伪装成已验证的市场结论。
 - HTTP Host 当前提供同步消息接口，不提供流式 Token 或实时事件推送。
@@ -90,9 +101,21 @@ export WEAVRIA_MODEL_API_KEY="..."
 export WEAVRIA_MODEL_JSON_MODE="true"
 uv run python examples/live_finscope_weekly_summary.py \
   --history-turns 0 \
-  --understanding live
+  --understanding live \
+  --coverage model
 ```
 
 该入口不会访问实时 FinScope，不会保存凭据、请求正文或供应商原始响应。它输出任务结构覆盖、工具轨迹、上下文峰值、Token、延迟和答案字段评测；单次成功不能替代重复实验或生产验证。
 
 使用 `--understanding fixed` 会跳过任务理解模型，注入同一 Fixture 的四字段规格，只用于隔离执行模型行为。它是诊断上界，不是部署建议。
+
+使用 `--coverage off` 可以同时关闭证据面引导和义务审计；`--coverage profile` 只把版本化证据面
+暴露给规划器，不运行独立审计；默认 `model` 与 Sidecar 生产路径一致，同时启用规划引导、审计和
+有界修复。三档用于区分规划信息增益与审计门禁，不能把 `off` 对 `model` 的全部差异都归因于
+审计调用。发生一次语义修复时，`model` 还会增加一次修复和一次复审调用，因此报告分别记录
+Task Understanding Provider 的调用数、Token、覆盖 verdict、修复次数和原子义务状态。不要只
+比较最终 HTTP 是否完成。
+
+`--understanding forced-broad --coverage model` 是修复路径诊断：它只把第一份候选规格替换为合法但
+宽泛的 `/data` 需求，之后的义务审计、规格修复和复审都由真实理解模型完成。它用于证明有界修复
+链路，不计入自然规划成功率，也不是生产配置。

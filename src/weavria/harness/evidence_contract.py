@@ -1,5 +1,6 @@
 """Ground low-trust evidence selectors against host-owned JSON Schemas."""
 
+import json
 from collections.abc import Mapping
 from typing import cast
 
@@ -22,6 +23,26 @@ def schema_supports_pointer(schema: Mapping[str, JsonValue], pointer: str) -> bo
         return False
     root = cast(dict[str, object], dict(schema))
     return _supports(root, root, tokens, depth=0)
+
+
+def schema_allows_value_at_pointer(
+    schema: Mapping[str, JsonValue],
+    pointer: str,
+    value: JsonValue,
+) -> bool:
+    """Return whether a declared literal is compatible with a field schema.
+
+    This is deliberately a bounded contract check rather than a complete JSON Schema
+    implementation. It resolves the same local references and composition keywords as
+    selector grounding, and rejects contradictions in ``const``, ``enum`` and JSON types.
+    Unconstrained or unsupported validation keywords remain compatible.
+    """
+    try:
+        tokens = _pointer_tokens(pointer) if pointer else ()
+    except ValueError:
+        return False
+    root = cast(dict[str, object], dict(schema))
+    return _allows_value_at(root, root, tokens, value, depth=0)
 
 
 def unsupported_evidence_fields(
@@ -133,6 +154,146 @@ def _supports(
             return _supports(root, typed_items[index], remaining, depth=depth + 1)
         return _supports(root, items, remaining, depth=depth + 1)
     return False
+
+
+def _allows_value_at(
+    root: Mapping[str, object],
+    node: object,
+    tokens: tuple[str, ...],
+    value: JsonValue,
+    *,
+    depth: int,
+) -> bool:
+    if depth > len(tokens) * 8 + 32 or node is False:
+        return False
+    if node is True:
+        return True
+    current = _mapping(node)
+    if current is None:
+        return False
+    if not tokens:
+        return _allows_literal(root, current, value, depth=depth)
+    if not current:
+        return True
+
+    reference = current.get("$ref")
+    if isinstance(reference, str):
+        target = _resolve_local_reference(root, reference)
+        if target is None:
+            return True
+        siblings = {key: item for key, item in current.items() if key != "$ref"}
+        if siblings and not _allows_value_at(root, siblings, tokens, value, depth=depth + 1):
+            return False
+        return _allows_value_at(root, target, tokens, value, depth=depth + 1)
+
+    for keyword in ("allOf", "anyOf", "oneOf"):
+        branches = current.get(keyword)
+        if isinstance(branches, list):
+            typed_branches = cast(list[object], branches)
+            checks = (
+                _allows_value_at(root, branch, tokens, value, depth=depth + 1)
+                for branch in typed_branches
+            )
+            return all(checks) if keyword == "allOf" else any(checks)
+
+    token, remaining = tokens[0], tokens[1:]
+    declared_type = current.get("type")
+    allowed_types: set[str] = set()
+    if isinstance(declared_type, str):
+        allowed_types.add(declared_type)
+    elif isinstance(declared_type, list) and all(
+        isinstance(item, str) for item in cast(list[object], declared_type)
+    ):
+        allowed_types.update(cast(list[str], declared_type))
+    properties = _mapping(current.get("properties"))
+    object_possible = (
+        "object" in allowed_types
+        or properties is not None
+        or "additionalProperties" in current
+        or not allowed_types
+    )
+    if object_possible:
+        if properties is not None and token in properties:
+            return _allows_value_at(root, properties[token], remaining, value, depth=depth + 1)
+        additional = current.get("additionalProperties", properties is None)
+        if additional is True:
+            return True
+        if _mapping(additional) is not None:
+            return _allows_value_at(root, additional, remaining, value, depth=depth + 1)
+
+    array_possible = "array" in allowed_types or "items" in current
+    if array_possible and (token == "-" or token.isdigit()):
+        items = current.get("items", {})
+        if isinstance(items, list):
+            typed_items = cast(list[object], items)
+            index = int(token) if token.isdigit() else len(typed_items)
+            if index >= len(typed_items):
+                return False
+            return _allows_value_at(root, typed_items[index], remaining, value, depth=depth + 1)
+        return _allows_value_at(root, items, remaining, value, depth=depth + 1)
+    return False
+
+
+def _allows_literal(
+    root: Mapping[str, object],
+    schema: Mapping[str, object],
+    value: JsonValue,
+    *,
+    depth: int,
+) -> bool:
+    reference = schema.get("$ref")
+    if isinstance(reference, str):
+        target = _resolve_local_reference(root, reference)
+        if target is not None and not _allows_value_at(root, target, (), value, depth=depth + 1):
+            return False
+    for keyword in ("allOf", "anyOf", "oneOf"):
+        branches = schema.get(keyword)
+        if isinstance(branches, list):
+            checks = (
+                _allows_value_at(root, branch, (), value, depth=depth + 1)
+                for branch in cast(list[object], branches)
+            )
+            if not (all(checks) if keyword == "allOf" else any(checks)):
+                return False
+    if "const" in schema and not _same_json_value(schema["const"], value):
+        return False
+    enum = schema.get("enum")
+    if isinstance(enum, list) and not any(
+        _same_json_value(candidate, value) for candidate in cast(list[object], enum)
+    ):
+        return False
+    declared = schema.get("type")
+    if isinstance(declared, str):
+        return _matches_json_type(value, declared)
+    if isinstance(declared, list) and all(
+        isinstance(item, str) for item in cast(list[object], declared)
+    ):
+        return any(_matches_json_type(value, item) for item in cast(list[str], declared))
+    return True
+
+
+def _matches_json_type(value: JsonValue, declared: str) -> bool:
+    if declared == "null":
+        return value is None
+    if declared == "boolean":
+        return isinstance(value, bool)
+    if declared == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if declared == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if declared == "string":
+        return isinstance(value, str)
+    if declared == "array":
+        return isinstance(value, list)
+    if declared == "object":
+        return isinstance(value, dict)
+    return True
+
+
+def _same_json_value(left: object, right: object) -> bool:
+    return json.dumps(
+        left, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ) == json.dumps(right, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
 def _resolve_local_reference(root: Mapping[str, object], reference: str) -> object | None:

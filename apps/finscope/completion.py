@@ -1,7 +1,5 @@
 """FinScope-local acceptance rule; no financial concept enters the runtime."""
 
-import json
-
 from weavria.artifacts import ArtifactSnapshot
 from weavria.core import (
     CompletionAccept,
@@ -14,7 +12,7 @@ from weavria.harness import (
     EvidenceEvaluation,
     InformationRequirement,
     StructuralEvidenceExtractor,
-    TaskFrame,
+    load_task_frame,
 )
 from weavria.runtime import CompletionContext
 
@@ -67,9 +65,7 @@ class MarketAnswerPolicy:
     ) -> CompletionAccept | CompletionRepair | CompletionUnverifiable:
         observation = context.task_observation
         if observation is not None:
-            frame = TaskFrame.model_validate_json(
-                json.dumps(observation.payload, ensure_ascii=False, separators=(",", ":"))
-            )
+            frame = load_task_frame(observation.payload)
             if frame.specification.route != "execute":
                 return CompletionUnverifiable(
                     reason=(

@@ -1,6 +1,9 @@
 from pydantic import BaseModel, ConfigDict, JsonValue
 
-from weavria.harness.evidence_contract import schema_supports_pointer
+from weavria.harness.evidence_contract import (
+    schema_allows_value_at_pointer,
+    schema_supports_pointer,
+)
 
 
 class _Envelope(BaseModel):
@@ -39,3 +42,20 @@ def test_schema_grounding_rejects_explicitly_forbidden_property() -> None:
     }
 
     assert not schema_supports_pointer(schema, "/forbidden")
+
+
+def test_schema_literal_grounding_rejects_enum_and_type_contradictions() -> None:
+    schema: dict[str, JsonValue] = {
+        "type": "object",
+        "properties": {
+            "focus": {"enum": ["summary", "details"], "type": "string"},
+            "limit": {"type": "integer"},
+        },
+        "additionalProperties": False,
+    }
+
+    assert schema_allows_value_at_pointer(schema, "/focus", "summary")
+    assert not schema_allows_value_at_pointer(schema, "/focus", "unknown")
+    assert schema_allows_value_at_pointer(schema, "/limit", 3)
+    assert not schema_allows_value_at_pointer(schema, "/limit", True)
+    assert not schema_allows_value_at_pointer(schema, "/missing", "summary")

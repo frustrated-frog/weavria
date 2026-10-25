@@ -22,6 +22,7 @@ from .provider import ModelCapabilities, ModelOutputError
 _JSON_OBJECT = TypeAdapter(dict[str, JsonValue])
 _LOGGER = logging.getLogger(__name__)
 _MAX_RECOVERED_DELIMITERS = 8
+ReasoningEffort = Literal["none", "low", "medium", "high", "max"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,6 +33,7 @@ class OpenAICompatibleConfig:
     temperature: float = 0.0
     max_output_tokens: int = 4096
     json_mode: bool = False
+    reasoning_effort: ReasoningEffort | None = None
 
     def __post_init__(self) -> None:
         if not self.model.strip():
@@ -40,6 +42,8 @@ class OpenAICompatibleConfig:
             raise ValueError("model temperature must be finite")
         if type(self.max_output_tokens) is not int or self.max_output_tokens <= 0:
             raise ValueError("model output budget must be a positive integer")
+        if self.reasoning_effort not in {None, "none", "low", "medium", "high", "max"}:
+            raise ValueError("reasoning effort is unsupported")
 
 
 class ChatCompletionTransport(Protocol):
@@ -120,6 +124,8 @@ class OpenAICompatibleProvider:
         }
         if self._config.json_mode:
             result["response_format"] = {"type": "json_object"}
+        if self._config.reasoning_effort is not None:
+            result["reasoning_effort"] = self._config.reasoning_effort
         return result
 
 
@@ -156,6 +162,8 @@ def _session_request_body(
     }
     if config.json_mode:
         body["response_format"] = {"type": "json_object"}
+    if config.reasoning_effort is not None:
+        body["reasoning_effort"] = config.reasoning_effort
     return body
 
 
