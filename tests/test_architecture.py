@@ -9,11 +9,13 @@ import pytest
 LAYERS = {
     "core": (),
     "models": ("core",),
+    "memory": (),
     "artifacts": ("core",),
     "tools": ("core", "artifacts"),
     "context": ("core", "artifacts"),
     "runtime": ("core", "models", "artifacts", "tools", "context"),
     "harness": (
+        "memory",
         "core",
         "models",
         "artifacts",

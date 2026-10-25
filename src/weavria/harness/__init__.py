@@ -50,6 +50,14 @@ from .intent import (
     RiskAwareAskOrActPolicy,
     intent_uncertainty_sha256,
 )
+from .memory_admission import (
+    ConservativeMemoryAdmission,
+    MemoryFormationError,
+    ground_memory_candidates,
+)
+from .memory_formation import MemoryExtractor, MemoryFormationEngine, MemoryReviewer
+from .memory_models import ModelMemoryExtractor, ModelMemoryReviewer
+from .memory_session import AcceptedMemoryEvents, SessionMemoryBinding, SessionMemoryIngestor
 from .progress import NeedProgressEvaluator
 from .requirements import (
     CompletionObligation,
@@ -95,6 +103,7 @@ from .understanding import (
 )
 
 __all__ = [
+    "AcceptedMemoryEvents",
     "BM25CapabilityRetriever",
     "BeliefUpdater",
     "BlockingAmbiguityPolicy",
@@ -125,6 +134,7 @@ __all__ = [
     "CompletionEvaluation",
     "CompletionObligation",
     "ConsequenceAwareQuestionSelector",
+    "ConservativeMemoryAdmission",
     "DeterministicBeliefUpdater",
     "EvidenceAddress",
     "EvidenceBinding",
@@ -141,6 +151,12 @@ __all__ = [
     "IntentDecisionPolicy",
     "IntentHypothesis",
     "IntentUncertainty",
+    "MemoryExtractor",
+    "MemoryFormationEngine",
+    "MemoryFormationError",
+    "MemoryReviewer",
+    "ModelMemoryExtractor",
+    "ModelMemoryReviewer",
     "ModelTaskInterpreter",
     "NeedFailure",
     "NeedLedger",
@@ -153,6 +169,8 @@ __all__ = [
     "PublicCapabilityPolicy",
     "RiskAwareAskOrActPolicy",
     "SchemaAwareSelector",
+    "SessionMemoryBinding",
+    "SessionMemoryIngestor",
     "StructuralEvidenceExtractor",
     "TaskAwareAgent",
     "TaskAwareExecution",
@@ -172,6 +190,7 @@ __all__ = [
     "apply_frame_patch",
     "canonicalize_task_frame",
     "create_frame_patch",
+    "ground_memory_candidates",
     "intent_uncertainty_sha256",
     "load_need_ledger",
     "load_task_frame",
