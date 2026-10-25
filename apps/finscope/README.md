@@ -80,3 +80,15 @@ FinScope 前端设置 `VITE_WEAVRIA_AGENT_URL=http://127.0.0.1:8765` 后才显�
 ```bash
 uv run pytest tests/finscope_app tests/models/test_openai_compatible.py
 ```
+
+使用固定脱敏市场数据、真实模型和正式 Sidecar/Runtime 路径运行一次显式探针：
+
+```bash
+export WEAVRIA_MODEL_BASE_URL="https://provider.example/v1"
+export WEAVRIA_MODEL_NAME="model-name"
+export WEAVRIA_MODEL_API_KEY="..."
+export WEAVRIA_MODEL_JSON_MODE="true"
+uv run python examples/live_finscope_weekly_summary.py --history-turns 0
+```
+
+该入口不会访问实时 FinScope，不会保存凭据、请求正文或供应商原始响应。它输出任务结构覆盖、工具轨迹、上下文峰值、Token、延迟和答案字段评测；单次成功不能替代重复实验或生产验证。

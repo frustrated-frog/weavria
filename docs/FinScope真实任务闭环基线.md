@@ -4,7 +4,7 @@
 
 仓库现在有一条固定、脱敏、可重放的 FinScope 真实任务验收路径：从应用 HTTP 入口提交“总结这一周的市场情况”，经过正式的 Session、Task Frame、Need Ledger、Tool、Artifact、Context、Progress、Intervention 和 Completion 链路，再验证最终 HTTP 输出。
 
-基线同时运行新会话和带 8 轮无关历史的长会话。语料由版本 1 Fixture 和 SHA-256 固定，模型、预算和评测断言也在测试中显式冻结。对应架构决策见 [0038 固定真实任务的跨层闭环验收](decisions/0038-固定真实任务的跨层闭环验收.md)。
+基线同时运行新会话和带 8 轮无关历史的长会话。当前语料为版本 2，SHA-256 是 `275e33ce5551dc14fd25d5cb5467dcb80918f1427fb7b3369ee1de04bebc3535`；模型、预算和评测断言也在测试中显式冻结。对应架构决策见 [0038 固定真实任务的跨层闭环验收](decisions/0038-固定真实任务的跨层闭环验收.md)。
 
 ## 2. 它在 Agent 系统中解决什么问题
 
@@ -64,9 +64,23 @@ uv run pytest tests/finscope_app/test_weekly_summary_baseline.py -q
 uv run pytest tests/finscope_app -q
 ```
 
+显式运行真实模型新会话探针：
+
+```bash
+export WEAVRIA_MODEL_BASE_URL="https://provider.example/v1"
+export WEAVRIA_MODEL_NAME="model-name"
+export WEAVRIA_MODEL_API_KEY="..."
+export WEAVRIA_MODEL_JSON_MODE="true"
+uv run python examples/live_finscope_weekly_summary.py --history-turns 0
+```
+
+真实入口会输出数据集摘要、模型与预算、任务理解和执行调用的 Token/延迟、Task Frame 字段覆盖、Need 状态、工具记录、上下文峰值与最终结果。它不会把密钥、模型请求正文或供应商原始响应写入报告。
+
+2026-10-25 的 `deepseek-flash` 版本 2 探索样本完成并命中全部 8 个原子字段：任务理解 1 次、执行模型 3 次、总计 35,268 Token、端到端约 26.9 秒；产生 2 次市场 HTTP 读取和 4 条工具记录。Task Frame 只有一项宽泛外部需求且 `required_fields` 为空，预期四字段覆盖率为 0%。所以这条轨迹证明模型能在该样本中读取 Artifact 并组织正确回答，也同时证明 Harness 的结构化任务义务尚未达到确定性基线的强度。
+
 ## 6. 当前刻意没有实现什么
 
-- 没有调用真实 LLM，因此没有真实模型任务完成率或推理质量结论；
+- 确定性 CI 不调用真实 LLM；目前只有两个新会话探索样本，没有稳定成功率或模型对照结论；
 - 没有访问实时 FinScope 服务或生产数据，不能证明当前行情正确；
 - 没有执行浏览器、iframe 或 DOM 测试，只验证到应用 HTTP 输出；
 - 没有加入独立答案验证器，所以 `task_outcome` 不是 `verified`；
@@ -76,4 +90,4 @@ uv run pytest tests/finscope_app -q
 
 ## 7. 下一小步建议
 
-复用这份固定 Fixture 和同一组预算，增加一个默认关闭、需显式凭据启用的真实模型探针。首轮只比较真实模型能否在新鲜与长历史条件下完成同一任务，并记录证据覆盖、无效调用、模型轮数、总请求字节、延迟和失败阶段。若失败稳定发生，再从 Trace 判断应改进任务理解、上下文交付、行动反馈还是完成验收，而不是提前扩展更多模块。
+先在版本 2 上区分两个变量：一组固定 TaskSpecification、只让真实模型执行；另一组让真实模型同时理解与执行。各自做少量重复后再判断 `required_fields` 为空是否稳定。若问题稳定发生，优先改进领域无关的任务理解输出契约和结构校验；之后再运行 8 轮长历史样本，避免把理解误差与上下文压缩混为一谈。

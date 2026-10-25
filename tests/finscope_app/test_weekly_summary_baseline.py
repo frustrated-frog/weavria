@@ -3,15 +3,20 @@
 import asyncio
 import hashlib
 from pathlib import Path
-from typing import Literal
 
 import httpx
 import pytest
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, TypeAdapter
 
 from apps.finscope.config import FinScopeSettings
+from apps.finscope.evaluation import (
+    WEEKLY_SUMMARY_REQUIRED_FIELDS,
+    WeeklySummaryCase,
+    expanded_market_data,
+    grade_weekly_answer,
+    load_weekly_summary_case,
+)
 from apps.finscope.market import MarketPulseClient
-from apps.finscope.server import MessageOutput, PageContext, SessionCreated, create_app
+from apps.finscope.server import MessageOutput, SessionCreated, create_app
 from weavria.core import (
     ActionInterventionChecked,
     CompletionChecked,
@@ -45,74 +50,7 @@ from weavria.harness import (
 from weavria.models import ModelCapabilities
 from weavria.sessions import SQLiteSessionStore
 
-FIXTURE = Path(__file__).parents[1] / "fixtures/finscope_weekly_summary_v1.json"
-FIXTURE_SHA256 = "6fe81e168fb224dbb1254d102f03fab119837e080c5b0d624f3081359161bebd"
-_MARKET_PAYLOAD = TypeAdapter(dict[str, JsonValue])
-
-
-class _FixtureModel(BaseModel):
-    model_config = ConfigDict(strict=True, extra="forbid")
-
-
-class _SyntheticNoise(_FixtureModel):
-    rows: int = Field(ge=1)
-    text: str = Field(min_length=1)
-
-
-class _BreadthData(_FixtureModel):
-    advancing_ratio: str = Field(alias="advancingRatio")
-    median_return: str = Field(alias="medianReturn")
-    turnover: str
-    history: list[dict[str, JsonValue]]
-
-
-class _MarketData(_FixtureModel):
-    business_date: str = Field(alias="businessDate")
-    generated_at: str = Field(alias="generatedAt")
-    quality_status: str = Field(alias="qualityStatus")
-    warnings: list[str]
-    regime: dict[str, JsonValue]
-    recent_regimes: list[dict[str, JsonValue]] = Field(alias="recentRegimes")
-    history_points: list[dict[str, JsonValue]] = Field(alias="historyPoints")
-    breadth: _BreadthData
-    daily_review: dict[str, JsonValue] = Field(alias="dailyReview")
-
-
-class _WeeklySummaryCase(_FixtureModel):
-    schema_version: Literal[1]
-    case_id: Literal["weekly-market-summary"]
-    prompt: str = Field(min_length=1)
-    page_context: PageContext
-    expected_output_terms: list[str] = Field(min_length=1)
-    delivery_probe_terms: list[str] = Field(min_length=1)
-    synthetic_noise: _SyntheticNoise
-    market_data: _MarketData
-
-
-def _case() -> _WeeklySummaryCase:
-    source = FIXTURE.read_bytes()
-    assert hashlib.sha256(source).hexdigest() == FIXTURE_SHA256
-    return _WeeklySummaryCase.model_validate_json(source)
-
-
-def _market_data(case: _WeeklySummaryCase) -> dict[str, JsonValue]:
-    value = case.market_data.model_copy(deep=True)
-    for index in range(case.synthetic_noise.rows):
-        value.history_points.append(
-            {
-                "ordinal": index,
-                "label": f"脱敏历史点-{index:03d}",
-                "detail": case.synthetic_noise.text,
-            }
-        )
-        value.breadth.history.append(
-            {
-                "ordinal": index,
-                "label": f"脱敏宽度点-{index:03d}",
-                "detail": case.synthetic_noise.text,
-            }
-        )
-    return _MARKET_PAYLOAD.validate_python(value.model_dump(mode="json", by_alias=True))
+FIXTURE = Path(__file__).parents[1] / "fixtures/finscope_weekly_summary_v2.json"
 
 
 async def _events(store: SQLiteSessionStore, session_id: str) -> tuple[SessionEvent, ...]:
@@ -213,7 +151,7 @@ class _EvidenceAwareScenarioModel:
 
     capabilities = ModelCapabilities(tool_calls=True, multi_tool_calls=True)
 
-    def __init__(self, case: _WeeklySummaryCase) -> None:
+    def __init__(self, case: WeeklySummaryCase) -> None:
         self._prompt = case.prompt
         self._delivery_probes = tuple(case.delivery_probe_terms)
         self.requests: list[SessionRequest] = []
@@ -298,9 +236,9 @@ async def test_weekly_summary_closes_every_observable_layer(
     tmp_path: Path,
     history_turns: int,
 ) -> None:
-    case = _case()
+    case = load_weekly_summary_case(FIXTURE)
     prompt = case.prompt
-    market_data = _market_data(case)
+    market_data = expanded_market_data(case)
     market_calls: list[tuple[str, str]] = []
 
     def market_response(request: httpx.Request) -> httpx.Response:
@@ -368,8 +306,7 @@ async def test_weekly_summary_closes_every_observable_layer(
     assert payload.error is None, payload.error
     assert payload.status == "completed", payload.model_dump(mode="json")
     assert payload.task_outcome == "unverified"
-    assert payload.answer is not None
-    assert all(term in payload.answer for term in case.expected_output_terms)
+    assert grade_weekly_answer(case, payload.answer).correct
     assert len(market_calls) == 4
 
     run_facts = tuple(
@@ -399,12 +336,9 @@ async def test_weekly_summary_closes_every_observable_layer(
 
     frame = load_task_frame(semantic[-1].observation.payload)
     ledger = load_need_ledger(semantic[-1].need_ledger)
-    assert {field for need in frame.requirements for field in need.required_fields} == {
-        "/data/regime",
-        "/data/recentRegimes",
-        "/data/breadth",
-        "/data/dailyReview",
-    }
+    assert {
+        field for need in frame.requirements for field in need.required_fields
+    } == WEEKLY_SUMMARY_REQUIRED_FIELDS
     assert all(state.status is NeedStatus.SATISFIED for state in ledger.states)
     assert all(state.evidence_binding_ids for state in ledger.states)
 
