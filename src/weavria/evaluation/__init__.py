@@ -30,6 +30,13 @@ from .intent_decision import (
     IntentDecisionExperiment,
     evaluate_intent_decision,
 )
+from .live_provider import (
+    ModelCallSample,
+    RecordingHTTPTransport,
+    finish_reason_from_payload,
+    summarize_samples,
+    usage_from_payload,
+)
 from .progress_control import (
     ProgressAttempt,
     ProgressAttemptResult,
@@ -79,6 +86,7 @@ __all__ = [
     "LiveProgressDataset",
     "LiveProgressExperiment",
     "LiveProgressRun",
+    "ModelCallSample",
     "ProgressAttempt",
     "ProgressAttemptResult",
     "ProgressControlCase",
@@ -89,6 +97,7 @@ __all__ = [
     "ProgressSignalExperiment",
     "ProgressStrategySummary",
     "ProviderFinishReason",
+    "RecordingHTTPTransport",
     "TokenUsage",
     "build_live_progress_experiment",
     "evaluate_action_interventions",
@@ -98,6 +107,9 @@ __all__ = [
     "evaluate_intent_decision",
     "evaluate_progress_control",
     "evaluate_progress_signals",
+    "finish_reason_from_payload",
     "load_live_progress_dataset",
     "result_is_correct",
+    "summarize_samples",
+    "usage_from_payload",
 ]

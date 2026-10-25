@@ -1,0 +1,122 @@
+{
+  "schema_version": 1,
+  "dataset_version": "release-readiness/1",
+  "dossier": {
+    "generated_at": "2026-10-24T09:30:00Z",
+    "identity": {
+      "release_id": "orion-2.4.0",
+      "product": "Orion Workspace",
+      "version": "2.4.0",
+      "target_date": "2026-10-28"
+    },
+    "readiness": {
+      "recommendation": "hold",
+      "risk_level": "high",
+      "rationale": "One critical payment migration defect remains open."
+    },
+    "quality": {
+      "test_pass_rate": 0.992,
+      "critical_failures": 1,
+      "blockers": [
+        {
+          "blocker_id": "PAY-417",
+          "severity": "critical",
+          "status": "open",
+          "summary": "Retrying the payment migration can duplicate ledger entries."
+        }
+      ]
+    },
+    "operations": {
+      "rollback_tested": true,
+      "rollback_window_minutes": 15,
+      "runbook_url": "https://runbooks.example/orion/2.4.0-rollback"
+    },
+    "changes": [
+      {
+        "change_id": "IAM-208",
+        "title": "SSO audit export",
+        "audience": "administrators"
+      },
+      {
+        "change_id": "DEV-119",
+        "title": "Faster workspace indexing",
+        "audience": "developers"
+      }
+    ],
+    "communications": {
+      "audiences": [
+        "enterprise administrators",
+        "workspace owners"
+      ],
+      "template_status": "draft",
+      "owner": "Customer Operations"
+    }
+  },
+  "cases": [
+    {
+      "case_id": "core-go-no-go",
+      "prompt": "评估 Orion 2.4.0 是否可以按计划发布，说明阻塞项和回滚准备情况。",
+      "expected_surface_ids": [
+        "release.decision",
+        "release.blockers",
+        "release.rollback"
+      ],
+      "forbidden_surface_ids": [
+        "release.user_changes",
+        "release.customer_notice"
+      ],
+      "required_answer_terms": [
+        "hold",
+        "PAY-417",
+        "回滚",
+        "15"
+      ],
+      "forbidden_answer_terms": [
+        "SSO audit export",
+        "Customer Operations"
+      ],
+      "delivery_probe_terms": [
+        "hold",
+        "PAY-417",
+        "rollback_tested",
+        "15"
+      ],
+      "explicit_only_expectation": "exclude"
+    },
+    {
+      "case_id": "explicit-release-communication",
+      "prompt": "评估 Orion 2.4.0 是否可以按计划发布，说明阻塞项和回滚准备情况，并列出用户可见变更以及客户通知的受众、负责人和模板状态。",
+      "expected_surface_ids": [
+        "release.decision",
+        "release.blockers",
+        "release.rollback",
+        "release.user_changes",
+        "release.customer_notice"
+      ],
+      "forbidden_surface_ids": [],
+      "required_answer_terms": [
+        "hold",
+        "PAY-417",
+        "回滚",
+        "15",
+        "SSO audit export",
+        "Faster workspace indexing",
+        "enterprise administrators",
+        "workspace owners",
+        "Customer Operations",
+        "draft"
+      ],
+      "forbidden_answer_terms": [],
+      "delivery_probe_terms": [
+        "hold",
+        "PAY-417",
+        "rollback_tested",
+        "SSO audit export",
+        "enterprise administrators",
+        "Customer Operations",
+        "draft"
+      ],
+      "explicit_only_expectation": "include"
+    }
+  ]
+}
