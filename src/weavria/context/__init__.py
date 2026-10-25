@@ -42,6 +42,7 @@ from .selection import (
     SelectionReason,
     build_context,
 )
+from .supply import ContextSource, ContextSourceError
 
 __all__ = [
     "CompiledSessionContext",
@@ -52,6 +53,8 @@ __all__ = [
     "ContextDemand",
     "ContextFocus",
     "ContextPlan",
+    "ContextSource",
+    "ContextSourceError",
     "ContextTokenBudgetError",
     "ControlContextBuilder",
     "ControlEvidencePlan",

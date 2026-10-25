@@ -36,6 +36,7 @@ from .formation import (
     MemoryReconciliation,
     MemoryReview,
 )
+from .groups import MemoryGroup, MemoryGroupRecall
 from .store import SQLiteMemoryStore
 
 __all__ = [
@@ -59,6 +60,8 @@ __all__ = [
     "MemoryFormationInput",
     "MemoryFormationJob",
     "MemoryFormationPlan",
+    "MemoryGroup",
+    "MemoryGroupRecall",
     "MemoryHit",
     "MemoryJudgment",
     "MemoryMutation",

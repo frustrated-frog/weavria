@@ -16,6 +16,7 @@ from weavria.artifacts import ArtifactStore
 from weavria.context import (
     ContextBudgetError,
     ContextCapacityError,
+    ContextSourceError,
     ContextTokenBudgetError,
     ControlContextBuilder,
     ControlEvidencePlan,
@@ -504,7 +505,12 @@ class _AgentKernel:
                             )
                             if self._feedback_budget < 1:
                                 raise ValueError("compiled feedback budget must be positive")
-                    except (ContextBudgetError, ContextTokenBudgetError, ContextCapacityError):
+                    except (
+                        ContextBudgetError,
+                        ContextTokenBudgetError,
+                        ContextCapacityError,
+                        ContextSourceError,
+                    ):
                         if task.revision != self.state.task.revision:
                             continue
                         raise
@@ -689,6 +695,20 @@ class _AgentKernel:
                 return await self._end(RunStatus.BUDGET_EXHAUSTED, "context_capacity")
             if isinstance(exc, ContextBudgetError):
                 return await self._end(RunStatus.BUDGET_EXHAUSTED, "context_bytes")
+            if isinstance(exc, ContextSourceError):
+                if exc.reason == "capacity":
+                    return await self._end(RunStatus.BUDGET_EXHAUSTED, "context_capacity")
+                return await self._end(
+                    RunStatus.FAILED,
+                    "context_source_failure",
+                    error=RunError(
+                        category=ErrorCategory.POLICY_DENIED
+                        if exc.reason == "access_denied"
+                        else ErrorCategory.CONTEXT_SOURCE_FAILURE,
+                        message=str(exc),
+                        cause_type=type(exc.__cause__ or exc).__name__,
+                    ),
+                )
             if isinstance(exc, CompletionCheckError):
                 return await self._end(
                     RunStatus.FAILED,
@@ -883,7 +903,12 @@ class _AgentKernel:
                     requested = preflight.request_bytes + preflight.control_padding_bytes
                     if requested > preflight.budget_bytes:
                         raise ContextBudgetError(requested, preflight.budget_bytes)
-                except (ContextBudgetError, ContextTokenBudgetError, ContextCapacityError):
+                except (
+                    ContextBudgetError,
+                    ContextTokenBudgetError,
+                    ContextCapacityError,
+                    ContextSourceError,
+                ):
                     result = self._recovery_outcome(result, "budget")
         async with self._commit_lock:
             if task.revision != self.state.task.revision:

@@ -55,6 +55,7 @@ from .memory_admission import (
     MemoryFormationError,
     ground_memory_candidates,
 )
+from .memory_context import MemoryContextSource, MemoryGroupReader
 from .memory_formation import MemoryExtractor, MemoryFormationEngine, MemoryReviewer
 from .memory_models import ModelMemoryExtractor, ModelMemoryReviewer
 from .memory_session import AcceptedMemoryEvents, SessionMemoryBinding, SessionMemoryIngestor
@@ -151,9 +152,11 @@ __all__ = [
     "IntentDecisionPolicy",
     "IntentHypothesis",
     "IntentUncertainty",
+    "MemoryContextSource",
     "MemoryExtractor",
     "MemoryFormationEngine",
     "MemoryFormationError",
+    "MemoryGroupReader",
     "MemoryReviewer",
     "ModelMemoryExtractor",
     "ModelMemoryReviewer",

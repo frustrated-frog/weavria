@@ -12,6 +12,7 @@ from pydantic import (
 )
 
 from ._schema import ContractModel, NonBlankString
+from .context_supply import ContextSupplyReport
 from .recovery import RecoveryRange
 from .retrieval import HistoryRetrievalReport
 
@@ -30,7 +31,7 @@ class ContextCompilation(BaseModel):
     """Bind allocation diagnostics to the exact complete request sent to a provider."""
 
     model_config = ContractModel.model_config
-    schema_version: Literal[1, 2, 3, 4, 5, 6] = 1
+    schema_version: Literal[1, 2, 3, 4, 5, 6, 7] = 1
 
     policy_version: NonBlankString
     counter_version: NonBlankString
@@ -54,6 +55,7 @@ class ContextCompilation(BaseModel):
     allocation_exhausted: bool = False
     choices: tuple[ContextChoice, ...]
     uncovered_demand_ids: tuple[str, ...] = ()
+    supply: ContextSupplyReport | None = None
     retrieval: HistoryRetrievalReport | None = None
     recovery_ranges: tuple[RecoveryRange, ...] = Field(default=(), max_length=8)
 
@@ -76,6 +78,8 @@ class ContextCompilation(BaseModel):
             data.pop("next_step_reserve_bytes", None)
         if self.schema_version < 6:
             data.pop("feedback_reserve_floor_bytes", None)
+        if self.schema_version < 7:
+            data.pop("supply", None)
         return data
 
     @model_validator(mode="after")
@@ -94,6 +98,18 @@ class ContextCompilation(BaseModel):
             raise ValueError("feedback reserve floor requires compilation v6")
         if self.feedback_budget_bytes < self.feedback_reserve_floor_bytes:
             raise ValueError("compiled feedback budget is below its required floor")
+        if self.supply is not None and (
+            self.schema_version < 7 or self.supply.task_revision != self.task_revision
+        ):
+            raise ValueError("source supply requires compilation v7 and the same revision")
+        bundle_choices = tuple(c for c in self.choices if c.source_id.startswith("bundle:"))
+        if bundle_choices and self.supply is None:
+            raise ValueError("bundle choices require a source supply report")
+        if self.supply is not None and (
+            len(bundle_choices) != self.supply.supplied_groups
+            or any(c.representation not in ("raw", "omitted") for c in bundle_choices)
+        ):
+            raise ValueError("supplied bundles must be accounted for without lossy representations")
         choices = {c.source_id: c for c in self.choices}
         for part in self.recovery_ranges:
             choice = choices.get(f"call:{part.call_id}")
