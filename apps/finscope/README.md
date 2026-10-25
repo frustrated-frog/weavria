@@ -88,7 +88,11 @@ export WEAVRIA_MODEL_BASE_URL="https://provider.example/v1"
 export WEAVRIA_MODEL_NAME="model-name"
 export WEAVRIA_MODEL_API_KEY="..."
 export WEAVRIA_MODEL_JSON_MODE="true"
-uv run python examples/live_finscope_weekly_summary.py --history-turns 0
+uv run python examples/live_finscope_weekly_summary.py \
+  --history-turns 0 \
+  --understanding live
 ```
 
 该入口不会访问实时 FinScope，不会保存凭据、请求正文或供应商原始响应。它输出任务结构覆盖、工具轨迹、上下文峰值、Token、延迟和答案字段评测；单次成功不能替代重复实验或生产验证。
+
+使用 `--understanding fixed` 会跳过任务理解模型，注入同一 Fixture 的四字段规格，只用于隔离执行模型行为。它是诊断上界，不是部署建议。

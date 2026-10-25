@@ -6,6 +6,13 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, TypeAdapter
 
+from weavria.harness import (
+    CapabilityNeed,
+    CompletionCriterion,
+    InformationNeed,
+    TaskSpecification,
+)
+
 from .server import PageContext
 
 FROZEN_WEEKLY_SUMMARY_V2_SHA256 = "275e33ce5551dc14fd25d5cb5467dcb80918f1427fb7b3369ee1de04bebc3535"
@@ -63,6 +70,68 @@ class WeeklyAnswerGrade(_EvaluationModel):
     correct: bool
     present_terms: tuple[str, ...]
     missing_terms: tuple[str, ...]
+
+
+def weekly_summary_specification() -> TaskSpecification:
+    """Return the frozen semantic contract used to isolate live execution behavior."""
+    return TaskSpecification(
+        route="execute",
+        intent="Summarize the accepted weekly market evidence",
+        goal="Summarize market regime, weekly history, breadth and the daily review",
+        information_needs=(
+            InformationNeed(
+                description="Current market regime",
+                source="external",
+                freshness="current",
+                required_fields=("/data/regime",),
+            ),
+            InformationNeed(
+                description="Recent market regimes for the week",
+                source="external",
+                freshness="current",
+                required_fields=("/data/recentRegimes",),
+            ),
+            InformationNeed(
+                description="Current market breadth",
+                source="external",
+                freshness="current",
+                required_fields=("/data/breadth",),
+            ),
+            InformationNeed(
+                description="Daily review supporting the weekly summary",
+                source="external",
+                freshness="current",
+                required_fields=("/data/dailyReview",),
+            ),
+        ),
+        capability_needs=(
+            CapabilityNeed(
+                name="read_market_pulse",
+                purpose="Read the authoritative market snapshot",
+                necessity="required",
+            ),
+        ),
+        completion_criteria=(
+            CompletionCriterion(
+                kind="capability_result",
+                description="Read the market snapshot",
+                capability="read_market_pulse",
+            ),
+            CompletionCriterion(kind="response", description="Deliver the weekly summary"),
+        ),
+    )
+
+
+def unrelated_direct_specification() -> TaskSpecification:
+    """Keep long-history seed turns out of the frozen market execution path."""
+    return TaskSpecification(
+        route="direct",
+        intent="Acknowledge unrelated context",
+        goal="Acknowledge the unrelated context without using tools",
+        completion_criteria=(
+            CompletionCriterion(kind="response", description="Acknowledge the message"),
+        ),
+    )
 
 
 def load_weekly_summary_case(path: Path) -> WeeklySummaryCase:

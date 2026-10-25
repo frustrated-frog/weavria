@@ -21,12 +21,16 @@ from apps.finscope.evaluation import (
     expanded_market_data,
     grade_weekly_answer,
     load_weekly_summary_case,
+    unrelated_direct_specification,
+    weekly_summary_specification,
 )
 from apps.finscope.market import MarketPulseClient
 from apps.finscope.server import MessageOutput, SessionCreated, create_app
 from weavria.core import (
     ActionInterventionChecked,
     CompletionChecked,
+    ModelRequest,
+    ModelResponse,
     ModelStarted,
     ProgressAssessed,
     RunEnded,
@@ -34,12 +38,15 @@ from weavria.core import (
     SessionEvent,
     SessionRunEvent,
     SessionSemanticCommitted,
+    ToolCallAction,
     ToolFailedObservation,
     ToolRecorded,
 )
 from weavria.evaluation import ProviderFinishReason, TokenUsage
 from weavria.harness import load_need_ledger, load_task_frame
 from weavria.models import (
+    ModelCapabilities,
+    ModelProvider,
     OpenAICompatibleConfig,
     OpenAICompatibleProvider,
     OpenAICompatibleSessionProvider,
@@ -53,6 +60,7 @@ _MAX_MODEL_CALLS = 20
 _MAX_TOOL_CALLS = 20
 _MAX_REQUEST_BYTES = 64_000
 _MAX_DURATION_SECONDS = 180.0
+UnderstandingMode = Literal["fixed", "live"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,6 +134,31 @@ class RecordingHTTPTransport:
 
     async def close(self) -> None:
         await self._client.aclose()
+
+
+class FixedWeeklyInterpreter:
+    """Freeze TaskSpecification so only live execution-model behavior remains variable."""
+
+    capabilities = ModelCapabilities(tool_calls=True)
+
+    def __init__(self, prompt: str) -> None:
+        self._prompt = prompt
+        self.calls = 0
+
+    async def generate(self, request: ModelRequest) -> ModelResponse:
+        self.calls += 1
+        specification = (
+            weekly_summary_specification()
+            if request.task.goal == self._prompt
+            else unrelated_direct_specification()
+        )
+        return ModelResponse(
+            action=ToolCallAction(
+                call_id=f"fixed-understanding-{self.calls}",
+                tool_name="declare_task_specification",
+                arguments=specification.model_dump(mode="json"),
+            )
+        )
 
 
 def usage_from_payload(payload: object) -> TokenUsage:
@@ -318,7 +351,9 @@ def _semantic_metrics(events: tuple[SessionEvent, ...], run_id: str | None) -> d
     }
 
 
-async def evaluate(*, history_turns: Literal[0, 8]) -> dict[str, object]:
+async def evaluate(
+    *, history_turns: Literal[0, 8], understanding: UnderstandingMode
+) -> dict[str, object]:
     repository = Path(__file__).parents[1]
     fixture = repository / "tests" / "fixtures" / "finscope_weekly_summary_v2.json"
     case = load_weekly_summary_case(fixture)
@@ -344,8 +379,10 @@ async def evaluate(*, history_turns: Literal[0, 8]) -> dict[str, object]:
         base_url, api_key, timeout_seconds=timeout_seconds
     )
     execution_transport = RecordingHTTPTransport(base_url, api_key, timeout_seconds=timeout_seconds)
-    understanding_provider = OpenAICompatibleProvider(
-        model_config, transport=understanding_transport
+    understanding_provider: ModelProvider = (
+        OpenAICompatibleProvider(model_config, transport=understanding_transport)
+        if understanding == "live"
+        else FixedWeeklyInterpreter(case.prompt)
     )
     execution_provider = OpenAICompatibleSessionProvider(
         model_config, transport=execution_transport
@@ -431,7 +468,7 @@ async def evaluate(*, history_turns: Literal[0, 8]) -> dict[str, object]:
     return {
         "schema_version": 1,
         "dataset_version": "finscope-weekly-summary/2",
-        "evaluator_version": "finscope-weekly-live/2",
+        "evaluator_version": "finscope-weekly-live/3",
         "dataset_sha256": FROZEN_WEEKLY_SUMMARY_V2_SHA256,
         "model": model_name,
         "configuration": {
@@ -446,6 +483,7 @@ async def evaluate(*, history_turns: Literal[0, 8]) -> dict[str, object]:
             "max_request_bytes": _MAX_REQUEST_BYTES,
             "max_duration_seconds": _MAX_DURATION_SECONDS,
             "history_turns": history_turns,
+            "understanding": understanding,
         },
         "response_status": response_status,
         "execution_status": payload.status if payload is not None else None,
@@ -477,10 +515,16 @@ def _required(name: str) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--history-turns", type=int, choices=(0, 8), default=0)
+    parser.add_argument("--understanding", choices=("fixed", "live"), default="live")
     args = parser.parse_args()
     history_turns = 8 if args.history_turns == 8 else 0
+    understanding: UnderstandingMode = "fixed" if args.understanding == "fixed" else "live"
     print(
-        json.dumps(asyncio.run(evaluate(history_turns=history_turns)), ensure_ascii=False, indent=2)
+        json.dumps(
+            asyncio.run(evaluate(history_turns=history_turns, understanding=understanding)),
+            ensure_ascii=False,
+            indent=2,
+        )
     )
 
 
