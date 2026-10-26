@@ -231,6 +231,39 @@ async def test_verify_recommendation_rejects_further_tool_effects() -> None:
     assert decision.reason_codes == ("test_recommendation",)
 
 
+async def test_verify_recommendation_allows_an_exact_bounded_artifact_continuation() -> None:
+    context = _context()
+    assessment = _assessment("neutral", "verify").model_copy(
+        update={
+            "obligations": ObligationProgressSignal(
+                observable_total=1,
+                open_before=0,
+                open_after=0,
+            ),
+            "coverage": EvidenceCoverageSignal(
+                total_units=1,
+                covered_before=1,
+                covered_after=1,
+            ),
+        }
+    )
+
+    decision = await ProgressActionInterventionPolicy().evaluate(
+        ActionInterventionContext(
+            task=context.task,
+            proposal=context.proposal,
+            progress_assessment=assessment,
+            remaining_model_calls=2,
+            remaining_tool_calls=3,
+            bounded_continuation=True,
+        )
+    )
+
+    assert decision.disposition == "allow"
+    assert decision.trigger == "verification_advisory"
+    assert decision.reason_codes == ("bounded_artifact_continuation",)
+
+
 async def test_productive_transition_to_verify_keeps_one_advisory_step() -> None:
     context = _context()
     assessment = _assessment("positive", "verify").model_copy(

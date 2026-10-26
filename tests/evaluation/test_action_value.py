@@ -93,7 +93,7 @@ async def test_action_value_policy_uses_gain_magnitude_uncertainty_and_risk() ->
     report = await evaluate_action_value_policy(gain_rate_regression_cases())
 
     assert report.schema_version == 2
-    assert report.policy_version.startswith("progress-action-intervention/4[")
+    assert report.policy_version.startswith("progress-action-intervention/5[")
     assert report.baseline_version == "progress-action-intervention/1"
     assert report.selected_correct == report.total_cases == 16
     assert report.baseline_correct == 11

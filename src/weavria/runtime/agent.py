@@ -12,7 +12,7 @@ from typing import Literal, Protocol
 
 from pydantic import JsonValue, TypeAdapter
 
-from weavria.artifacts import ArtifactStore
+from weavria.artifacts import ArtifactAccessError, ArtifactStore
 from weavria.context import (
     ContextBudgetError,
     ContextCapacityError,
@@ -83,6 +83,7 @@ from weavria.core import (
     TaskUpdate,
     ToolBatch,
     ToolCallAction,
+    ToolRecord,
     ToolRecorded,
     ToolStarted,
     TurnDecided,
@@ -104,6 +105,8 @@ from weavria.models import (
     call_model_turn,
 )
 from weavria.tools import (
+    ArtifactReadInput,
+    ArtifactReadOutput,
     ReadOnlyPolicy,
     ToolActionIdentity,
     ToolExecutor,
@@ -966,6 +969,7 @@ class _AgentKernel:
             progress_assessment=progress,
             remaining_model_calls=max(0, self._limits.max_model_calls - self.state.model_calls),
             remaining_tool_calls=max(0, self._limits.max_tool_calls - self.state.tool_calls),
+            bounded_continuation=await self._is_bounded_artifact_continuation(batch),
             action_value_context=value_context,
             action_value_profiles=self.state.action_value_profiles,
         )
@@ -1009,6 +1013,45 @@ class _AgentKernel:
                 raise _InterventionExhausted
             return False, action_identities, value_context
         return True, action_identities, value_context
+
+    async def _is_bounded_artifact_continuation(self, batch: ToolBatch) -> bool:
+        """Recognize the exact next page of an accepted framework artifact read."""
+        if len(batch.calls) != 1 or batch.calls[0].tool_name != "read_artifact":
+            return False
+        try:
+            proposed = ArtifactReadInput.model_validate(batch.calls[0].arguments)
+        except ValueError:
+            return False
+        previous: ToolRecord | None = None
+        for record in reversed(self.state.records):
+            action = record.exchange.action
+            if action.tool_name != "read_artifact":
+                continue
+            try:
+                arguments = ArtifactReadInput.model_validate(action.arguments)
+            except ValueError:
+                return False
+            if (
+                arguments.artifact_id == proposed.artifact_id
+                and arguments.pointer == proposed.pointer
+            ):
+                previous = record
+                break
+        if previous is None or previous.artifact is None:
+            return False
+        try:
+            snapshot = await self._artifacts.get(self._run_id, previous.artifact.artifact_id)
+            page = ArtifactReadOutput.model_validate_json(
+                json.dumps(snapshot.value, ensure_ascii=False, separators=(",", ":"))
+            )
+        except (ValueError, ArtifactAccessError):
+            return False
+        return (
+            page.source_artifact == proposed.artifact_id
+            and page.pointer == proposed.pointer
+            and page.has_more
+            and proposed.start == page.end
+        )
 
     async def _admit_batch(
         self,

@@ -57,8 +57,10 @@ Sidecar 默认启用 Weavria 的联合上下文编译、持久历史检索与主
 显式改成兼容编码，不要把默认值当成供应商能力探测结果。
 
 本地真实模型验证默认允许 20 次模型调用、20 次工具调用、64,000 字节单次请求预算和 180 秒
-总运行时间。它们是宿主运行策略而不是金融业务规则，可通过 `WEAVRIA_RUN_MAX_*` 环境变量调整；
-Context Compiler 仍会独立遵守模型上下文窗口和输出预留。
+Agent 执行时间。任务理解阶段另有 180 秒上限；两阶段受二者之和形成的单次请求硬 Deadline
+约束，因此任一阶段未用完的时间不会扩大另一阶段自己的上限。它们是宿主运行策略而不是金融
+业务规则，可通过 `WEAVRIA_RUN_MAX_*` 与 `WEAVRIA_UNDERSTANDING_MAX_DURATION_SECONDS`
+环境变量调整；Context Compiler 仍会独立遵守模型上下文窗口和输出预留。
 
 FinScope 前端设置 `VITE_WEAVRIA_AGENT_URL=http://127.0.0.1:8765` 后才显示入口；没有
 设置时不会渲染悬浮窗。

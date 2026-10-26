@@ -90,7 +90,7 @@ from weavria.runtime import (
     ToolScheduling,
     reduce_event,
 )
-from weavria.tools import ToolContext, ToolRegistry, TypedTool
+from weavria.tools import ToolContext, ToolRegistry, TypedTool, artifact_read_tool
 
 
 class Input(BaseModel):
@@ -852,6 +852,69 @@ async def test_ready_to_verify_blocks_more_tools_and_converges_to_finish() -> No
     ]
     assert decisions[-1].disposition == "reconsider"
     assert decisions[-1].trigger == "completion_recommended"
+    replay(agent)
+
+
+async def test_ready_to_verify_allows_the_exact_next_artifact_page() -> None:
+    store = InMemoryArtifactStore()
+    long_value = "x" * 3000
+    source = await store.put("run", "source", {"value": long_value})
+    provider = FakeControlProvider(
+        (
+            batch(call("source", long_value)),
+            batch(
+                ToolCallAction(
+                    call_id="page-1",
+                    tool_name="read_artifact",
+                    arguments={
+                        "artifact_id": source.reference.artifact_id,
+                        "pointer": "/value",
+                        "start": 0,
+                        "length": 1000,
+                    },
+                )
+            ),
+            batch(
+                ToolCallAction(
+                    call_id="page-2",
+                    tool_name="read_artifact",
+                    arguments={
+                        "artifact_id": source.reference.artifact_id,
+                        "pointer": "/value",
+                        "start": 998,
+                        "length": 1000,
+                    },
+                )
+            ),
+            finish("grounded"),
+        )
+    )
+    tools = ToolRegistry((echo_tool(), artifact_read_tool()))
+    agent = AgentLoop(
+        run_id="run",
+        task=TaskInput(goal="Read and report the paged value"),
+        instructions="Use evidence",
+        model=provider,
+        artifacts=store,
+        tools=tools,
+        limits=RunLimits(max_request_bytes=20_000),
+        scheduling=ToolScheduling(2, frozenset({"echo", "read_artifact"})),
+        progress_assessor=_ReadyThenNeutralProgressAssessor(),
+    )
+
+    result = await agent.execute()
+
+    assert result.status is RunStatus.COMPLETED and result.output == "grounded"
+    assert [
+        event.data.call_id for event in agent.events if isinstance(event.data, ToolStarted)
+    ] == ["source", "page-1", "page-2"]
+    page_two = [
+        event.data.decision
+        for event in agent.events
+        if isinstance(event.data, ActionInterventionChecked)
+    ][-1]
+    assert page_two.disposition == "allow"
+    assert page_two.reason_codes == ("bounded_artifact_continuation",)
     replay(agent)
 
 

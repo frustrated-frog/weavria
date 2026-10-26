@@ -13,6 +13,7 @@ from weavria.core import (
     ErrorCategory,
     FinishAction,
     Message,
+    ModelRequest,
     ModelResponse,
     ModelTurn,
     ProgressAssessed,
@@ -442,6 +443,40 @@ class _DirectSessionModel:
         return ModelTurn(decision=FinishAction(output="I am the configured assistant."))
 
 
+class _AdvancingClock:
+    def __init__(self) -> None:
+        self.elapsed = 0.0
+
+    def monotonic(self) -> float:
+        return self.elapsed
+
+    def now(self) -> datetime:
+        return datetime(2026, 1, 1, tzinfo=UTC) + timedelta(seconds=self.elapsed)
+
+    def advance(self, seconds: float) -> None:
+        self.elapsed += seconds
+
+
+class _AdvancingInterpreter(FakeModelProvider):
+    def __init__(self, response: ModelResponse, clock: _AdvancingClock) -> None:
+        super().__init__((response,))
+        self._clock = clock
+
+    async def generate(self, request: ModelRequest) -> ModelResponse:
+        self._clock.advance(70.0)
+        return await super().generate(request)
+
+
+class _AdvancingDirectSessionModel(_DirectSessionModel):
+    def __init__(self, clock: _AdvancingClock) -> None:
+        super().__init__()
+        self._clock = clock
+
+    async def generate_session(self, request: SessionRequest) -> ModelTurn:
+        self._clock.advance(50.0)
+        return await super().generate_session(request)
+
+
 async def test_task_frame_preserves_raw_request_and_hides_business_tools_in_v4_session(
     tmp_path: Path,
 ) -> None:
@@ -483,6 +518,34 @@ async def test_task_frame_preserves_raw_request_and_hides_business_tools_in_v4_s
         "Who are you?",
         "I am the configured assistant.",
     ]
+
+
+@pytest.mark.parametrize(
+    ("max_request_duration", "expected_status"),
+    ((None, RunStatus.BUDGET_EXHAUSTED), (200.0, RunStatus.COMPLETED)),
+)
+async def test_request_deadline_can_bound_preparation_and_run_without_sharing_run_slice(
+    tmp_path: Path,
+    max_request_duration: float | None,
+    expected_status: RunStatus,
+) -> None:
+    clock = _AdvancingClock()
+    interpreter = _AdvancingInterpreter(_declaration(_direct()), clock)
+    model = _AdvancingDirectSessionModel(clock)
+    preparer = TaskAwareSessionPreparer(TaskUnderstandingEngine(ModelTaskInterpreter(interpreter)))
+    async with SessionEngine(
+        tmp_path / f"request-budget-{max_request_duration}.db",
+        model=model,
+        tools=_registry(),
+        task_preparation=preparer,
+        limits=RunLimits(max_duration=100.0),
+        max_request_duration=max_request_duration,
+        clock=clock,
+    ) as engine:
+        await engine.create("s")
+        result = await engine.send("s", "Who are you?", input_id="input-1")
+
+    assert result.report.status is expected_status
 
 
 class _ExecuteSessionModel:

@@ -109,6 +109,7 @@ class ActionInterventionContext:
     """Serialized snapshots sampled before any proposed effect is admitted."""
 
     __slots__ = (
+        "_bounded_continuation",
         "_progress_assessment_json",
         "_proposal_json",
         "_remaining_model_calls",
@@ -126,6 +127,7 @@ class ActionInterventionContext:
         progress_assessment: ProgressAssessment | None,
         remaining_model_calls: int,
         remaining_tool_calls: int,
+        bounded_continuation: bool = False,
         action_value_context: ActionValueContext | None = None,
         action_value_profiles: tuple[ActionValueProfile, ...] = (),
     ) -> None:
@@ -133,6 +135,8 @@ class ActionInterventionContext:
             raise ValueError("remaining model calls must be a nonnegative integer")
         if type(remaining_tool_calls) is not int or remaining_tool_calls < 0:
             raise ValueError("remaining tool calls must be a nonnegative integer")
+        if type(bounded_continuation) is not bool:
+            raise TypeError("bounded continuation must be a boolean")
         if progress_assessment is not None and progress_assessment.task_revision != task.revision:
             raise ValueError("progress assessment belongs to another task revision")
         if action_value_context is not None and action_value_context.task_revision != task.revision:
@@ -157,6 +161,7 @@ class ActionInterventionContext:
         )
         self._remaining_model_calls = remaining_model_calls
         self._remaining_tool_calls = remaining_tool_calls
+        self._bounded_continuation = bounded_continuation
         self._value_context_json = (
             ActionValueContext.model_validate(action_value_context).model_dump_json()
             if action_value_context is not None
@@ -190,6 +195,10 @@ class ActionInterventionContext:
     @property
     def remaining_tool_calls(self) -> int:
         return self._remaining_tool_calls
+
+    @property
+    def bounded_continuation(self) -> bool:
+        return self._bounded_continuation
 
     @property
     def action_value_context(self) -> ActionValueContext | None:
@@ -260,7 +269,7 @@ class ProgressActionInterventionPolicy:
     @property
     def version(self) -> str:
         return (
-            "progress-action-intervention/4["
+            "progress-action-intervention/5["
             f"min_observations={self._minimum_observations};"
             f"min_expected_yield={self._minimum_yield:g};"
             f"max_pessimistic_regression={self._maximum_regression:g};"
@@ -277,11 +286,15 @@ class ProgressActionInterventionPolicy:
             )
         recommendation = assessment.continuation.recommended_action
         if recommendation == "verify":
-            if assessment.material_progress:
+            if assessment.material_progress or context.bounded_continuation:
                 return InterventionDecision(
                     disposition="allow",
                     trigger="verification_advisory",
-                    reason_codes=assessment.continuation.reason_codes,
+                    reason_codes=(
+                        ("bounded_artifact_continuation",)
+                        if context.bounded_continuation
+                        else assessment.continuation.reason_codes
+                    ),
                 )
             return InterventionDecision(
                 disposition="reconsider",

@@ -171,6 +171,9 @@ def create_app(
                 max_completion_duration=5.0,
                 max_completion_repairs=2,
             ),
+            max_request_duration=(
+                resolved.understanding_max_duration_seconds + resolved.run_max_duration_seconds
+            ),
             completion=MarketAnswerPolicy(),
             history_budget_bytes=8_000,
             task_preparation=TaskAwareSessionPreparer(

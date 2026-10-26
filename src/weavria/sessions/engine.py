@@ -590,6 +590,7 @@ class SessionEngine:
         tools: ToolRegistry,
         instructions: str = "",
         limits: RunLimits | None = None,
+        max_request_duration: float | None = None,
         scheduling: ToolScheduling | None = None,
         completion: CompletionPolicy | None = None,
         policy: ToolPolicy | None = None,
@@ -655,6 +656,15 @@ class SessionEngine:
             + "Earlier task-specific instructions do not automatically become global rules."
         )
         self._limits = limits or RunLimits()
+        if max_request_duration is not None and (
+            isinstance(max_request_duration, bool)
+            or not math.isfinite(max_request_duration)
+            or max_request_duration <= 0
+        ):
+            raise ValueError("request duration must be positive and finite")
+        self._max_request_duration = (
+            self._limits.max_duration if max_request_duration is None else max_request_duration
+        )
         self._scheduling = scheduling
         prepared_completion = cast(
             CompletionPolicy | None,
@@ -718,7 +728,7 @@ class SessionEngine:
         claimed_run: str | None = None
         interruption_reason = "owner_exit"
         try:
-            root_budget = RootBudget.start(self._clock.monotonic(), self._limits.max_duration)
+            root_budget = RootBudget.start(self._clock.monotonic(), self._max_request_duration)
             run_id = self._ids()
             identity = input_id if input_id is not None else self._ids()
             config = json.dumps(
@@ -760,6 +770,7 @@ class SessionEngine:
                     "model_capabilities": asdict(self._model.capabilities),
                     "session_tools_version": "2",
                     "limits": asdict(self._limits),
+                    "max_request_duration": self._max_request_duration,
                     "history_budget_bytes": self._history_budget,
                     "history_mode": self._history_mode.value,
                     "instructions": self._instructions,
@@ -957,7 +968,10 @@ class SessionEngine:
                 self._retrieval_config,
                 self._recovery_limits,
             )
-            remaining = root_budget.remaining(self._clock.monotonic())
+            remaining = min(
+                self._limits.max_duration,
+                root_budget.remaining(self._clock.monotonic()),
+            )
             run_limits = replace(
                 self._limits,
                 max_duration=max(remaining, 0.000_001),
