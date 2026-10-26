@@ -10,11 +10,12 @@ from fastapi import Path as ApiPath
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from weavria.context import ContextCompilerConfig, HistoryRetrievalConfig
 from weavria.core import ApplicationObservation, CompletionUnverifiable, RecoveryLimits
 from weavria.harness import (
+    CapabilityResolver,
     EvidenceResolver,
     ModelRequirementCoverageValidator,
     ModelTaskInterpreter,
@@ -33,20 +34,55 @@ from weavria.runtime import RunLimits
 from weavria.sessions import SessionConflictError, SessionEngine
 from weavria.tools import ToolRegistry
 
-from .completion import MarketAnswerPolicy, MarketPulseEvidenceExtractor
+from .completion import (
+    FinScopeAnswerPolicy,
+    FinScopeWorkspaceEvidenceExtractor,
+    MarketPulseEvidenceExtractor,
+)
 from .config import FinScopeSettings
 from .market import MarketPulseClient, market_pulse_evidence_profile, market_pulse_tool
 from .model import HTTPChatCompletionTransport
+from .policy import FinScopeReadOnlyPolicy
+from .workspace import (
+    FinScopeWorkspaceClient,
+    finscope_workspace_evidence_profiles,
+    finscope_workspace_tools,
+)
+
+_MARKET_VIEWS = frozenset({"panorama", "review", "transition", "breadth", "history"})
+
+
+class WorkspaceNavigation(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
+    view: str = Field(min_length=1, max_length=32, pattern=r"^[a-z][a-z0-9_-]*$")
+    label: str = Field(min_length=1, max_length=64)
+    hint: str | None = Field(default=None, min_length=1, max_length=160)
 
 
 class PageContext(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
     schema_version: Literal[1] = 1
-    surface: Literal["market_pulse"]
+    surface: Literal["market_pulse", "finscope_workspace"]
     business_date: str | None = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
-    current_view: Literal["panorama", "review", "transition", "breadth", "history"]
+    current_view: str = Field(min_length=1, max_length=32, pattern=r"^[a-z][a-z0-9_-]*$")
     quality_status: Literal["READY", "PARTIAL", "STALE", "UNAVAILABLE"] | None = None
     generated_at: str | None = Field(default=None, max_length=64)
+    navigation: WorkspaceNavigation | None = None
+
+    @model_validator(mode="after")
+    def validate_surface_shape(self) -> "PageContext":
+        if self.surface == "market_pulse":
+            if self.current_view not in _MARKET_VIEWS or self.navigation is not None:
+                raise ValueError("market_pulse context has an invalid view or navigation")
+            return self
+        if self.navigation is None or self.navigation.view != self.current_view:
+            raise ValueError("workspace context requires matching navigation metadata")
+        if any(
+            value is not None
+            for value in (self.business_date, self.quality_status, self.generated_at)
+        ):
+            raise ValueError("workspace context cannot carry Market Pulse evidence fields")
+        return self
 
 
 class MessageInput(BaseModel):
@@ -93,6 +129,7 @@ def create_app(
     provider: SessionModelProvider | None = None,
     interpreter_provider: ModelProvider | None = None,
     market_client: MarketPulseClient | None = None,
+    workspace_client: FinScopeWorkspaceClient | None = None,
     requirement_coverage: bool = True,
     evidence_guidance: bool | None = None,
 ) -> FastAPI:
@@ -147,7 +184,22 @@ def create_app(
                 timeout_seconds=resolved.request_timeout_seconds,
             )
         active_market = market_client or created_market
-        assert active_provider is not None and active_market is not None
+        created_workspace = None
+        if workspace_client is None:
+            created_workspace = FinScopeWorkspaceClient(
+                resolved.finscope_base_url,
+                timeout_seconds=resolved.request_timeout_seconds,
+            )
+        active_workspace = workspace_client or created_workspace
+        assert (
+            active_provider is not None
+            and active_market is not None
+            and active_workspace is not None
+        )
+        access_policy = FinScopeReadOnlyPolicy()
+        tools = ToolRegistry(
+            (market_pulse_tool(active_market), *finscope_workspace_tools(active_workspace))
+        )
         token_counter = (
             active_provider.token_counter(encoding=resolved.context_encoding)
             if isinstance(active_provider, OpenAICompatibleSessionProvider)
@@ -160,7 +212,7 @@ def create_app(
         engine = SessionEngine(
             resolved.state_path,
             model=active_provider,
-            tools=ToolRegistry((market_pulse_tool(active_market),)),
+            tools=tools,
             instructions=_instructions(),
             limits=RunLimits(
                 max_model_calls=resolved.run_max_model_calls,
@@ -174,7 +226,8 @@ def create_app(
             max_request_duration=(
                 resolved.understanding_max_duration_seconds + resolved.run_max_duration_seconds
             ),
-            completion=MarketAnswerPolicy(),
+            completion=FinScopeAnswerPolicy(),
+            policy=access_policy,
             history_budget_bytes=8_000,
             task_preparation=TaskAwareSessionPreparer(
                 TaskUnderstandingEngine(
@@ -186,11 +239,19 @@ def create_app(
                     ),
                     coverage_repairer=task_interpreter if requirement_coverage else None,
                     evidence_profiles=(
-                        (market_pulse_evidence_profile(),) if use_evidence_guidance else ()
+                        (
+                            market_pulse_evidence_profile(),
+                            *finscope_workspace_evidence_profiles(),
+                        )
+                        if use_evidence_guidance
+                        else ()
                     ),
                     max_duration=resolved.understanding_max_duration_seconds,
                 ),
-                evidence=EvidenceResolver((MarketPulseEvidenceExtractor(),)),
+                evidence=EvidenceResolver(
+                    (MarketPulseEvidenceExtractor(), FinScopeWorkspaceEvidenceExtractor())
+                ),
+                capabilities=CapabilityResolver(policy=access_policy),
             ),
             context_compiler=ContextCompilerConfig(
                 window_tokens=resolved.context_window_tokens,
@@ -210,6 +271,8 @@ def create_app(
                 await created_transport.aclose()
             if created_market is not None:
                 await created_market.aclose()
+            if created_workspace is not None:
+                await created_workspace.aclose()
 
     app = FastAPI(
         title="Weavria FinScope Adapter",
@@ -337,15 +400,16 @@ def _runtime(request: Request) -> _Runtime:
 
 def _instructions() -> str:
     return (
-        "You are a read-only research assistant embedded in FinScope Market Pulse. "
+        "You are a read-only research assistant embedded in the FinScope local research workspace. "
         "Answer in concise Chinese. Page metadata only identifies what the user is viewing; "
         "it is not authoritative evidence. Follow the Task Frame route: answer direct requests "
-        "without a market read, ask one focused question for clarify requests, and for execute "
+        "without an evidence read, ask one focused question for clarify requests, and for execute "
         "requests use only the exposed capabilities with the smallest relevant scope. "
-        "A date explicitly named by the user "
-        "takes precedence over the page date; otherwise use the page date. Use more than one focus "
-        "only when the question requires it. Distinguish observed facts from inference, "
-        "state 数据质量 explicitly, and never turn research candidates into buy or sell advice. "
-        "Cite successful market evidence with the exact marker "
-        "[来源:market-pulse:YYYY-MM-DD]. If evidence is unavailable, say what cannot be judged."
+        "Never invent a URL, path, HTTP method, write, refresh, generation, SQL, or filesystem "
+        "operation. A date explicitly named by the user takes precedence over the Market Pulse "
+        "page date; otherwise use the page date. Use more than one read only when the question "
+        "requires it. Distinguish observed facts from inference and never turn research candidates "
+        "into buy or sell advice. Cite every successful read with the exact source_id marker "
+        "[来源:<source_id>]. For Market Pulse evidence, also state 数据质量 explicitly. If "
+        "required evidence is unavailable, say what cannot be judged."
     )

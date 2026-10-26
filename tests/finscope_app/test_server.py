@@ -10,6 +10,7 @@ import pytest
 from apps.finscope.config import FinScopeSettings
 from apps.finscope.market import MarketPulseClient
 from apps.finscope.server import MessageOutput, SessionCreated, create_app
+from apps.finscope.workspace import FinScopeWorkspaceClient
 from weavria.core import (
     FinishAction,
     ModelResponse,
@@ -123,6 +124,38 @@ def _market_execution() -> TaskSpecification:
                 capability="read_market_pulse",
             ),
             CompletionCriterion(kind="response", description="Explain the market stage"),
+        ),
+    )
+
+
+def _article_catalogue_execution() -> TaskSpecification:
+    return TaskSpecification(
+        route="execute",
+        intent="Read the recent FinScope article catalogue",
+        goal="Summarize recent saved articles from authoritative workspace evidence",
+        information_needs=(
+            InformationNeed(
+                description="Recent saved articles",
+                source="external",
+                freshness="current",
+                required_fields=("/data",),
+                capability_names=("read_finscope_catalogue",),
+            ),
+        ),
+        capability_needs=(
+            CapabilityNeed(
+                name="read_finscope_catalogue",
+                purpose="Read the bounded article catalogue",
+                necessity="required",
+            ),
+        ),
+        completion_criteria=(
+            CompletionCriterion(
+                kind="capability_result",
+                description="Read the article catalogue",
+                capability="read_finscope_catalogue",
+            ),
+            CompletionCriterion(kind="response", description="Summarize recent articles"),
         ),
     )
 
@@ -320,6 +353,110 @@ async def test_widget_session_executes_real_runtime_and_reports_tool_trace(
         "max_stagnant_actions_per_family": 3,
     }
     await market_http.aclose()
+
+
+async def test_workspace_context_executes_private_get_tool_with_provenance(
+    tmp_path: Path,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def workspace_response(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "success": True,
+                "data": {
+                    "items": [
+                        {"id": 42, "title": "光模块资本开支线索", "publishedAt": "2026-10-27"}
+                    ],
+                    "page": 0,
+                    "pageSize": 5,
+                    "total": 1,
+                },
+            },
+        )
+
+    workspace_http = httpx.AsyncClient(transport=httpx.MockTransport(workspace_response))
+    workspace = FinScopeWorkspaceClient("http://finscope.test", client=workspace_http)
+    provider = FakeSessionProvider(
+        (
+            ModelTurn(
+                decision=ToolBatch(
+                    calls=(
+                        ToolCallAction(
+                            call_id="article-catalogue-1",
+                            tool_name="read_finscope_catalogue",
+                            arguments={"area": "articles", "page": 0, "limit": 5},
+                        ),
+                    )
+                )
+            ),
+            ModelTurn(decision=FinishAction(output="最近保存了光模块资本开支线索。")),
+            ModelTurn(
+                decision=FinishAction(
+                    output="最近保存了光模块资本开支线索。[来源:finscope:catalogue:articles]"
+                )
+            ),
+        )
+    )
+    interpreter = FakeModelProvider((_declaration(_article_catalogue_execution()),))
+    app = create_app(
+        FinScopeSettings(
+            model_base_url="http://model.test",
+            model_name="fake",
+            model_api_key="",
+            state_path=tmp_path / "workspace-sessions.sqlite3",
+        ),
+        provider=provider,
+        interpreter_provider=interpreter,
+        workspace_client=workspace,
+        requirement_coverage=False,
+    )
+
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://sidecar.test"
+        ) as client:
+            created = SessionCreated.model_validate((await client.post("/api/sessions")).json())
+            response = await client.post(
+                f"/api/sessions/{created.session_id}/messages",
+                json={
+                    "input_id": "workspace-1",
+                    "text": "概括最近进入工作区的文章",
+                    "context": {
+                        "schema_version": 1,
+                        "surface": "finscope_workspace",
+                        "current_view": "agent",
+                        "navigation": {
+                            "view": "agent",
+                            "label": "Agent",
+                            "hint": "全域问答",
+                        },
+                    },
+                },
+            )
+
+    payload = MessageOutput.model_validate(response.json())
+    assert response.status_code == 200
+    assert payload.status == "completed"
+    assert payload.answer is not None
+    assert payload.answer.endswith("[来源:finscope:catalogue:articles]")
+    assert [tool.tool_name for tool in payload.tools] == ["read_finscope_catalogue"]
+    assert [(request.method, request.url.path) for request in requests] == [
+        ("GET", "/api/articles/paged")
+    ]
+    assert dict(requests[0].url.params) == {"page": "0", "pageSize": "5"}
+    observation = provider.requests[0].current.task_observation
+    assert observation is not None
+    frame = TaskFrame.model_validate_json(json.dumps(observation.payload))
+    assert frame.application_context[0].payload["surface"] == "finscope_workspace"
+    assert frame.application_context[0].payload["navigation"] == {
+        "view": "agent",
+        "label": "Agent",
+        "hint": "全域问答",
+    }
+    await workspace_http.aclose()
 
 
 async def test_finscope_retries_ungrounded_model_evidence_path_before_execution(
@@ -705,16 +842,22 @@ async def test_widget_has_parent_and_script_restrictions(tmp_path: Path) -> None
             transport=httpx.ASGITransport(app=app), base_url="http://sidecar.test"
         ) as client:
             response = await client.get("/widget")
+            full_response = await client.get("/widget?mode=full&asset-version=4")
             markdown_script = await client.get("/widget-assets/markdown.js")
             script = await client.get("/widget-assets/widget.js")
+            stylesheet = await client.get("/widget-assets/widget.css")
 
     assert response.status_code == 200
     assert "frame-ancestors http://localhost:5173" in response.headers["content-security-policy"]
     assert response.headers["cache-control"] == "no-store"
-    assert '<link rel="stylesheet" href="/widget-assets/widget.css?v=3" />' in response.text
-    assert '<script src="/widget-assets/markdown.js?v=3" defer></script>' in response.text
-    assert '<script src="/widget-assets/widget.js?v=3" defer></script>' in response.text
+    assert '<link rel="stylesheet" href="/widget-assets/widget.css?v=4" />' in response.text
+    assert '<script src="/widget-assets/markdown.js?v=4" defer></script>' in response.text
+    assert '<script src="/widget-assets/widget.js?v=4" defer></script>' in response.text
     assert '<button type="button" id="send">发送</button>' in response.text
+    assert "市场状态 Agent" in response.text
+    assert full_response.status_code == 200
+    assert "FIN//SCOPE EVIDENCE DESK" in full_response.text
+    assert "不写入 · 不刷新" in full_response.text
     assert markdown_script.status_code == 200
     assert markdown_script.headers["cache-control"] == "no-store"
     assert "document.createTextNode" in markdown_script.text
@@ -723,12 +866,20 @@ async def test_widget_has_parent_and_script_restrictions(tmp_path: Path) -> None
     assert script.headers["cache-control"] == "no-store"
     assert "send.addEventListener('click'" in script.text
     assert "void submitQuestion();" in script.text
-    assert "const WIDGET_ASSET_VERSION = 3;" in script.text
+    assert "const WIDGET_ASSET_VERSION = 4;" in script.text
     assert "const markdownReady = ensureMarkdownRenderer();" in script.text
     assert "script.src = `/widget-assets/markdown.js?v=${WIDGET_ASSET_VERSION}`;" in script.text
     assert "window.WeavriaMarkdown.renderMarkdown(content, text);" in script.text
     assert "result.task_outcome === 'unverifiable'" in script.text
     assert "'未能核验'" in script.text
+    assert "get('mode') === 'full'" in script.text
+    assert "weavria.finscope.sessionId" in script.text
+    assert "weavria.finscopeWorkspace.sessionId" in script.text
+    assert "context.surface === 'finscope_workspace'" in script.text
+    assert stylesheet.status_code == 200
+    assert 'body[data-mode="full"] .workspace-intro' in stylesheet.text
+    assert "min-height: 100dvh" in stylesheet.text
+    assert "env(safe-area-inset-bottom)" in stylesheet.text
     await market_http.aclose()
 
 

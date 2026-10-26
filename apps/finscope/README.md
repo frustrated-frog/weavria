@@ -1,9 +1,9 @@
-# FinScope 市场状态 Agent 适配器
+# FinScope Agent 适配器
 
 本目录是独立应用适配器，不属于 Weavria Core、Runtime 或 Harness。它通过 FinScope
-已有的只读 HTTP API 获取 Market Pulse 数据，使用公开 `TaskAwareSessionPreparer`、
+已有的只读 HTTP API 获取工作区数据，使用公开 `TaskAwareSessionPreparer`、
 `SessionEngine`、`TypedTool` 和 `CompletionPolicy` 运行多轮 Agent，再以隔离 iframe 提供
-悬浮窗口。
+市场悬浮窗口与完整问答页。
 
 FinScope 可以在不启动本 sidecar 时独立运行；Weavria 核心测试也不依赖 FinScope。金融
 术语、API 映射、提示词、验收规则和 Widget 都只保留在本目录。
@@ -47,6 +47,7 @@ Sidecar 监听 `127.0.0.1:8765`。健康检查和 Widget 地址分别为：
 ```text
 http://127.0.0.1:8765/health
 http://127.0.0.1:8765/widget
+http://127.0.0.1:8765/widget?mode=full
 ```
 
 会话默认持久化到 `.weavria/finscope-sessions.sqlite3`。可以用
@@ -62,14 +63,20 @@ Agent 执行时间。任务理解阶段另有 180 秒上限；两阶段受二者
 业务规则，可通过 `WEAVRIA_RUN_MAX_*` 与 `WEAVRIA_UNDERSTANDING_MAX_DURATION_SECONDS`
 环境变量调整；Context Compiler 仍会独立遵守模型上下文窗口和输出预留。
 
-FinScope 前端设置 `VITE_WEAVRIA_AGENT_URL=http://127.0.0.1:8765` 后才显示入口；没有
-设置时不会渲染悬浮窗。
+FinScope 前端设置 `VITE_WEAVRIA_AGENT_URL=http://127.0.0.1:8765` 后，市场页悬浮窗与左侧
+Agent 问答页都会连接这个 sidecar。完整页和悬浮窗复用同一持久会话；未配置时 Agent 页只显示
+本地配置指引，不会尝试访问远端服务。
 
 ## 当前能力与边界
 
-- Task Frame 为 direct / clarify 时不暴露市场工具；execute 时只暴露
-  `read_market_pulse`，不会刷新行情、修改 FinScope 或执行交易操作。
-- 页面只传日期、当前标签和质量状态；这些是导航元数据，不是事实证据。
+- Task Frame 为 direct / clarify 时不暴露数据工具；execute 时只暴露四个应用能力：
+  `read_market_pulse`、`read_finscope_catalogue`、`read_finscope_resource` 与
+  `search_finscope`。后三者覆盖当前工作区的采集、研究、知识、新闻、市场、自选、财务、产业链、
+  策略、持仓、量化与运行记录等主要数据域。
+- 所有能力都注册为 `read_only`、`replay_safe`、低风险且无需审批。工作区适配器只接受枚举化的
+  数据集/资源类型和经过约束的标识，不接受调用方提供 URL、路径、HTTP 方法或 SQL；固定路由只发
+  `GET`，并显式关闭会触发刷新的查询开关。
+- 页面只传日期、当前标签、质量状态或 Agent 导航信息；这些是导航元数据，不是事实证据。
 - 任务理解默认执行“规格规划—独立义务覆盖审计—主机校验—至多一次语义修复—再次审计”。
   FinScope 只在适配器中声明版本化市场证据面；通用 Harness 不理解金融字段。规划、审计与修复
   共享同一理解阶段时限，覆盖仍不足时不会进入 Runtime。单次供应商请求继续受
@@ -81,8 +88,9 @@ FinScope 前端设置 `VITE_WEAVRIA_AGENT_URL=http://127.0.0.1:8765` 后才显�
 - 任务理解只接受能够落到显式生产能力 `output_schema` 的证据字段；Profile 参数值也必须与工具
   输入 Schema 相容。成功工具结果即使零字段匹配也会留下 Evidence Probe，并以契约不匹配
   收敛，不再重复调用直到耗尽完成预算。
-- execute 回答必须读取 Market Pulse、显示数据质量并包含精确来源标记，否则验收策略要求
-  修正；direct / clarify 回答明确标为 unverifiable，不伪装成已验证的市场结论。
+- execute 回答必须读取所需 FinScope 证据并包含精确来源标记，否则验收策略要求修正；使用
+  Market Pulse 时还必须显示数据质量。direct / clarify 回答明确标为 unverifiable，不伪装成
+  已验证结论。
 - HTTP Host 当前提供同步消息接口，不提供流式 Token 或实时事件推送。
 - Widget 以本地受限 Markdown 渲染 Agent 回答，支持标题、列表、表格、强调、代码与安全的
   HTTP(S) 链接；原始 HTML 始终作为文本处理，不执行模型返回的脚本或标签。

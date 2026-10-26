@@ -1,10 +1,27 @@
+const widgetMode = new URLSearchParams(window.location.search).get('mode') === 'full'
+  ? 'full'
+  : 'compact';
+const sessionStorageKey = 'weavria.finscope.sessionId';
+const legacySessionStorageKeys = [
+  'weavria.marketPulse.sessionId',
+  'weavria.finscopeWorkspace.sessionId'
+];
+const restoredSessionId = window.localStorage.getItem(sessionStorageKey)
+  || legacySessionStorageKeys
+    .map((key) => window.localStorage.getItem(key))
+    .find((value) => Boolean(value))
+  || null;
+if (restoredSessionId) {
+  window.localStorage.setItem(sessionStorageKey, restoredSessionId);
+}
+
 const state = {
   context: null,
   busy: false,
   clarificationId: null,
-  sessionId: window.localStorage.getItem('weavria.marketPulse.sessionId')
+  sessionId: restoredSessionId
 };
-const WIDGET_ASSET_VERSION = 3;
+const WIDGET_ASSET_VERSION = 4;
 const markdownReady = ensureMarkdownRenderer();
 
 const conversation = document.querySelector('#conversation');
@@ -13,12 +30,33 @@ const question = document.querySelector('#question');
 const send = document.querySelector('#send');
 const status = document.querySelector('#agent-status');
 const contextLabel = document.querySelector('#context-label');
+const agentTitle = document.querySelector('#agent-title');
+const questionLabel = document.querySelector('#question-label');
+const composerNote = document.querySelector('#composer-note');
+
+document.documentElement.dataset.mode = widgetMode;
+document.body.dataset.mode = widgetMode;
+if (widgetMode === 'full') {
+  document.title = 'FinScope Agent 工作台';
+  agentTitle.textContent = 'FinScope Agent 工作台';
+  questionLabel.textContent = '向整个研究工作区提问';
+  question.placeholder = '例如：最近有哪些证据正在改变我对某个主题的判断？';
+  composerNote.textContent = '只读研究 · 固定来源 · 不写入、不刷新、不生成业务数据';
+}
 
 window.addEventListener('message', (event) => {
   if (event.source !== window.parent || !isContextMessage(event.data)) return;
   state.context = event.data.context;
-  const date = state.context.business_date || '最新交易日';
-  contextLabel.textContent = `${date} · ${viewLabel(state.context.current_view)}`;
+  if (state.context.surface === 'market_pulse') {
+    const date = state.context.business_date || '最新交易日';
+    contextLabel.textContent = `${date} · ${viewLabel(state.context.current_view)}`;
+  } else {
+    const hint = state.context.navigation.hint;
+    contextLabel.textContent = hint
+      ? `${state.context.navigation.label} · ${hint}`
+      : state.context.navigation.label;
+  }
+  setStatus('只读就绪', '');
 });
 
 window.parent.postMessage({ type: 'weavria:ready', version: 1 }, '*');
@@ -60,7 +98,14 @@ async function submitQuestion() {
     const result = await sendMessage(text, false);
     state.clarificationId = null;
     await markdownReady;
-    appendMessage('agent', result.answer || result.error || '本次运行没有生成可交付答案。', result.tools, result.clarification_id);
+    const responseText = result.answer || result.error || '本次运行没有生成可交付答案。';
+    appendMessage(
+      'agent',
+      responseText,
+      result.tools,
+      result.clarification_id,
+      result.error || !result.answer ? 'error' : ''
+    );
     const completedLabel = result.task_outcome === 'verified'
       ? '已核验'
       : result.task_outcome === 'unverifiable'
@@ -69,7 +114,15 @@ async function submitQuestion() {
     setStatus(result.status === 'completed' ? completedLabel : result.status, result.status === 'completed' ? '' : 'error');
   } catch (error) {
     await markdownReady;
-    appendMessage('agent', error instanceof Error ? error.message : 'Agent 暂时不可用。');
+    appendMessage(
+      'agent',
+      error instanceof Error
+        ? `连接未完成：${error.message}。你的问题仍保留在对话中，可以稍后重试。`
+        : '连接未完成。你的问题仍保留在对话中，可以稍后重试。',
+      [],
+      null,
+      'error'
+    );
     setStatus('连接失败', 'error');
   } finally {
     setBusy(false, false);
@@ -93,7 +146,7 @@ async function sendMessage(text, retried) {
   if (!state.sessionId) {
     const created = await request('/api/sessions', { method: 'POST' });
     state.sessionId = created.session_id;
-    window.localStorage.setItem('weavria.marketPulse.sessionId', state.sessionId);
+    window.localStorage.setItem(sessionStorageKey, state.sessionId);
   }
   try {
     return await request(`/api/sessions/${encodeURIComponent(state.sessionId)}/messages`, {
@@ -108,11 +161,16 @@ async function sendMessage(text, retried) {
   } catch (error) {
     if (!retried && error instanceof HttpError && error.status === 404) {
       state.sessionId = null;
-      window.localStorage.removeItem('weavria.marketPulse.sessionId');
+      clearStoredSession();
       return sendMessage(text, true);
     }
     throw error;
   }
+}
+
+function clearStoredSession() {
+  window.localStorage.removeItem(sessionStorageKey);
+  legacySessionStorageKeys.forEach((key) => window.localStorage.removeItem(key));
 }
 
 async function request(path, options) {
@@ -126,9 +184,9 @@ async function request(path, options) {
   return body;
 }
 
-function appendMessage(role, text, tools = [], clarificationId = null) {
+function appendMessage(role, text, tools = [], clarificationId = null, tone = '') {
   const item = document.createElement('article');
-  item.className = `message ${role}`;
+  item.className = `message ${role}${tone ? ` ${tone}` : ''}`;
   const label = document.createElement('span');
   label.textContent = role === 'user' ? '你的问题' : 'AGENT 回答';
   const content = document.createElement(role === 'agent' ? 'div' : 'p');
@@ -138,6 +196,7 @@ function appendMessage(role, text, tools = [], clarificationId = null) {
   } else {
     content.textContent = text;
   }
+  if (tone === 'error') content.setAttribute('role', 'alert');
   item.append(label, content);
   if (tools.length) {
     const trace = document.createElement('div');
@@ -170,6 +229,7 @@ function setBusy(busy, updateStatus = true) {
   state.busy = busy;
   send.disabled = busy;
   question.disabled = busy;
+  conversation.setAttribute('aria-busy', busy ? 'true' : 'false');
   if (busy && updateStatus) setStatus('正在取证', 'busy');
 }
 
@@ -179,8 +239,29 @@ function setStatus(text, tone) {
 }
 
 function isContextMessage(value) {
-  return value && value.type === 'weavria:context' && value.context?.schema_version === 1
-    && value.context.surface === 'market_pulse';
+  if (!value || value.type !== 'weavria:context' || value.context?.schema_version !== 1) {
+    return false;
+  }
+  return widgetMode === 'full'
+    ? isWorkspaceContext(value.context)
+    : isMarketContext(value.context);
+}
+
+function isMarketContext(context) {
+  return context.surface === 'market_pulse'
+    && ['panorama', 'review', 'transition', 'breadth', 'history'].includes(context.current_view);
+}
+
+function isWorkspaceContext(context) {
+  const navigation = context.navigation;
+  return context.surface === 'finscope_workspace'
+    && typeof context.current_view === 'string'
+    && context.current_view.length > 0
+    && navigation
+    && navigation.view === context.current_view
+    && typeof navigation.label === 'string'
+    && navigation.label.length > 0
+    && (navigation.hint === undefined || typeof navigation.hint === 'string');
 }
 
 function viewLabel(view) {
