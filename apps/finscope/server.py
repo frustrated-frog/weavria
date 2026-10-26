@@ -12,7 +12,12 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from weavria.context import ContextCompilerConfig, HistoryRetrievalConfig
+from weavria.context import (
+    ContextCompilerConfig,
+    HistoryRetrievalConfig,
+    ModelRequestContextCompiler,
+    ModelRequestContextConfig,
+)
 from weavria.core import ApplicationObservation, CompletionUnverifiable, RecoveryLimits
 from weavria.harness import (
     CapabilityResolver,
@@ -162,6 +167,9 @@ def create_app(
             max_output_tokens=resolved.understanding_model_max_output_tokens,
             json_mode=resolved.json_mode,
             reasoning_effort=resolved.understanding_reasoning_effort,
+            context_window_tokens=resolved.context_window_tokens,
+            context_encoding=resolved.context_encoding,
+            max_request_bytes=resolved.run_max_request_bytes,
         )
         active_provider = provider
         if active_provider is None:
@@ -208,7 +216,24 @@ def create_app(
                 encoding=resolved.context_encoding,
             )
         )
-        task_interpreter = ModelTaskInterpreter(active_interpreter)
+        understanding_counter = OpenAICompatibleTokenCounter(
+            understanding_model_config,
+            encoding=resolved.context_encoding,
+        )
+        understanding_context = ModelRequestContextCompiler(
+            ModelRequestContextConfig(
+                window_tokens=resolved.context_window_tokens,
+                output_tokens=resolved.understanding_model_max_output_tokens,
+                max_request_bytes=resolved.run_max_request_bytes,
+                max_history_bytes=8_000,
+                max_history_entries=16,
+            ),
+            understanding_counter,
+        )
+        task_interpreter = ModelTaskInterpreter(
+            active_interpreter,
+            context_compiler=understanding_context,
+        )
         engine = SessionEngine(
             resolved.state_path,
             model=active_provider,
@@ -233,7 +258,10 @@ def create_app(
                 TaskUnderstandingEngine(
                     task_interpreter,
                     coverage_validator=(
-                        ModelRequirementCoverageValidator(active_interpreter)
+                        ModelRequirementCoverageValidator(
+                            active_interpreter,
+                            context_compiler=understanding_context,
+                        )
                         if requirement_coverage
                         else None
                     ),

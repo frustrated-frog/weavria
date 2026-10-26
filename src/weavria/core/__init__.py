@@ -50,6 +50,7 @@ from .conversation import (
     SessionResult,
     SessionRunEvent,
     SessionSourceRead,
+    SessionTaskPreparationFailed,
     SessionTaskUpdated,
     SourceUse,
     TextExcerpt,
@@ -65,7 +66,14 @@ from .delivery import (
     EvidenceInitialAccess,
     EvidenceNavigationProof,
 )
-from .errors import ErrorCategory, InvalidActionError, ModelOutputDiagnostic, RunError
+from .errors import (
+    ErrorCategory,
+    InvalidActionError,
+    ModelOutputDiagnostic,
+    ModelRequestDiagnostic,
+    RunError,
+    TaskPreparationAttemptDiagnostic,
+)
 from .evidence_access import EvidenceAccessView
 from .execution import (
     ArtifactRef,
@@ -239,6 +247,7 @@ __all__ = [
     "ModelOutputRejected",
     "ModelOutputRepairNotice",
     "ModelRequest",
+    "ModelRequestDiagnostic",
     "ModelResponse",
     "ModelStarted",
     "ModelTurn",
@@ -278,11 +287,13 @@ __all__ = [
     "SessionRunEvent",
     "SessionSemanticCommitted",
     "SessionSourceRead",
+    "SessionTaskPreparationFailed",
     "SessionTaskUpdated",
     "SourceUse",
     "TaskDirective",
     "TaskInput",
     "TaskObservation",
+    "TaskPreparationAttemptDiagnostic",
     "TaskRevised",
     "TaskUpdate",
     "TextExcerpt",

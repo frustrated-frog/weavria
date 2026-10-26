@@ -17,7 +17,16 @@ from pydantic import (
     model_validator,
 )
 
-from weavria.core import ErrorCategory, FinishAction, ModelRequest, RunError, ToolCallAction
+from weavria.context import ModelRequestContextCompiler, ModelRequestContextError
+from weavria.core import (
+    ErrorCategory,
+    FinishAction,
+    ModelOutputDiagnostic,
+    ModelRequest,
+    RunError,
+    TaskPreparationAttemptDiagnostic,
+    ToolCallAction,
+)
 from weavria.models import ModelCallError, ModelProvider, call_model
 
 if TYPE_CHECKING:
@@ -282,9 +291,17 @@ class RequirementCoverageReport(_CoverageContract):
 class RequirementCoverageError(Exception):
     """Stable failure at the independent semantic coverage boundary."""
 
-    def __init__(self, error: RunError) -> None:
-        self.error = error
-        super().__init__(error.message)
+    def __init__(
+        self,
+        error: RunError,
+        *,
+        attempts: tuple[TaskPreparationAttemptDiagnostic, ...] = (),
+    ) -> None:
+        self.error = RunError.model_validate(error)
+        self.attempts = tuple(
+            TaskPreparationAttemptDiagnostic.model_validate(item) for item in attempts
+        )
+        super().__init__(self.error.message)
 
 
 class RequirementCoverageValidator(Protocol):
@@ -321,10 +338,16 @@ class TaskSpecificationRepairer(Protocol):
 class ModelRequirementCoverageValidator:
     """Use a separate structured model pass to audit semantic task coverage."""
 
-    version = "model-requirement-coverage/1"
+    version = "model-requirement-coverage/2"
 
-    def __init__(self, provider: ModelProvider) -> None:
+    def __init__(
+        self,
+        provider: ModelProvider,
+        *,
+        context_compiler: ModelRequestContextCompiler | None = None,
+    ) -> None:
         self._provider = provider
+        self._context_compiler = context_compiler
 
     async def assess(
         self,
@@ -421,23 +444,64 @@ class ModelRequirementCoverageValidator:
         deadline = asyncio.get_running_loop().time() + max_duration
         failure: ValidationError | ValueError | None = None
         last_action_kind = "invalid_action"
+        attempts: list[TaskPreparationAttemptDiagnostic] = []
         for attempt in range(2):
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
-                raise RequirementCoverageError(
-                    RunError(
-                        category=ErrorCategory.TIMEOUT,
-                        message="Requirement coverage validation exceeded its deadline",
+                timeout_error = RunError(
+                    category=ErrorCategory.TIMEOUT,
+                    message="Requirement coverage validation exceeded its deadline",
+                )
+                attempts.append(
+                    TaskPreparationAttemptDiagnostic(
+                        stage="coverage_validation",
+                        attempt=attempt + 1,
+                        error=timeout_error,
                     )
                 )
+                raise RequirementCoverageError(
+                    timeout_error,
+                    attempts=tuple(attempts),
+                )
+            request_diagnostic = None
+            try:
+                dispatched = model_request
+                if self._context_compiler is not None:
+                    plan = self._context_compiler.compile(model_request)
+                    dispatched = plan.request
+                    request_diagnostic = plan.diagnostic
+            except ModelRequestContextError as exc:
+                error = RunError(
+                    category=ErrorCategory.CONTEXT_BUDGET_EXCEEDED,
+                    message="Requirement coverage request exceeds its context budget",
+                    cause_type=type(exc).__name__,
+                )
+                attempts.append(
+                    TaskPreparationAttemptDiagnostic(
+                        stage="coverage_validation",
+                        attempt=attempt + 1,
+                        error=error,
+                        request=exc.diagnostic,
+                    )
+                )
+                raise RequirementCoverageError(error, attempts=tuple(attempts)) from exc
             try:
                 response = await call_model(
                     self._provider,
-                    model_request,
+                    dispatched,
                     max_duration=remaining,
                 )
             except ModelCallError as exc:
-                if exc.error.category is ErrorCategory.INVALID_MODEL_RESPONSE and attempt == 0:
+                attempts.append(
+                    TaskPreparationAttemptDiagnostic(
+                        stage="coverage_validation",
+                        attempt=attempt + 1,
+                        error=exc.error,
+                        request=exc.request_diagnostic or request_diagnostic,
+                        output=exc.output_diagnostic,
+                    )
+                )
+                if exc.allows_output_repair and attempt == 0:
                     model_request = model_request.model_copy(
                         update={
                             "instructions": (
@@ -447,7 +511,7 @@ class ModelRequirementCoverageValidator:
                         }
                     )
                     continue
-                raise RequirementCoverageError(exc.error) from exc
+                raise RequirementCoverageError(exc.error, attempts=tuple(attempts)) from exc
             action = response.action
             last_action_kind = "finish" if isinstance(action, FinishAction) else "invalid_action"
             if isinstance(action, ToolCallAction) and action.tool_name == _COVERAGE_TOOL:
@@ -473,6 +537,20 @@ class ModelRequirementCoverageValidator:
                     return assessment
                 except (ValidationError, ValueError) as exc:
                     failure = exc
+            validation_error = RunError(
+                category=ErrorCategory.INVALID_MODEL_RESPONSE,
+                message=f"Requirement coverage validator returned {last_action_kind}",
+                cause_type=type(failure).__name__ if failure is not None else None,
+            )
+            attempts.append(
+                TaskPreparationAttemptDiagnostic(
+                    stage="coverage_validation",
+                    attempt=attempt + 1,
+                    error=validation_error,
+                    request=request_diagnostic,
+                    output=ModelOutputDiagnostic(code="schema_mismatch"),
+                )
+            )
             if attempt == 0:
                 feedback = _coverage_retry_feedback(failure)
                 model_request = model_request.model_copy(
@@ -487,11 +565,8 @@ class ModelRequirementCoverageValidator:
                     }
                 )
         error = RequirementCoverageError(
-            RunError(
-                category=ErrorCategory.INVALID_MODEL_RESPONSE,
-                message=f"Requirement coverage validator returned {last_action_kind}",
-                cause_type=type(failure).__name__ if failure is not None else None,
-            )
+            attempts[-1].error,
+            attempts=tuple(attempts),
         )
         if failure is not None:
             raise error from failure

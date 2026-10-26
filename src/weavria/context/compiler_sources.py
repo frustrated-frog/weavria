@@ -317,6 +317,15 @@ async def source_units(
         variants = [Representation("reference", minimum_exchange(record).model_dump_json(), ())]
         if source.snapshot is not None:
             reference = source.snapshot.reference
+            # An empty container at a declared model-facing root is exact negative
+            # evidence. Keep it with every excerpt of that source; otherwise lexical
+            # ranking can retain a descriptive sibling (for example an endpoint) while
+            # silently dropping the decisive fact that the result set is empty.
+            empty_roots = tuple(
+                passage
+                for passage in source.passages
+                if passage.value_json in {"[]", "{}"} and passage.pointer in record.context_paths
+            )
             common: dict[str, JsonValue] = {
                 "artifact_id": reference.artifact_id,
                 "sha256": reference.sha256,
@@ -359,7 +368,7 @@ async def source_units(
                 for size in sorted(
                     {1, min(2, len(ranked)), min(4, len(ranked)), len(ranked)} - {0}
                 ):
-                    chosen = tuple(dict.fromkeys((*protected, *ranked[:size])))
+                    chosen = tuple(dict.fromkeys((*protected, *empty_roots, *ranked[:size])))
                     variants.append(
                         Representation(
                             "excerpt",

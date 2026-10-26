@@ -14,6 +14,7 @@ from weavria.core import (
     ErrorCategory,
     ModelOutputDiagnostic,
     ModelRequest,
+    ModelRequestDiagnostic,
     ModelResponse,
     ModelTurn,
     RecoverContext,
@@ -62,11 +63,20 @@ class ModelCallError(Exception):
         *,
         timeout_origin: ModelTimeoutOrigin | None = None,
         output_diagnostic: ModelOutputDiagnostic | None = None,
+        request_diagnostic: ModelRequestDiagnostic | None = None,
     ) -> None:
         self.error = error
         self.timeout_origin = timeout_origin
         self.output_diagnostic = output_diagnostic
+        self.request_diagnostic = request_diagnostic
         super().__init__(error.message)
+
+    @property
+    def allows_output_repair(self) -> bool:
+        """Whether a bounded correction attempt can act on this model failure."""
+        return self.error.category is ErrorCategory.INVALID_MODEL_RESPONSE and (
+            self.output_diagnostic is None or self.output_diagnostic.repairable
+        )
 
 
 class ModelOutputError(ValueError):
@@ -80,6 +90,14 @@ class ModelOutputError(ValueError):
     ) -> None:
         self.diagnostic = diagnostic or ModelOutputDiagnostic(code="unknown")
         super().__init__(message)
+
+
+class ModelInputError(ValueError):
+    """A request was rejected before dispatch because its declared budget was exceeded."""
+
+    def __init__(self, diagnostic: ModelRequestDiagnostic) -> None:
+        self.diagnostic = ModelRequestDiagnostic.model_validate(diagnostic)
+        super().__init__("model request exceeds its declared context budget")
 
 
 class TurnModelProvider(Protocol):
@@ -257,6 +275,17 @@ async def _invoke_model[Input: BaseModel, Response: BaseModel](
             ),
             timeout_origin=origin,
         ) from exc
+    except ModelInputError as exc:
+        if owner is not None and owner.cancelling() > cancellation_count:
+            raise asyncio.CancelledError from exc
+        raise ModelCallError(
+            RunError(
+                category=ErrorCategory.CONTEXT_BUDGET_EXCEEDED,
+                message="Model request exceeds its declared context budget",
+                cause_type=type(exc).__name__,
+            ),
+            request_diagnostic=exc.diagnostic,
+        ) from exc
     except ModelOutputError as exc:
         if owner is not None and owner.cancelling() > cancellation_count:
             raise asyncio.CancelledError from exc
@@ -272,7 +301,12 @@ async def _invoke_model[Input: BaseModel, Response: BaseModel](
         raise ModelCallError(
             RunError(
                 category=ErrorCategory.INVALID_MODEL_RESPONSE,
-                message="Model provider returned an invalid response",
+                message=(
+                    "Model output budget was exhausted before a visible response"
+                    if exc.diagnostic.code == "output_truncated"
+                    and exc.diagnostic.response_bytes == 0
+                    else "Model provider returned an invalid response"
+                ),
                 cause_type=type(exc).__name__,
             ),
             output_diagnostic=exc.diagnostic,

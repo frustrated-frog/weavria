@@ -5,6 +5,8 @@ from .budget import (
     ContextCapacityError,
     ContextCompilerConfig,
     ContextTokenBudgetError,
+    ModelRequestContextConfig,
+    ModelRequestTokenCounter,
     SessionTokenCounter,
 )
 from .compiler import CompiledSessionContext, ControlContextBuilder, SessionContextCompiler
@@ -18,6 +20,11 @@ from .evidence import (
     EvidenceMode,
     EvidencePlan,
     TurnEvidencePlan,
+)
+from .model_request import (
+    ModelRequestContextCompiler,
+    ModelRequestContextError,
+    ModelRequestContextPlan,
 )
 from .policies import (
     FocusedHistory,
@@ -69,6 +76,11 @@ __all__ = [
     "HistoryDecision",
     "HistoryRetrievalConfig",
     "HistorySelector",
+    "ModelRequestContextCompiler",
+    "ModelRequestContextConfig",
+    "ModelRequestContextError",
+    "ModelRequestContextPlan",
+    "ModelRequestTokenCounter",
     "RecentHistory",
     "RecoveryContextBuilder",
     "RetrievedHistory",

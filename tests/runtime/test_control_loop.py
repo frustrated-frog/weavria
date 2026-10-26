@@ -716,10 +716,21 @@ async def test_feedback_rejection_requests_more_capacity_from_the_next_context()
                 control=control,
                 required_call_ids=required_call_ids,
             )
+            # The first compilation spends most of the hard request capacity on
+            # optional context, leaving less room than the proposed feedback needs.
+            # The next compilation must start from the hard capacity and reclaim it.
+            compiled_budget = (
+                max_request_bytes
+                if feedback_reserve_floor_bytes
+                else min(
+                    max_request_bytes,
+                    plan.request_bytes + plan.control_padding_bytes + 32,
+                )
+            )
             return ControlEvidencePlan(
                 plan.request_json,
                 plan.mode,
-                plan.budget_bytes,
+                compiled_budget,
                 plan.decisions,
                 plan.compilation_json,
                 min(max_request_bytes, feedback_reserve_floor_bytes + 1024)
@@ -747,6 +758,7 @@ async def test_feedback_rejection_requests_more_capacity_from_the_next_context()
     rejected = [event.data for event in agent.events if isinstance(event.data, BatchRejected)]
     assert result.status is RunStatus.COMPLETED
     assert len(rejected) == 1 and rejected[0].notice.reason == "feedback_budget"
+    assert rejected[0].notice.required_bytes > agent.plans[0].budget_bytes
     assert floors[:2] == [0, rejected[0].notice.required_bytes]
     started = [event.data.call_id for event in agent.events if isinstance(event.data, ToolStarted)]
     assert started == ["second"]

@@ -24,6 +24,7 @@ from weavria.core import (
 )
 
 from .history_index import (
+    MODEL_VISIBLE_RUN_PREDICATE,
     HistoryIndexError,
     HistoryLimit,
     HistoryWork,
@@ -100,11 +101,14 @@ class _Search:
         for term in term_demands:
             self.work.check()
             frequency = self.conn.execute(
-                """SELECT COUNT(*) FROM history_postings t
+                f"""SELECT COUNT(*) FROM history_postings t
                     JOIN history_passages p ON p.id=t.passage_id
                     JOIN history_sources s ON s.session_id=p.session_id AND s.source_id=p.source_id
                     JOIN history_catalog c ON c.run_id=s.run_id
-                    WHERE t.session_id=? AND t.term=? AND c.ordinal<? AND c.accepted_sequence<=?""",
+                    JOIN runs r ON r.id=s.run_id
+                    WHERE {MODEL_VISIBLE_RUN_PREDICATE}
+                    AND t.session_id=? AND t.term=? AND c.ordinal<?
+                    AND c.accepted_sequence<=?""",
                 (self.session_id, term, self.before, self.sequence),
             ).fetchone()[0]
             frequencies.append((frequency, term))
@@ -115,12 +119,15 @@ class _Search:
                 continue
             remaining = self.work.config.max_postings - self.examined
             cursor = self.conn.execute(
-                """SELECT p.id,t.frequency,p.token_count,s.run_id,c.ordinal,c.accepted_sequence,
+                f"""SELECT p.id,t.frequency,p.token_count,s.run_id,c.ordinal,c.accepted_sequence,
                     s.field,s.update_id,s.sha256,p.start,p.end FROM history_postings t
                     JOIN history_passages p ON p.id=t.passage_id
                     JOIN history_sources s ON s.session_id=p.session_id AND s.source_id=p.source_id
                     JOIN history_catalog c ON c.run_id=s.run_id
-                    WHERE t.session_id=? AND t.term=? AND c.ordinal<? AND c.accepted_sequence<=?
+                    JOIN runs r ON r.id=s.run_id
+                    WHERE {MODEL_VISIBLE_RUN_PREDICATE}
+                    AND t.session_id=? AND t.term=? AND c.ordinal<?
+                    AND c.accepted_sequence<=?
                     ORDER BY t.passage_id LIMIT ?""",
                 (self.session_id, term, self.before, self.sequence, remaining + 1),
             )
@@ -208,8 +215,10 @@ def search_history(
     recent = [
         row[0]
         for row in conn.execute(
-            "SELECT run_id FROM history_catalog WHERE session_id=? AND ordinal<? "
-            "AND accepted_sequence<=? ORDER BY ordinal DESC LIMIT ?",
+            f"""SELECT c.run_id FROM history_catalog c JOIN runs r ON r.id=c.run_id
+                WHERE {MODEL_VISIBLE_RUN_PREDICATE}
+                AND c.session_id=? AND c.ordinal<? AND c.accepted_sequence<=?
+                ORDER BY c.ordinal DESC LIMIT ?""",
             (
                 session_id,
                 before_ordinal,
@@ -236,7 +245,10 @@ def search_history(
     used = 0
     for run in origins:
         row = conn.execute(
-            "SELECT view_sha256,size_bytes FROM history_catalog WHERE session_id=? AND run_id=?",
+            f"""SELECT c.view_sha256,c.size_bytes FROM history_catalog c
+                JOIN runs r ON r.id=c.run_id
+                WHERE {MODEL_VISIBLE_RUN_PREDICATE}
+                AND c.session_id=? AND c.run_id=?""",
             (session_id, run),
         ).fetchone()
         if row is None:
@@ -334,10 +346,12 @@ def _resolve_anchors(
         for anchor in demand.anchors:
             work.check()
             row = conn.execute(
-                """SELECT a.reference FROM outcomes o JOIN artifacts a
+                f"""SELECT a.reference FROM outcomes o JOIN artifacts a
                     ON o.run_id=a.run_id AND o.artifact_id=a.id
                     JOIN history_catalog c ON c.run_id=o.run_id
-                    WHERE c.session_id=? AND c.ordinal<? AND c.accepted_sequence<=?
+                    JOIN runs r ON r.id=o.run_id
+                    WHERE {MODEL_VISIBLE_RUN_PREDICATE}
+                    AND c.session_id=? AND c.ordinal<? AND c.accepted_sequence<=?
                     AND o.run_id=? AND o.call_id=?""",
                 (session_id, before, sequence, anchor.run_id, anchor.call_id),
             ).fetchone()

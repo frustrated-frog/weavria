@@ -7,6 +7,7 @@ from pydantic import JsonValue, TypeAdapter
 from weavria.core import (
     ControlRequest,
     ConversationView,
+    ErrorCategory,
     FinishAction,
     Message,
     MessageRole,
@@ -17,10 +18,12 @@ from weavria.core import (
     ToolCallAction,
 )
 from weavria.models import (
+    ModelCallError,
     ModelOutputError,
     OpenAICompatibleConfig,
     OpenAICompatibleProvider,
     OpenAICompatibleSessionProvider,
+    call_model,
 )
 
 
@@ -91,6 +94,28 @@ async def test_adapter_forwards_explicit_reasoning_effort_only_as_transport_conf
     assert transport.requests[0]["reasoning_effort"] == "none"
 
 
+async def test_adapter_rejects_oversized_request_before_transport_dispatch() -> None:
+    transport = Transport(_response('{"action":{"kind":"finish","output":"done"}}'))
+    provider = OpenAICompatibleProvider(
+        OpenAICompatibleConfig(
+            model="test",
+            max_output_tokens=128,
+            context_window_tokens=4_096,
+            max_request_bytes=64,
+        ),
+        transport=transport,
+    )
+
+    with pytest.raises(ModelCallError) as raised:
+        await call_model(provider, _request())
+
+    assert raised.value.error.category is ErrorCategory.CONTEXT_BUDGET_EXCEEDED
+    assert raised.value.request_diagnostic is not None
+    assert raised.value.request_diagnostic.admitted is False
+    assert raised.value.request_diagnostic.request_bytes > 64
+    assert transport.requests == []
+
+
 async def test_adapter_normalizes_tool_identity_from_request_snapshot() -> None:
     payload = {
         "action": {
@@ -143,6 +168,20 @@ async def test_adapter_rejects_truncated_output_before_json_recovery() -> None:
     assert raised.value.diagnostic.code == "output_truncated"
     assert raised.value.diagnostic.finish_reason == "length"
     assert raised.value.diagnostic.response_bytes > 0
+
+
+async def test_adapter_marks_empty_output_budget_exhaustion_as_not_repairable() -> None:
+    provider = OpenAICompatibleProvider(
+        OpenAICompatibleConfig(model="test"),
+        transport=Transport(_response(None, finish_reason="length")),
+    )
+
+    with pytest.raises(ModelOutputError, match="valid JSON action") as raised:
+        await provider.generate(_request())
+
+    assert raised.value.diagnostic.code == "output_truncated"
+    assert raised.value.diagnostic.response_bytes == 0
+    assert raised.value.diagnostic.repairable is False
 
 
 async def test_adapter_does_not_recover_without_a_normal_finish_signal() -> None:

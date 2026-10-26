@@ -13,6 +13,8 @@ from apps.finscope.server import MessageOutput, SessionCreated, create_app
 from apps.finscope.workspace import FinScopeWorkspaceClient
 from weavria.core import (
     FinishAction,
+    Message,
+    MessageRole,
     ModelResponse,
     ModelTurn,
     SessionContextCompiled,
@@ -35,7 +37,12 @@ from weavria.harness import (
     TaskFrame,
     TaskSpecification,
 )
-from weavria.models import FakeModelProvider, FakeSessionProvider
+from weavria.models import (
+    FakeModelProvider,
+    FakeSessionProvider,
+    OpenAICompatibleConfig,
+    OpenAICompatibleTokenCounter,
+)
 
 
 def test_task_understanding_feature_switches_are_strict_booleans() -> None:
@@ -613,6 +620,87 @@ async def test_direct_question_uses_task_frame_without_market_tool(tmp_path: Pat
     assert payload.answer == "我是只读的市场研究助手。"
     assert payload.tools == ()
     assert market_calls == 0
+    await market_http.aclose()
+
+
+async def test_long_session_task_preparation_is_bounded_before_model_dispatch(
+    tmp_path: Path,
+) -> None:
+    prior_turns = 16
+    interpreter = FakeModelProvider(tuple(_declaration(_direct()) for _ in range(prior_turns + 1)))
+    provider = FakeSessionProvider(
+        tuple(
+            ModelTurn(decision=FinishAction(output=f"answer-{index}"))
+            for index in range(prior_turns + 1)
+        )
+    )
+    settings = FinScopeSettings(
+        model_base_url="http://model.test",
+        model_name="fake",
+        model_api_key="",
+        state_path=tmp_path / "long-session.sqlite3",
+    )
+    market_http = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(500))
+    )
+    app = create_app(
+        settings,
+        provider=provider,
+        interpreter_provider=interpreter,
+        market_client=MarketPulseClient("http://finscope.test", client=market_http),
+        requirement_coverage=False,
+    )
+
+    page_context = {
+        "schema_version": 1,
+        "surface": "market_pulse",
+        "business_date": "2026-10-15",
+        "current_view": "panorama",
+        "quality_status": "READY",
+        "generated_at": "2026-10-15T15:40:00",
+    }
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://sidecar.test"
+        ) as client:
+            created = SessionCreated.model_validate((await client.post("/api/sessions")).json())
+            for index in range(prior_turns):
+                response = await client.post(
+                    f"/api/sessions/{created.session_id}/messages",
+                    json={
+                        "input_id": f"history-{index}",
+                        "text": f"历史问题 {index}: " + "历史背景" * 500,
+                        "context": page_context,
+                    },
+                )
+                assert response.status_code == 200, response.text
+            final_response = await client.post(
+                f"/api/sessions/{created.session_id}/messages",
+                json={
+                    "input_id": "complex-current-request",
+                    "text": "结合自选股、关注板块与当日筛选解释机会, 并明确处理空数据。",
+                    "context": page_context,
+                },
+            )
+
+    assert final_response.status_code == 200, final_response.text
+    dispatched = interpreter.requests[-1]
+    assert 0 < len(dispatched.history) < prior_turns * 2
+    assert isinstance(dispatched.history[0], Message)
+    assert dispatched.history[0].role is MessageRole.USER
+    counter = OpenAICompatibleTokenCounter(
+        OpenAICompatibleConfig(
+            model=settings.model_name,
+            max_output_tokens=settings.understanding_model_max_output_tokens,
+            json_mode=settings.json_mode,
+            reasoning_effort=settings.understanding_reasoning_effort,
+        ),
+        encoding=settings.context_encoding,
+    )
+    assert counter.count_model_request(dispatched) <= (
+        settings.context_window_tokens - settings.understanding_model_max_output_tokens - 256
+    )
+    assert counter.model_request_bytes(dispatched) <= settings.run_max_request_bytes
     await market_http.aclose()
 
 

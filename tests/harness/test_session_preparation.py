@@ -25,6 +25,7 @@ from weavria.core import (
     SessionRequest,
     SessionRunEvent,
     SessionSemanticCommitted,
+    SessionTaskPreparationFailed,
     TaskInput,
     ToolBatch,
     ToolCallAction,
@@ -1180,6 +1181,47 @@ async def test_preparation_failure_is_persisted_without_starting_runtime_model(
         and event.data.reason == "task_preparation_failure"
         for event in events
     )
+    diagnostic_events = [
+        event for event in events if isinstance(event.data, SessionTaskPreparationFailed)
+    ]
+    assert len(diagnostic_events) == 1
+    diagnostic_event = diagnostic_events[0]
+    diagnostic = diagnostic_event.data
+    assert isinstance(diagnostic, SessionTaskPreparationFailed)
+    assert diagnostic_event.schema_version == 5
+    assert [attempt.attempt for attempt in diagnostic.attempts] == [1, 2]
+    assert all(
+        attempt.error.category is ErrorCategory.INVALID_MODEL_RESPONSE
+        and attempt.output is not None
+        and attempt.output.code == "schema_mismatch"
+        for attempt in diagnostic.attempts
+    )
+
+
+async def test_interrupted_turn_is_not_replayed_into_the_next_task_interpretation(
+    tmp_path: Path,
+) -> None:
+    interpreter = FakeModelProvider(
+        (
+            ModelResponse(action=FinishAction(output="not a frame")),
+            ModelResponse(action=FinishAction(output="still not a frame")),
+            _declaration(_direct()),
+        )
+    )
+    preparer = TaskAwareSessionPreparer(TaskUnderstandingEngine(ModelTaskInterpreter(interpreter)))
+    async with SessionEngine(
+        tmp_path / "session.db",
+        model=_DirectSessionModel(),
+        tools=_registry(),
+        task_preparation=preparer,
+    ) as engine:
+        await engine.create("s")
+        with pytest.raises(TaskUnderstandingError):
+            await engine.send("s", "A request that failed.", input_id="input-1")
+        result = await engine.send("s", "A fresh request.", input_id="input-2")
+
+    assert result.report.status is RunStatus.COMPLETED
+    assert interpreter.requests[2].history == ()
 
 
 async def test_joint_compiler_uses_accepted_ledger_progress_without_changing_task_authority(

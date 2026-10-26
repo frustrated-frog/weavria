@@ -42,6 +42,9 @@ async def bounded_passages(
         if visited % 64 == 1:
             await asyncio.sleep(0)
         if isinstance(current, dict):
+            if not current:
+                await add(pointer, 0, 0, current)
+                continue
 
             def children(obj: dict[str, JsonValue], prefix: str) -> Iterator[tuple[str, JsonValue]]:
                 for key, child in obj.items():
@@ -50,6 +53,9 @@ async def bounded_passages(
 
             pending.append(children(current, pointer))
         elif isinstance(current, list):
+            if not current:
+                await add(pointer, 0, 0, current)
+                continue
 
             def elements(items: list[JsonValue], prefix: str) -> Iterator[tuple[str, JsonValue]]:
                 for i, child in enumerate(items):

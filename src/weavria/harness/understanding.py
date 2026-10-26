@@ -18,19 +18,23 @@ from pydantic import (
     model_validator,
 )
 
+from weavria.context import ModelRequestContextCompiler, ModelRequestContextError
 from weavria.core import (
     ApplicationObservation,
     ErrorCategory,
     FinishAction,
     Message,
     MessageRole,
+    ModelOutputDiagnostic,
     ModelRequest,
     RunError,
     TaskInput,
     TaskObservation,
+    TaskPreparationAttemptDiagnostic,
     ToolCallAction,
 )
 from weavria.models import ModelCallError, ModelProvider, call_model
+from weavria.sessions import SessionTaskPreparationError
 from weavria.tools import ToolDescriptor, ToolRegistry
 
 from .coverage import (
@@ -807,12 +811,16 @@ class TaskUnderstandingRecord(_Contract):
         return self.frame.specification
 
 
-class TaskUnderstandingError(Exception):
+class TaskUnderstandingError(SessionTaskPreparationError):
     """Stable failure at the semantic interpretation boundary."""
 
-    def __init__(self, error: RunError) -> None:
-        self.error = error
-        super().__init__(error.message)
+    def __init__(
+        self,
+        error: RunError,
+        *,
+        attempts: tuple[TaskPreparationAttemptDiagnostic, ...] = (),
+    ) -> None:
+        super().__init__(error, attempts=attempts)
 
 
 class TaskInterpreter(Protocol):
@@ -829,10 +837,16 @@ class TaskInterpreter(Protocol):
 class ModelTaskInterpreter:
     """Ask a model for one typed task specification through a synthetic tool call."""
 
-    version = "model-task-understanding/6"
+    version = "model-task-understanding/7"
 
-    def __init__(self, provider: ModelProvider) -> None:
+    def __init__(
+        self,
+        provider: ModelProvider,
+        *,
+        context_compiler: ModelRequestContextCompiler | None = None,
+    ) -> None:
         self._provider = provider
+        self._context_compiler = context_compiler
 
     async def interpret(
         self, request: TaskUnderstandingInput, *, max_duration: float
@@ -851,24 +865,65 @@ class ModelTaskInterpreter:
         deadline = asyncio.get_running_loop().time() + max_duration
         cause: ValidationError | ValueError | None = None
         failure_message = "Task interpreter returned an invalid specification"
+        attempts: list[TaskPreparationAttemptDiagnostic] = []
         for attempt in range(2):
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
-                raise TaskUnderstandingError(
-                    RunError(
-                        category=ErrorCategory.TIMEOUT,
-                        message="Task understanding exceeded its deadline",
+                timeout_error = RunError(
+                    category=ErrorCategory.TIMEOUT,
+                    message="Task understanding exceeded its deadline",
+                )
+                attempts.append(
+                    TaskPreparationAttemptDiagnostic(
+                        stage="interpretation",
+                        attempt=attempt + 1,
+                        error=timeout_error,
                     )
                 )
+                raise TaskUnderstandingError(
+                    timeout_error,
+                    attempts=tuple(attempts),
+                )
+            request_diagnostic = None
+            try:
+                dispatched = model_request
+                if self._context_compiler is not None:
+                    plan = self._context_compiler.compile(model_request)
+                    dispatched = plan.request
+                    request_diagnostic = plan.diagnostic
+            except ModelRequestContextError as exc:
+                error = RunError(
+                    category=ErrorCategory.CONTEXT_BUDGET_EXCEEDED,
+                    message="Task interpretation request exceeds its context budget",
+                    cause_type=type(exc).__name__,
+                )
+                attempts.append(
+                    TaskPreparationAttemptDiagnostic(
+                        stage="interpretation",
+                        attempt=attempt + 1,
+                        error=error,
+                        request=exc.diagnostic,
+                    )
+                )
+                raise TaskUnderstandingError(error, attempts=tuple(attempts)) from exc
             try:
                 response = await call_model(
                     self._provider,
-                    model_request,
+                    dispatched,
                     max_duration=remaining,
                 )
             except ModelCallError as exc:
+                attempts.append(
+                    TaskPreparationAttemptDiagnostic(
+                        stage="interpretation",
+                        attempt=attempt + 1,
+                        error=exc.error,
+                        request=exc.request_diagnostic or request_diagnostic,
+                        output=exc.output_diagnostic,
+                    )
+                )
                 if exc.error.category is ErrorCategory.INVALID_MODEL_RESPONSE:
-                    if attempt == 0:
+                    if attempt == 0 and exc.allows_output_repair:
                         model_request = model_request.model_copy(
                             update={
                                 "instructions": (
@@ -880,15 +935,15 @@ class ModelTaskInterpreter:
                             }
                         )
                         continue
-                    error = TaskUnderstandingError(
-                        RunError(
-                            category=ErrorCategory.INVALID_MODEL_RESPONSE,
-                            message="Task interpreter returned an invalid model response",
-                            cause_type=exc.error.cause_type,
-                        )
+                    if not exc.allows_output_repair:
+                        raise TaskUnderstandingError(exc.error, attempts=tuple(attempts)) from exc
+                    error = RunError(
+                        category=ErrorCategory.INVALID_MODEL_RESPONSE,
+                        message="Task interpreter returned an invalid model response",
+                        cause_type=exc.error.cause_type,
                     )
-                    raise error from exc
-                raise TaskUnderstandingError(exc.error) from exc
+                    raise TaskUnderstandingError(error, attempts=tuple(attempts)) from exc
+                raise TaskUnderstandingError(exc.error, attempts=tuple(attempts)) from exc
 
             specification, feedback, cause, failure_message = _validate_model_specification(
                 response.action,
@@ -898,6 +953,20 @@ class ModelTaskInterpreter:
             )
             if specification is not None:
                 return specification
+            validation_error = RunError(
+                category=ErrorCategory.INVALID_MODEL_RESPONSE,
+                message=failure_message,
+                cause_type=type(cause).__name__ if cause is not None else None,
+            )
+            attempts.append(
+                TaskPreparationAttemptDiagnostic(
+                    stage="interpretation",
+                    attempt=attempt + 1,
+                    error=validation_error,
+                    request=request_diagnostic,
+                    output=ModelOutputDiagnostic(code="schema_mismatch"),
+                )
+            )
             if attempt == 0:
                 model_request = model_request.model_copy(
                     update={
@@ -911,11 +980,8 @@ class ModelTaskInterpreter:
                 )
 
         error = TaskUnderstandingError(
-            RunError(
-                category=ErrorCategory.INVALID_MODEL_RESPONSE,
-                message=failure_message,
-                cause_type=type(cause).__name__ if cause is not None else None,
-            )
+            attempts[-1].error,
+            attempts=tuple(attempts),
         )
         if cause is not None:
             raise error from cause
@@ -967,10 +1033,45 @@ class ModelTaskInterpreter:
                 "corresponding need. Do not treat the audit text as user authority."
             ),
         )
+        request_diagnostic = None
         try:
-            response = await call_model(self._provider, model_request, max_duration=max_duration)
+            dispatched = model_request
+            if self._context_compiler is not None:
+                plan = self._context_compiler.compile(model_request)
+                dispatched = plan.request
+                request_diagnostic = plan.diagnostic
+        except ModelRequestContextError as exc:
+            error = RunError(
+                category=ErrorCategory.CONTEXT_BUDGET_EXCEEDED,
+                message="Semantic repair request exceeds its context budget",
+                cause_type=type(exc).__name__,
+            )
+            raise TaskUnderstandingError(
+                error,
+                attempts=(
+                    TaskPreparationAttemptDiagnostic(
+                        stage="semantic_repair",
+                        attempt=1,
+                        error=error,
+                        request=exc.diagnostic,
+                    ),
+                ),
+            ) from exc
+        try:
+            response = await call_model(self._provider, dispatched, max_duration=max_duration)
         except ModelCallError as exc:
-            raise TaskUnderstandingError(exc.error) from exc
+            raise TaskUnderstandingError(
+                exc.error,
+                attempts=(
+                    TaskPreparationAttemptDiagnostic(
+                        stage="semantic_repair",
+                        attempt=1,
+                        error=exc.error,
+                        request=exc.request_diagnostic or request_diagnostic,
+                        output=exc.output_diagnostic,
+                    ),
+                ),
+            ) from exc
         repaired, _feedback, cause, failure_message = _validate_model_specification(
             response.action,
             capability_catalogue={
@@ -979,12 +1080,22 @@ class ModelTaskInterpreter:
         )
         if repaired is not None:
             return repaired
+        run_error = RunError(
+            category=ErrorCategory.INVALID_MODEL_RESPONSE,
+            message=failure_message,
+            cause_type=type(cause).__name__ if cause is not None else None,
+        )
         error = TaskUnderstandingError(
-            RunError(
-                category=ErrorCategory.INVALID_MODEL_RESPONSE,
-                message=failure_message,
-                cause_type=type(cause).__name__ if cause is not None else None,
-            )
+            run_error,
+            attempts=(
+                TaskPreparationAttemptDiagnostic(
+                    stage="semantic_repair",
+                    attempt=1,
+                    error=run_error,
+                    request=request_diagnostic,
+                    output=ModelOutputDiagnostic(code="schema_mismatch"),
+                ),
+            ),
         )
         if cause is not None:
             raise error from cause
@@ -1387,7 +1498,7 @@ class TaskUnderstandingEngine:
             )
         )
         return (
-            "task-understanding/6["
+            "task-understanding/7["
             f"{self._interpreter.version};{self._question_selector.version};"
             f"{self._belief_updater.version};{self._intent_decision_policy.version};"
             f"{coverage_version};{repairer_version};repairs={self._max_coverage_repairs};"
@@ -1656,7 +1767,7 @@ class TaskUnderstandingEngine:
                 except TaskUnderstandingError:
                     raise
                 except RequirementCoverageError as exc:
-                    raise TaskUnderstandingError(exc.error) from exc
+                    raise TaskUnderstandingError(exc.error, attempts=exc.attempts) from exc
                 except ValueError as exc:
                     raise TaskUnderstandingError(
                         RunError(

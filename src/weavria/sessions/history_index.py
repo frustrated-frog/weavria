@@ -13,6 +13,19 @@ from typing import Literal
 from weavria.context import HistoryRetrievalConfig, history_text_fields, history_text_passages
 from weavria.core import ConversationTurn
 
+MODEL_VISIBLE_RUN_PREDICATE = """NOT EXISTS (
+    SELECT 1 FROM session_events hidden
+    WHERE hidden.session_id=r.session_id
+      AND json_extract(hidden.data,'$.data.run_id')=r.id
+      AND (
+        json_extract(hidden.data,'$.data.kind')='task_preparation_failed'
+        OR (
+          json_extract(hidden.data,'$.data.kind')='interrupted'
+          AND json_extract(hidden.data,'$.data.reason')='task_preparation_failure'
+        )
+      )
+)"""
+
 
 class HistoryIndexError(ValueError):
     """Derived history or its accepted source identity is inconsistent."""
@@ -185,9 +198,11 @@ def catch_up_index(
 ) -> int:
     _, ordinal, _ = index_state(conn, session_id)
     rows = conn.execute(
-        """SELECT ordinal,run_id,accepted_sequence,view_sha256,size_bytes
-            FROM history_catalog WHERE session_id=? AND ordinal>? AND ordinal<?
-            AND accepted_sequence<=? ORDER BY ordinal LIMIT ?""",
+        f"""SELECT c.ordinal,c.run_id,c.accepted_sequence,c.view_sha256,c.size_bytes,
+            {MODEL_VISIBLE_RUN_PREDICATE} AS model_visible
+            FROM history_catalog c JOIN runs r ON r.id=c.run_id
+            WHERE c.session_id=? AND c.ordinal>? AND c.ordinal<?
+            AND c.accepted_sequence<=? ORDER BY c.ordinal LIMIT ?""",
         (session_id, ordinal, before_ordinal, through_sequence, work.config.max_index_turns + 1),
     ).fetchall()
     indexed = 0
@@ -195,7 +210,7 @@ def catch_up_index(
         work.check()
         if indexed >= work.config.max_index_turns:
             break
-        ordinal, run_id, sequence, expected, size = item
+        ordinal, run_id, sequence, expected, size, model_visible = item
         if work.index_bytes + size > work.config.max_index_bytes:
             break
         encoded = conn.execute("SELECT view FROM runs WHERE id=?", (run_id,)).fetchone()[0]
@@ -206,7 +221,9 @@ def catch_up_index(
         with work.guard(conn):
             conn.execute("BEGIN IMMEDIATE")
             try:
-                passages, tokens = _index_turn(conn, session_id, turn, work)
+                passages, tokens = (
+                    _index_turn(conn, session_id, turn, work) if model_visible else (0, 0)
+                )
                 previous = conn.execute(
                     "SELECT cumulative_passages,cumulative_tokens FROM history_turn_stats "
                     "WHERE session_id=? ORDER BY ordinal DESC LIMIT 1",

@@ -79,5 +79,71 @@ class RunError(ContractModel):
         return self
 
 
+class ModelRequestDiagnostic(ContractModel):
+    """Content-free accounting for one exact provider request candidate."""
+
+    counter_version: NonBlankString
+    input_tokens: int
+    input_budget_tokens: int
+    output_tokens: int
+    safety_tokens: int
+    request_bytes: int
+    request_budget_bytes: int
+    source_history_entries: int
+    selected_history_entries: int
+    admitted: bool
+
+    @model_validator(mode="after")
+    def validate_accounting(self) -> Self:
+        if any(
+            value < 0
+            for value in (
+                self.input_tokens,
+                self.safety_tokens,
+                self.request_bytes,
+                self.source_history_entries,
+                self.selected_history_entries,
+            )
+        ) or any(
+            value <= 0
+            for value in (
+                self.input_budget_tokens,
+                self.output_tokens,
+                self.request_budget_bytes,
+            )
+        ):
+            raise ValueError("model request accounting contains invalid limits")
+        if self.selected_history_entries > self.source_history_entries:
+            raise ValueError("selected history cannot exceed its source")
+        fits = (
+            self.input_tokens <= self.input_budget_tokens
+            and self.request_bytes <= self.request_budget_bytes
+        )
+        if self.admitted != fits:
+            raise ValueError("model request admission disagrees with measured limits")
+        return self
+
+
+class TaskPreparationAttemptDiagnostic(ContractModel):
+    """Safe failure evidence for one bounded task-preparation model attempt."""
+
+    stage: Literal["interpretation", "coverage_validation", "semantic_repair"]
+    attempt: int
+    error: RunError
+    request: ModelRequestDiagnostic | None = None
+    output: ModelOutputDiagnostic | None = None
+
+    @model_validator(mode="after")
+    def validate_attempt(self) -> Self:
+        if self.attempt < 1:
+            raise ValueError("task preparation attempt must be positive")
+        if (
+            self.output is not None
+            and self.error.category is not ErrorCategory.INVALID_MODEL_RESPONSE
+        ):
+            raise ValueError("model output diagnostics require an invalid response")
+        return self
+
+
 class InvalidActionError(ValueError):
     """Model output did not match the closed action contract."""

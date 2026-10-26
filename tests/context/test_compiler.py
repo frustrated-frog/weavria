@@ -573,6 +573,87 @@ async def test_context_paths_do_not_create_spurious_optional_relevance(
     assert plan.compilation.choices[0].representation == "omitted"
 
 
+async def test_empty_model_facing_container_is_retained_with_ranked_excerpt(
+    session_counter: OpenAICompatibleTokenCounter,
+) -> None:
+    class CatalogueInput(BaseModel):
+        limit: int
+
+    class CatalogueOutput(BaseModel):
+        data: tuple[str, ...]
+        endpoint: str
+        unrelated: str
+
+    async def catalogue(arguments: CatalogueInput, context: ToolContext) -> CatalogueOutput:
+        del arguments, context
+        return CatalogueOutput(
+            data=(),
+            endpoint="/api/watchlist",
+            unrelated="unrelated payload " * 1000,
+        )
+
+    store = InMemoryArtifactStore()
+    registry = ToolRegistry(
+        (
+            TypedTool(
+                name="read_catalogue",
+                version="1",
+                description="Read a catalogue",
+                input_type=CatalogueInput,
+                output_type=CatalogueOutput,
+                execute=catalogue,
+                context_paths=("/data", "/endpoint"),
+            ),
+        )
+    )
+    record = await ToolExecutor("run", registry, store, ReadOnlyPolicy()).execute(
+        ToolCallAction(
+            call_id="catalogue",
+            tool_name="read_catalogue",
+            arguments={"limit": 5},
+        ),
+        max_duration=1,
+    )
+    request = base("check the watchlist endpoint").model_copy(
+        update={
+            "feedback": TurnFeedback(
+                task_revision=1,
+                calls=(CallFeedback(call_id="catalogue", status="succeeded"),),
+            )
+        }
+    )
+
+    plan = await compiler(store, session_counter).compile(
+        run_id="run",
+        session_id="s",
+        sequence=0,
+        base=request,
+        turns=(),
+        total_turns=0,
+        records=(record,),
+        max_request_bytes=5000,
+    )
+
+    assert plan.compilation.choices[0].representation == "excerpt"
+    delivered = plan.request.current.history[0].model_dump_json()
+    assert '"pointer":"/data"' in delivered and '"value":[]' in delivered
+    assert '"pointer":"/endpoint"' in delivered
+    assert "unrelated payload" not in delivered
+
+
+async def test_empty_containers_are_exact_index_passages() -> None:
+    from weavria.context.evidence import index_passages
+    from weavria.context.indexing import bounded_passages
+
+    value: JsonValue = {"empty_list": [], "empty_object": {}}
+    synchronous = index_passages(value)
+    bounded = await bounded_passages(value, max_passages=4, max_bytes=100)
+
+    for passages in (synchronous, bounded):
+        views = {(passage.pointer, passage.value_json) for passage in passages}
+        assert views == {("/empty_list", "[]"), ("/empty_object", "{}")}
+
+
 def test_token_configuration_and_source_range_contracts() -> None:
     with pytest.raises(ValueError):
         ContextCompilerConfig(window_tokens=100, output_tokens=200)

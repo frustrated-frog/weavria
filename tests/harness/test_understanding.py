@@ -14,6 +14,7 @@ from weavria.core import (
     FinishAction,
     Message,
     MessageRole,
+    ModelOutputDiagnostic,
     ModelRequest,
     ModelResponse,
     ModelTurn,
@@ -580,6 +581,39 @@ async def test_model_interpreter_bounds_malformed_response_retries() -> None:
     assert raised.value.error.category is ErrorCategory.INVALID_MODEL_RESPONSE
     assert raised.value.error.cause_type == "ModelOutputError"
     assert len(provider.requests) == 2
+
+
+async def test_model_interpreter_does_not_repeat_nonrepairable_output_failure() -> None:
+    class OutputBudgetExhaustedProvider:
+        capabilities = ModelCapabilities(tool_calls=True)
+
+        def __init__(self) -> None:
+            self.requests: list[ModelRequest] = []
+
+        async def generate(self, request: ModelRequest) -> ModelResponse:
+            self.requests.append(request)
+            raise ModelOutputError(
+                "output budget exhausted",
+                diagnostic=ModelOutputDiagnostic(
+                    code="output_truncated",
+                    finish_reason="length",
+                    repairable=False,
+                ),
+            )
+
+    provider = OutputBudgetExhaustedProvider()
+    interpreter = ModelTaskInterpreter(provider)
+
+    with pytest.raises(TaskUnderstandingError, match="before a visible response") as raised:
+        await interpreter.interpret(
+            TaskUnderstandingInput(task=TaskInput(goal="Read the report")),
+            max_duration=1,
+        )
+
+    assert len(provider.requests) == 1
+    assert len(raised.value.attempts) == 1
+    assert raised.value.attempts[0].output is not None
+    assert raised.value.attempts[0].output.repairable is False
 
 
 async def test_model_interpreter_rejects_new_clarify_output_without_uncertainty() -> None:

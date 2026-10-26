@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
-from weavria.core import SessionRequest
+from weavria.core import ModelRequest, SessionRequest
 
 from .selection import ContextBuildError
 
@@ -36,6 +36,20 @@ class SessionTokenCounter(Protocol):
         on a conservative byte-per-token bound.
         """
         ...
+
+
+class ModelRequestTokenCounter(Protocol):
+    """Count the exact transport representation used for task-preparation requests."""
+
+    @property
+    def version(self) -> str: ...
+
+    @property
+    def output_tokens(self) -> int: ...
+
+    def count_model_request(self, request: ModelRequest) -> int: ...
+
+    def model_request_bytes(self, request: ModelRequest) -> int: ...
 
 
 class ContextTokenBudgetError(ContextBuildError):
@@ -105,6 +119,41 @@ class ContextCompilerConfig:
             or self.next_step_reserve_bytes > 1_048_576
         ):
             raise ValueError("compiler candidate limits exceed supported bounds")
+
+    @property
+    def input_tokens(self) -> int:
+        return self.window_tokens - self.output_tokens - self.safety_tokens
+
+
+@dataclass(frozen=True, slots=True)
+class ModelRequestContextConfig:
+    """Independent admission limits for task interpretation and semantic audits."""
+
+    window_tokens: int
+    output_tokens: int
+    max_request_bytes: int
+    safety_tokens: int = 256
+    max_history_bytes: int = 8_000
+    max_history_entries: int = 16
+
+    def __post_init__(self) -> None:
+        if any(
+            type(value) is not int or value <= 0
+            for value in (
+                self.window_tokens,
+                self.output_tokens,
+                self.max_request_bytes,
+                self.max_history_bytes,
+                self.max_history_entries,
+            )
+        ):
+            raise ValueError("model request context limits must be positive integers")
+        if type(self.safety_tokens) is not int or self.safety_tokens < 0:
+            raise ValueError("model request safety tokens must be nonnegative")
+        if self.input_tokens <= 0:
+            raise ValueError("model request reserves exhaust the context window")
+        if self.max_history_entries > 64 or self.max_history_bytes > self.max_request_bytes:
+            raise ValueError("model request history limits exceed supported bounds")
 
     @property
     def input_tokens(self) -> int:

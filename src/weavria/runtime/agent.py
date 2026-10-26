@@ -370,6 +370,7 @@ class _AgentKernel:
         self._journal_version = journal_version
         self._scheduling = scheduling
         self._limits = limits if limits is not None else RunLimits()
+        self._request_capacity = self._limits.max_request_bytes
         self._request_budget = self._limits.max_request_bytes
         self._builder = EvidenceContextBuilder(artifacts, mode=mode)
         self._control_builder = context_builder or self._builder
@@ -526,8 +527,12 @@ class _AgentKernel:
                                 <= self._limits.max_request_bytes
                             ):
                                 raise ValueError("invalid turn preparation budget or revision")
-                            self._request_budget = prepared.request_budget_bytes
+                            self._request_capacity = prepared.request_budget_bytes
                             self._apply_turn_preparation(prepared, task)
+                        # A compiled view may spend capacity on optional conversation or
+                        # evidence. Rebuild every decision from the turn's hard capacity
+                        # so an admission rejection can reclaim that optional space.
+                        self._request_budget = self._request_capacity
                         plan = await self._build_context(task)
                         if isinstance(plan, ControlEvidencePlan):
                             if not 0 < plan.budget_bytes <= self._request_budget:
@@ -1366,7 +1371,7 @@ class _AgentKernel:
             if progress.blocked:
                 reason = "no_progress"
         if reason is not None:
-            if reason == "feedback_budget" and reservation.required_bytes <= self._request_budget:
+            if reason == "feedback_budget" and reservation.required_bytes <= self._request_capacity:
                 if self._feedback_reserve_revision != revision:
                     self._feedback_reserve_floor = 0
                 self._feedback_reserve_revision = revision

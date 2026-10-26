@@ -85,6 +85,7 @@ from .preparation import (
     SessionProgressContext,
     SessionSemanticContext,
     SessionTaskContext,
+    SessionTaskPreparationError,
     SessionTaskPreparer,
 )
 from .store import SessionBusyError, SessionConflictError, SQLiteSessionStore
@@ -217,7 +218,11 @@ class _SessionAdapter:
         await self._refresh_semantics(task)
         sequence, count = await self._store.head(self._session_id)
         history = (
-            await self._store.history(self._session_id, before_ordinal=self._ordinal)
+            await self._store.history(
+                self._session_id,
+                before_ordinal=self._ordinal,
+                model_visible_only=True,
+            )
             if self._retrieval_config is None
             else ()
         )
@@ -826,6 +831,7 @@ class SessionEngine:
                 history = await self.store.history(
                     session_id,
                     before_ordinal=claim.ordinal,
+                    model_visible_only=True,
                 )
                 await self._expire_clarifications(session_id)
                 pending = await self.store.pending_clarifications(session_id)
@@ -1064,6 +1070,18 @@ class SessionEngine:
             return SessionResult(
                 session_id=session_id, input_id=claim.input_id, run_id=run_id, report=report
             )
+        except SessionTaskPreparationError as exc:
+            if claimed_run is not None and exc.attempts:
+                _, cancelled = await settle_mutation(
+                    self.store.record_task_preparation_failure(
+                        session_id,
+                        claimed_run,
+                        exc.attempts,
+                    )
+                )
+                if cancelled:
+                    raise asyncio.CancelledError from exc
+            raise
         except JournalCommitError:
             interruption_reason = "storage_failure"
             raise

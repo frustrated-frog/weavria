@@ -48,8 +48,10 @@ from weavria.core import (
     SessionRunEvent,
     SessionSemanticCommitted,
     SessionSourceRead,
+    SessionTaskPreparationFailed,
     SessionTaskUpdated,
     SourceUse,
+    TaskPreparationAttemptDiagnostic,
     TaskRevised,
     TaskUpdate,
     ToolBatch,
@@ -62,6 +64,7 @@ from weavria.runtime import Clock, Phase, RunState, SystemClock, reduce_event, s
 from weavria.tools import ToolExecutionError
 
 from .history_index import (
+    MODEL_VISIBLE_RUN_PREDICATE,
     HistoryCancelled,
     HistoryIndexError,
     HistoryWork,
@@ -388,17 +391,24 @@ class SQLiteSessionStore:
         | SessionRunEvent
         | SessionSourceRead
         | SessionInterrupted
+        | SessionTaskPreparationFailed
         | SessionContextPrepared
         | SessionContextCompiled
         | SessionTaskUpdated
         | SessionControlDecided
         | SessionSemanticCommitted
         | SessionClarificationChanged,
-        # Only the new event kind needs v4; existing kinds retain their v3 envelope.
+        # New diagnostic and compilation facts retain explicit envelope versions.
     ) -> None:
         head = conn.execute("SELECT head FROM sessions WHERE id=?", (session_id,)).fetchone()[0]
         event = SessionEvent(
-            schema_version=4 if isinstance(data, SessionContextCompiled) else 3,
+            schema_version=(
+                5
+                if isinstance(data, SessionTaskPreparationFailed)
+                else 4
+                if isinstance(data, SessionContextCompiled)
+                else 3
+            ),
             session_id=session_id,
             sequence=head + 1,
             data=data,
@@ -1011,6 +1021,33 @@ class SQLiteSessionStore:
     async def interrupt(self, run_id: str, reason: str = "owner_exit") -> None:
         await self._submit(lambda: self._interrupt(run_id, reason))
 
+    async def record_task_preparation_failure(
+        self,
+        session_id: str,
+        run_id: str,
+        attempts: tuple[TaskPreparationAttemptDiagnostic, ...],
+    ) -> None:
+        """Persist content-free pre-Run diagnostics before the interruption fact."""
+        notice = SessionTaskPreparationFailed(
+            run_id=run_id,
+            attempts=attempts,
+        )
+        encoded = notice.model_dump_json()
+
+        def record() -> None:
+            accepted = SessionTaskPreparationFailed.model_validate_json(encoded)
+            with self._transaction() as conn:
+                row = conn.execute(
+                    "SELECT session_id,status FROM runs WHERE id=?", (run_id,)
+                ).fetchone()
+                if row is None or row[0] != session_id or row[1] != "running":
+                    raise SessionConflictError(
+                        "task preparation diagnostic has no active session run"
+                    )
+                self._session_event(conn, session_id, accepted)
+
+        await self._submit(record)
+
     def _interrupt(self, run_id: str, reason: str) -> None:
         with self._transaction() as conn:
             row = conn.execute(
@@ -1119,18 +1156,24 @@ class SQLiteSessionStore:
         await self._submit(rebuild)
 
     async def history(
-        self, session_id: str, *, before_ordinal: int | None = None, limit: int = 64
+        self,
+        session_id: str,
+        *,
+        before_ordinal: int | None = None,
+        limit: int = 64,
+        model_visible_only: bool = False,
     ) -> tuple[ConversationTurn, ...]:
-        if type(limit) is not int or not 1 <= limit <= 256:
+        if type(limit) is not int or not 1 <= limit <= 256 or type(model_visible_only) is not bool:
             raise ValueError("history page size must be in [1,256]")
 
         def read() -> tuple[ConversationTurn, ...]:
+            visibility_filter = f" AND {MODEL_VISIBLE_RUN_PREDICATE}" if model_visible_only else ""
             rows = (
                 self._conn()
                 .execute(
                     (
-                        "SELECT view FROM runs WHERE session_id=? AND view IS NOT NULL AND"
-                        " ordinal<? ORDER BY ordinal DESC LIMIT ?"
+                        "SELECT r.view FROM runs r WHERE r.session_id=? AND r.view IS NOT NULL AND"
+                        f" r.ordinal<?{visibility_filter} ORDER BY r.ordinal DESC LIMIT ?"
                     ),
                     (
                         session_id,

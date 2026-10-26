@@ -74,10 +74,14 @@ def index_passages(value: JsonValue, pointer: str = "") -> tuple[Passage, ...]:
     """Index lossless source ranges once; no model-generated summaries."""
     result: list[Passage] = []
     if isinstance(value, dict):
+        if not value:
+            result.append(Passage(pointer, 0, 0, "{}", terms(f"{pointer} {{}}")))
         for key, child in value.items():
             escaped = key.replace("~", "~0").replace("/", "~1")
             result.extend(index_passages(child, f"{pointer}/{escaped}"))
     elif isinstance(value, list):
+        if not value:
+            result.append(Passage(pointer, 0, 0, "[]", terms(f"{pointer} []")))
         for index, child in enumerate(value):
             result.extend(index_passages(child, f"{pointer}/{index}"))
     elif isinstance(value, str):

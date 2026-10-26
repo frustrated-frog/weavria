@@ -11,6 +11,7 @@ from .preparation import (
     SessionSemanticContext,
     SessionTaskContext,
     SessionTaskPreparation,
+    SessionTaskPreparationError,
     SessionTaskPreparer,
 )
 from .store import (
@@ -35,5 +36,6 @@ __all__ = [
     "SessionSemanticContext",
     "SessionTaskContext",
     "SessionTaskPreparation",
+    "SessionTaskPreparationError",
     "SessionTaskPreparer",
 ]

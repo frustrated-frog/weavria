@@ -11,15 +11,33 @@ from weavria.core import (
     ApplicationObservation,
     ConversationTurn,
     ProgressAssessment,
+    RunError,
     SemanticSnapshot,
     SemanticTransition,
     TaskInput,
     TaskObservation,
+    TaskPreparationAttemptDiagnostic,
     ToolRecord,
     TurnFeedback,
     WorkStatus,
 )
 from weavria.tools import ToolRegistry
+
+
+class SessionTaskPreparationError(Exception):
+    """Stable preparation failure that can cross the application/session boundary."""
+
+    def __init__(
+        self,
+        error: RunError,
+        *,
+        attempts: tuple[TaskPreparationAttemptDiagnostic, ...] = (),
+    ) -> None:
+        self.error = RunError.model_validate(error)
+        self.attempts = tuple(
+            TaskPreparationAttemptDiagnostic.model_validate(item) for item in attempts
+        )
+        super().__init__(self.error.message)
 
 
 @dataclass(frozen=True, slots=True)

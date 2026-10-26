@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from ._schema import ContractModel, NonBlankString
 from .context import SessionContextCompiled
 from .control import ControlEvent, ControlRequest, RunReport
-from .errors import ErrorCategory
+from .errors import ErrorCategory, TaskPreparationAttemptDiagnostic
 from .execution import ArtifactRef, ExecutionEvent
 from .intervention import TaskUpdate, TurnResolution
 from .model_io import ApplicationObservation
@@ -305,6 +305,21 @@ class SessionInterrupted(ContractModel):
     ]
 
 
+class SessionTaskPreparationFailed(ContractModel):
+    """Persist safe diagnostics when failure occurs before Runtime event sequence zero."""
+
+    kind: Literal["task_preparation_failed"] = "task_preparation_failed"
+    run_id: NonBlankString
+    attempts: tuple[TaskPreparationAttemptDiagnostic, ...] = Field(min_length=1, max_length=8)
+
+    @model_validator(mode="after")
+    def validate_attempts(self) -> Self:
+        identities = [(item.stage, item.attempt) for item in self.attempts]
+        if len(identities) != len(set(identities)):
+            raise ValueError("task preparation attempt identities must be unique")
+        return self
+
+
 class SessionContextPrepared(ContractModel):
     kind: Literal["context_prepared"] = "context_prepared"
     run_id: NonBlankString
@@ -333,7 +348,7 @@ class SessionControlDecided(ContractModel):
 
 class SessionEvent(BaseModel):
     model_config = ContractModel.model_config
-    schema_version: Literal[1, 2, 3, 4] = 3
+    schema_version: Literal[1, 2, 3, 4, 5] = 3
 
     @field_validator("schema_version", mode="before")
     @classmethod
@@ -355,6 +370,7 @@ class SessionEvent(BaseModel):
         | SessionRunEvent
         | SessionSourceRead
         | SessionInterrupted
+        | SessionTaskPreparationFailed
         | SessionContextPrepared
         | SessionContextCompiled
         | SessionTaskUpdated
@@ -365,6 +381,8 @@ class SessionEvent(BaseModel):
 
     @model_validator(mode="after")
     def validate_payload_version(self) -> Self:
+        if self.schema_version < 5 and isinstance(self.data, SessionTaskPreparationFailed):
+            raise ValueError("task preparation diagnostics require session event v5")
         if self.schema_version < 4 and isinstance(self.data, SessionContextCompiled):
             raise ValueError("context compilation requires session event v4")
         if self.schema_version == 1 and isinstance(

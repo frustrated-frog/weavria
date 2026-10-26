@@ -479,14 +479,16 @@ async def test_accepted_artifact_anchor_discovers_producer_without_indexing_body
         assert not body.report.matches
 
 
-async def test_migration_from_v5_keeps_originals_and_indexes_interrupted_turn(
+async def test_migration_from_v5_keeps_interrupted_original_out_of_model_retrieval(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "v5.db"
-    await seed(path, ("Aurora password",))
+    runs = await seed(path, ("Aurora password",))
     async with SQLiteSessionStore(path) as store:
         await store.begin("s", "interrupted-input", "interrupted-run", "杭州水库检修", "{}")
-        await store.interrupt("interrupted-run")
+        await store.interrupt("interrupted-run", "task_preparation_failure")
+        await store.begin("s", "process-input", "process-run", "进程恢复上下文", "{}")
+        await store.interrupt("process-run", "process_exit")
         events = await store.events("s")
         turns = await store.history("s")
     with sqlite3.connect(path) as conn:
@@ -502,9 +504,15 @@ async def test_migration_from_v5_keeps_originals_and_indexes_interrupted_turn(
         conn.execute("PRAGMA user_version=5")
     async with SQLiteSessionStore(path) as store:
         found = await query(store, "杭州水库检修")
-        assert any(m.address.run_id == "interrupted-run" for m in found.report.matches)
+        assert all(c.run_id != "interrupted-run" for c in found.report.candidates)
+        assert all(m.address.run_id != "interrupted-run" for m in found.report.matches)
+        recovered = await query(store, "进程恢复上下文")
+        assert any(c.run_id == "process-run" for c in recovered.report.candidates)
+        assert any(m.address.run_id == "process-run" for m in recovered.report.matches)
         assert await store.events("s") == events
         assert await store.history("s") == turns
+        model_history = await store.history("s", model_visible_only=True)
+        assert {turn.run_id for turn in model_history} == {runs[0], "process-run"}
         with sqlite3.connect(path) as conn:
             assert conn.execute("PRAGMA user_version").fetchone()[0] == 6
 

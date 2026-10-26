@@ -8,6 +8,8 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 from weavria.core import (
     ApplicationObservation,
     ErrorCategory,
+    ModelOutputDiagnostic,
+    ModelRequest,
     ModelResponse,
     TaskInput,
     ToolCallAction,
@@ -23,6 +25,7 @@ from weavria.harness import (
     ModelRequirementCoverageValidator,
     ObligationCoverage,
     RequirementCoverageAssessment,
+    RequirementCoverageError,
     RequirementCoverageReport,
     SemanticObligation,
     TaskSpecification,
@@ -31,7 +34,7 @@ from weavria.harness import (
     TaskUnderstandingInput,
     compile_requirement_coverage,
 )
-from weavria.models import FakeModelProvider
+from weavria.models import FakeModelProvider, ModelCapabilities, ModelOutputError
 from weavria.tools import ToolContext, ToolRegistry, TypedTool
 
 
@@ -723,3 +726,40 @@ async def test_model_coverage_validator_retries_invalid_cross_references_once() 
     assert len(provider.requests) == 2
     assert "failed trusted host validation" in provider.requests[1].instructions
     assert "unknown_need_index" in provider.requests[1].instructions
+
+
+async def test_model_coverage_validator_does_not_repeat_nonrepairable_output_failure() -> None:
+    class OutputBudgetExhaustedProvider:
+        capabilities = ModelCapabilities(tool_calls=True)
+
+        def __init__(self) -> None:
+            self.requests: list[ModelRequest] = []
+
+        async def generate(self, request: ModelRequest) -> ModelResponse:
+            self.requests.append(request)
+            raise ModelOutputError(
+                "output budget exhausted",
+                diagnostic=ModelOutputDiagnostic(
+                    code="output_truncated",
+                    finish_reason="length",
+                    repairable=False,
+                ),
+            )
+
+    provider = OutputBudgetExhaustedProvider()
+    validator = ModelRequirementCoverageValidator(provider)
+
+    with pytest.raises(RequirementCoverageError) as raised:
+        await validator.assess(
+            TaskUnderstandingInput(
+                task=TaskInput(goal="Summarize the report"),
+                capabilities=(_capability_view(),),
+            ),
+            _broad_specification(),
+            max_duration=1,
+        )
+
+    assert len(provider.requests) == 1
+    assert len(raised.value.attempts) == 1
+    assert raised.value.attempts[0].output is not None
+    assert raised.value.attempts[0].output.repairable is False
