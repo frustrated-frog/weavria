@@ -13,6 +13,7 @@ from weavria.core import (
     ActionValueScope,
     ContinuationSignal,
     EvidenceCoverageSignal,
+    EvidenceNavigationProof,
     InformationGainSignal,
     InterventionDecision,
     ObligationProgressSignal,
@@ -113,6 +114,25 @@ def _value_context(
         objective=objective,
         proposal_sha256=hashlib.sha256(proposal.model_dump_json().encode()).hexdigest(),
         action_family_sha256s=("c" * 64,),
+    )
+
+
+def _navigation_proof(proposal: ToolBatch) -> EvidenceNavigationProof:
+    return EvidenceNavigationProof(
+        task_revision=1,
+        control_request_sha256="a" * 64,
+        delivery_manifest_sha256="b" * 64,
+        proposal_sha256=hashlib.sha256(proposal.model_dump_json().encode()).hexdigest(),
+        result_call_id="page-1",
+        result_artifact_id="page-result",
+        result_artifact_sha256="c" * 64,
+        source_artifact_id="source",
+        source_artifact_sha256="d" * 64,
+        pointer="/items",
+        previous_start=0,
+        previous_end=1,
+        total=2,
+        next_start=1,
     )
 
 
@@ -229,6 +249,39 @@ async def test_verify_recommendation_rejects_further_tool_effects() -> None:
     assert decision.disposition == "reconsider"
     assert decision.trigger == "completion_recommended"
     assert decision.reason_codes == ("test_recommendation",)
+
+
+async def test_verify_recommendation_allows_a_proven_evidence_navigation() -> None:
+    context = _context()
+    assessment = _assessment("neutral", "verify").model_copy(
+        update={
+            "obligations": ObligationProgressSignal(
+                observable_total=1,
+                open_before=0,
+                open_after=0,
+            ),
+            "coverage": EvidenceCoverageSignal(
+                total_units=1,
+                covered_before=1,
+                covered_after=1,
+            ),
+        }
+    )
+
+    decision = await ProgressActionInterventionPolicy().evaluate(
+        ActionInterventionContext(
+            task=context.task,
+            proposal=context.proposal,
+            progress_assessment=assessment,
+            remaining_model_calls=2,
+            remaining_tool_calls=3,
+            navigation_proof=_navigation_proof(context.proposal),
+        )
+    )
+
+    assert decision.disposition == "allow"
+    assert decision.trigger == "verification_advisory"
+    assert decision.reason_codes == ("evidence_navigation_continuation",)
 
 
 async def test_productive_transition_to_verify_keeps_one_advisory_step() -> None:

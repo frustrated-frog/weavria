@@ -7,6 +7,7 @@ from .openai_compatible import (
     OpenAICompatibleProvider,
     OpenAICompatibleSessionProvider,
     OpenAICompatibleTokenCounter,
+    ReasoningEffort,
 )
 from .provider import (
     ControlModelProvider,
@@ -39,6 +40,7 @@ __all__ = [
     "OpenAICompatibleProvider",
     "OpenAICompatibleSessionProvider",
     "OpenAICompatibleTokenCounter",
+    "ReasoningEffort",
     "SessionModelProvider",
     "TurnModelProvider",
     "call_controlled_model",

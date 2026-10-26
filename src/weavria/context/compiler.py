@@ -13,6 +13,7 @@ from weavria.core import (
     ControlRequest,
     ConversationTurn,
     ConversationView,
+    EvidenceDeliveryManifest,
     HistoryRetrievalReport,
     RecoverContext,
     RecoveryLimits,
@@ -256,7 +257,9 @@ class SessionContextCompiler:
             base.control.model_dump_json().encode() if base.control else b"null"
         )
         policy_version = (
-            6
+            7
+            if records
+            else 6
             if feedback_reserve_floor_bytes
             else 5
             if next_step_reserve_bytes
@@ -270,7 +273,9 @@ class SessionContextCompiler:
             session_id=session_id,
             through_sequence=sequence,
             omitted_turns=total_turns,
-            policy_version="context-compiler/6"
+            policy_version="context-compiler/7"
+            if policy_version == 7
+            else "context-compiler/6"
             if policy_version == 6
             else "context-compiler/5"
             if policy_version == 5
@@ -354,6 +359,21 @@ class SessionContextCompiler:
         require(cost)
         request = render(selected)
         encoded = request.model_dump_json()
+        request_sha256 = digest(encoded)
+        delivery_manifest = (
+            EvidenceDeliveryManifest(
+                task_revision=base.task.revision,
+                control_request_sha256=digest(request.current.model_dump_json()),
+                transport_request_sha256=request_sha256,
+                deliveries=tuple(
+                    delivery
+                    for index, level in sorted(selected.items())
+                    if (delivery := units[index].variants[level].delivery) is not None
+                ),
+            )
+            if records
+            else None
+        )
         actual_tokens = self.counter.count(request)
         if actual_tokens + padding + next_step_reserve_bytes != cost.tokens:
             raise ContextBuildError("token counter changed within one compilation")
@@ -372,7 +392,7 @@ class SessionContextCompiler:
             task_revision=base.task.revision,
             source_sha256=digest(json.dumps([(u.identity, u.digest) for u in units])),
             demand_sha256=digest(json.dumps([asdict(d) for d in demands], sort_keys=True)),
-            request_sha256=digest(encoded),
+            request_sha256=request_sha256,
             request_bytes=len(encoded.encode()),
             budget_bytes=max_request_bytes,
             input_tokens=actual_tokens,
@@ -404,5 +424,6 @@ class SessionContextCompiler:
             ),
             retrieval=retrieval,
             recovery_ranges=recovery_ranges,
+            delivery_manifest=delivery_manifest,
         )
         return CompiledSessionContext(encoded, report.model_dump_json())

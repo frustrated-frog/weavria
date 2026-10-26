@@ -5,12 +5,15 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal
 
+from weavria.core import EvidenceDelivery
+
 
 @dataclass(frozen=True, slots=True)
 class Representation:
     kind: Literal["raw", "excerpt", "reference"]
     payload_json: str
     features: tuple[tuple[str, float], ...]
+    delivery: EvidenceDelivery | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -14,6 +14,9 @@ from apps.finscope.evaluation import (
     expanded_market_data,
     grade_weekly_answer,
     load_weekly_summary_case,
+    unrelated_direct_specification,
+    weekly_summary_coverage_assessment,
+    weekly_summary_specification,
 )
 from apps.finscope.market import MarketPulseClient
 from apps.finscope.server import MessageOutput, SessionCreated, create_app
@@ -38,15 +41,7 @@ from weavria.core import (
     ToolExchange,
     ToolRecorded,
 )
-from weavria.harness import (
-    CapabilityNeed,
-    CompletionCriterion,
-    InformationNeed,
-    NeedStatus,
-    TaskSpecification,
-    load_need_ledger,
-    load_task_frame,
-)
+from weavria.harness import NeedStatus, load_need_ledger, load_task_frame
 from weavria.models import ModelCapabilities
 from weavria.sessions import SQLiteSessionStore
 
@@ -62,66 +57,6 @@ async def _events(store: SQLiteSessionStore, session_id: str) -> tuple[SessionEv
     return tuple(events)
 
 
-def _weekly_specification() -> TaskSpecification:
-    return TaskSpecification(
-        route="execute",
-        intent="Summarize the accepted weekly market evidence",
-        goal="Summarize market regime, weekly history, breadth and the daily review",
-        information_needs=(
-            InformationNeed(
-                description="Current market regime",
-                source="external",
-                freshness="current",
-                required_fields=("/data/regime",),
-            ),
-            InformationNeed(
-                description="Recent market regimes for the week",
-                source="external",
-                freshness="current",
-                required_fields=("/data/recentRegimes",),
-            ),
-            InformationNeed(
-                description="Current market breadth",
-                source="external",
-                freshness="current",
-                required_fields=("/data/breadth",),
-            ),
-            InformationNeed(
-                description="Daily review supporting the weekly summary",
-                source="external",
-                freshness="current",
-                required_fields=("/data/dailyReview",),
-            ),
-        ),
-        capability_needs=(
-            CapabilityNeed(
-                name="read_market_pulse",
-                purpose="Read the authoritative market snapshot",
-                necessity="required",
-            ),
-        ),
-        completion_criteria=(
-            CompletionCriterion(
-                kind="capability_result",
-                description="Read the market snapshot",
-                capability="read_market_pulse",
-            ),
-            CompletionCriterion(kind="response", description="Deliver the weekly summary"),
-        ),
-    )
-
-
-def _direct_specification() -> TaskSpecification:
-    return TaskSpecification(
-        route="direct",
-        intent="Acknowledge unrelated context",
-        goal="Acknowledge the unrelated context without using tools",
-        completion_criteria=(
-            CompletionCriterion(kind="response", description="Acknowledge the message"),
-        ),
-    )
-
-
 class _ScenarioInterpreter:
     capabilities = ModelCapabilities(tool_calls=True)
 
@@ -131,10 +66,12 @@ class _ScenarioInterpreter:
 
     async def generate(self, request: ModelRequest) -> ModelResponse:
         self.requests.append(ModelRequest.model_validate_json(request.model_dump_json()))
+        if "declare_requirement_coverage" in request.instructions:
+            return _weekly_coverage_declaration()
         specification = (
-            _weekly_specification()
+            weekly_summary_specification()
             if request.task.goal == self._prompt
-            else _direct_specification()
+            else unrelated_direct_specification()
         )
         await asyncio.sleep(0)
         return ModelResponse(
@@ -144,6 +81,16 @@ class _ScenarioInterpreter:
                 arguments=specification.model_dump(mode="json"),
             )
         )
+
+
+def _weekly_coverage_declaration() -> ModelResponse:
+    return ModelResponse(
+        action=ToolCallAction(
+            call_id="coverage-weekly",
+            tool_name="declare_requirement_coverage",
+            arguments=weekly_summary_coverage_assessment().model_dump(mode="json"),
+        )
+    )
 
 
 class _EvidenceAwareScenarioModel:
@@ -336,6 +283,9 @@ async def test_weekly_summary_closes_every_observable_layer(
 
     frame = load_task_frame(semantic[-1].observation.payload)
     ledger = load_need_ledger(semantic[-1].need_ledger)
+    assert frame.requirement_coverage is not None
+    assert frame.requirement_coverage.verdict == "sufficient"
+    assert frame.requirement_coverage.repair_count == 0
     assert {
         field for need in frame.requirements for field in need.required_fields
     } == WEEKLY_SUMMARY_REQUIRED_FIELDS

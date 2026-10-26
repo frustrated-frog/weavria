@@ -28,6 +28,9 @@ from weavria.core import (
     ControlFeedback,
     DecisionDiscarded,
     EvidenceAccessView,
+    EvidenceContinuationAccess,
+    EvidenceDeliveryManifest,
+    EvidenceInitialAccess,
     ExecutionEvent,
     FinishAction,
     InterventionNotice,
@@ -63,6 +66,7 @@ from weavria.core import (
     parse_action,
     recovery_digest,
 )
+from weavria.tools import ArtifactReadInput
 
 from .intervention import action_value_state_sha256, observe_action_value
 
@@ -124,6 +128,7 @@ class RunState:
     intervention_reconsiderations: int = 0
     context_call_ids: tuple[str, ...] = ()
     context_request_sha256: str | None = None
+    delivery_manifest_json: str | None = None
     recovery_limits_json: str | None = None
     recovery_rounds: int = 0
     recovery_bytes: int = 0
@@ -136,6 +141,14 @@ class RunState:
         return (
             RecoveryLimits.model_validate_json(self.recovery_limits_json)
             if self.recovery_limits_json
+            else None
+        )
+
+    @property
+    def delivery_manifest(self) -> EvidenceDeliveryManifest | None:
+        return (
+            EvidenceDeliveryManifest.model_validate_json(self.delivery_manifest_json)
+            if self.delivery_manifest_json is not None
             else None
         )
 
@@ -267,6 +280,7 @@ def reduce_event(state: RunState | None, event: JournalEvent) -> RunState:
             last_completion_frontier_sha256=None,
             action_value_profiles_json=(),
             model_output_failures=0,
+            delivery_manifest_json=None,
             recovery_ranges_json=(),
             recovery_seen_json=(),
             recovery_attempts=(),
@@ -318,12 +332,32 @@ def reduce_event(state: RunState | None, event: JournalEvent) -> RunState:
                 "context omitted latest tool feedback",
             )
         _require(set(state.feedback_call_ids) <= selected, "context omitted turn feedback")
+        manifest = data.delivery_manifest
+        if manifest is not None:
+            _require(
+                manifest.task_revision == state.task.revision
+                and manifest.control_request_sha256 == data.request_sha256,
+                "delivery manifest belongs to another task or request",
+            )
+            for delivery in manifest.deliveries:
+                record = records.get(delivery.call_id)
+                artifact = record.artifact if record is not None else None
+                _require(
+                    delivery.call_id in selected
+                    and artifact is not None
+                    and artifact.run_id == delivery.run_id
+                    and artifact.artifact_id == delivery.artifact_id
+                    and artifact.sha256 == delivery.artifact_sha256
+                    and artifact.size_bytes == delivery.artifact_size_bytes,
+                    "delivery manifest references an unaccepted Artifact",
+                )
         return replace(
             next_state,
             phase=Phase.CONTEXT,
             pending_progress_sequence=None,
             context_call_ids=data.selected_call_ids,
             context_request_sha256=data.request_sha256,
+            delivery_manifest_json=(manifest.model_dump_json() if manifest is not None else None),
         )
     if isinstance(data, ModelStarted):
         _require(
@@ -706,6 +740,131 @@ def _reduce_control(
             == hashlib.sha256(turn.decision.model_dump_json().encode()).hexdigest(),
             "intervention does not bind the active proposal",
         )
+        if data.navigation_proof is not None:
+            proof = data.navigation_proof
+            manifest = state.delivery_manifest
+            _require(
+                manifest is not None
+                and state.context_request_sha256 == proof.control_request_sha256
+                and manifest.sha256 == proof.delivery_manifest_sha256,
+                "navigation proof does not bind the active delivered context",
+            )
+            assert manifest is not None
+            delivered = manifest.for_call(proof.result_call_id)
+            records = {record.exchange.action.call_id: record for record in state.records}
+            source = next(
+                (
+                    record.artifact
+                    for record in state.records
+                    if record.artifact is not None
+                    and record.artifact.artifact_id == proof.source_artifact_id
+                ),
+                None,
+            )
+            _require(
+                delivered is not None
+                and delivered.complete
+                and delivered.artifact_id == proof.result_artifact_id
+                and delivered.artifact_sha256 == proof.result_artifact_sha256
+                and proof.result_call_id in records
+                and source is not None
+                and source.sha256 == proof.source_artifact_sha256,
+                "navigation proof is not backed by accepted delivered Artifacts",
+            )
+        if data.evidence_access_proof is not None:
+            proof = data.evidence_access_proof
+            manifest = state.delivery_manifest
+            _require(
+                manifest is not None
+                and state.context_request_sha256 == proof.control_request_sha256
+                and manifest.sha256 == proof.delivery_manifest_sha256,
+                "evidence access proof does not bind the active delivered context",
+            )
+            assert manifest is not None
+            _require(
+                tuple(item.call_id for item in proof.accesses)
+                == tuple(call.call_id for call in turn.decision.calls),
+                "evidence access proof does not cover the complete proposal",
+            )
+            records = {record.exchange.action.call_id: record for record in state.records}
+            for access, call in zip(proof.accesses, turn.decision.calls, strict=True):
+                _require(call.tool_name == "read_artifact", "evidence proof covers another tool")
+                try:
+                    proposed = ArtifactReadInput.model_validate(call.arguments)
+                except ValueError as exc:
+                    raise EventAcceptanceError(
+                        "evidence proof covers invalid read arguments"
+                    ) from exc
+                source_record = records.get(access.source_call_id)
+                source = source_record.artifact if source_record is not None else None
+                _require(
+                    source is not None
+                    and proposed.artifact_id == access.source_artifact_id == source.artifact_id
+                    and access.source_artifact_sha256 == source.sha256
+                    and proposed.pointer == access.pointer,
+                    "evidence proof source does not match accepted execution",
+                )
+                if isinstance(access, EvidenceInitialAccess):
+                    source_delivery = manifest.for_call(access.source_call_id)
+                    _require(
+                        proposed.start == access.start == 0
+                        and source_delivery is not None
+                        and not source_delivery.complete
+                        and source_delivery.artifact_id == access.source_artifact_id
+                        and source_delivery.artifact_sha256 == access.source_artifact_sha256
+                        and not source_delivery.covers(access.missing_range),
+                        "initial evidence access lacks a current delivery gap",
+                    )
+                    for prior in state.records:
+                        if (
+                            prior.artifact is None
+                            or prior.exchange.action.tool_name != "read_artifact"
+                        ):
+                            continue
+                        try:
+                            prior_arguments = ArtifactReadInput.model_validate(
+                                prior.exchange.action.arguments
+                            )
+                        except ValueError as exc:
+                            raise EventAcceptanceError(
+                                "accepted Artifact read has invalid arguments"
+                            ) from exc
+                        _require(
+                            prior_arguments.artifact_id != proposed.artifact_id
+                            or prior_arguments.pointer != proposed.pointer,
+                            "initial evidence access repeats an accepted source pointer",
+                        )
+                    continue
+                assert isinstance(access, EvidenceContinuationAccess)
+                result_record = records.get(access.result_call_id)
+                result = result_record.artifact if result_record is not None else None
+                delivered = manifest.for_call(access.result_call_id)
+                _require(
+                    result_record is not None
+                    and result is not None
+                    and delivered is not None
+                    and delivered.complete
+                    and result.artifact_id == access.result_artifact_id == delivered.artifact_id
+                    and result.sha256 == access.result_artifact_sha256 == delivered.artifact_sha256
+                    and proposed.start == access.next_start,
+                    "continuation evidence access lacks a delivered previous page",
+                )
+                assert result_record is not None
+                try:
+                    previous = ArtifactReadInput.model_validate(
+                        result_record.exchange.action.arguments
+                    )
+                except ValueError as exc:
+                    raise EventAcceptanceError(
+                        "accepted continuation page has invalid arguments"
+                    ) from exc
+                _require(
+                    result_record.exchange.action.tool_name == "read_artifact"
+                    and previous.artifact_id == proposed.artifact_id
+                    and previous.pointer == proposed.pointer
+                    and previous.start == access.previous_start,
+                    "continuation evidence access changes its source cursor",
+                )
         progress = state.progress_assessment
         progress_sha256 = (
             hashlib.sha256(progress.model_dump_json().encode()).hexdigest()

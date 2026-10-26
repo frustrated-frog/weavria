@@ -71,12 +71,18 @@ export WEAVRIA_MODEL_BASE_URL="https://provider.example/v1"
 export WEAVRIA_MODEL_NAME="model-name"
 export WEAVRIA_MODEL_API_KEY="..."
 export WEAVRIA_MODEL_JSON_MODE="true"
-uv run python examples/live_finscope_weekly_summary.py --history-turns 0
+uv run python examples/live_finscope_weekly_summary.py \
+  --history-turns 0 \
+  --understanding live
 ```
 
 真实入口会输出数据集摘要、模型与预算、任务理解和执行调用的 Token/延迟、Task Frame 字段覆盖、Need 状态、工具记录、上下文峰值与最终结果。它不会把密钥、模型请求正文或供应商原始响应写入报告。
 
+将 `--understanding` 改为 `fixed`，可以跳过任务理解模型并注入四字段冻结规格，只观察真实执行模型。该模式是诊断上界，不是生产配置。
+
 2026-10-25 的 `deepseek-flash` 版本 2 探索样本完成并命中全部 8 个原子字段：任务理解 1 次、执行模型 3 次、总计 35,268 Token、端到端约 26.9 秒；产生 2 次市场 HTTP 读取和 4 条工具记录。Task Frame 只有一项宽泛外部需求且 `required_fields` 为空，预期四字段覆盖率为 0%。所以这条轨迹证明模型能在该样本中读取 Artifact 并组织正确回答，也同时证明 Harness 的结构化任务义务尚未达到确定性基线的强度。
+
+随后各运行 3 次固定规格与真实理解对照：固定组答案 3/3 正确、字段覆盖 100%、平均 17,761 Token 和 7.00 秒；真实理解组答案 1/3 正确、字段覆盖 0%、平均 26,054 Token 和 23.35 秒。六次 Runtime 都显示完成，说明过宽 Task Frame 不只影响可观测性，也会让不完整答案穿过当前完成验收。样本量仍然很小，固定规格又是人工诊断上界，不能把差异外推成总体收益。
 
 ## 6. 当前刻意没有实现什么
 
@@ -90,4 +96,4 @@ uv run python examples/live_finscope_weekly_summary.py --history-turns 0
 
 ## 7. 下一小步建议
 
-先在版本 2 上区分两个变量：一组固定 TaskSpecification、只让真实模型执行；另一组让真实模型同时理解与执行。各自做少量重复后再判断 `required_fields` 为空是否稳定。若问题稳定发生，优先改进领域无关的任务理解输出契约和结构校验；之后再运行 8 轮长历史样本，避免把理解误差与上下文压缩混为一谈。
+下一步只研究任务理解，不先改 Runtime：冻结规格结构评分器，对比当前解释 Prompt、显式 JSON Pointer 选择引导和一次有界结构修复。至少加入一个非金融任务，验证改进不是 FinScope 字段特例；结构覆盖稳定后再运行 8 轮长历史样本。

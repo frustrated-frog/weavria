@@ -28,10 +28,20 @@ from weavria.harness import (
     InformationNeed,
     IntentHypothesis,
     IntentUncertainty,
+    ObligationCoverage,
+    RequirementCoverageAssessment,
+    SemanticObligation,
     TaskFrame,
     TaskSpecification,
 )
 from weavria.models import FakeModelProvider, FakeSessionProvider
+
+
+def test_task_understanding_feature_switches_are_strict_booleans() -> None:
+    with pytest.raises(TypeError, match="requirement_coverage"):
+        create_app(requirement_coverage=1)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="evidence_guidance"):
+        create_app(evidence_guidance="yes")  # type: ignore[arg-type]
 
 
 def _declaration(specification: TaskSpecification) -> ModelResponse:
@@ -40,6 +50,47 @@ def _declaration(specification: TaskSpecification) -> ModelResponse:
             call_id="understand",
             tool_name="declare_task_specification",
             arguments=specification.model_dump(mode="json"),
+        )
+    )
+
+
+def _market_coverage() -> ModelResponse:
+    assessment = RequirementCoverageAssessment(
+        obligations=(
+            SemanticObligation(
+                obligation_id="current_market_stage",
+                description="Explain the current market stage",
+                kind="information",
+                origin="task_goal",
+            ),
+            SemanticObligation(
+                obligation_id="answer_delivery",
+                description="Deliver the requested explanation",
+                kind="deliverable",
+                origin="task_goal",
+            ),
+        ),
+        findings=(
+            ObligationCoverage(
+                obligation_id="current_market_stage",
+                status="covered",
+                information_need_indices=(0,),
+                evidence_surface_ids=("market.regime",),
+                reason_code="covered_by_need",
+            ),
+            ObligationCoverage(
+                obligation_id="answer_delivery",
+                status="covered",
+                completion_criterion_indices=(1,),
+                reason_code="covered_by_completion",
+            ),
+        ),
+    )
+    return ModelResponse(
+        action=ToolCallAction(
+            call_id="coverage",
+            tool_name="declare_requirement_coverage",
+            arguments=assessment.model_dump(mode="json"),
         )
     )
 
@@ -55,6 +106,7 @@ def _market_execution() -> TaskSpecification:
                 source="external",
                 freshness="current",
                 required_fields=("/data/regime",),
+                capability_names=("read_market_pulse",),
             ),
         ),
         capability_needs=(
@@ -186,7 +238,7 @@ async def test_widget_session_executes_real_runtime_and_reports_tool_trace(
             ),
         )
     )
-    interpreter = FakeModelProvider((_declaration(_market_execution()),))
+    interpreter = FakeModelProvider((_declaration(_market_execution()), _market_coverage()))
     settings = FinScopeSettings(
         model_base_url="http://model.test",
         model_name="fake",
@@ -285,7 +337,9 @@ async def test_finscope_retries_ungrounded_model_evidence_path_before_execution(
             )
         }
     )
-    interpreter = FakeModelProvider((_declaration(invalid), _declaration(_market_execution())))
+    interpreter = FakeModelProvider(
+        (_declaration(invalid), _declaration(_market_execution()), _market_coverage())
+    )
     provider = FakeSessionProvider(
         (
             ModelTurn(
@@ -359,9 +413,10 @@ async def test_finscope_retries_ungrounded_model_evidence_path_before_execution(
     payload = MessageOutput.model_validate(response.json())
     assert payload.status == "completed"
     assert payload.task_outcome == "unverified"
-    assert len(interpreter.requests) == 2
+    assert len(interpreter.requests) == 3
     assert "one or more selectors are unsupported" in interpreter.requests[1].instructions
     assert "/regime" not in interpreter.requests[1].instructions
+    assert "Independently audit" in interpreter.requests[2].instructions
     observation = provider.requests[0].current.task_observation
     assert observation is not None
     frame = TaskFrame.model_validate_json(json.dumps(observation.payload))
@@ -521,7 +576,9 @@ async def test_market_source_failure_finishes_unverifiable_without_completion_lo
             state_path=tmp_path / "sessions.sqlite3",
         ),
         provider=provider,
-        interpreter_provider=FakeModelProvider((_declaration(_market_execution()),)),
+        interpreter_provider=FakeModelProvider(
+            (_declaration(_market_execution()), _market_coverage())
+        ),
         market_client=MarketPulseClient("http://finscope.test", client=market_http),
     )
 

@@ -11,9 +11,13 @@ from pydantic import BaseModel, ConfigDict, JsonValue, TypeAdapter, ValidationEr
 
 from weavria.artifacts import ArtifactAccessError, ArtifactSnapshot, InMemoryArtifactStore
 from weavria.context import (
+    ContextCompilerConfig,
     ControlEvidencePlan,
     EvidenceContextBuilder,
+    EvidenceDecision,
     EvidenceMode,
+    SessionContextCompiler,
+    SessionTokenCounter,
     reserve_feedback,
 )
 from weavria.core import (
@@ -39,7 +43,9 @@ from weavria.core import (
     ControlFeedback,
     ControlRequest,
     ErrorCategory,
+    EvidenceContinuationAccess,
     EvidenceCoverageSignal,
+    EvidenceInitialAccess,
     FeedbackBounds,
     FinishAction,
     InformationGainSignal,
@@ -90,7 +96,7 @@ from weavria.runtime import (
     ToolScheduling,
     reduce_event,
 )
-from weavria.tools import ToolContext, ToolRegistry, TypedTool
+from weavria.tools import ToolContext, ToolRegistry, TypedTool, artifact_read_tool
 
 
 class Input(BaseModel):
@@ -150,6 +156,70 @@ def batch(*calls: ToolCallAction) -> ModelTurn:
 
 def finish(output: str = "done") -> ModelTurn:
     return ModelTurn(decision=FinishAction(output=output))
+
+
+class _CompilerControlBuilder:
+    """Exercise the production compiler without the Session persistence adapter."""
+
+    def __init__(self, store: InMemoryArtifactStore, counter: SessionTokenCounter) -> None:
+        self._compiler = SessionContextCompiler(
+            store,
+            config=ContextCompilerConfig(window_tokens=24_000, output_tokens=256),
+            counter=counter,
+        )
+
+    async def build_control(
+        self,
+        *,
+        run_id: str,
+        instructions: str,
+        task: TaskInput,
+        task_observation: TaskObservation | None = None,
+        records: tuple[ToolRecord, ...],
+        max_request_bytes: int,
+        feedback: TurnFeedback | None = None,
+        control: ControlFeedback | None = None,
+        required_call_ids: tuple[str, ...] = (),
+        feedback_reserve_floor_bytes: int = 0,
+    ) -> ControlEvidencePlan:
+        base = ControlRequest(
+            instructions=instructions,
+            task=task,
+            task_observation=task_observation,
+            control=control,
+        ).model_copy(update={"feedback": feedback})
+        compiled = await self._compiler.compile(
+            run_id=run_id,
+            session_id="session",
+            sequence=0,
+            base=base,
+            turns=(),
+            total_turns=0,
+            records=records,
+            max_request_bytes=max_request_bytes,
+            required_call_ids=required_call_ids,
+            feedback_reserve_floor_bytes=feedback_reserve_floor_bytes,
+        )
+        choices = {item.source_id: item for item in compiled.compilation.choices}
+        decisions = tuple(
+            EvidenceDecision(
+                record.exchange.action.call_id,
+                choices[f"call:{record.exchange.action.call_id}"].representation != "omitted",
+                choices[f"call:{record.exchange.action.call_id}"].representation,
+                0.0,
+                record.dependencies,
+                "test_joint_context_compilation",
+            )
+            for record in records
+        )
+        return ControlEvidencePlan(
+            compiled.request.current.model_dump_json(),
+            EvidenceMode.RELEVANT,
+            max_request_bytes,
+            decisions,
+            compiled.compilation.model_dump_json(),
+            compiled.compilation.feedback_budget_bytes,
+        )
 
 
 def make_loop(
@@ -852,6 +922,253 @@ async def test_ready_to_verify_blocks_more_tools_and_converges_to_finish() -> No
     ]
     assert decisions[-1].disposition == "reconsider"
     assert decisions[-1].trigger == "completion_recommended"
+    replay(agent)
+
+
+async def test_ready_to_verify_allows_the_exact_next_artifact_page(
+    session_counter: SessionTokenCounter,
+) -> None:
+    store = InMemoryArtifactStore()
+    long_value = "x" * 3000
+    source = await store.put("run", "source", {"value": long_value})
+    provider = FakeControlProvider(
+        (
+            batch(call("source", long_value)),
+            batch(
+                ToolCallAction(
+                    call_id="page-1",
+                    tool_name="read_artifact",
+                    arguments={
+                        "artifact_id": source.reference.artifact_id,
+                        "pointer": "/value",
+                        "start": 0,
+                        "length": 1000,
+                    },
+                )
+            ),
+            batch(
+                ToolCallAction(
+                    call_id="page-2",
+                    tool_name="read_artifact",
+                    arguments={
+                        "artifact_id": source.reference.artifact_id,
+                        "pointer": "/value",
+                        "start": 998,
+                        "length": 1000,
+                    },
+                )
+            ),
+            finish("grounded"),
+        )
+    )
+    tools = ToolRegistry((echo_tool(), artifact_read_tool()))
+    agent = AgentLoop(
+        run_id="run",
+        task=TaskInput(goal="Read and report the paged value"),
+        instructions="Use evidence",
+        model=provider,
+        artifacts=store,
+        tools=tools,
+        limits=RunLimits(max_request_bytes=20_000),
+        scheduling=ToolScheduling(2, frozenset({"echo", "read_artifact"})),
+        progress_assessor=_ReadyThenNeutralProgressAssessor(),
+        context_builder=_CompilerControlBuilder(store, session_counter),
+    )
+
+    result = await agent.execute()
+
+    assert result.status is RunStatus.COMPLETED and result.output == "grounded"
+    assert [
+        event.data.call_id for event in agent.events if isinstance(event.data, ToolStarted)
+    ] == ["source", "page-1", "page-2"]
+    page_two = [
+        event.data.decision
+        for event in agent.events
+        if isinstance(event.data, ActionInterventionChecked)
+    ][-1]
+    assert page_two.disposition == "allow"
+    assert page_two.reason_codes == ("evidence_navigation_continuation",)
+    intervention = [
+        event.data for event in agent.events if isinstance(event.data, ActionInterventionChecked)
+    ][-1]
+    assert intervention.schema_version == 3
+    assert intervention.evidence_access_proof is not None
+    access = intervention.evidence_access_proof.accesses
+    assert len(access) == 1 and isinstance(access[0], EvidenceContinuationAccess)
+    assert access[0].result_call_id == "page-1"
+    replay(agent)
+
+
+async def test_ready_to_verify_allows_mixed_continuation_and_undelivered_first_page(
+    session_counter: SessionTokenCounter,
+) -> None:
+    store = InMemoryArtifactStore()
+    value_a = "recent regimes " + "a" * 4000
+    value_b = "market breadth " + "b" * 4000
+    source_a = await store.put("run", "source-a", {"value": value_a})
+    source_b = await store.put("run", "source-b", {"value": value_b})
+    provider = FakeControlProvider(
+        (
+            batch(call("source-a", value_a), call("source-b", value_b)),
+            batch(
+                ToolCallAction(
+                    call_id="page-a-1",
+                    tool_name="read_artifact",
+                    arguments={
+                        "artifact_id": source_a.reference.artifact_id,
+                        "pointer": "/value",
+                        "start": 0,
+                        "length": 1000,
+                    },
+                )
+            ),
+            batch(
+                ToolCallAction(
+                    call_id="page-a-2",
+                    tool_name="read_artifact",
+                    arguments={
+                        "artifact_id": source_a.reference.artifact_id,
+                        "pointer": "/value",
+                        "start": 998,
+                        "length": 1000,
+                    },
+                ),
+                ToolCallAction(
+                    call_id="page-b-1",
+                    tool_name="read_artifact",
+                    arguments={
+                        "artifact_id": source_b.reference.artifact_id,
+                        "pointer": "/value",
+                        "start": 0,
+                        "length": 1000,
+                    },
+                ),
+            ),
+            finish("grounded"),
+        )
+    )
+    agent = AgentLoop(
+        run_id="run",
+        task=TaskInput(goal="Compare recent regimes and market breadth"),
+        instructions="Use evidence",
+        model=provider,
+        artifacts=store,
+        tools=ToolRegistry((echo_tool(), artifact_read_tool())),
+        limits=RunLimits(max_request_bytes=20_000),
+        scheduling=ToolScheduling(2, frozenset({"echo", "read_artifact"})),
+        progress_assessor=_ReadyThenNeutralProgressAssessor(),
+        context_builder=_CompilerControlBuilder(store, session_counter),
+    )
+
+    result = await agent.execute()
+
+    assert result.status is RunStatus.COMPLETED and result.output == "grounded"
+    assert [
+        event.data.call_id for event in agent.events if isinstance(event.data, ToolStarted)
+    ] == ["source-a", "source-b", "page-a-1", "page-a-2", "page-b-1"]
+    intervention = [
+        event.data for event in agent.events if isinstance(event.data, ActionInterventionChecked)
+    ][-1]
+    assert intervention.schema_version == 3
+    assert intervention.decision.reason_codes == ("evidence_access_pending",)
+    assert intervention.evidence_access_proof is not None
+    continuation, initial = intervention.evidence_access_proof.accesses
+    assert isinstance(continuation, EvidenceContinuationAccess)
+    assert continuation.result_call_id == "page-a-1" and continuation.next_start == 998
+    assert isinstance(initial, EvidenceInitialAccess)
+    assert initial.source_call_id == "source-b"
+    assert initial.missing_range.pointer == "/value"
+    replay(agent)
+    state = None
+    for event in agent.events:
+        if (
+            isinstance(event.data, ActionInterventionChecked)
+            and event.data.evidence_access_proof is not None
+            and len(event.data.evidence_access_proof.accesses) == 2
+            and any(
+                isinstance(item, EvidenceInitialAccess)
+                for item in event.data.evidence_access_proof.accesses
+            )
+        ):
+            assert state is not None and state.delivery_manifest is not None
+            delivered = state.delivery_manifest.for_call(initial.source_call_id)
+            assert delivered is not None and delivered.ranges
+            forged_initial = initial.model_copy(update={"missing_range": delivered.ranges[0]})
+            forged_proof = event.data.evidence_access_proof.model_copy(
+                update={"accesses": (continuation, forged_initial)}
+            )
+            forged = event.model_copy(
+                update={
+                    "data": event.data.model_copy(update={"evidence_access_proof": forged_proof})
+                }
+            )
+            with pytest.raises(EventAcceptanceError, match="delivery gap"):
+                reduce_event(state, forged)
+            break
+        state = reduce_event(state, event)
+
+
+async def test_ready_to_verify_rejects_next_page_without_current_delivery_proof() -> None:
+    store = InMemoryArtifactStore()
+    long_value = "x" * 3000
+    source = await store.put("run", "source", {"value": long_value})
+    provider = FakeControlProvider(
+        (
+            batch(call("source", long_value)),
+            batch(
+                ToolCallAction(
+                    call_id="page-1",
+                    tool_name="read_artifact",
+                    arguments={
+                        "artifact_id": source.reference.artifact_id,
+                        "pointer": "/value",
+                        "start": 0,
+                        "length": 1000,
+                    },
+                )
+            ),
+            batch(
+                ToolCallAction(
+                    call_id="page-2",
+                    tool_name="read_artifact",
+                    arguments={
+                        "artifact_id": source.reference.artifact_id,
+                        "pointer": "/value",
+                        "start": 998,
+                        "length": 1000,
+                    },
+                )
+            ),
+            finish("grounded"),
+        )
+    )
+    agent = AgentLoop(
+        run_id="run",
+        task=TaskInput(goal="Read and report the paged value"),
+        instructions="Use evidence",
+        model=provider,
+        artifacts=store,
+        tools=ToolRegistry((echo_tool(), artifact_read_tool())),
+        limits=RunLimits(max_request_bytes=20_000),
+        scheduling=ToolScheduling(2, frozenset({"echo", "read_artifact"})),
+        progress_assessor=_ReadyThenNeutralProgressAssessor(),
+    )
+
+    result = await agent.execute()
+
+    assert result.status is RunStatus.COMPLETED and result.output == "grounded"
+    assert [
+        event.data.call_id for event in agent.events if isinstance(event.data, ToolStarted)
+    ] == ["source", "page-1"]
+    rejected = [
+        event.data
+        for event in agent.events
+        if isinstance(event.data, ActionInterventionChecked)
+        and event.data.decision.trigger == "completion_recommended"
+    ]
+    assert len(rejected) == 1
+    assert rejected[0].schema_version == 1 and rejected[0].navigation_proof is None
+    assert rejected[0].decision.disposition == "reconsider"
     replay(agent)
 
 

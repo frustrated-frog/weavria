@@ -6,8 +6,15 @@ import pytest
 from weavria.core import (
     BatchAdmitted,
     ContextCompilation,
+    ContextSelected,
     ConversationItem,
+    EvidenceAccessProof,
     EvidenceAccessView,
+    EvidenceContinuationAccess,
+    EvidenceDelivery,
+    EvidenceDeliveryManifest,
+    EvidenceDeliveryRange,
+    EvidenceInitialAccess,
     FeedbackBounds,
     FeedbackEnvelopeBound,
     LocatedTextExcerpt,
@@ -107,6 +114,112 @@ def test_compilation_fact_requires_explicit_v4_envelope() -> None:
     with pytest.raises(ValueError, match="v5"):
         ContextCompilation.model_validate(
             report.model_copy(update={"schema_version": 4, "next_step_reserve_bytes": 1})
+        )
+    manifest = EvidenceDeliveryManifest(
+        task_revision=1,
+        control_request_sha256="3" * 64,
+        transport_request_sha256=report.request_sha256,
+    )
+    delivered = ContextCompilation.model_validate(
+        report.model_copy(update={"schema_version": 7, "delivery_manifest": manifest})
+    )
+    assert ContextCompilation.model_validate_json(delivered.model_dump_json()) == delivered
+    selected = ContextSelected(
+        schema_version=3,
+        delivery_manifest=manifest,
+        request_bytes=100,
+        budget_bytes=200,
+        request_sha256=manifest.control_request_sha256,
+        selected_call_ids=(),
+    )
+    assert ContextSelected.model_validate_json(selected.model_dump_json()) == selected
+    with pytest.raises(ValueError, match="compilation v7"):
+        ContextCompilation.model_validate(
+            report.model_copy(update={"schema_version": 6, "delivery_manifest": manifest})
+        )
+
+
+def test_delivery_manifest_is_content_free_and_rejects_ambiguous_ranges() -> None:
+    delivery = EvidenceDelivery(
+        run_id="run",
+        call_id="call",
+        artifact_id="artifact",
+        artifact_sha256="a" * 64,
+        artifact_size_bytes=123,
+        representation="excerpt",
+        ranges=(EvidenceDeliveryRange(pointer="/text", kind="text", start=4, end=9),),
+    )
+    manifest = EvidenceDeliveryManifest(
+        task_revision=1,
+        control_request_sha256="b" * 64,
+        transport_request_sha256="c" * 64,
+        deliveries=(delivery,),
+    )
+
+    assert manifest.for_call("call") == delivery
+    assert "artifact" in manifest.model_dump_json()
+    assert "delivered text" not in manifest.model_dump_json()
+    with pytest.raises(ValueError, match="complete Artifact"):
+        EvidenceDelivery.model_validate(delivery.model_copy(update={"representation": "raw"}))
+    with pytest.raises(ValueError, match="non-empty"):
+        EvidenceDeliveryRange(pointer="/text", kind="text", start=4, end=4)
+
+
+def test_evidence_access_proof_binds_every_distinct_source_position() -> None:
+    initial = EvidenceInitialAccess(
+        call_id="initial-call",
+        source_call_id="source-call",
+        source_artifact_id="source",
+        source_artifact_sha256="a" * 64,
+        pointer="/data",
+        missing_range=EvidenceDeliveryRange(pointer="/data/headline", kind="value"),
+    )
+    continuation = EvidenceContinuationAccess(
+        call_id="next-call",
+        result_call_id="page-call",
+        result_artifact_id="page",
+        result_artifact_sha256="b" * 64,
+        source_call_id="source-call",
+        source_artifact_id="source",
+        source_artifact_sha256="a" * 64,
+        pointer="/items",
+        previous_start=0,
+        previous_end=2,
+        total=4,
+        next_start=2,
+    )
+
+    proof = EvidenceAccessProof(
+        task_revision=1,
+        control_request_sha256="c" * 64,
+        delivery_manifest_sha256="d" * 64,
+        proposal_sha256="e" * 64,
+        accesses=(continuation, initial),
+    )
+
+    assert not proof.continuation_only
+    assert EvidenceAccessProof.model_validate_json(proof.model_dump_json()) == proof
+    with pytest.raises(ValueError, match="duplicate source positions"):
+        EvidenceAccessProof.model_validate(
+            proof.model_copy(
+                update={
+                    "accesses": (
+                        continuation,
+                        continuation.model_copy(update={"call_id": "another-call"}),
+                    )
+                }
+            )
+        )
+    with pytest.raises(ValueError, match="under the requested pointer"):
+        EvidenceInitialAccess.model_validate(
+            initial.model_copy(
+                update={
+                    "missing_range": EvidenceDeliveryRange(
+                        pointer="/other/value",
+                        kind="value",
+                    )
+                }
+            )
         )
 
 

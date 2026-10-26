@@ -12,6 +12,7 @@ from pydantic import (
 )
 
 from ._schema import ContractModel, NonBlankString
+from .delivery import EvidenceDeliveryManifest
 from .recovery import RecoveryRange
 from .retrieval import HistoryRetrievalReport
 
@@ -30,7 +31,7 @@ class ContextCompilation(BaseModel):
     """Bind allocation diagnostics to the exact complete request sent to a provider."""
 
     model_config = ContractModel.model_config
-    schema_version: Literal[1, 2, 3, 4, 5, 6] = 1
+    schema_version: Literal[1, 2, 3, 4, 5, 6, 7] = 1
 
     policy_version: NonBlankString
     counter_version: NonBlankString
@@ -56,6 +57,7 @@ class ContextCompilation(BaseModel):
     uncovered_demand_ids: tuple[str, ...] = ()
     retrieval: HistoryRetrievalReport | None = None
     recovery_ranges: tuple[RecoveryRange, ...] = Field(default=(), max_length=8)
+    delivery_manifest: EvidenceDeliveryManifest | None = None
 
     @field_validator("schema_version", mode="before")
     @classmethod
@@ -76,6 +78,8 @@ class ContextCompilation(BaseModel):
             data.pop("next_step_reserve_bytes", None)
         if self.schema_version < 6:
             data.pop("feedback_reserve_floor_bytes", None)
+        if self.schema_version < 7:
+            data.pop("delivery_manifest", None)
         return data
 
     @model_validator(mode="after")
@@ -92,6 +96,8 @@ class ContextCompilation(BaseModel):
             raise ValueError("next-step reserve requires compilation v5")
         if self.feedback_reserve_floor_bytes and self.schema_version < 6:
             raise ValueError("feedback reserve floor requires compilation v6")
+        if (self.schema_version == 7) != (self.delivery_manifest is not None):
+            raise ValueError("evidence delivery manifest requires compilation v7")
         if self.feedback_budget_bytes < self.feedback_reserve_floor_bytes:
             raise ValueError("compiled feedback budget is below its required floor")
         choices = {c.source_id: c for c in self.choices}
@@ -126,6 +132,21 @@ class ContextCompilation(BaseModel):
                 raise ValueError("required context cannot be omitted")
             if choice.source_id in selected and not set(choice.dependencies) <= selected:
                 raise ValueError("compiled context is not dependency closed")
+        if self.delivery_manifest is not None:
+            manifest = self.delivery_manifest
+            if (
+                manifest.task_revision != self.task_revision
+                or manifest.transport_request_sha256 != self.request_sha256
+            ):
+                raise ValueError("delivery manifest does not bind this compilation")
+            for delivery in manifest.deliveries:
+                choice = choices.get(f"call:{delivery.call_id}")
+                if (
+                    choice is None
+                    or choice.representation != delivery.representation
+                    or choice.representation == "omitted"
+                ):
+                    raise ValueError("delivery manifest contradicts the selected representation")
         return self
 
 
