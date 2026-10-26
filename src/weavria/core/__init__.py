@@ -55,6 +55,16 @@ from .conversation import (
     TextExcerpt,
     TextRange,
 )
+from .delivery import (
+    EvidenceAccess,
+    EvidenceAccessProof,
+    EvidenceContinuationAccess,
+    EvidenceDelivery,
+    EvidenceDeliveryManifest,
+    EvidenceDeliveryRange,
+    EvidenceInitialAccess,
+    EvidenceNavigationProof,
+)
 from .errors import ErrorCategory, InvalidActionError, ModelOutputDiagnostic, RunError
 from .evidence_access import EvidenceAccessView
 from .execution import (
@@ -191,8 +201,16 @@ __all__ = [
     "DecisionDiscarded",
     "DirectiveView",
     "ErrorCategory",
+    "EvidenceAccess",
+    "EvidenceAccessProof",
     "EvidenceAccessView",
+    "EvidenceContinuationAccess",
     "EvidenceCoverageSignal",
+    "EvidenceDelivery",
+    "EvidenceDeliveryManifest",
+    "EvidenceDeliveryRange",
+    "EvidenceInitialAccess",
+    "EvidenceNavigationProof",
     "ExecutionData",
     "ExecutionEvent",
     "FeedbackBounds",

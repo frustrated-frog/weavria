@@ -12,7 +12,7 @@ from typing import Literal, Protocol
 
 from pydantic import JsonValue, TypeAdapter
 
-from weavria.artifacts import ArtifactAccessError, ArtifactStore
+from weavria.artifacts import ArtifactAccessError, ArtifactStore, resolve_pointer
 from weavria.context import (
     ContextBudgetError,
     ContextCapacityError,
@@ -24,6 +24,8 @@ from weavria.context import (
     EvidencePlan,
     RecoveryContextBuilder,
     TurnEvidencePlan,
+    delivery_ranges,
+    first_delivery_gap,
     reserve_feedback,
     validate_recovery_view,
 )
@@ -49,7 +51,12 @@ from weavria.core import (
     ControlRequest,
     DecisionDiscarded,
     ErrorCategory,
+    EvidenceAccessProof,
     EvidenceAccessView,
+    EvidenceContinuationAccess,
+    EvidenceDeliveryManifest,
+    EvidenceDeliveryRange,
+    EvidenceInitialAccess,
     ExecutionData,
     ExecutionEvent,
     FeedbackBounds,
@@ -282,6 +289,33 @@ def _instructions_for(instructions: str, tools: ToolRegistry, journal_version: i
             "Do not repeat an identical unsuccessful request against unchanged sources."
         )
     return assembled
+
+
+def _artifact_page_source_ranges(page: ArtifactReadOutput) -> tuple[EvidenceDeliveryRange, ...]:
+    """Project a fully delivered Artifact page onto the ranges it revealed in its source."""
+    if page.value_kind == "string":
+        if page.end > page.start:
+            return (
+                EvidenceDeliveryRange(
+                    pointer=page.pointer,
+                    kind="text",
+                    start=page.start,
+                    end=page.end,
+                ),
+            )
+        return (
+            (EvidenceDeliveryRange(pointer=page.pointer, kind="value"),)
+            if page.total == 0 and page.start == 0
+            else ()
+        )
+    if page.value_kind not in {"array", "object"}:
+        return (EvidenceDeliveryRange(pointer=page.pointer, kind="value"),)
+    return tuple(
+        source_range
+        for item in page.items
+        if item.included
+        for source_range in delivery_ranges(item.value, pointer=item.pointer)
+    )
 
 
 class _AgentKernel:
@@ -963,13 +997,20 @@ class _AgentKernel:
                 identity.action_family_sha256 for identity in action_identities
             ),
         )
+        evidence_access_proof = (
+            await self._evidence_access_proof(batch)
+            if progress is not None
+            and progress.continuation.recommended_action == "verify"
+            and not progress.material_progress
+            else None
+        )
         context = ActionInterventionContext(
             task=self.state.task,
             proposal=batch,
             progress_assessment=progress,
             remaining_model_calls=max(0, self._limits.max_model_calls - self.state.model_calls),
             remaining_tool_calls=max(0, self._limits.max_tool_calls - self.state.tool_calls),
-            bounded_continuation=await self._is_bounded_artifact_continuation(batch),
+            evidence_access_proof=evidence_access_proof,
             action_value_context=value_context,
             action_value_profiles=self.state.action_value_profiles,
         )
@@ -990,6 +1031,7 @@ class _AgentKernel:
         )
         accepted = await self._accept(
             ActionInterventionChecked(
+                schema_version=3 if evidence_access_proof is not None else 1,
                 task_revision=revision,
                 policy_version=policy.version,
                 proposal_sha256=proposal_sha256,
@@ -998,6 +1040,7 @@ class _AgentKernel:
                 action_value_state_sha256=action_value_state_sha256(
                     self.state.action_value_profiles
                 ),
+                evidence_access_proof=evidence_access_proof,
                 prior_reconsiderations=prior_reconsiderations,
                 decision=decision,
             ),
@@ -1014,44 +1057,221 @@ class _AgentKernel:
             return False, action_identities, value_context
         return True, action_identities, value_context
 
-    async def _is_bounded_artifact_continuation(self, batch: ToolBatch) -> bool:
-        """Recognize the exact next page of an accepted framework artifact read."""
-        if len(batch.calls) != 1 or batch.calls[0].tool_name != "read_artifact":
-            return False
-        try:
-            proposed = ArtifactReadInput.model_validate(batch.calls[0].arguments)
-        except ValueError:
-            return False
-        previous: ToolRecord | None = None
-        for record in reversed(self.state.records):
+    async def _evidence_access_proof(self, batch: ToolBatch) -> EvidenceAccessProof | None:
+        """Prove every proposed Artifact read adds evidence visible to the next model call."""
+        if not batch.calls or any(call.tool_name != "read_artifact" for call in batch.calls):
+            return None
+        manifest = self.state.delivery_manifest
+        control_request_sha256 = self.state.context_request_sha256
+        if manifest is None or control_request_sha256 is None:
+            return None
+        records = self.state.records
+        records_by_call = {record.exchange.action.call_id: record for record in records}
+        accesses: list[EvidenceInitialAccess | EvidenceContinuationAccess] = []
+        source_ranges: dict[tuple[str, str], tuple[EvidenceDeliveryRange, ...]] = {}
+
+        for call in batch.calls:
+            try:
+                proposed = ArtifactReadInput.model_validate(call.arguments)
+            except ValueError:
+                return None
+            source_record = next(
+                (
+                    record
+                    for record in records
+                    if record.artifact is not None
+                    and record.artifact.artifact_id == proposed.artifact_id
+                ),
+                None,
+            )
+            if source_record is None or source_record.artifact is None:
+                return None
+            source = source_record.artifact
+            previous: ToolRecord | None = None
+            previous_arguments: ArtifactReadInput | None = None
+            for record in reversed(records):
+                action = record.exchange.action
+                if action.tool_name != "read_artifact" or record.artifact is None:
+                    continue
+                try:
+                    arguments = ArtifactReadInput.model_validate(action.arguments)
+                except ValueError:
+                    return None
+                if (
+                    arguments.artifact_id == proposed.artifact_id
+                    and arguments.pointer == proposed.pointer
+                ):
+                    previous = record
+                    previous_arguments = arguments
+                    break
+
+            if previous is not None and previous_arguments is not None:
+                delivered = manifest.for_call(previous.exchange.action.call_id)
+                if (
+                    previous.artifact is None
+                    or delivered is None
+                    or not delivered.complete
+                    or delivered.run_id != previous.artifact.run_id
+                    or delivered.artifact_id != previous.artifact.artifact_id
+                    or delivered.artifact_sha256 != previous.artifact.sha256
+                ):
+                    return None
+                try:
+                    snapshot = await self._artifacts.get(
+                        self._run_id, previous.artifact.artifact_id
+                    )
+                    if (
+                        snapshot.reference.artifact_id != previous.artifact.artifact_id
+                        or snapshot.reference.sha256 != previous.artifact.sha256
+                    ):
+                        return None
+                    page = ArtifactReadOutput.model_validate_json(
+                        json.dumps(snapshot.value, ensure_ascii=False, separators=(",", ":"))
+                    )
+                except (ValueError, ArtifactAccessError):
+                    return None
+                if not (
+                    page.source_artifact == proposed.artifact_id == previous_arguments.artifact_id
+                    and page.source_sha256 == source.sha256
+                    and page.pointer == proposed.pointer == previous_arguments.pointer
+                    and page.start == previous_arguments.start
+                    and page.has_more
+                    and page.start < page.end < page.total
+                    and proposed.start == page.end
+                ):
+                    return None
+                accesses.append(
+                    EvidenceContinuationAccess(
+                        call_id=call.call_id,
+                        result_call_id=previous.exchange.action.call_id,
+                        result_artifact_id=previous.artifact.artifact_id,
+                        result_artifact_sha256=previous.artifact.sha256,
+                        source_call_id=source_record.exchange.action.call_id,
+                        source_artifact_id=source.artifact_id,
+                        source_artifact_sha256=source.sha256,
+                        pointer=page.pointer,
+                        previous_start=page.start,
+                        previous_end=page.end,
+                        total=page.total,
+                        next_start=proposed.start,
+                    )
+                )
+                continue
+
+            if proposed.start != 0:
+                return None
+            source_delivery = next(
+                (item for item in manifest.deliveries if item.artifact_id == source.artifact_id),
+                None,
+            )
+            if (
+                source_delivery is None
+                or source_delivery.complete
+                or source_delivery.call_id != source_record.exchange.action.call_id
+                or source_delivery.artifact_sha256 != source.sha256
+            ):
+                return None
+            cache_key = source.artifact_id, source.sha256
+            delivered_ranges = source_ranges.get(cache_key)
+            if delivered_ranges is None:
+                delivered_ranges = await self._delivered_source_ranges(
+                    manifest,
+                    source_artifact_id=source.artifact_id,
+                    source_artifact_sha256=source.sha256,
+                    records_by_call=records_by_call,
+                )
+                source_ranges[cache_key] = delivered_ranges
+            try:
+                snapshot = await self._artifacts.get(self._run_id, source.artifact_id)
+                if snapshot.reference.sha256 != source.sha256:
+                    return None
+                target = resolve_pointer(snapshot.value, proposed.pointer)
+                missing = first_delivery_gap(
+                    target,
+                    pointer=proposed.pointer,
+                    delivered=delivered_ranges,
+                )
+            except (ArtifactAccessError, KeyError, IndexError, ValueError):
+                return None
+            if missing is None:
+                return None
+            accesses.append(
+                EvidenceInitialAccess(
+                    call_id=call.call_id,
+                    source_call_id=source_record.exchange.action.call_id,
+                    source_artifact_id=source.artifact_id,
+                    source_artifact_sha256=source.sha256,
+                    pointer=proposed.pointer,
+                    missing_range=missing,
+                )
+            )
+
+        positions = tuple(
+            (
+                item.source_artifact_id,
+                item.pointer,
+                item.start if isinstance(item, EvidenceInitialAccess) else item.next_start,
+            )
+            for item in accesses
+        )
+        if len(set(positions)) != len(positions):
+            return None
+        return EvidenceAccessProof(
+            task_revision=self.state.task.revision,
+            control_request_sha256=control_request_sha256,
+            delivery_manifest_sha256=manifest.sha256,
+            proposal_sha256=hashlib.sha256(batch.model_dump_json().encode()).hexdigest(),
+            accesses=tuple(accesses),
+        )
+
+    async def _delivered_source_ranges(
+        self,
+        manifest: EvidenceDeliveryManifest,
+        *,
+        source_artifact_id: str,
+        source_artifact_sha256: str,
+        records_by_call: dict[str, ToolRecord],
+    ) -> tuple[EvidenceDeliveryRange, ...]:
+        """Map current source excerpts and raw Artifact pages back to source ranges."""
+        ranges: list[EvidenceDeliveryRange] = []
+        for delivered in manifest.deliveries:
+            if delivered.artifact_id == source_artifact_id:
+                ranges.extend(delivered.ranges)
+                continue
+            if not delivered.complete:
+                continue
+            record = records_by_call.get(delivered.call_id)
+            if record is None or record.artifact is None:
+                continue
             action = record.exchange.action
             if action.tool_name != "read_artifact":
                 continue
             try:
                 arguments = ArtifactReadInput.model_validate(action.arguments)
             except ValueError:
-                return False
+                continue
+            if arguments.artifact_id != source_artifact_id:
+                continue
+            try:
+                snapshot = await self._artifacts.get(self._run_id, delivered.artifact_id)
+                if (
+                    snapshot.reference.artifact_id != delivered.artifact_id
+                    or snapshot.reference.sha256 != delivered.artifact_sha256
+                ):
+                    continue
+                page = ArtifactReadOutput.model_validate_json(
+                    json.dumps(snapshot.value, ensure_ascii=False, separators=(",", ":"))
+                )
+            except (ValueError, ArtifactAccessError):
+                continue
             if (
-                arguments.artifact_id == proposed.artifact_id
-                and arguments.pointer == proposed.pointer
+                page.source_artifact != source_artifact_id
+                or page.source_sha256 != source_artifact_sha256
             ):
-                previous = record
-                break
-        if previous is None or previous.artifact is None:
-            return False
-        try:
-            snapshot = await self._artifacts.get(self._run_id, previous.artifact.artifact_id)
-            page = ArtifactReadOutput.model_validate_json(
-                json.dumps(snapshot.value, ensure_ascii=False, separators=(",", ":"))
-            )
-        except (ValueError, ArtifactAccessError):
-            return False
-        return (
-            page.source_artifact == proposed.artifact_id
-            and page.pointer == proposed.pointer
-            and page.has_more
-            and proposed.start == page.end
-        )
+                continue
+            ranges.extend(_artifact_page_source_ranges(page))
+        identities = {(item.pointer, item.kind, item.start, item.end): item for item in ranges}
+        return tuple(identities.values())
 
     async def _admit_batch(
         self,
@@ -1105,15 +1325,26 @@ class _AgentKernel:
         if reason is None:
             intervention = self.state.intervention
             estimate = intervention.decision.value_estimate if intervention is not None else None
-            # Only a persisted, allowed v2 value judgement owns exploratory stopping.
-            # Exact repeats, capability/feedback/tool budgets and Tool Policy still apply.
+            # A persisted value judgement or delivery-gap proof can authorize bounded
+            # exploration. Exact repeats, capability/feedback/tool budgets and Tool Policy
+            # still apply.
+            evidence_access = (
+                intervention.evidence_access_proof
+                if intervention is not None and intervention.decision.disposition == "allow"
+                else None
+            )
             adaptive_exploration = (
                 intervention is not None
                 and intervention.decision.disposition == "allow"
-                and estimate is not None
-                and estimate.schema_version == 2
-                and action_value_context.scope is not None
-                and action_value_context.scope.complete
+                and (
+                    (
+                        estimate is not None
+                        and estimate.schema_version == 2
+                        and action_value_context.scope is not None
+                        and action_value_context.scope.complete
+                    )
+                    or evidence_access is not None
+                )
             )
             progress = self._progress.inspect(
                 task=self.state.task,
@@ -1493,23 +1724,29 @@ class _AgentKernel:
         async with self._commit_lock:
             if revision != self.state.task.revision:
                 return False
+            compilation: ContextCompilation | None = None
+            if isinstance(plan, ControlEvidencePlan) and plan.compilation_json is not None:
+                compilation = ContextCompilation.model_validate_json(plan.compilation_json)
             if self._journal_version == 4:
-                if not isinstance(plan, ControlEvidencePlan) or plan.compilation_json is None:
+                if not isinstance(plan, ControlEvidencePlan) or compilation is None:
                     raise ValueError("recovery context requires a compilation receipt")
                 validate_recovery_view(plan.request, self.state.recovery_ranges)
-                compilation = ContextCompilation.model_validate_json(plan.compilation_json)
                 if (
                     compilation.schema_version < 4
                     or compilation.recovery_ranges != self.state.recovery_ranges
                 ):
                     raise ValueError("compiled ranges differ from accepted recovery")
+            manifest = compilation.delivery_manifest if compilation is not None else None
             self._plans.append(plan)
             await self._accept_locked(
                 ContextSelected(
-                    schema_version=2 if self._journal_version == 4 else 1,
+                    schema_version=(
+                        3 if manifest is not None else 2 if self._journal_version == 4 else 1
+                    ),
                     recovery_sha256=recovery_digest(self.state.recovery_ranges)
                     if self._journal_version == 4
                     else None,
+                    delivery_manifest=manifest,
                     request_bytes=plan.request_bytes,
                     budget_bytes=plan.budget_bytes,
                     request_sha256=hashlib.sha256(plan.request_json.encode()).hexdigest(),

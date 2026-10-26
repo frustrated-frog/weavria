@@ -6,14 +6,18 @@ import json
 import math
 from collections import Counter, OrderedDict
 from dataclasses import dataclass
+from typing import Literal
 
 from pydantic import JsonValue
 
 from weavria.artifacts import ArtifactSnapshot, ArtifactStore
 from weavria.core import (
+    ArtifactRef,
     ConversationItem,
     ConversationTurn,
     DirectiveView,
+    EvidenceDelivery,
+    EvidenceDeliveryRange,
     LocatedTextExcerpt,
     RecoveryRange,
     ToolExchange,
@@ -326,6 +330,7 @@ async def source_units(
                     source.snapshot.value,
                 ).model_dump_json(),
                 scorer.features(source.passages, source=source),
+                _delivery(reference, "raw"),
             )
 
             if record.feedback_delivery == "complete" and call_id in mandatory:
@@ -346,6 +351,7 @@ async def source_units(
                             },
                         ),
                         scorer.features(protected, source=source),
+                        _delivery(reference, "excerpt", protected),
                     )
                 ]
             if not (record.feedback_delivery == "complete" and call_id in mandatory):
@@ -366,6 +372,7 @@ async def source_units(
                                 },
                             ),
                             scorer.features(chosen, source=source),
+                            _delivery(reference, "excerpt", chosen),
                         )
                     )
                 # context_paths select scoring subtrees, not an authorization boundary.
@@ -383,7 +390,10 @@ async def source_units(
         if call_id in mandatory:
             variants = [variants[0]] + [
                 Representation(
-                    v.kind, v.payload_json, (*v.features, (f"availability:{call_id}", 0.25))
+                    v.kind,
+                    v.payload_json,
+                    (*v.features, (f"availability:{call_id}", 0.25)),
+                    v.delivery,
                 )
                 for v in variants[1:]
             ]
@@ -398,6 +408,38 @@ async def source_units(
             )
         )
     return tuple(result)
+
+
+def _delivery(
+    reference: ArtifactRef,
+    representation: Literal["raw", "excerpt"],
+    passages: tuple[Passage, ...] = (),
+) -> EvidenceDelivery | None:
+    """Project only source identities and exact ranges, never delivered content."""
+    if representation == "excerpt" and not passages:
+        return None
+    artifact = ArtifactRef.model_validate(reference)
+    ranges: dict[tuple[str, str, int, int], EvidenceDeliveryRange] = {}
+    for passage in passages:
+        kind: Literal["value", "text"] = "text" if passage.end > passage.start else "value"
+        ranges.setdefault(
+            (passage.pointer, kind, passage.start, passage.end),
+            EvidenceDeliveryRange(
+                pointer=passage.pointer,
+                kind=kind,
+                start=passage.start,
+                end=passage.end,
+            ),
+        )
+    return EvidenceDelivery(
+        run_id=artifact.run_id,
+        call_id=artifact.call_id,
+        artifact_id=artifact.artifact_id,
+        artifact_sha256=artifact.sha256,
+        artifact_size_bytes=artifact.size_bytes,
+        representation=representation,
+        ranges=tuple(ranges.values()),
+    )
 
 
 def conversation_passages(turn: ConversationTurn) -> tuple[Passage, ...]:

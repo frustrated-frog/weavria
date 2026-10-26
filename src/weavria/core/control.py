@@ -16,6 +16,7 @@ from pydantic import (
 
 from ._schema import ContractModel, NonBlankString
 from .actions import FinishAction
+from .delivery import EvidenceAccessProof, EvidenceNavigationProof
 from .errors import ModelOutputDiagnostic, RunError
 from .evidence_access import EvidenceAccessView
 from .execution import (
@@ -411,9 +412,11 @@ class ProgressAssessed(ContractModel):
     assessment: ProgressAssessment
 
 
-class ActionInterventionChecked(ContractModel):
+class ActionInterventionChecked(BaseModel):
     """Bind a policy verdict to the current task, proposal and progress snapshot."""
 
+    model_config = ContractModel.model_config
+    schema_version: Literal[1, 2, 3] = 1
     kind: Literal["action_intervention_checked"] = "action_intervention_checked"
     task_revision: int = Field(ge=1)
     policy_version: NonBlankString
@@ -421,11 +424,46 @@ class ActionInterventionChecked(ContractModel):
     progress_assessment_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
     action_value_context: ActionValueContext | None = None
     action_value_state_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    navigation_proof: EvidenceNavigationProof | None = None
+    evidence_access_proof: EvidenceAccessProof | None = None
     prior_reconsiderations: int = Field(ge=0)
     decision: InterventionDecision
 
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def validate_version_type(cls, value: object) -> object:
+        return ContractModel.validate_version_type(value)
+
+    @model_serializer(mode="wrap")
+    def preserve_legacy_wire(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        data = handler(self)
+        if self.schema_version == 1:
+            data.pop("navigation_proof", None)
+            data.pop("evidence_access_proof", None)
+        elif self.schema_version == 2:
+            data.pop("evidence_access_proof", None)
+        else:
+            data.pop("navigation_proof", None)
+        return data
+
     @model_validator(mode="after")
     def bind_assessment(self) -> Self:
+        if (self.schema_version == 2) != (self.navigation_proof is not None):
+            raise ValueError("legacy navigation proof requires intervention schema version 2")
+        if (self.schema_version == 3) != (self.evidence_access_proof is not None):
+            raise ValueError("evidence access proof requires intervention schema version 3")
+        if self.navigation_proof is not None and self.evidence_access_proof is not None:
+            raise ValueError("intervention can carry only one evidence proof")
+        if self.navigation_proof is not None and (
+            self.navigation_proof.task_revision != self.task_revision
+            or self.navigation_proof.proposal_sha256 != self.proposal_sha256
+        ):
+            raise ValueError("navigation proof does not bind the intervention proposal")
+        if self.evidence_access_proof is not None and (
+            self.evidence_access_proof.task_revision != self.task_revision
+            or self.evidence_access_proof.proposal_sha256 != self.proposal_sha256
+        ):
+            raise ValueError("evidence access proof does not bind the intervention proposal")
         has_assessment = self.progress_assessment_sha256 is not None
         if self.decision.trigger == "assessment_unavailable" and has_assessment:
             raise ValueError("intervention trigger contradicts assessment availability")
@@ -497,19 +535,28 @@ class ControlEvent(BaseModel):
     def validate_identity(self) -> Self:
         if self.schema_version < 4 and (
             isinstance(self.data, RecoveryResolved)
+            or (isinstance(self.data, RunStarted) and self.data.schema_version != 1)
             or (
-                isinstance(self.data, (RunStarted, ContextSelected))
-                and self.data.schema_version != 1
+                isinstance(self.data, ContextSelected)
+                and (
+                    self.data.schema_version not in (1, 3) or self.data.recovery_sha256 is not None
+                )
             )
             or (isinstance(self.data, TurnDecided) and self.data.turn.schema_version != 1)
         ):
             raise ValueError("recovery facts require ControlEvent v4")
         if (
             self.schema_version == 4
-            and isinstance(self.data, (RunStarted, ContextSelected))
+            and isinstance(self.data, RunStarted)
             and self.data.schema_version != 2
         ):
-            raise ValueError("recovery journal requires bound configuration and context")
+            raise ValueError("recovery journal requires bound configuration")
+        if (
+            self.schema_version == 4
+            and isinstance(self.data, ContextSelected)
+            and (self.data.schema_version not in (2, 3) or self.data.recovery_sha256 is None)
+        ):
+            raise ValueError("recovery journal requires a recovery-bound context")
         if self.attempt_id is not None and self.step_id is None:
             raise ValueError("attempt identity requires a step")
         return self

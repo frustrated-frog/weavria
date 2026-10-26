@@ -143,7 +143,7 @@ def market_pulse_evidence_profile() -> CapabilityEvidenceProfile:
     return CapabilityEvidenceProfile(
         capability_name="read_market_pulse",
         capability_version="1",
-        profile_version="finscope-market-evidence/1",
+        profile_version="finscope-market-evidence/2",
         surfaces=(
             EvidenceSurface(
                 surface_id="market.regime",
@@ -172,6 +172,19 @@ def market_pulse_evidence_profile() -> CapabilityEvidenceProfile:
                 demand_policy="broad_or_explicit",
                 required_fields=("/data/dailyReview",),
                 parameter_constraints=focus("overview", "review"),
+            ),
+            EvidenceSurface(
+                surface_id="market.quality",
+                description="Snapshot data quality status",
+                demand_policy="explicit_only",
+                required_fields=("/quality_status",),
+                parameter_constraints=focus(
+                    "overview",
+                    "opportunities",
+                    "breadth",
+                    "history",
+                    "review",
+                ),
             ),
             EvidenceSurface(
                 surface_id="market.opportunities",

@@ -9,6 +9,7 @@ from .budget import (
 )
 from .compiler import CompiledSessionContext, ControlContextBuilder, SessionContextCompiler
 from .conversation import ConversationPlan, project_turn, select_conversation
+from .delivery import delivery_range_is_covered, delivery_ranges, first_delivery_gap
 from .demand import ContextDemand, ContextFocus, EvidenceAnchor
 from .evidence import (
     ControlEvidencePlan,
@@ -76,6 +77,9 @@ __all__ = [
     "SessionTokenCounter",
     "TurnEvidencePlan",
     "build_context",
+    "delivery_range_is_covered",
+    "delivery_ranges",
+    "first_delivery_gap",
     "history_query_digest",
     "history_text_fields",
     "history_text_passages",

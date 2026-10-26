@@ -133,7 +133,8 @@ async def test_search_discovers_omitted_source_and_exact_ranges_survive_allocati
     part = result.ranges[0]
     assert part.start > 0 and part.end <= len(original)
     active = await engine.compile(**args, recovery_ranges=result.ranges)
-    assert active.compilation.schema_version == 4
+    assert active.compilation.schema_version == 7
+    assert active.compilation.delivery_manifest is not None
     assert active.compilation.recovery_ranges == result.ranges
     assert "violet" in active.request_json
     assert "violet" not in active.compilation_json

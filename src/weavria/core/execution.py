@@ -15,6 +15,7 @@ from pydantic import (
 
 from ._schema import ContractModel, NonBlankString
 from .actions import AgentAction
+from .delivery import EvidenceDeliveryManifest
 from .model_io import TaskInput, ToolExchange
 from .outcomes import AgentResult, ToolSucceededObservation
 from .recovery import RecoveryLimits
@@ -143,8 +144,9 @@ class ContextSelected(BaseModel):
     """Identify the bounded model view without exporting its content."""
 
     model_config = ContractModel.model_config
-    schema_version: Literal[1, 2] = 1
+    schema_version: Literal[1, 2, 3] = 1
     recovery_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    delivery_manifest: EvidenceDeliveryManifest | None = None
 
     @field_validator("schema_version", mode="before")
     @classmethod
@@ -156,12 +158,22 @@ class ContextSelected(BaseModel):
         data = handler(self)
         if self.schema_version == 1:
             data.pop("recovery_sha256", None)
+        if self.schema_version < 3:
+            data.pop("delivery_manifest", None)
         return data
 
     @model_validator(mode="after")
-    def validate_recovery_version(self) -> Self:
-        if (self.schema_version == 2) != (self.recovery_sha256 is not None):
-            raise ValueError("recovery payload requires version 2")
+    def validate_payload_version(self) -> Self:
+        if self.schema_version == 1 and (
+            self.recovery_sha256 is not None or self.delivery_manifest is not None
+        ):
+            raise ValueError("legacy context cannot carry recovery or delivery payloads")
+        if self.schema_version == 2 and (
+            self.recovery_sha256 is None or self.delivery_manifest is not None
+        ):
+            raise ValueError("recovery-only context requires version 2")
+        if self.schema_version == 3 and self.delivery_manifest is None:
+            raise ValueError("evidence delivery context requires version 3")
         return self
 
     kind: Literal["context_selected"] = "context_selected"
@@ -174,6 +186,10 @@ class ContextSelected(BaseModel):
     def validate_budget(self) -> Self:
         if self.request_bytes > self.budget_bytes:
             raise ValueError("selected context exceeds budget")
+        if self.delivery_manifest is not None and (
+            self.delivery_manifest.control_request_sha256 != self.request_sha256
+        ):
+            raise ValueError("delivery manifest does not bind the selected control request")
         return self
 
 

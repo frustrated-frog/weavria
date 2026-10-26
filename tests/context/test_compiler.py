@@ -600,8 +600,13 @@ async def test_latest_opaque_value_survives_zero_lexical_relevance(
         max_request_bytes=4000,
     )
     assert "74931" in plan.request.current.history[0].model_dump_json()
-    assert plan.compilation.choices[0].required
+    choice = plan.compilation.choices[0]
+    assert choice.required
     assert plan.compilation.uncovered_demand_ids == ("current_task",)
+    manifest = plan.compilation.delivery_manifest
+    assert manifest is not None
+    delivery = manifest.for_call("c0")
+    assert delivery is not None and delivery.representation == choice.representation
 
 
 async def test_complete_feedback_page_is_not_re_excerpted_and_fails_closed_on_budget(
@@ -654,6 +659,7 @@ async def test_complete_feedback_page_is_not_re_excerpted_and_fails_closed_on_bu
         ),
         max_duration=1,
     )
+    assert page.artifact is not None
     feedback = TurnFeedback(
         task_revision=1,
         calls=(CallFeedback(call_id="page", status="succeeded"),),
@@ -694,6 +700,17 @@ async def test_complete_feedback_page_is_not_re_excerpted_and_fails_closed_on_bu
     assert labels == [f"entry-{index}" for index in range(8)]
     choice = next(c for c in plan.compilation.choices if c.source_id == "call:page")
     assert choice.required and choice.representation == "raw"
+    manifest = plan.compilation.delivery_manifest
+    assert plan.compilation.schema_version == 7 and manifest is not None
+    assert manifest.transport_request_sha256 == plan.compilation.request_sha256
+    assert (
+        manifest.control_request_sha256
+        == hashlib.sha256(plan.request.current.model_dump_json().encode()).hexdigest()
+    )
+    delivery = manifest.for_call("page")
+    assert delivery is not None and delivery.complete and delivery.ranges == ()
+    assert delivery.artifact_id == page.artifact.artifact_id
+    assert "entry-0" not in manifest.model_dump_json()
 
     minimum_budget = plan.compilation.request_bytes + plan.compilation.control_reserve_bytes
     with pytest.raises(ContextBudgetError):

@@ -115,7 +115,7 @@ async def test_action_intervention_changes_dispatch_only_for_hard_stop() -> None
 
     report = await evaluate_action_interventions(cases)
 
-    assert report.policy_version.startswith("progress-action-intervention/5[")
+    assert report.policy_version.startswith("progress-action-intervention/7[")
     assert report.baseline_version == "allow-all-action-intervention/1"
     assert report.total_cases == 6
     assert report.selected_correct == 6 and report.baseline_correct == 5

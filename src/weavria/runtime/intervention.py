@@ -13,6 +13,8 @@ from weavria.core import (
     ActionValueEstimate,
     ActionValueProfile,
     ErrorCategory,
+    EvidenceAccessProof,
+    EvidenceNavigationProof,
     InterventionDecision,
     ProgressAssessment,
     RunError,
@@ -109,7 +111,8 @@ class ActionInterventionContext:
     """Serialized snapshots sampled before any proposed effect is admitted."""
 
     __slots__ = (
-        "_bounded_continuation",
+        "_evidence_access_proof_json",
+        "_navigation_proof_json",
         "_progress_assessment_json",
         "_proposal_json",
         "_remaining_model_calls",
@@ -127,7 +130,8 @@ class ActionInterventionContext:
         progress_assessment: ProgressAssessment | None,
         remaining_model_calls: int,
         remaining_tool_calls: int,
-        bounded_continuation: bool = False,
+        navigation_proof: EvidenceNavigationProof | None = None,
+        evidence_access_proof: EvidenceAccessProof | None = None,
         action_value_context: ActionValueContext | None = None,
         action_value_profiles: tuple[ActionValueProfile, ...] = (),
     ) -> None:
@@ -135,15 +139,27 @@ class ActionInterventionContext:
             raise ValueError("remaining model calls must be a nonnegative integer")
         if type(remaining_tool_calls) is not int or remaining_tool_calls < 0:
             raise ValueError("remaining tool calls must be a nonnegative integer")
-        if type(bounded_continuation) is not bool:
-            raise TypeError("bounded continuation must be a boolean")
         if progress_assessment is not None and progress_assessment.task_revision != task.revision:
             raise ValueError("progress assessment belongs to another task revision")
+        proposal_sha256 = hashlib.sha256(proposal.model_dump_json().encode()).hexdigest()
+        if navigation_proof is not None and (
+            navigation_proof.task_revision != task.revision
+            or navigation_proof.proposal_sha256 != proposal_sha256
+        ):
+            raise ValueError("navigation proof does not bind the current task and proposal")
+        if evidence_access_proof is not None and (
+            evidence_access_proof.task_revision != task.revision
+            or evidence_access_proof.proposal_sha256 != proposal_sha256
+            or tuple(item.call_id for item in evidence_access_proof.accesses)
+            != tuple(item.call_id for item in proposal.calls)
+        ):
+            raise ValueError("evidence access proof does not bind the complete proposal")
+        if navigation_proof is not None and evidence_access_proof is not None:
+            raise ValueError("one intervention cannot carry two evidence proofs")
         if action_value_context is not None and action_value_context.task_revision != task.revision:
             raise ValueError("action-value context belongs to another task revision")
         if action_value_context is not None and (
-            action_value_context.proposal_sha256
-            != hashlib.sha256(proposal.model_dump_json().encode()).hexdigest()
+            action_value_context.proposal_sha256 != proposal_sha256
             or len(action_value_context.action_family_sha256s) != len(proposal.calls)
         ):
             raise ValueError("action-value context does not bind the complete proposal")
@@ -161,7 +177,12 @@ class ActionInterventionContext:
         )
         self._remaining_model_calls = remaining_model_calls
         self._remaining_tool_calls = remaining_tool_calls
-        self._bounded_continuation = bounded_continuation
+        self._navigation_proof_json = (
+            navigation_proof.model_dump_json() if navigation_proof is not None else None
+        )
+        self._evidence_access_proof_json = (
+            evidence_access_proof.model_dump_json() if evidence_access_proof is not None else None
+        )
         self._value_context_json = (
             ActionValueContext.model_validate(action_value_context).model_dump_json()
             if action_value_context is not None
@@ -197,8 +218,20 @@ class ActionInterventionContext:
         return self._remaining_tool_calls
 
     @property
-    def bounded_continuation(self) -> bool:
-        return self._bounded_continuation
+    def navigation_proof(self) -> EvidenceNavigationProof | None:
+        return (
+            EvidenceNavigationProof.model_validate_json(self._navigation_proof_json)
+            if self._navigation_proof_json is not None
+            else None
+        )
+
+    @property
+    def evidence_access_proof(self) -> EvidenceAccessProof | None:
+        return (
+            EvidenceAccessProof.model_validate_json(self._evidence_access_proof_json)
+            if self._evidence_access_proof_json is not None
+            else None
+        )
 
     @property
     def action_value_context(self) -> ActionValueContext | None:
@@ -269,7 +302,7 @@ class ProgressActionInterventionPolicy:
     @property
     def version(self) -> str:
         return (
-            "progress-action-intervention/5["
+            "progress-action-intervention/7["
             f"min_observations={self._minimum_observations};"
             f"min_expected_yield={self._minimum_yield:g};"
             f"max_pessimistic_regression={self._maximum_regression:g};"
@@ -286,15 +319,23 @@ class ProgressActionInterventionPolicy:
             )
         recommendation = assessment.continuation.recommended_action
         if recommendation == "verify":
-            if assessment.material_progress or context.bounded_continuation:
+            access_proof = context.evidence_access_proof
+            if assessment.material_progress:
                 return InterventionDecision(
                     disposition="allow",
                     trigger="verification_advisory",
-                    reason_codes=(
-                        ("bounded_artifact_continuation",)
-                        if context.bounded_continuation
-                        else assessment.continuation.reason_codes
-                    ),
+                    reason_codes=assessment.continuation.reason_codes,
+                )
+            if context.navigation_proof is not None or access_proof is not None:
+                evidence_reason = (
+                    "evidence_navigation_continuation"
+                    if access_proof is None or access_proof.continuation_only
+                    else "evidence_access_pending",
+                )
+                return InterventionDecision(
+                    disposition="allow",
+                    trigger="verification_advisory",
+                    reason_codes=evidence_reason,
                 )
             return InterventionDecision(
                 disposition="reconsider",
