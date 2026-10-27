@@ -2,11 +2,11 @@
 
 本目录是独立应用适配器，不属于 Weavria Core、Runtime 或 Harness。它通过 FinScope
 已有的只读 HTTP API 获取工作区数据，使用公开 `TaskAwareSessionPreparer`、
-`SessionEngine`、`TypedTool` 和 `CompletionPolicy` 运行多轮 Agent，再以隔离 iframe 提供
-市场悬浮窗口与完整问答页。
+`SessionEngine`、`TypedTool` 和 `CompletionPolicy` 运行多轮 Agent，并通过本地 HTTP API
+向 FinScope 返回结构化结果。用户界面由 FinScope 原生组件负责。
 
 FinScope 可以在不启动本 sidecar 时独立运行；Weavria 核心测试也不依赖 FinScope。金融
-术语、API 映射、提示词、验收规则和 Widget 都只保留在本目录。
+术语、API 映射、提示词和验收规则都只保留在本目录。
 
 ## 启动
 
@@ -42,12 +42,12 @@ uv run --extra finscope python -m apps.finscope
 会对最终结构进行独立校验。若模型只遗漏了可无歧义推导、且不超过 8 个的末尾 `}`/`]`，
 OpenAI-compatible 边界会补齐后再校验；错配括号、未闭合字符串和其他损坏仍会失败。
 
-Sidecar 监听 `127.0.0.1:8765`。健康检查和 Widget 地址分别为：
+Sidecar 监听 `127.0.0.1:8765`，提供以下 HTTP 接口：
 
 ```text
-http://127.0.0.1:8765/health
-http://127.0.0.1:8765/widget
-http://127.0.0.1:8765/widget?mode=full
+GET  http://127.0.0.1:8765/health
+POST http://127.0.0.1:8765/api/sessions
+POST http://127.0.0.1:8765/api/sessions/{session_id}/messages
 ```
 
 会话默认持久化到 `.weavria/finscope-sessions.sqlite3`。可以用
@@ -64,8 +64,8 @@ Agent 执行时间。任务理解阶段另有 180 秒上限；两阶段受二者
 环境变量调整；Context Compiler 仍会独立遵守模型上下文窗口和输出预留。
 
 FinScope 前端设置 `VITE_WEAVRIA_AGENT_URL=http://127.0.0.1:8765` 后，市场页悬浮窗与左侧
-Agent 问答页都会连接这个 sidecar。完整页和悬浮窗复用同一持久会话；未配置时 Agent 页只显示
-本地配置指引，不会尝试访问远端服务。
+Agent 问答页会通过原生 FinScope 组件调用这些接口。完整页和悬浮窗复用同一持久会话；未配置时
+Agent 页只显示本地配置指引，不会尝试访问远端服务。Sidecar 不提供 HTML、CSS 或 JavaScript。
 
 ## 当前能力与边界
 
@@ -92,8 +92,7 @@ Agent 问答页都会连接这个 sidecar。完整页和悬浮窗复用同一持
   Market Pulse 时还必须显示数据质量。direct / clarify 回答明确标为 unverifiable，不伪装成
   已验证结论。
 - HTTP Host 当前提供同步消息接口，不提供流式 Token 或实时事件推送。
-- Widget 以本地受限 Markdown 渲染 Agent 回答，支持标题、列表、表格、强调、代码与安全的
-  HTTP(S) 链接；原始 HTML 始终作为文本处理，不执行模型返回的脚本或标签。
+- Sidecar 只返回结构化 JSON；Markdown 展示、交互状态和错误提示由宿主应用负责。
 - Sidecar 面向本机单用户实验，没有远程部署所需的认证、TLS 和多租户隔离。
 
 ## 验证

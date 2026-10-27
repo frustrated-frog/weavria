@@ -1,15 +1,13 @@
-"""Local HTTP sidecar and isolated widget for the FinScope experiment."""
+"""Local HTTP sidecar for the FinScope application adapter."""
 
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import asynccontextmanager
-from pathlib import Path
 from typing import Annotated, Literal
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi import Path as ApiPath
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, Response
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from weavria.context import (
@@ -145,7 +143,6 @@ def create_app(
         raise TypeError("evidence_guidance must be a boolean or None")
     use_evidence_guidance = requirement_coverage if evidence_guidance is None else evidence_guidance
     resolved = settings or FinScopeSettings.from_env()
-    static = Path(__file__).with_name("static")
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
@@ -315,21 +312,16 @@ def create_app(
         allow_methods=["GET", "POST"],
         allow_headers=["Content-Type"],
     )
-    app.mount("/widget-assets", StaticFiles(directory=static), name="widget-assets")
 
     @app.middleware("http")
     async def security_headers(
         request: Request, call_next: Callable[[Request], Awaitable[Response]]
     ) -> Response:
         response = await call_next(request)
-        response.headers["Content-Security-Policy"] = (
-            "default-src 'self'; style-src 'self'; script-src 'self'; "
-            f"connect-src 'self'; frame-ancestors {resolved.allowed_parent_origin}"
-        )
+        response.headers["Content-Security-Policy"] = "default-src 'none'; frame-ancestors 'none'"
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Referrer-Policy"] = "no-referrer"
-        if request.url.path == "/widget" or request.url.path.startswith("/widget-assets/"):
-            response.headers["Cache-Control"] = "no-store"
+        response.headers["Cache-Control"] = "no-store"
         return response
 
     @app.exception_handler(SessionConflictError)
@@ -345,10 +337,6 @@ def create_app(
     @app.get("/health")
     async def health() -> dict[str, str]:
         return {"status": "ready"}
-
-    @app.get("/widget", response_class=FileResponse)
-    async def widget() -> FileResponse:
-        return FileResponse(static / "widget.html")
 
     @app.post("/api/sessions", response_model=SessionCreated, status_code=201)
     async def create_session(request: Request) -> SessionCreated:

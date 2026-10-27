@@ -1,7 +1,5 @@
 import json
-import shutil
 import sqlite3
-import subprocess
 from pathlib import Path
 
 import httpx
@@ -230,7 +228,7 @@ def _clarify() -> TaskSpecification:
     )
 
 
-async def test_widget_session_executes_real_runtime_and_reports_tool_trace(
+async def test_session_api_executes_real_runtime_and_reports_tool_trace(
     tmp_path: Path,
 ) -> None:
     def market_response(request: httpx.Request) -> httpx.Response:
@@ -910,7 +908,7 @@ async def test_invalid_task_understanding_returns_safe_gateway_error(tmp_path: P
     await market_http.aclose()
 
 
-async def test_widget_has_parent_and_script_restrictions(tmp_path: Path) -> None:
+async def test_sidecar_exposes_api_without_hosting_application_ui(tmp_path: Path) -> None:
     provider = FakeSessionProvider(())
     market_http = httpx.AsyncClient(
         transport=httpx.MockTransport(lambda _request: httpx.Response(500))
@@ -929,114 +927,17 @@ async def test_widget_has_parent_and_script_restrictions(tmp_path: Path) -> None
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://sidecar.test"
         ) as client:
-            response = await client.get("/widget")
-            full_response = await client.get("/widget?mode=full&asset-version=4")
-            markdown_script = await client.get("/widget-assets/markdown.js")
-            script = await client.get("/widget-assets/widget.js")
-            stylesheet = await client.get("/widget-assets/widget.css")
+            health = await client.get("/health")
+            widget = await client.get("/widget")
+            widget_asset = await client.get("/widget-assets/widget.js")
 
-    assert response.status_code == 200
-    assert "frame-ancestors http://localhost:5173" in response.headers["content-security-policy"]
-    assert response.headers["cache-control"] == "no-store"
-    assert '<link rel="stylesheet" href="/widget-assets/widget.css?v=4" />' in response.text
-    assert '<script src="/widget-assets/markdown.js?v=4" defer></script>' in response.text
-    assert '<script src="/widget-assets/widget.js?v=4" defer></script>' in response.text
-    assert '<button type="button" id="send">发送</button>' in response.text
-    assert "市场状态 Agent" in response.text
-    assert full_response.status_code == 200
-    assert "FIN//SCOPE EVIDENCE DESK" in full_response.text
-    assert "不写入 · 不刷新" in full_response.text
-    assert markdown_script.status_code == 200
-    assert markdown_script.headers["cache-control"] == "no-store"
-    assert "document.createTextNode" in markdown_script.text
-    assert "innerHTML" not in markdown_script.text
-    assert script.status_code == 200
-    assert script.headers["cache-control"] == "no-store"
-    assert "send.addEventListener('click'" in script.text
-    assert "void submitQuestion();" in script.text
-    assert "const WIDGET_ASSET_VERSION = 4;" in script.text
-    assert "const markdownReady = ensureMarkdownRenderer();" in script.text
-    assert "script.src = `/widget-assets/markdown.js?v=${WIDGET_ASSET_VERSION}`;" in script.text
-    assert "window.WeavriaMarkdown.renderMarkdown(content, text);" in script.text
-    assert "result.task_outcome === 'unverifiable'" in script.text
-    assert "'未能核验'" in script.text
-    assert "get('mode') === 'full'" in script.text
-    assert "weavria.finscope.sessionId" in script.text
-    assert "weavria.finscopeWorkspace.sessionId" in script.text
-    assert "context.surface === 'finscope_workspace'" in script.text
-    assert stylesheet.status_code == 200
-    assert 'body[data-mode="full"] .workspace-intro' in stylesheet.text
-    assert "min-height: 100dvh" in stylesheet.text
-    assert "env(safe-area-inset-bottom)" in stylesheet.text
-    await market_http.aclose()
-
-
-def test_widget_markdown_parser_preserves_format_and_rejects_active_links() -> None:
-    node = shutil.which("node")
-    if node is None:
-        pytest.skip("Node.js is required to exercise the browser-side Markdown parser")
-
-    markdown_path = Path(__file__).parents[2] / "apps/finscope/static/markdown.js"
-    source = """**推断**
-
-| 日期 | 质量 |
-|---|---:|
-| 10-23 | **PARTIAL** |
-
-- 结论包含 **重点**
-- <script>alert('x')</script>
-
-[安全链接](https://example.com) [危险链接](javascript:alert(1))
-"""
-    program = """
-const parser = require(process.argv[1]);
-let source = '';
-process.stdin.setEncoding('utf8');
-process.stdin.on('data', (chunk) => { source += chunk; });
-process.stdin.on('end', () => {
-  process.stdout.write(JSON.stringify({
-    blocks: parser.parseMarkdown(source),
-    links: parser.parseInline('[安全](https://example.com) [危险](javascript:alert(1))')
-  }));
-});
-"""
-    completed = subprocess.run(
-        [node, "-e", program, str(markdown_path)],
-        input=source,
-        capture_output=True,
-        check=True,
-        text=True,
-        timeout=5,
+    assert health.status_code == 200
+    assert health.json() == {"status": "ready"}
+    assert health.headers["cache-control"] == "no-store"
+    assert health.headers["content-security-policy"] == (
+        "default-src 'none'; frame-ancestors 'none'"
     )
-    parsed = json.loads(completed.stdout)
-
-    assert parsed["blocks"][0] == {
-        "type": "paragraph",
-        "lines": [[{"type": "strong", "text": "推断"}]],
-    }
-    assert parsed["blocks"][1] == {
-        "type": "table",
-        "headers": [
-            [{"type": "text", "text": "日期"}],
-            [{"type": "text", "text": "质量"}],
-        ],
-        "alignments": ["left", "right"],
-        "rows": [
-            [
-                [{"type": "text", "text": "10-23"}],
-                [{"type": "strong", "text": "PARTIAL"}],
-            ]
-        ],
-    }
-    assert parsed["blocks"][2]["type"] == "unordered_list"
-    assert {token["type"] for token in parsed["blocks"][2]["items"][0]} == {
-        "text",
-        "strong",
-    }
-    assert parsed["blocks"][2]["items"][1] == [
-        {"type": "text", "text": "<script>alert('x')</script>"}
-    ]
-    assert [token for token in parsed["links"] if token["type"] == "link"] == [
-        {"type": "link", "text": "安全", "href": "https://example.com"}
-    ]
-    assert "javascript:alert(1)" in "".join(token["text"] for token in parsed["links"])
+    assert health.headers["x-content-type-options"] == "nosniff"
+    assert widget.status_code == 404
+    assert widget_asset.status_code == 404
+    await market_http.aclose()

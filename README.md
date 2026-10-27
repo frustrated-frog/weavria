@@ -51,9 +51,11 @@ uv run python examples/progress_control.py
 当前 `AgentLoop` 使用 `ControlRequest` / `ControlEvent` / `RunReport` v3：普通反馈按最小表示计算上界，声明完整交付的工具则按绑定动作与估算器版本的完整信封计算；整批结果无法在下一轮共同交付时，工具执行前就向模型返回拒绝观察。Finish 先成为候选，由 `CompletionPolicy` 检查实际成果、反馈缺口继续修正，或报告无法验证。默认没有验收规则时明确返回 `unverifiable`，不会自动调用评判模型。设计、迁移及冻结的文件任务对照见 [AgentLoop v3](docs/agent-loop-control.md)、[完整反馈执行前预算证明](docs/完整反馈执行前预算证明.md) 与 [ADR 0006](docs/decisions/0006-feedback-admission-completion-control.md)。实验验证控制机制及额外调用成本，尚不能证明真实 LLM 的规划或纠错收益。
 
 首个真实应用实验位于 `apps/finscope`：独立 sidecar 使用 OpenAI-compatible Provider 和
-FinScope 现有只读 HTTP API，在隔离 iframe 中提供市场悬浮窗与完整持久多轮问答页。金融类型、
-固定路由和规则不进入通用包，FinScope 不需要共享数据库或替换其 Java Runtime。启动方式与限制见
-[FinScope 适配器](apps/finscope/README.md) 和 [ADR 0009](docs/decisions/0009-external-application-sidecar.md)。
+FinScope 现有只读 HTTP API，通过结构化会话接口支持市场悬浮窗与完整持久多轮问答页。界面由
+FinScope 原生渲染；金融类型、固定路由和规则不进入通用包，FinScope 不需要共享数据库或替换其
+Java Runtime。启动方式与限制见
+[FinScope 适配器](apps/finscope/README.md)、[ADR 0009](docs/decisions/0009-external-application-sidecar.md)
+和 [ADR 0049](docs/decisions/0049-宿主原生界面与接口边界.md)。
 
 历史契约与选择基线仍可观察：
 
