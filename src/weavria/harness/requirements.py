@@ -34,7 +34,7 @@ class _SemanticContract(BaseModel):
 
 class _SemanticLedgerContract(BaseModel):
     model_config = _SemanticContract.model_config
-    schema_version: Literal[3] = 3
+    schema_version: Literal[4] = 4
 
 
 class NeedStatus(StrEnum):
@@ -187,6 +187,8 @@ class NeedFailure(_SemanticContract):
     tool_name: _Identifier
     category: ErrorCategory
     retryable: bool
+    match_plan_id: _Identifier | None = None
+    attempt_identity_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
 
 
 class NeedState(_SemanticContract):
@@ -196,15 +198,24 @@ class NeedState(_SemanticContract):
     missing_fields: tuple[str, ...] = ()
     failures: tuple[NeedFailure, ...] = ()
     can_retry: bool = False
+    # This describes observed acquisition paths, never absence of the requested data.
+    acquisition_status: Literal["open", "retryable", "unavailable", "contract_gap"] = "open"
 
     @model_validator(mode="after")
     def validate_state(self) -> Self:
         if self.status is NeedStatus.SATISFIED and (
-            not self.evidence_binding_ids or self.missing_fields or self.failures
+            not self.evidence_binding_ids
+            or self.missing_fields
+            or self.failures
+            or self.acquisition_status != "open"
         ):
             raise ValueError("satisfied need requires evidence and no unresolved gaps")
         if self.can_retry and not self.failures:
             raise ValueError("retryability requires an observed failure")
+        if self.acquisition_status == "retryable" and not self.can_retry:
+            raise ValueError("retryable acquisition requires a retryable query")
+        if self.acquisition_status in {"unavailable", "contract_gap"} and self.can_retry:
+            raise ValueError("terminal acquisition cannot retain a retryable query")
         return self
 
 
@@ -258,7 +269,12 @@ class NeedLedger(_SemanticLedgerContract):
                 "can_retry": state.can_retry,
                 "failures": sorted(
                     {
-                        (item.tool_name, item.category.value, item.retryable)
+                        (
+                            item.tool_name,
+                            item.category.value,
+                            item.retryable,
+                            *((item.match_plan_id,) if item.match_plan_id is not None else ()),
+                        )
                         for item in state.failures
                     }
                 ),
@@ -295,6 +311,8 @@ class NeedLedger(_SemanticLedgerContract):
                     }
                 ),
             }
+            if state.acquisition_status != "open":
+                state_payload["acquisition_status"] = state.acquisition_status
             state_probes = tuple(
                 probe
                 for probe in self.probes
@@ -339,7 +357,15 @@ class EvidenceProbe(_SemanticContract):
     artifact_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
     evaluator_key: _Identifier | None = None
     evaluator_version: _Reference | None = None
-    status: Literal["matched", "partial", "schema_mismatch", "unsupported", "unavailable", "stale"]
+    status: Literal[
+        "matched",
+        "partial",
+        "schema_mismatch",
+        "unsupported",
+        "unavailable",
+        "stale",
+        "not_applicable",
+    ]
     matched_fields: tuple[str, ...] = ()
     missing_fields: tuple[str, ...] = ()
     freshness: Literal["valid", "stale", "unknown"] = "unknown"
@@ -351,6 +377,7 @@ class EvidenceProbe(_SemanticContract):
     result_kind: Literal["found", "empty", "not_found", "partial"] | None = None
     scope_completeness: Literal["complete", "partial", "unknown"] | None = None
     reason_code: _Identifier
+    attempt_identity_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
 
     @model_validator(mode="after")
     def validate_probe(self) -> Self:
@@ -392,6 +419,10 @@ def load_need_ledger(value: str | Mapping[str, object]) -> NeedLedger:
             probe.setdefault("proof_strength", None)
             probe.setdefault("result_kind", None)
             probe.setdefault("scope_completeness", None)
+    if payload.get("schema_version") == 3:
+        # Historical judgments and their progress digest stay intact. Missing attempt
+        # attribution is unknown; only a fresh projection can establish V4 availability.
+        payload["schema_version"] = 4
     return NeedLedger.model_validate_json(
         json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     )
@@ -497,7 +528,7 @@ class EvidenceResolver:
     @property
     def version(self) -> str:
         strategies = ",".join(f"{item.key}@{item.version}" for item in self._extractors)
-        return f"evidence-resolver/4[{strategies}]"
+        return f"evidence-resolver/5[{strategies}]"
 
     async def resolve(
         self,
@@ -522,47 +553,58 @@ class EvidenceResolver:
                 tool_name = record.exchange.action.tool_name
                 if tool_name not in requirement.capability_names:
                     continue
-                observation = record.exchange.observation
-                if isinstance(observation, ToolFailedObservation):
-                    failures.append(
-                        NeedFailure(
-                            call_id=observation.call_id,
-                            tool_name=observation.tool_name,
-                            category=observation.error.category,
-                            retryable=observation.error.retryable,
-                        )
-                    )
-                    requirement_probes.append(
-                        _probe(
-                            requirement=requirement,
-                            record=record,
-                            status="unavailable",
-                            reason_code="tool_failure",
-                        )
-                    )
-                    continue
-                if record.artifact is None:
-                    requirement_probes.append(
-                        _probe(
-                            requirement=requirement,
-                            record=record,
-                            status="unavailable",
-                            reason_code="artifact_missing",
-                        )
-                    )
-                    continue
-                snapshot = await read_artifact(record.artifact.artifact_id)
                 matched_plans = _matching_plans(requirement, record)
                 if requirement.evidence_match_plans and not matched_plans:
                     requirement_probes.append(
                         _probe(
                             requirement=requirement,
                             record=record,
-                            status="unsupported",
+                            status="not_applicable",
                             reason_code="evidence_scope_mismatch",
                         )
                     )
                     continue
+                applicable_plans: tuple[EvidenceMatchPlan | None, ...] = (
+                    tuple(matched_plans) if matched_plans else (None,)
+                )
+                observation = record.exchange.observation
+                if isinstance(observation, ToolFailedObservation):
+                    for plan in applicable_plans:
+                        failures.append(
+                            NeedFailure(
+                                call_id=observation.call_id,
+                                tool_name=observation.tool_name,
+                                category=observation.error.category,
+                                retryable=observation.error.retryable,
+                                match_plan_id=plan.plan_id if plan is not None else None,
+                                attempt_identity_sha256=_attempt_identity(record, plan),
+                            )
+                        )
+                        requirement_probes.append(
+                            _probe(
+                                requirement=requirement,
+                                record=record,
+                                status="unavailable",
+                                reason_code="tool_failure",
+                                match_plan_id=plan.plan_id if plan is not None else None,
+                                attempt_identity_sha256=_attempt_identity(record, plan),
+                            )
+                        )
+                    continue
+                if record.artifact is None:
+                    for plan in applicable_plans:
+                        requirement_probes.append(
+                            _probe(
+                                requirement=requirement,
+                                record=record,
+                                status="unavailable",
+                                reason_code="artifact_missing",
+                                match_plan_id=plan.plan_id if plan is not None else None,
+                                attempt_identity_sha256=_attempt_identity(record, plan),
+                            )
+                        )
+                    continue
+                snapshot = await read_artifact(record.artifact.artifact_id)
                 extractor = next(
                     (
                         candidate
@@ -572,19 +614,19 @@ class EvidenceResolver:
                     None,
                 )
                 if extractor is None:
-                    requirement_probes.append(
-                        _probe(
-                            requirement=requirement,
-                            record=record,
-                            status="unsupported",
-                            reason_code="extractor_unsupported",
+                    for plan in applicable_plans:
+                        requirement_probes.append(
+                            _probe(
+                                requirement=requirement,
+                                record=record,
+                                status="unsupported",
+                                reason_code="extractor_unsupported",
+                                match_plan_id=plan.plan_id if plan is not None else None,
+                                attempt_identity_sha256=_attempt_identity(record, plan),
+                            )
                         )
-                    )
                     continue
                 evaluation = await extractor.evaluate(requirement, record, snapshot)
-                applicable_plans: tuple[EvidenceMatchPlan | None, ...] = (
-                    tuple(matched_plans) if matched_plans else (None,)
-                )
                 for plan in applicable_plans:
                     scope_identity = _scope_identity(evaluation, record, plan)
                     proof_strength = _binding_proof(evaluation, plan)
@@ -614,6 +656,7 @@ class EvidenceResolver:
                             proof_strength=proof_strength,
                             result_kind=evaluation.result_kind,
                             scope_completeness=evaluation.scope_completeness,
+                            attempt_identity_sha256=_attempt_identity(record, plan),
                         )
                     )
                     addresses = tuple(
@@ -671,17 +714,32 @@ class EvidenceResolver:
                 else:
                     prior_ids = set(prior_state.evidence_binding_ids)
                     current_binding_ids = {binding.binding_id for binding in requirement_bindings}
+                    plan_ids = {plan.plan_id for plan in requirement.evidence_match_plans}
                     requirement_bindings.extend(
                         binding
                         for binding in previous.bindings
                         if binding.binding_id in prior_ids
                         and binding.binding_id not in current_binding_ids
+                        and (
+                            binding.match_plan_id in plan_ids
+                            if plan_ids
+                            else binding.match_plan_id is None
+                        )
                     )
-                    current_failure_ids = {failure.call_id for failure in failures}
+                    current_failure_ids = {
+                        (failure.call_id, failure.match_plan_id) for failure in failures
+                    }
+                    current_call_ids = {record.exchange.action.call_id for record in records}
                     failures.extend(
                         failure
                         for failure in prior_state.failures
-                        if failure.call_id not in current_failure_ids
+                        if (failure.call_id, failure.match_plan_id) not in current_failure_ids
+                        and failure.call_id not in current_call_ids
+                        and (
+                            failure.match_plan_id in plan_ids
+                            if plan_ids
+                            else failure.match_plan_id is None
+                        )
                     )
                     current_probe_ids = {probe.probe_id for probe in requirement_probes}
                     requirement_probes.extend(
@@ -689,10 +747,13 @@ class EvidenceResolver:
                         for probe in previous.probes
                         if probe.need_id == requirement.need_id
                         and probe.probe_id not in current_probe_ids
+                        and probe.producer_call_id not in current_call_ids
                     )
             bindings.extend(requirement_bindings)
             probes.extend(requirement_probes)
-            states.append(_reduce_need(requirement, requirement_bindings, failures))
+            states.append(
+                _reduce_need(requirement, requirement_bindings, failures, requirement_probes)
+            )
 
         revision = 1
         if previous is not None:
@@ -801,6 +862,24 @@ def _scope_identity(
     ).hexdigest()
 
 
+def _attempt_identity(record: ToolRecord, plan: EvidenceMatchPlan | None) -> str:
+    """Identify a normalized query independently of call IDs and response contents."""
+    authorization = record.authorization
+    payload = {
+        "producer_name": record.exchange.action.tool_name,
+        "producer_version": authorization.tool_version if authorization is not None else None,
+        "arguments": (
+            authorization.normalized_arguments
+            if authorization is not None
+            else record.exchange.action.arguments
+        ),
+        "match_plan_id": plan.plan_id if plan is not None else None,
+    }
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
 def _binding_proof(
     evaluation: EvidenceEvaluation,
     plan: EvidenceMatchPlan | None,
@@ -820,7 +899,15 @@ def _probe(
     *,
     requirement: InformationRequirement,
     record: ToolRecord,
-    status: Literal["matched", "partial", "schema_mismatch", "unsupported", "unavailable", "stale"],
+    status: Literal[
+        "matched",
+        "partial",
+        "schema_mismatch",
+        "unsupported",
+        "unavailable",
+        "stale",
+        "not_applicable",
+    ],
     reason_code: str,
     evaluator_key: str | None = None,
     evaluator_version: str | None = None,
@@ -833,6 +920,7 @@ def _probe(
     | None = None,
     result_kind: Literal["found", "empty", "not_found", "partial"] | None = None,
     scope_completeness: Literal["complete", "partial", "unknown"] | None = None,
+    attempt_identity_sha256: str | None = None,
 ) -> EvidenceProbe:
     artifact = record.artifact
     seed = json.dumps(
@@ -867,13 +955,80 @@ def _probe(
         result_kind=result_kind,
         scope_completeness=scope_completeness,
         reason_code=reason_code,
+        attempt_identity_sha256=attempt_identity_sha256,
     )
+
+
+def _acquisition_status(
+    requirement: InformationRequirement,
+    failures: list[NeedFailure],
+    probes: list[EvidenceProbe],
+) -> tuple[Literal["open", "retryable", "unavailable", "contract_gap"], bool]:
+    """Keep untried producers open; bound retries within each exact query only.
+
+    A terminal result describes the observed declared paths. Match predicates do
+    not enumerate every possible argument, so this is never an absence proof.
+    """
+    paths = (
+        tuple((plan.plan_id, plan.producer_name) for plan in requirement.evidence_match_plans)
+        if requirement.evidence_match_plans
+        else tuple((None, name) for name in requirement.capability_names)
+    )
+    statuses: list[Literal["open", "retryable", "unavailable", "contract_gap"]] = []
+    for plan_id, tool_name in paths:
+        relevant_probes = [
+            probe
+            for probe in probes
+            if probe.match_plan_id == plan_id
+            and probe.tool_name == tool_name
+            and probe.status != "not_applicable"
+            and probe.reason_code != "evidence_scope_mismatch"
+            and probe.attempt_identity_sha256 is not None
+        ]
+        relevant_failures = [
+            failure
+            for failure in failures
+            if failure.match_plan_id == plan_id and failure.tool_name == tool_name
+        ]
+        if any(probe.status in {"matched", "partial", "stale"} for probe in relevant_probes):
+            statuses.append("open")
+        attempts: dict[str, list[NeedFailure]] = {}
+        for failure in relevant_failures:
+            # Old failures have no trustworthy query identity and cannot exhaust a retry scope.
+            identity = failure.attempt_identity_sha256 or f"unknown:{failure.call_id}"
+            attempts.setdefault(identity, []).append(failure)
+        retryable = any(
+            any(item.retryable for item in group)
+            and not any(not item.retryable for item in group)
+            and (
+                any(item.attempt_identity_sha256 is None for item in group)
+                or len({item.call_id for item in group}) < 2
+            )
+            for group in attempts.values()
+        )
+        if retryable:
+            statuses.append("retryable")
+        elif any(probe.status in {"schema_mismatch", "unsupported"} for probe in relevant_probes):
+            statuses.append("contract_gap")
+        elif relevant_probes and all(probe.status == "unavailable" for probe in relevant_probes):
+            statuses.append("unavailable")
+        else:
+            statuses.append("open")
+    can_retry = "retryable" in statuses
+    if not statuses or "open" in statuses:
+        return "open", can_retry
+    if can_retry:
+        return "retryable", True
+    if "contract_gap" in statuses:
+        return "contract_gap", False
+    return "unavailable", False
 
 
 def _reduce_need(
     requirement: InformationRequirement,
     bindings: list[EvidenceBinding],
     failures: list[NeedFailure],
+    probes: list[EvidenceProbe],
 ) -> NeedState:
     contradictory = [binding for binding in bindings if binding.relation == "contradicts"]
     stale = [binding for binding in bindings if binding.freshness == "stale"]
@@ -885,17 +1040,19 @@ def _reduce_need(
         and _proof_at_least(binding.proof_strength, requirement.minimum_proof)
     ]
     coverage_complete, missing = _scope_coverage(requirement, eligible)
+    acquisition_status, can_retry = _acquisition_status(requirement, failures, probes)
     if contradictory:
         status = NeedStatus.CONTRADICTED
     elif coverage_complete:
         status = NeedStatus.SATISFIED
         failures = []
         missing = ()
+        acquisition_status, can_retry = "open", False
     elif stale and not eligible:
         status = NeedStatus.STALE
     elif eligible or bindings:
         status = NeedStatus.PARTIAL
-    elif failures:
+    elif acquisition_status in {"retryable", "unavailable"}:
         status = NeedStatus.UNAVAILABLE
     else:
         status = NeedStatus.PENDING
@@ -905,7 +1062,8 @@ def _reduce_need(
         evidence_binding_ids=tuple(binding.binding_id for binding in bindings),
         missing_fields=missing,
         failures=tuple(failures),
-        can_retry=any(failure.retryable for failure in failures),
+        can_retry=can_retry,
+        acquisition_status=acquisition_status,
     )
 
 

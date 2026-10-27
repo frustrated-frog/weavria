@@ -64,7 +64,7 @@ class CandidateAnswerVerifier(Protocol):
 class TaskCompletionEvaluator:
     """Evaluate declared obligations without trusting model claims of completion."""
 
-    version = "task-obligations/6"
+    version = "task-obligations/7"
 
     def __init__(
         self,
@@ -180,47 +180,29 @@ class TaskCompletionEvaluator:
                 outcome="unverifiable",
                 reason_code="conflicting_evidence",
             )
-        unavailable = tuple(
-            item for item in required_states if item.status is NeedStatus.UNAVAILABLE
-        )
-        exhausted_retry = any(item.can_retry and len(item.failures) >= 2 for item in unavailable)
-        if unavailable and (not any(item.can_retry for item in unavailable) or exhausted_retry):
-            return CompletionEvaluation(
-                disposition="cannot_proceed",
-                verdicts=verdicts,
-                next_required_actions=("Report which mandatory evidence is unavailable",),
-                outcome="unverifiable",
-                reason_code="mandatory_evidence_unavailable",
-            )
         incomplete = tuple(
             item for item in required_states if item.status is not NeedStatus.SATISFIED
         )
         if incomplete:
             retryable = any(item.can_retry for item in incomplete)
-            terminal_contract_gap = any(
-                any(
-                    probe.status in {"schema_mismatch", "unsupported"}
-                    for probe in ledger.probes
-                    if probe.need_id == item.need_id
-                )
-                and not any(
-                    probe.status in {"matched", "partial"}
-                    for probe in ledger.probes
-                    if probe.need_id == item.need_id
-                )
-                and not item.can_retry
-                for item in incomplete
+            terminal_paths = all(
+                item.acquisition_status in {"unavailable", "contract_gap"} for item in incomplete
             )
-            if terminal_contract_gap:
+            if terminal_paths:
+                contract_gap = any(item.acquisition_status == "contract_gap" for item in incomplete)
                 return CompletionEvaluation(
                     disposition="cannot_proceed",
                     verdicts=verdicts,
                     next_required_actions=(
-                        "Report that the accepted capability output cannot satisfy the "
-                        "declared evidence selectors",
+                        "Report the limits of the attempted evidence paths; do not infer "
+                        "that the requested data does not exist",
                     ),
                     outcome="unverifiable",
-                    reason_code="evidence_contract_mismatch",
+                    reason_code=(
+                        "evidence_contract_mismatch"
+                        if contract_gap
+                        else "mandatory_evidence_unavailable"
+                    ),
                 )
             return CompletionEvaluation(
                 disposition="repair",

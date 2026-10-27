@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import json
 from typing import Literal
@@ -27,6 +28,7 @@ from weavria.tools import (
     ReadOnlyPolicy,
     ToolContext,
     ToolExecutor,
+    ToolFault,
     ToolRegistry,
     TypedTool,
 )
@@ -572,7 +574,7 @@ def test_v1_need_ledger_is_explicitly_upcast_without_inventing_probes() -> None:
 
     ledger = load_need_ledger(legacy)
 
-    assert ledger.schema_version == 3
+    assert ledger.schema_version == 4
     assert ledger.probes == ()
     legacy_progress: list[dict[str, object]] = [
         {
@@ -756,3 +758,280 @@ async def test_requirement_dependency_graph_rejects_cycles_before_evidence_proje
             records=(),
             read_artifact=lambda artifact_id: pytest.fail(artifact_id),
         )
+
+
+def _profiled_requirement(keys: tuple[str, ...] = ("a", "b")) -> InformationRequirement:
+    return _requirement().model_copy(
+        update={
+            "minimum_proof": "scoped_semantic",
+            "evidence_match_plans": tuple(
+                EvidenceMatchPlan(
+                    plan_id=f"plan-{key}",
+                    producer_name="fetch",
+                    producer_version="1",
+                    profile_version="fetch/1",
+                    surface_id="fetch.value",
+                    required_fields=("/value",),
+                    parameter_matches=(
+                        EvidenceParameterMatch(input_pointer="/key", allowed_values=(key,)),
+                    ),
+                )
+                for key in keys
+            ),
+        }
+    )
+
+
+async def _failed_record(key: str, call_id: str, *, retryable: bool = False) -> ToolRecord:
+    async def fail(arguments: _Input, context: ToolContext) -> _Output:
+        raise ToolFault(ErrorCategory.TOOL_FAILURE, "source unavailable", retryable=retryable)
+
+    tool = TypedTool(
+        name="fetch",
+        version="1",
+        description="Fetch one value",
+        input_type=_Input,
+        output_type=_Output,
+        execute=fail,
+    )
+    return await ToolExecutor(
+        "run-1", ToolRegistry((tool,)), InMemoryArtifactStore(), ReadOnlyPolicy()
+    ).execute(
+        ToolCallAction(call_id=call_id, tool_name="fetch", arguments={"key": key}), max_duration=1
+    )
+
+
+@pytest.mark.parametrize("failed", [False, True])
+async def test_non_applicable_records_are_audit_only_and_never_read_artifacts(failed: bool) -> None:
+    _, records = await _success_records()
+    record = await _failed_record("b", "failed-b") if failed else records[1]
+    requirement = _profiled_requirement(("a",))
+    resolver = EvidenceResolver()
+
+    async def unexpected_read(artifact_id: str) -> ArtifactSnapshot:
+        raise AssertionError("unrelated artifacts must not be read")
+
+    empty = await resolver.resolve(
+        work_id="work-a",
+        task_revision=1,
+        frame_revision=1,
+        requirements=(requirement,),
+        records=(),
+        read_artifact=unexpected_read,
+    )
+    ledger = await resolver.resolve(
+        work_id="work-a",
+        task_revision=1,
+        frame_revision=1,
+        requirements=(requirement,),
+        records=(record,),
+        read_artifact=unexpected_read,
+        previous=empty,
+    )
+
+    state = ledger.state_for(requirement.need_id)
+    assert state.status is NeedStatus.PENDING
+    assert state.failures == () and state.acquisition_status == "open"
+    assert ledger.bindings == ()
+    assert ledger.probes[0].status == "not_applicable"
+    assert ledger.progress_sha256() == empty.progress_sha256()
+
+
+async def test_failure_attribution_survives_incremental_projection_without_double_counting() -> (
+    None
+):
+    failure = await _failed_record("a", "failed-a", retryable=True)
+    requirement = _profiled_requirement()
+    resolver = EvidenceResolver()
+    store = InMemoryArtifactStore()
+    first = await resolver.resolve(
+        work_id="work-a",
+        task_revision=1,
+        frame_revision=1,
+        requirements=(requirement,),
+        records=(failure,),
+        read_artifact=lambda identity: store.get("run-1", identity),
+    )
+    restored = load_need_ledger(first.model_dump_json())
+    repeated = await resolver.resolve(
+        work_id="work-a",
+        task_revision=1,
+        frame_revision=1,
+        requirements=(requirement,),
+        records=(failure,),
+        read_artifact=lambda identity: store.get("run-1", identity),
+        previous=restored,
+    )
+    second_failure = await _failed_record("a", "failed-a-2", retryable=True)
+    exhausted_a = await resolver.resolve(
+        work_id="work-a",
+        task_revision=1,
+        frame_revision=1,
+        requirements=(requirement,),
+        records=(second_failure,),
+        read_artifact=lambda identity: store.get("run-1", identity),
+        previous=repeated,
+    )
+
+    assert repeated.evidence_revision == first.evidence_revision
+    state = repeated.state_for(requirement.need_id)
+    assert len(state.failures) == 1 and state.can_retry
+    assert state.failures[0].match_plan_id == "plan-a"
+    assert state.failures[0].attempt_identity_sha256 is not None
+    # A's retry bound is consumed, but untried B is still open.
+    assert exhausted_a.state_for(requirement.need_id).status is NeedStatus.PENDING
+    assert exhausted_a.state_for(requirement.need_id).acquisition_status == "open"
+    assert not exhausted_a.state_for(requirement.need_id).can_retry
+
+
+async def test_alternative_success_satisfies_need_after_another_producer_failed() -> None:
+    store, records = await _success_records()
+    failure = await _failed_record("b", "failed-b")
+    requirement = _profiled_requirement()
+    resolver = EvidenceResolver((_SemanticExtractor(),))
+    first = await resolver.resolve(
+        work_id="work-a",
+        task_revision=1,
+        frame_revision=1,
+        requirements=(requirement,),
+        records=(failure,),
+        read_artifact=lambda identity: store.get("run-1", identity),
+    )
+    completed = await resolver.resolve(
+        work_id="work-a",
+        task_revision=1,
+        frame_revision=1,
+        requirements=(requirement,),
+        records=(records[0],),
+        read_artifact=lambda identity: store.get("run-1", identity),
+        previous=load_need_ledger(first.model_dump_json()),
+    )
+
+    assert completed.state_for(requirement.need_id).status is NeedStatus.SATISFIED
+    assert completed.state_for(requirement.need_id).failures == ()
+
+
+async def test_unattributed_or_denied_failure_cannot_claim_a_profile_path() -> None:
+    failure = await _failed_record("a", "failed-a")
+    assert failure.authorization is not None
+    variants = (
+        failure.model_copy(update={"authorization": None}),
+        failure.model_copy(
+            update={"authorization": failure.authorization.model_copy(update={"allowed": False})}
+        ),
+    )
+    for record in variants:
+        ledger = await EvidenceResolver().resolve(
+            work_id="work-a",
+            task_revision=1,
+            frame_revision=1,
+            requirements=(_profiled_requirement(("a",)),),
+            records=(record,),
+            read_artifact=lambda identity: InMemoryArtifactStore().get("run-1", identity),
+        )
+        assert ledger.states[0].status is NeedStatus.PENDING
+        assert ledger.states[0].failures == ()
+
+
+async def test_resolver_cancellation_closes_in_flight_artifact_read() -> None:
+    _, record = await _success_record()
+    started, closed = asyncio.Event(), asyncio.Event()
+
+    async def read(artifact_id: str) -> ArtifactSnapshot:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+            raise AssertionError("cancelled read resumed")
+        finally:
+            closed.set()
+
+    owner = asyncio.create_task(
+        EvidenceResolver().resolve(
+            work_id="work-a",
+            task_revision=1,
+            frame_revision=1,
+            requirements=(_requirement(),),
+            records=(record,),
+            read_artifact=read,
+        )
+    )
+    await asyncio.wait_for(started.wait(), 1)
+    owner.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await owner
+    assert closed.is_set()
+
+
+async def test_v3_failure_migration_keeps_unknown_attribution_and_reprojects_conservatively() -> (
+    None
+):
+    failure = await _failed_record("b", "failed-b")
+    store = InMemoryArtifactStore()
+    legacy = (
+        await EvidenceResolver().resolve(
+            work_id="work-a",
+            task_revision=1,
+            frame_revision=1,
+            requirements=(_requirement(),),
+            records=(failure,),
+            read_artifact=lambda identity: store.get("run-1", identity),
+        )
+    ).model_dump(mode="json")
+    legacy["schema_version"] = 3
+    for state in legacy["states"]:
+        state.pop("acquisition_status")
+        for item in state["failures"]:
+            item.pop("match_plan_id")
+            item.pop("attempt_identity_sha256")
+    for probe in legacy["probes"]:
+        probe.pop("attempt_identity_sha256")
+    restored = load_need_ledger(legacy)
+    assert restored.states[0].status is NeedStatus.UNAVAILABLE
+    assert restored.states[0].acquisition_status == "open"
+    assert restored.states[0].failures[0].match_plan_id is None
+    reprojected = await EvidenceResolver().resolve(
+        work_id="work-a",
+        task_revision=2,
+        frame_revision=2,
+        requirements=(_profiled_requirement(("a",)),),
+        records=(),
+        read_artifact=lambda identity: store.get("run-1", identity),
+        previous=restored,
+    )
+    assert reprojected.states[0].status is NeedStatus.PENDING
+    assert reprojected.states[0].failures == ()
+
+
+async def test_new_failed_query_does_not_masquerade_as_semantic_progress() -> None:
+    requirement = _profiled_requirement(("a",))
+    plan = requirement.evidence_match_plans[0].model_copy(
+        update={
+            "parameter_matches": (
+                EvidenceParameterMatch(input_pointer="/key", allowed_values=("a", "b")),
+            ),
+        }
+    )
+    requirement = requirement.model_copy(update={"evidence_match_plans": (plan,)})
+    resolver = EvidenceResolver()
+    store = InMemoryArtifactStore()
+    first = await resolver.resolve(
+        work_id="work-a",
+        task_revision=1,
+        frame_revision=1,
+        requirements=(requirement,),
+        records=(await _failed_record("a", "failure-a", retryable=True),),
+        read_artifact=lambda identity: store.get("run-1", identity),
+    )
+    second = await resolver.resolve(
+        work_id="work-a",
+        task_revision=1,
+        frame_revision=1,
+        requirements=(requirement,),
+        records=(await _failed_record("b", "failure-b", retryable=True),),
+        read_artifact=lambda identity: store.get("run-1", identity),
+        previous=first,
+    )
+
+    assert second.states[0].can_retry
+    assert second.evidence_revision > first.evidence_revision
+    assert second.progress_sha256() == first.progress_sha256()

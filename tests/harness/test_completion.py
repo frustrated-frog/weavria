@@ -1,18 +1,23 @@
 from collections.abc import Awaitable, Callable
 
+import pytest
 from pydantic import BaseModel
 
 from weavria.artifacts import ArtifactSnapshot, InMemoryArtifactStore
 from weavria.core import (
     COMPLETION_GUIDANCE_JSON_BYTES,
     CompletionAccept,
+    CompletionChecked,
     CompletionRepair,
     CompletionUnverifiable,
     ErrorCategory,
     FinishAction,
     ModelResponse,
+    ModelTurn,
+    RunStatus,
     TaskInput,
     TaskObservation,
+    ToolBatch,
     ToolCallAction,
     fit_completion_guidance,
 )
@@ -20,6 +25,8 @@ from weavria.harness import (
     CapabilityNeed,
     CompletionCriterion,
     EvidenceEvaluation,
+    EvidenceMatchPlan,
+    EvidenceParameterMatch,
     EvidenceResolver,
     InformationNeed,
     InformationRequirement,
@@ -29,9 +36,10 @@ from weavria.harness import (
     TaskObligationCompletionPolicy,
     TaskSpecification,
     TaskUnderstandingEngine,
+    load_task_frame,
 )
-from weavria.models import FakeModelProvider
-from weavria.runtime import CompletionContext
+from weavria.models import FakeControlProvider, FakeModelProvider
+from weavria.runtime import AgentLoop, CompletionContext, RunLimits
 from weavria.tools import (
     ReadOnlyPolicy,
     ToolContext,
@@ -398,3 +406,276 @@ async def test_required_capability_result_without_a_need_requires_a_successful_r
 
     assert isinstance(decision, CompletionRepair)
     assert decision.issue_codes == ("missing_capability_result",)
+
+
+async def _scoped_context(
+    *,
+    targets: tuple[str, ...],
+    calls: tuple[str, ...],
+    failures: dict[str, bool],
+    same_plan: bool = False,
+) -> CompletionContext:
+    async def read(arguments: _Input, context: ToolContext) -> _Output:
+        if arguments.key in failures:
+            raise ToolFault(
+                ErrorCategory.TOOL_FAILURE, "source unavailable", retryable=failures[arguments.key]
+            )
+        return await _read(arguments, context)
+
+    registry = _registry(read)
+    task, frame, _ = await _frame(registry)
+    plans = tuple(
+        EvidenceMatchPlan(
+            plan_id=f"plan-{index}",
+            producer_name="read_value",
+            producer_version="1",
+            profile_version="values/1",
+            surface_id="value",
+            required_fields=("/value",),
+            parameter_matches=(
+                EvidenceParameterMatch(input_pointer="/key", allowed_values=values),
+            ),
+        )
+        for index, values in enumerate(
+            (targets,) if same_plan else tuple((key,) for key in targets)
+        )
+    )
+    requirement = frame.requirements[0].model_copy(
+        update={"evidence_match_plans": plans, "minimum_proof": "scoped_semantic"}
+    )
+    frame = frame.model_copy(update={"requirements": (requirement,)})
+    observation = TaskObservation(
+        observation_id=frame.frame_id,
+        input_id="input-1",
+        task_revision=task.revision,
+        frame_revision=frame.revision,
+        producer_version=frame.interpreter_version,
+        payload_schema="weavria.task-frame/6",
+        payload=frame.model_dump(mode="json"),
+    )
+    store = InMemoryArtifactStore()
+    executor = ToolExecutor("run", registry, store, ReadOnlyPolicy())
+    records = tuple(
+        [
+            await executor.execute(
+                ToolCallAction(
+                    call_id=f"read-{index}", tool_name="read_value", arguments={"key": key}
+                ),
+                max_duration=1,
+            )
+            for index, key in enumerate(calls)
+        ]
+    )
+    return CompletionContext(
+        "run", task, FinishAction(output="candidate"), records, store, observation
+    )
+
+
+@pytest.mark.parametrize("failure", [False, True])
+async def test_unrelated_success_or_failure_cannot_close_an_untried_need(failure: bool) -> None:
+    context = await _scoped_context(
+        targets=("alpha",), calls=("beta",), failures={"beta": False} if failure else {}
+    )
+
+    decision = await TaskObligationCompletionPolicy().verify(context)
+
+    assert isinstance(decision, CompletionRepair)
+    assert decision.issue_codes == ("missing_evidence",)
+
+
+@pytest.mark.parametrize("retryable", [False, True])
+async def test_failed_producer_does_not_close_an_untried_alternative(retryable: bool) -> None:
+    context = await _scoped_context(
+        targets=("alpha", "beta"), calls=("alpha",), failures={"alpha": retryable}
+    )
+
+    decision = await TaskObligationCompletionPolicy().verify(context)
+
+    assert isinstance(decision, CompletionRepair)
+
+
+@pytest.mark.parametrize(
+    ("calls", "expected"),
+    [
+        (("alpha", "beta"), CompletionRepair),
+        (("alpha", "alpha"), CompletionUnverifiable),
+        (("alpha", "alpha", "beta", "beta"), CompletionUnverifiable),
+    ],
+)
+async def test_retry_exhaustion_is_per_exact_query_not_total_failure_count(
+    calls: tuple[str, ...], expected: type[CompletionRepair] | type[CompletionUnverifiable]
+) -> None:
+    context = await _scoped_context(
+        targets=("alpha", "beta"),
+        calls=calls,
+        failures={"alpha": True, "beta": True},
+        same_plan=True,
+    )
+
+    decision = await TaskObligationCompletionPolicy().verify(context)
+
+    assert isinstance(decision, expected)
+
+
+async def test_terminal_failure_cannot_exhaust_a_retryable_alternative() -> None:
+    context = await _scoped_context(
+        targets=("alpha", "beta"),
+        calls=("alpha", "beta"),
+        failures={"alpha": False, "beta": True},
+    )
+
+    decision = await TaskObligationCompletionPolicy().verify(context)
+
+    assert isinstance(decision, CompletionRepair)
+    assert decision.issue_codes == ("retryable_source_failure",)
+
+
+async def test_all_observed_declared_paths_unavailable_allow_limited_delivery() -> None:
+    context = await _scoped_context(
+        targets=("alpha", "beta"),
+        calls=("alpha", "beta"),
+        failures={"alpha": False, "beta": False},
+    )
+
+    decision = await TaskObligationCompletionPolicy().verify(context)
+
+    assert isinstance(decision, CompletionUnverifiable)
+    assert decision.reason == "mandatory_evidence_unavailable"
+
+
+async def test_contract_gap_does_not_close_an_untried_producer() -> None:
+    context = await _scoped_context(targets=("alpha", "beta"), calls=("alpha",), failures={})
+
+    class NoFields:
+        key = "no-fields"
+        version = "1"
+
+        def supports(self, requirement: InformationRequirement, record: object) -> bool:
+            return True
+
+        async def evaluate(
+            self, requirement: InformationRequirement, record: object, snapshot: ArtifactSnapshot
+        ) -> EvidenceEvaluation:
+            return EvidenceEvaluation(
+                relation="unknown", pointers=(), missing_fields=requirement.required_fields
+            )
+
+    decision = await TaskObligationCompletionPolicy(
+        TaskCompletionEvaluator(evidence=EvidenceResolver((NoFields(),)))
+    ).verify(context)
+
+    assert isinstance(decision, CompletionRepair)
+
+
+async def test_unavailable_need_cannot_close_a_different_untried_need() -> None:
+    context = await _scoped_context(
+        targets=("alpha", "beta"), calls=("alpha",), failures={"alpha": False}
+    )
+    assert context.task_observation is not None
+    frame = load_task_frame(context.task_observation.payload)
+    requirement = frame.requirements[0]
+    first, second = requirement.evidence_match_plans
+    frame = frame.model_copy(
+        update={
+            "requirements": (
+                requirement.model_copy(update={"evidence_match_plans": (first,)}),
+                requirement.model_copy(
+                    update={"need_id": "need-beta", "evidence_match_plans": (second,)}
+                ),
+            )
+        }
+    )
+    observation = context.task_observation.model_copy(
+        update={"payload": frame.model_dump(mode="json")}
+    )
+    split = CompletionContext(
+        "run",
+        context.task,
+        context.candidate,
+        context.records,
+        InMemoryArtifactStore(),
+        observation,
+    )
+
+    decision = await TaskObligationCompletionPolicy().verify(split)
+
+    assert isinstance(decision, CompletionRepair)
+    assert decision.issue_codes == ("missing_evidence",)
+
+
+async def test_execution_repairs_premature_finish_then_uses_successful_alternative() -> None:
+    context = await _scoped_context(targets=("alpha", "beta"), calls=(), failures={})
+
+    async def read(arguments: _Input, context: ToolContext) -> _Output:
+        if arguments.key == "alpha":
+            raise ToolFault(ErrorCategory.TOOL_FAILURE, "alpha source unavailable")
+        return await _read(arguments, context)
+
+    class ValueExtractor:
+        key = "value"
+        version = "1"
+
+        def supports(self, requirement: InformationRequirement, record: object) -> bool:
+            return True
+
+        async def evaluate(
+            self, requirement: InformationRequirement, record: object, snapshot: ArtifactSnapshot
+        ) -> EvidenceEvaluation:
+            return EvidenceEvaluation(
+                relation="supports",
+                pointers=("/value",),
+                proof_strength="semantic",
+                freshness="valid",
+                scope_completeness="complete",
+            )
+
+    provider = FakeControlProvider(
+        (
+            ModelTurn(
+                decision=ToolBatch(
+                    calls=(
+                        ToolCallAction(
+                            call_id="failed-alpha",
+                            tool_name="read_value",
+                            arguments={"key": "alpha"},
+                        ),
+                    )
+                )
+            ),
+            ModelTurn(decision=FinishAction(output="Premature source unavailable claim")),
+            ModelTurn(
+                decision=ToolBatch(
+                    calls=(
+                        ToolCallAction(
+                            call_id="successful-beta",
+                            tool_name="read_value",
+                            arguments={"key": "beta"},
+                        ),
+                    )
+                )
+            ),
+            ModelTurn(decision=FinishAction(output="Value obtained from beta")),
+        )
+    )
+    agent = AgentLoop(
+        run_id="run",
+        task=context.task,
+        instructions="Read and report the value",
+        model=provider,
+        artifacts=InMemoryArtifactStore(),
+        tools=_registry(read),
+        task_observation=context.task_observation,
+        limits=RunLimits(max_request_bytes=24_000),
+        completion=TaskObligationCompletionPolicy(
+            TaskCompletionEvaluator(evidence=EvidenceResolver((ValueExtractor(),)))
+        ),
+    )
+
+    result = await agent.execute()
+
+    assert result.status is RunStatus.COMPLETED
+    assert result.output == "Value obtained from beta"
+    checks = [event.data for event in agent.events if isinstance(event.data, CompletionChecked)]
+    assert len(checks) == 2
+    assert isinstance(checks[0].assessment.decision, CompletionRepair)
+    assert isinstance(checks[1].assessment.decision, CompletionAccept)
