@@ -44,6 +44,7 @@ from weavria.harness import (
     TaskUnderstandingError,
     TaskUnderstandingInput,
     apply_frame_patch,
+    dump_task_frame,
     load_task_frame,
     load_task_frame_patch,
 )
@@ -583,6 +584,72 @@ async def test_model_interpreter_bounds_malformed_response_retries() -> None:
     assert len(provider.requests) == 2
 
 
+async def test_model_interpreter_normalizes_derived_required_capability_completion() -> None:
+    invalid = _execute().model_copy(
+        update={
+            "completion_criteria": (
+                CompletionCriterion(kind="response", description="Answer the user"),
+            )
+        }
+    )
+    interpreter = ModelTaskInterpreter(FakeModelProvider((_declaration(invalid),)))
+
+    specification = await interpreter.interpret(
+        TaskUnderstandingInput(
+            task=TaskInput(goal="Read the report"),
+            capabilities=(
+                CapabilityView(
+                    name="read_document",
+                    version="1",
+                    description="Read a named document",
+                    input_schema={"type": "object"},
+                    behavior="read_only",
+                    risk="low",
+                    approval_required=False,
+                ),
+            ),
+        ),
+        max_duration=1,
+    )
+
+    assert tuple(
+        item.capability
+        for item in specification.completion_criteria
+        if item.kind == "capability_result"
+    ) == ("read_document",)
+
+
+async def test_model_interpreter_persists_content_free_root_invariant_code() -> None:
+    execute = _execute()
+    invalid = execute.model_copy(
+        update={"capability_needs": (*execute.capability_needs, *execute.capability_needs)}
+    )
+    interpreter = ModelTaskInterpreter(
+        FakeModelProvider((_declaration(invalid), _declaration(invalid)))
+    )
+
+    with pytest.raises(TaskUnderstandingError) as raised:
+        await interpreter.interpret(
+            TaskUnderstandingInput(
+                task=TaskInput(goal="Read the report"),
+                capabilities=(
+                    CapabilityView(
+                        name="read_document",
+                        version="1",
+                        description="Read a named document",
+                        input_schema={"type": "object"},
+                        behavior="read_only",
+                        risk="low",
+                        approval_required=False,
+                    ),
+                ),
+            ),
+            max_duration=1,
+        )
+
+    assert raised.value.error.cause_type == "ValidationError:duplicate_capability"
+
+
 async def test_model_interpreter_does_not_repeat_nonrepairable_output_failure() -> None:
     class OutputBudgetExhaustedProvider:
         capabilities = ModelCapabilities(tool_calls=True)
@@ -939,6 +1006,12 @@ async def test_frame_revision_preserves_need_identity_and_rejects_stale_patch() 
 
     assert first.record.frame.schema_version == 6
     assert first.observation.payload_schema == "weavria.task-frame/6"
+    assert first.observation.payload == dump_task_frame(first.record.frame)
+    assert first.observation.payload["schema_version"] == 6
+    assert load_task_frame(first.observation.payload) == first.record.frame
+    assert len(json.dumps(first.observation.payload, separators=(",", ":")).encode()) < len(
+        first.record.frame.model_dump_json().encode()
+    )
     legacy_v5_payload: dict[str, JsonValue] = first.record.frame.model_dump(mode="json")
     legacy_v5_payload["schema_version"] = 5
     legacy_v5_payload.pop("requirement_coverage")

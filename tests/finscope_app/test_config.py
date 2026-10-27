@@ -58,6 +58,30 @@ def test_understanding_reasoning_effort_is_explicitly_loaded(
     assert settings.understanding_reasoning_effort == "none"
 
 
+def test_understanding_reasoning_effort_defaults_to_non_thinking(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("WEAVRIA_MODEL_BASE_URL", "https://model.example/v1")
+    monkeypatch.setenv("WEAVRIA_MODEL_NAME", "model")
+    monkeypatch.delenv("WEAVRIA_UNDERSTANDING_REASONING_EFFORT", raising=False)
+
+    settings = FinScopeSettings.from_env()
+
+    assert settings.understanding_reasoning_effort == "none"
+
+
+def test_understanding_reasoning_effort_can_be_omitted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("WEAVRIA_MODEL_BASE_URL", "https://model.example/v1")
+    monkeypatch.setenv("WEAVRIA_MODEL_NAME", "model")
+    monkeypatch.setenv("WEAVRIA_UNDERSTANDING_REASONING_EFFORT", "omit")
+
+    settings = FinScopeSettings.from_env()
+
+    assert settings.understanding_reasoning_effort is None
+
+
 @pytest.mark.parametrize(
     "factory",
     (

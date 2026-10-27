@@ -928,6 +928,12 @@ def _scope_coverage(
                 plan_bindings,
                 completion_mode=requirement.completion_mode,
             )
+            # A plan that contains the requirement's complete field contract is an
+            # alternative producer. Independently omissible multi-source demands must
+            # be separate InformationRequirements; forcing equivalent producers to
+            # share one source identity makes valid fallbacks impossible to satisfy.
+            if complete and set(requirement.required_fields).issubset(plan.required_fields):
+                return True, ()
             if not complete:
                 all_missing.extend(missing)
         common_scopes: set[str] = scopes_by_plan[0].copy() if scopes_by_plan else set()

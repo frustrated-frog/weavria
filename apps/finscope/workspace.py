@@ -1002,13 +1002,49 @@ def finscope_workspace_evidence_profiles() -> tuple[CapabilityEvidenceProfile, .
         CapabilityEvidenceProfile(
             capability_name="search_finscope",
             capability_version="1",
-            profile_version="finscope-search-evidence/2",
+            profile_version="finscope-search-evidence/3",
             surfaces=(
                 EvidenceSurface(
-                    surface_id="workspace.search.results",
-                    description="Bounded search results from one fixed FinScope scope",
+                    surface_id="workspace.search.companies",
+                    description="Company identity and company metadata search results",
                     demand_policy="explicit_only",
                     required_fields=("/data",),
+                    parameter_constraints=constraint("/scope", "companies"),
+                ),
+                EvidenceSurface(
+                    surface_id="workspace.search.news",
+                    description="Company news and market reaction event search results",
+                    demand_policy="explicit_only",
+                    required_fields=("/data",),
+                    parameter_constraints=constraint("/scope", "news_window", "reaction_events"),
+                ),
+                EvidenceSurface(
+                    surface_id="workspace.search.industry",
+                    description="Industry and sector classification search results",
+                    demand_policy="explicit_only",
+                    required_fields=("/data",),
+                    parameter_constraints=constraint("/scope", "sectors"),
+                ),
+                EvidenceSurface(
+                    surface_id="workspace.search.research",
+                    description="Knowledge, learning and quantitative research search results",
+                    demand_policy="explicit_only",
+                    required_fields=("/data",),
+                    parameter_constraints=constraint(
+                        "/scope", "knowledge_topics", "learning_tasks", "quant_catalog"
+                    ),
+                ),
+                EvidenceSurface(
+                    surface_id="workspace.search.forecasts",
+                    description="Forecast and attribution research result search",
+                    demand_policy="explicit_only",
+                    required_fields=("/data",),
+                    parameter_constraints=constraint(
+                        "/scope",
+                        "next_session_predictions",
+                        "single_stock_forecasts",
+                        "attribution_history",
+                    ),
                 ),
             ),
         ),

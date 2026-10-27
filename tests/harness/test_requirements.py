@@ -444,6 +444,39 @@ async def test_profile_surfaces_require_one_shared_scope_before_cross_plan_join(
     assert joined.state_for(requirement.need_id).status is NeedStatus.SATISFIED
 
 
+async def test_complete_profile_plans_are_alternative_producers_across_scopes() -> None:
+    store, records = await _success_records()
+    plans = tuple(
+        EvidenceMatchPlan(
+            plan_id=f"match-{key}",
+            producer_name="fetch",
+            producer_version="1",
+            profile_version="fetch-evidence/1",
+            surface_id=f"fetch.{key}",
+            required_fields=("/value",),
+            parameter_matches=(
+                EvidenceParameterMatch(input_pointer="/key", allowed_values=(key,)),
+            ),
+        )
+        for key in ("a", "b")
+    )
+    requirement = _requirement(required_fields=("/value",)).model_copy(
+        update={"evidence_match_plans": plans, "minimum_proof": "scoped_semantic"}
+    )
+
+    ledger = await EvidenceResolver((_ProgressiveExtractor(complete_second=False),)).resolve(
+        work_id="work-a",
+        task_revision=1,
+        frame_revision=1,
+        requirements=(requirement,),
+        records=records,
+        read_artifact=lambda artifact_id: store.get("run-1", artifact_id),
+    )
+
+    assert ledger.state_for(requirement.need_id).status is NeedStatus.SATISFIED
+    assert ledger.state_for(requirement.need_id).missing_fields == ()
+
+
 async def test_resolver_preserves_partial_fields_and_retryable_failures() -> None:
     store, record = await _success_record()
     partial = await EvidenceResolver().resolve(

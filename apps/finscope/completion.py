@@ -1,6 +1,9 @@
 """FinScope-local evidence extraction and answer acceptance rules."""
 
 import hashlib
+from typing import Literal
+
+from pydantic import JsonValue
 
 from weavria.artifacts import ArtifactSnapshot
 from weavria.core import (
@@ -70,7 +73,7 @@ class FinScopeWorkspaceEvidenceExtractor:
     """Treat a bounded live FinScope GET as current app-owned evidence."""
 
     key = "finscope-workspace"
-    version = "1"
+    version = "2"
 
     def __init__(self) -> None:
         self._structural = StructuralEvidenceExtractor()
@@ -86,6 +89,7 @@ class FinScopeWorkspaceEvidenceExtractor:
     ) -> EvidenceEvaluation:
         structural = await self._structural.evaluate(requirement, record, snapshot)
         output = FinScopeReadOutput.model_validate(snapshot.value)
+        tool_name = record.exchange.action.tool_name
         missing = tuple(field for field in structural.missing_fields if field != "$freshness")
         relation = (
             "supports"
@@ -102,13 +106,83 @@ class FinScopeWorkspaceEvidenceExtractor:
             source_identity_sha256=_identity(output.source_id),
             scope_identity_sha256=_identity(output.source_id),
             proof_strength="semantic",
-            result_kind=structural.result_kind,
-            scope_completeness=(
-                "complete"
-                if record.exchange.action.tool_name == "read_finscope_resource"
-                else "partial"
+            result_kind=_workspace_result_kind(
+                output.data,
+                tool_name=tool_name,
+                fallback=structural.result_kind,
+            ),
+            scope_completeness=_workspace_scope_completeness(
+                output.data,
+                tool_name=tool_name,
+                arguments=record.exchange.action.arguments,
             ),
         )
+
+
+def _workspace_result_kind(
+    data: JsonValue,
+    *,
+    tool_name: str,
+    fallback: Literal["found", "empty", "not_found", "partial"],
+) -> Literal["found", "empty", "not_found", "partial"]:
+    """Interpret collection envelopes without mistaking metadata for a finding."""
+    if data is None:
+        return "not_found" if tool_name == "read_finscope_resource" else "empty"
+    items = _collection_items(data)
+    if items is not None:
+        return "found" if items else "empty"
+    return fallback
+
+
+def _workspace_scope_completeness(
+    data: JsonValue,
+    *,
+    tool_name: str,
+    arguments: dict[str, JsonValue],
+) -> Literal["complete", "partial", "unknown"]:
+    """Prove only fixed resources or a complete first page as a closed search scope."""
+    if tool_name == "read_finscope_resource":
+        return "complete"
+
+    items = _collection_items(data)
+    if items is None:
+        # A non-collection catalogue response is the complete fixed endpoint snapshot.
+        return "complete" if tool_name == "read_finscope_catalogue" else "unknown"
+
+    page = _plain_int(arguments.get("page"), default=0)
+    limit = _plain_int(arguments.get("limit"), default=None)
+    total = _collection_total(data)
+    # One isolated later page cannot prove that earlier pages were traversed. The current
+    # evidence contract intentionally stays conservative until page-range coverage is a
+    # first-class ledger concept.
+    if page != 0:
+        return "partial"
+    if total is not None:
+        return "complete" if len(items) >= total else "partial"
+    if limit is not None:
+        return "complete" if len(items) < limit else "partial"
+    return "complete" if not items else "unknown"
+
+
+def _collection_items(data: JsonValue) -> list[JsonValue] | None:
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        items = data.get("items")
+        if isinstance(items, list):
+            return items
+    return None
+
+
+def _collection_total(data: JsonValue) -> int | None:
+    if not isinstance(data, dict):
+        return None
+    total = data.get("total")
+    return total if type(total) is int and total >= 0 else None
+
+
+def _plain_int(value: JsonValue | None, *, default: int | None) -> int | None:
+    return value if type(value) is int and value >= 0 else default
 
 
 def _identity(value: str) -> str:

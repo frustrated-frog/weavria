@@ -800,6 +800,7 @@ async def test_complete_feedback_batch_replans_before_any_oversized_effect() -> 
     rejected = [event.data for event in agent.events if isinstance(event.data, BatchRejected)]
     assert len(rejected) == 1 and rejected[0].notice.reason == "feedback_budget"
     assert rejected[0].notice.required_bytes > rejected[0].notice.budget_bytes
+    assert rejected[0].notice.recommended_max_calls == 1
     started = [event.data.call_id for event in agent.events if isinstance(event.data, ToolStarted)]
     assert started == ["page-one"]
     admitted = [event.data for event in agent.events if isinstance(event.data, BatchAdmitted)]
@@ -833,6 +834,7 @@ async def test_tool_budget_rejects_whole_batch_and_model_can_change_plan() -> No
     notice = provider.requests[1].control
     assert isinstance(notice, AdmissionNotice) and notice.reason == "tool_budget"
     assert notice.remaining_tool_calls == 1
+    assert notice.recommended_max_calls == 1
     assert agent.state.tool_calls == 1
     replay(agent)
 

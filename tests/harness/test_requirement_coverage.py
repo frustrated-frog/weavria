@@ -257,18 +257,21 @@ class _SequenceValidator:
     def __init__(self, assessments: tuple[RequirementCoverageAssessment, ...]) -> None:
         self._assessments = assessments
         self.calls = 0
+        self.obligation_inputs: list[tuple[SemanticObligation, ...] | None] = []
 
     async def assess(
         self,
         request: TaskUnderstandingInput,
         specification: TaskSpecification,
         *,
+        obligations: tuple[SemanticObligation, ...] | None = None,
         max_duration: float,
     ) -> RequirementCoverageAssessment:
         assert max_duration > 0
         assert request.capabilities[0].evidence_profile_version == "report-evidence/1"
         assert request.capabilities[0].evidence_surfaces[0].surface_id == "report.summary"
         assert specification.route == "execute"
+        self.obligation_inputs.append(obligations)
         result = self._assessments[self.calls]
         self.calls += 1
         await asyncio.sleep(0)
@@ -295,6 +298,7 @@ async def test_engine_repairs_semantically_incomplete_specification_once() -> No
 
     frame = preparation.record.frame
     assert validator.calls == 2
+    assert validator.obligation_inputs == [None, _assessment(covered=False).obligations]
     assert len(repairer.reports) == 1
     assert repairer.reports[0].verdict == "insufficient"
     assert frame.schema_version == 6
@@ -341,6 +345,10 @@ async def test_engine_bounds_repeated_semantic_coverage_failure() -> None:
 
     assert raised.value.error.category is ErrorCategory.INVALID_MODEL_RESPONSE
     assert "omitted required semantic obligations" in raised.value.error.message
+    assert "missing_selector=2" in raised.value.error.message
+    assert len(raised.value.attempts) == 1
+    assert raised.value.attempts[0].stage == "coverage_validation"
+    assert raised.value.attempts[0].attempt == 2
     assert validator.calls == 2
     assert len(repairer.reports) == 1
 
@@ -559,9 +567,10 @@ async def test_coverage_cancellation_propagates_without_semantic_repair() -> Non
             request: TaskUnderstandingInput,
             specification: TaskSpecification,
             *,
+            obligations: tuple[SemanticObligation, ...] | None = None,
             max_duration: float,
         ) -> RequirementCoverageAssessment:
-            del request, specification, max_duration
+            del request, specification, obligations, max_duration
             self.started.set()
             try:
                 await asyncio.Event().wait()
@@ -604,9 +613,10 @@ async def test_engine_enforces_deadline_when_coverage_validator_ignores_budget()
             request: TaskUnderstandingInput,
             specification: TaskSpecification,
             *,
+            obligations: tuple[SemanticObligation, ...] | None = None,
             max_duration: float,
         ) -> RequirementCoverageAssessment:
-            del request, specification, max_duration
+            del request, specification, obligations, max_duration
             try:
                 await asyncio.Event().wait()
             finally:

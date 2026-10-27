@@ -89,6 +89,7 @@ class AdmissionNotice(ContractModel):
     required_bytes: int = Field(ge=0)
     budget_bytes: int = Field(gt=0)
     remaining_tool_calls: int = Field(ge=0)
+    recommended_max_calls: int | None = Field(default=None, ge=0, le=32)
     progress_fingerprint_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
     canonical_tool_key_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
     progress_reason: Literal["repeated_action", "stagnant_action_family"] | None = None
@@ -116,6 +117,23 @@ class AdmissionNotice(ContractModel):
             raise ValueError("no-progress detail fields must be complete")
         if not progress and any(item is not None for item in progress_details):
             raise ValueError("only no-progress rejection can carry progress details")
+        if self.recommended_max_calls is not None and self.reason not in {
+            "feedback_budget",
+            "tool_budget",
+        }:
+            raise ValueError("only budget rejection can recommend a smaller next batch")
+        if (
+            self.reason == "feedback_budget"
+            and self.recommended_max_calls is not None
+            and self.recommended_max_calls > self.proposed_calls
+        ):
+            raise ValueError("feedback recommendation cannot expand the rejected batch")
+        if (
+            self.reason == "tool_budget"
+            and self.recommended_max_calls is not None
+            and self.recommended_max_calls > self.remaining_tool_calls
+        ):
+            raise ValueError("tool-budget recommendation exceeds remaining calls")
         if len(self.model_dump_json().encode()) > CONTROL_FEEDBACK_BYTES:
             raise ValueError("admission notice exceeds its reserved channel")
         return self

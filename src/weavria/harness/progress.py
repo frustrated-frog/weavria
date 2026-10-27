@@ -241,14 +241,19 @@ def _information_gain(before: NeedLedger, after: NeedLedger) -> InformationGainS
     new_bindings = tuple(
         binding for binding in after.bindings if binding.binding_id not in prior_ids
     )
-    prior_sources = _source_identities(before.bindings)
-    after_sources = _source_identities(after.bindings)
+    prior_sources = _positive_source_identities(before.bindings)
+    after_sources = _positive_source_identities(after.bindings)
     new_sources = after_sources - prior_sources
     repeated = 0
     unattributed = 0
     seen_sources = set(prior_sources)
     for binding in new_bindings:
-        sources = _source_identities((binding,))
+        # Closed empty/not-found scopes are valuable negative evidence only through the
+        # obligation state they satisfy. Counting every query identity as positive source
+        # gain would reward endless query variants even though no new fact was found.
+        if binding.result_kind in {"empty", "not_found"}:
+            continue
+        sources = _positive_source_identities((binding,))
         if not sources:
             unattributed += 1
         elif not sources - seen_sources:
@@ -266,10 +271,11 @@ def _information_gain(before: NeedLedger, after: NeedLedger) -> InformationGainS
     )
 
 
-def _source_identities(bindings: Iterable[EvidenceBinding]) -> set[str]:
+def _positive_source_identities(bindings: Iterable[EvidenceBinding]) -> set[str]:
     return {
         address.source_identity_sha256
         for binding in bindings
+        if binding.result_kind not in {"empty", "not_found"}
         for address in binding.addresses
         if address.source_identity_sha256 is not None
     }

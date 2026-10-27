@@ -39,6 +39,7 @@ from .understanding import (
     apply_frame_patch,
     canonicalize_task_frame,
     create_frame_patch,
+    dump_task_frame,
     load_task_frame,
     load_task_frame_patch,
     reduce_frame_patch,
@@ -222,7 +223,7 @@ class TaskAwareSessionPreparer:
                 frame_revision=frame.revision,
                 producer_version=frame.interpreter_version,
                 payload_schema="weavria.task-frame/6",
-                payload=frame.model_dump(mode="json"),
+                payload=dump_task_frame(frame),
             )
         if base is not None:
             assert preparation.patch is not None
@@ -350,7 +351,7 @@ class TaskAwareSessionPreparer:
             frame_revision=frame.revision,
             producer_version=frame.interpreter_version,
             payload_schema="weavria.task-frame/6",
-            payload=frame.model_dump(mode="json"),
+            payload=dump_task_frame(frame),
         )
         return SessionTaskPreparation(
             preparation_version=self.version,
@@ -461,5 +462,5 @@ class TaskFrameSemanticReducer:
             frame_revision=target.revision,
             producer_version=target.interpreter_version,
             payload_schema="weavria.task-frame/6",
-            payload=target.model_dump(mode="json"),
+            payload=dump_task_frame(target),
         )

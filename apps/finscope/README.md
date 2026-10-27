@@ -83,8 +83,13 @@ Agent 页只显示本地配置指引，不会尝试访问远端服务。Sidecar 
   `WEAVRIA_MODEL_TIMEOUT_SECONDS` 限制；多阶段总预算由
   `WEAVRIA_UNDERSTANDING_MAX_DURATION_SECONDS` 独立限制。结构化理解输出也使用独立的
   `WEAVRIA_UNDERSTANDING_MAX_OUTPUT_TOKENS`，避免大型规格或覆盖图与最终回答争用同一输出预留。
-  对默认开启思考的兼容端点，可显式设置 `WEAVRIA_UNDERSTANDING_REASONING_EFFORT=none`；未设置时
-  不向供应商发送该参数，避免按模型名称猜测能力。
+  任务理解必须在有限预算内生成严格结构化规格，因此默认发送
+  `WEAVRIA_UNDERSTANDING_REASONING_EFFORT=none`，避免兼容端点把输出预算全部用于隐藏思考。
+  该设置只作用于任务理解阶段，不改变最终回答模型；若供应商不接受此参数，可显式设置为
+  `omit`，让适配器不发送该字段。此策略由 FinScope 宿主声明，不依赖模型名称推断能力。依据：
+  [DeepSeek Thinking Mode](https://api-docs.deepseek.com/guides/thinking_mode/) 与
+  [Chat Completion API](https://api-docs.deepseek.com/api/create-chat-completion/)
+  （访问日期：2026-10-27）。
 - 任务理解只接受能够落到显式生产能力 `output_schema` 的证据字段；Profile 参数值也必须与工具
   输入 Schema 相容。成功工具结果即使零字段匹配也会留下 Evidence Probe，并以契约不匹配
   收敛，不再重复调用直到耗尽完成预算。

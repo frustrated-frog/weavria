@@ -24,7 +24,7 @@ class FinScopeSettings:
     json_mode: bool = False
     model_max_output_tokens: int = 4096
     understanding_model_max_output_tokens: int = 8192
-    understanding_reasoning_effort: UnderstandingReasoningEffort | None = None
+    understanding_reasoning_effort: UnderstandingReasoningEffort | None = "none"
     context_window_tokens: int = 32_768
     context_encoding: str = "cl100k_base"
     run_max_model_calls: int = 20
@@ -132,6 +132,8 @@ def _required(name: str) -> str:
 def _reasoning_effort_from_env(name: str) -> UnderstandingReasoningEffort | None:
     value = os.environ.get(name, "").strip().lower()
     if not value:
+        return "none"
+    if value == "omit":
         return None
     if value not in {"none", "low", "medium", "high", "max"}:
         raise ValueError(f"{name} is unsupported")

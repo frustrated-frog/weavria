@@ -288,3 +288,18 @@ def test_workspace_evidence_profiles_cover_each_registered_private_tool() -> Non
         for profile in profiles
         for surface in profile.surfaces
     )
+    search_profile = next(
+        profile for profile in profiles if profile.capability_name == "search_finscope"
+    )
+    assert search_profile.profile_version == "finscope-search-evidence/3"
+    assert {surface.surface_id for surface in search_profile.surfaces} == {
+        "workspace.search.companies",
+        "workspace.search.news",
+        "workspace.search.industry",
+        "workspace.search.research",
+        "workspace.search.forecasts",
+    }
+    assert all(
+        surface.parameter_constraints[0].input_pointer == "/scope"
+        for surface in search_profile.surfaces
+    )

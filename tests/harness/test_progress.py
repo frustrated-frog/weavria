@@ -141,6 +141,34 @@ class _ProgressiveSourceExtractor:
         )
 
 
+class _EmptySourceExtractor:
+    key = "empty-source"
+    version = "1"
+    source = hashlib.sha256(b"empty-query-scope").hexdigest()
+
+    def supports(self, requirement: InformationRequirement, record: ToolRecord) -> bool:
+        del requirement, record
+        return True
+
+    async def evaluate(
+        self,
+        requirement: InformationRequirement,
+        record: ToolRecord,
+        snapshot: ArtifactSnapshot,
+    ) -> EvidenceEvaluation:
+        del requirement, record, snapshot
+        return EvidenceEvaluation(
+            relation="supports",
+            pointers=("/value", "/other"),
+            freshness="valid",
+            source_identity_sha256=self.source,
+            scope_identity_sha256=self.source,
+            proof_strength="semantic",
+            result_kind="empty",
+            scope_completeness="complete",
+        )
+
+
 async def _accepted_records(
     registry: ToolRegistry, store: InMemoryArtifactStore
 ) -> tuple[ToolRecord, ToolRecord]:
@@ -231,6 +259,50 @@ async def test_progress_separates_coverage_obligation_and_independent_source_gai
     assert second_assessment.information_gain.new_source_sha256s == ()
     assert second_assessment.information_gain.repeated_source_bindings == 1
     assert second_assessment.continuation.recommended_action == "verify"
+
+
+async def test_empty_query_scope_does_not_masquerade_as_positive_source_gain() -> None:
+    registry = _registry()
+    task, frame = await _task_frame(registry)
+    store = InMemoryArtifactStore()
+    first, _second = await _accepted_records(registry, store)
+    resolver = EvidenceResolver((_EmptySourceExtractor(),))
+    before = await resolver.resolve(
+        work_id=frame.work_id,
+        task_revision=task.revision,
+        frame_revision=frame.revision,
+        requirements=frame.requirements,
+        records=(),
+        read_artifact=lambda artifact_id: store.get("run", artifact_id),
+    )
+    after = await resolver.resolve(
+        work_id=frame.work_id,
+        task_revision=task.revision,
+        frame_revision=frame.revision,
+        requirements=frame.requirements,
+        records=(first,),
+        read_artifact=lambda artifact_id: store.get("run", artifact_id),
+        previous=before,
+    )
+
+    assessment = NeedProgressEvaluator().assess(
+        task_revision=task.revision,
+        frame=frame,
+        before=before,
+        after=after,
+        records=(first,),
+        feedback=TurnFeedback(
+            task_revision=task.revision,
+            calls=(CallFeedback(call_id="call-1", status="succeeded"),),
+        ),
+        remaining_model_calls=4,
+        remaining_tool_calls=3,
+        capability_expanded=False,
+    )
+
+    assert assessment.information_gain.new_source_sha256s == ()
+    assert assessment.information_gain.attributed_sources_after == 0
+    assert assessment.information_gain.unattributed_new_bindings == 0
 
 
 @pytest.mark.parametrize(
