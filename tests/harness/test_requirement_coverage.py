@@ -306,6 +306,17 @@ async def test_engine_repairs_semantically_incomplete_specification_once() -> No
         ("/details",),
     ]
     assert all(item.capability_names == ("read_report",) for item in frame.requirements)
+    assert [item.minimum_proof for item in frame.requirements] == [
+        "scoped_semantic",
+        "scoped_semantic",
+    ]
+    assert [item.evidence_match_plans[0].surface_id for item in frame.requirements] == [
+        "report.summary",
+        "report.details",
+    ]
+    assert frame.requirements[0].evidence_match_plans[0].parameter_matches[0].allowed_values == (
+        "summary",
+    )
 
 
 async def test_engine_bounds_repeated_semantic_coverage_failure() -> None:

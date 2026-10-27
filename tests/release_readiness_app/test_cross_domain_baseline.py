@@ -7,6 +7,7 @@ import pytest
 
 from apps.release_readiness import (
     ReleaseDossierDiscoveryPolicy,
+    ReleaseDossierEvidenceExtractor,
     ReleaseDossierPolicy,
     ReleaseReadinessCase,
     expected_release_facets,
@@ -34,6 +35,7 @@ from weavria.core import (
 )
 from weavria.harness import (
     CapabilityResolver,
+    EvidenceResolver,
     ModelRequirementCoverageValidator,
     ModelTaskInterpreter,
     NeedStatus,
@@ -172,6 +174,7 @@ async def test_release_readiness_closes_cross_domain_semantics(
             evidence_profiles=(release_dossier_evidence_profile(),),
             max_duration=5,
         ),
+        evidence=EvidenceResolver((ReleaseDossierEvidenceExtractor(),)),
         capabilities=CapabilityResolver(policy=ReleaseDossierDiscoveryPolicy()),
     )
 

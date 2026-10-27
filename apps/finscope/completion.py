@@ -1,5 +1,7 @@
 """FinScope-local evidence extraction and answer acceptance rules."""
 
+import hashlib
+
 from weavria.artifacts import ArtifactSnapshot
 from weavria.core import (
     CompletionAccept,
@@ -42,7 +44,7 @@ class MarketPulseEvidenceExtractor:
         snapshot: ArtifactSnapshot,
     ) -> EvidenceEvaluation:
         structural = await self._structural.evaluate(requirement, record, snapshot)
-        MarketPulseOutput.model_validate(snapshot.value)
+        output = MarketPulseOutput.model_validate(snapshot.value)
         missing = tuple(field for field in structural.missing_fields if field != "$freshness")
         relation = (
             "supports"
@@ -56,6 +58,11 @@ class MarketPulseEvidenceExtractor:
             pointers=structural.pointers,
             missing_fields=missing,
             freshness="valid",
+            source_identity_sha256=_identity(output.source_id),
+            scope_identity_sha256=_identity(output.source_id),
+            proof_strength="semantic",
+            result_kind=structural.result_kind,
+            scope_completeness="complete",
         )
 
 
@@ -78,7 +85,7 @@ class FinScopeWorkspaceEvidenceExtractor:
         snapshot: ArtifactSnapshot,
     ) -> EvidenceEvaluation:
         structural = await self._structural.evaluate(requirement, record, snapshot)
-        FinScopeReadOutput.model_validate(snapshot.value)
+        output = FinScopeReadOutput.model_validate(snapshot.value)
         missing = tuple(field for field in structural.missing_fields if field != "$freshness")
         relation = (
             "supports"
@@ -92,7 +99,20 @@ class FinScopeWorkspaceEvidenceExtractor:
             pointers=structural.pointers,
             missing_fields=missing,
             freshness="valid",
+            source_identity_sha256=_identity(output.source_id),
+            scope_identity_sha256=_identity(output.source_id),
+            proof_strength="semantic",
+            result_kind=structural.result_kind,
+            scope_completeness=(
+                "complete"
+                if record.exchange.action.tool_name == "read_finscope_resource"
+                else "partial"
+            ),
         )
+
+
+def _identity(value: str) -> str:
+    return hashlib.sha256(value.encode()).hexdigest()
 
 
 class FinScopeAnswerPolicy:

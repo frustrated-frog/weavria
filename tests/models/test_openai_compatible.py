@@ -24,6 +24,7 @@ from weavria.models import (
     OpenAICompatibleProvider,
     OpenAICompatibleSessionProvider,
     call_model,
+    call_session_model,
 )
 
 
@@ -113,6 +114,22 @@ async def test_adapter_rejects_oversized_request_before_transport_dispatch() -> 
     assert raised.value.request_diagnostic is not None
     assert raised.value.request_diagnostic.admitted is False
     assert raised.value.request_diagnostic.request_bytes > 64
+    assert transport.requests == []
+
+
+async def test_adapter_enforces_byte_limit_without_token_window() -> None:
+    transport = Transport(_response('{"action":{"kind":"finish","output":"done"}}'))
+    provider = OpenAICompatibleProvider(
+        OpenAICompatibleConfig(model="test", max_request_bytes=64),
+        transport=transport,
+    )
+
+    with pytest.raises(ModelCallError) as raised:
+        await call_model(provider, _request())
+
+    diagnostic = raised.value.request_diagnostic
+    assert diagnostic is not None and not diagnostic.admitted
+    assert diagnostic.request_bytes > diagnostic.request_budget_bytes == 64
     assert transport.requests == []
 
 
@@ -247,6 +264,22 @@ async def test_session_provider_encodes_observations_and_parses_json_turn() -> N
     current = observations["current"]
     assert isinstance(current["task"], dict) and current["task"]["goal"] == "question"
     assert "instructions" not in current
+
+
+async def test_session_provider_enforces_final_request_admission_before_transport() -> None:
+    transport = Transport(_response('{"decision":{"kind":"finish","output":"完成"}}'))
+    provider = OpenAICompatibleSessionProvider(
+        OpenAICompatibleConfig(model="model", max_request_bytes=64),
+        transport=transport,
+    )
+
+    with pytest.raises(ModelCallError) as raised:
+        await call_session_model(provider, _session_request())
+
+    diagnostic = raised.value.request_diagnostic
+    assert diagnostic is not None and not diagnostic.admitted
+    assert diagnostic.request_bytes > diagnostic.request_budget_bytes == 64
+    assert transport.requests == []
 
 
 async def test_session_provider_rejects_non_json_final_content() -> None:

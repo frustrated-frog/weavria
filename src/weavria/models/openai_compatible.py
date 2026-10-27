@@ -92,8 +92,8 @@ class OpenAICompatibleProvider:
     async def generate(self, request: ModelRequest) -> ModelResponse:
         """Request one normalized action; transport and parsing failures remain provider errors."""
         validated = ModelRequest.model_validate(request)
-        self._admit(validated)
         body = _model_request_body(self._config, validated)
+        self._admit(validated, body)
         payload = await self._transport.complete(body)
         try:
             content, finish_reason = _message_generation(payload)
@@ -124,28 +124,23 @@ class OpenAICompatibleProvider:
         """Compatibility shim for tests inspecting the exact transport body."""
         return _model_request_body(self._config, request)
 
-    def _admit(self, request: ModelRequest) -> None:
-        if self._admission_counter is None or self._config.context_window_tokens is None:
+    def _admit(self, request: ModelRequest, body: dict[str, Any]) -> None:
+        if self._config.context_window_tokens is None and self._config.max_request_bytes is None:
             return
-        input_tokens = self._admission_counter.count_model_request(request)
-        request_bytes = self._admission_counter.model_request_bytes(request)
-        input_budget = (
-            self._config.context_window_tokens
-            - self._config.max_output_tokens
-            - self._config.safety_tokens
-        )
-        request_budget = self._config.max_request_bytes or 2**63 - 1
-        diagnostic = ModelRequestDiagnostic(
-            counter_version=self._admission_counter.version,
-            input_tokens=input_tokens,
-            input_budget_tokens=input_budget,
-            output_tokens=self._config.max_output_tokens,
-            safety_tokens=self._config.safety_tokens,
-            request_bytes=request_bytes,
-            request_budget_bytes=request_budget,
-            source_history_entries=len(request.history),
-            selected_history_entries=len(request.history),
-            admitted=input_tokens <= input_budget and request_bytes <= request_budget,
+        diagnostic = _request_admission_diagnostic(
+            self._config,
+            body,
+            input_tokens=(
+                self._admission_counter.count_model_request(request)
+                if self._admission_counter is not None
+                else 0
+            ),
+            counter_version=(
+                self._admission_counter.version
+                if self._admission_counter is not None
+                else "openai-compatible-transport-bytes/1"
+            ),
+            history_entries=len(request.history),
         )
         if not diagnostic.admitted:
             raise ModelInputError(diagnostic)
@@ -235,6 +230,11 @@ class OpenAICompatibleSessionProvider:
     ) -> None:
         self._config = config
         self._transport = transport
+        self._admission_counter = (
+            OpenAICompatibleTokenCounter(config, encoding=config.context_encoding)
+            if config.context_window_tokens is not None
+            else None
+        )
 
     def token_counter(
         self, *, encoding: str, framing_tokens: int = 32
@@ -248,6 +248,7 @@ class OpenAICompatibleSessionProvider:
         """Request a JSON decision; transport and schema failures remain model failures."""
         validated = SessionRequest.model_validate(request)
         body = _session_request_body(self._config, validated)
+        self._admit(validated, body)
         payload = await self._transport.complete(body)
         try:
             content, finish_reason = _message_generation(payload)
@@ -273,6 +274,55 @@ class OpenAICompatibleSessionProvider:
                 "model response did not contain one valid JSON turn",
                 diagnostic=_content_diagnostic("schema_mismatch", content, finish_reason),
             ) from exc
+
+    def _admit(self, request: SessionRequest, body: dict[str, Any]) -> None:
+        if self._config.context_window_tokens is None and self._config.max_request_bytes is None:
+            return
+        diagnostic = _request_admission_diagnostic(
+            self._config,
+            body,
+            input_tokens=(
+                self._admission_counter.count(request) if self._admission_counter is not None else 0
+            ),
+            counter_version=(
+                self._admission_counter.version
+                if self._admission_counter is not None
+                else "openai-compatible-transport-bytes/1"
+            ),
+            history_entries=len(request.conversation.turns),
+        )
+        if not diagnostic.admitted:
+            raise ModelInputError(diagnostic)
+
+
+def _request_admission_diagnostic(
+    config: OpenAICompatibleConfig,
+    body: dict[str, Any],
+    *,
+    input_tokens: int,
+    counter_version: str,
+    history_entries: int,
+) -> ModelRequestDiagnostic:
+    """Measure the immutable transport body and apply every configured limit independently."""
+    input_budget = (
+        config.context_window_tokens - config.max_output_tokens - config.safety_tokens
+        if config.context_window_tokens is not None
+        else 2**63 - 1
+    )
+    request_budget = config.max_request_bytes or 2**63 - 1
+    request_bytes = len(json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    return ModelRequestDiagnostic(
+        counter_version=counter_version,
+        input_tokens=input_tokens,
+        input_budget_tokens=input_budget,
+        output_tokens=config.max_output_tokens,
+        safety_tokens=config.safety_tokens,
+        request_bytes=request_bytes,
+        request_budget_bytes=request_budget,
+        source_history_entries=history_entries,
+        selected_history_entries=history_entries,
+        admitted=input_tokens <= input_budget and request_bytes <= request_budget,
+    )
 
 
 class _ContentPart(BaseModel):

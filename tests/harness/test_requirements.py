@@ -16,6 +16,8 @@ from weavria.core import (
 )
 from weavria.harness import (
     EvidenceEvaluation,
+    EvidenceMatchPlan,
+    EvidenceParameterMatch,
     EvidenceResolver,
     InformationRequirement,
     NeedStatus,
@@ -98,8 +100,9 @@ class _ProgressiveExtractor:
     key = "progressive"
     version = "1"
 
-    def __init__(self, *, complete_second: bool) -> None:
+    def __init__(self, *, complete_second: bool, shared_scope: bool = False) -> None:
         self._complete_second = complete_second
+        self._shared_scope = shared_scope
 
     def supports(self, requirement: InformationRequirement, record: ToolRecord) -> bool:
         return True
@@ -121,6 +124,10 @@ class _ProgressiveExtractor:
             pointers=(pointer,),
             missing_fields=missing,
             freshness="valid",
+            scope_identity_sha256=(
+                hashlib.sha256(b"shared-object").hexdigest() if self._shared_scope else None
+            ),
+            proof_strength="semantic",
         )
 
 
@@ -149,6 +156,40 @@ class _AttributedExtractor:
         )
 
 
+class _SemanticExtractor:
+    key = "semantic"
+    version = "1"
+
+    def __init__(
+        self,
+        *,
+        result_kind: Literal["found", "empty", "not_found", "partial"] = "found",
+        scope_completeness: Literal["complete", "partial", "unknown"] = "complete",
+    ) -> None:
+        self._result_kind: Literal["found", "empty", "not_found", "partial"] = result_kind
+        self._scope_completeness: Literal["complete", "partial", "unknown"] = scope_completeness
+
+    def supports(self, requirement: InformationRequirement, record: ToolRecord) -> bool:
+        del requirement, record
+        return True
+
+    async def evaluate(
+        self,
+        requirement: InformationRequirement,
+        record: ToolRecord,
+        snapshot: ArtifactSnapshot,
+    ) -> EvidenceEvaluation:
+        del requirement, record, snapshot
+        return EvidenceEvaluation(
+            relation="supports",
+            pointers=("/value",),
+            freshness="valid",
+            proof_strength="semantic",
+            result_kind=self._result_kind,
+            scope_completeness=self._scope_completeness,
+        )
+
+
 async def test_resolver_binds_accepted_artifact_and_satisfies_structural_need() -> None:
     store, record = await _success_record()
     resolver = EvidenceResolver()
@@ -170,6 +211,88 @@ async def test_resolver_binds_accepted_artifact_and_satisfies_structural_need() 
     assert address.producer_call_id == "call-1"
     assert record.artifact is not None
     assert address.artifact_sha256 == record.artifact.sha256
+
+
+async def test_profile_match_checks_normalized_parameters_and_semantic_proof() -> None:
+    store, records = await _success_records()
+    plan = EvidenceMatchPlan(
+        plan_id="match-fetch-a",
+        producer_name="fetch",
+        producer_version="1",
+        profile_version="fetch-evidence/1",
+        surface_id="fetch.value",
+        required_fields=("/value",),
+        parameter_matches=(EvidenceParameterMatch(input_pointer="/key", allowed_values=("a",)),),
+    )
+    requirement = _requirement().model_copy(
+        update={
+            "evidence_match_plans": (plan,),
+            "minimum_proof": "scoped_semantic",
+        }
+    )
+
+    mismatched = await EvidenceResolver((_SemanticExtractor(),)).resolve(
+        work_id="work-a",
+        task_revision=1,
+        frame_revision=1,
+        requirements=(requirement,),
+        records=(records[1],),
+        read_artifact=lambda artifact_id: store.get("run-1", artifact_id),
+    )
+    structural = await EvidenceResolver().resolve(
+        work_id="work-a",
+        task_revision=1,
+        frame_revision=1,
+        requirements=(requirement,),
+        records=(records[0],),
+        read_artifact=lambda artifact_id: store.get("run-1", artifact_id),
+    )
+    semantic = await EvidenceResolver((_SemanticExtractor(),)).resolve(
+        work_id="work-a",
+        task_revision=1,
+        frame_revision=1,
+        requirements=(requirement,),
+        records=(records[0],),
+        read_artifact=lambda artifact_id: store.get("run-1", artifact_id),
+    )
+
+    assert mismatched.bindings == ()
+    assert mismatched.probes[0].reason_code == "evidence_scope_mismatch"
+    assert structural.state_for(requirement.need_id).status is NeedStatus.PARTIAL
+    assert structural.bindings[0].proof_strength == "scoped_structural"
+    assert semantic.state_for(requirement.need_id).status is NeedStatus.SATISFIED
+    assert semantic.bindings[0].proof_strength == "scoped_semantic"
+
+
+@pytest.mark.parametrize(
+    ("completion_mode", "scope_completeness", "expected"),
+    [
+        ("positive_value_required", "complete", NeedStatus.PARTIAL),
+        ("report_findings", "complete", NeedStatus.SATISFIED),
+        ("report_findings", "partial", NeedStatus.PARTIAL),
+        ("exhaust_bounded_scope", "complete", NeedStatus.SATISFIED),
+    ],
+)
+async def test_empty_result_requires_compatible_completion_mode_and_complete_scope(
+    completion_mode: Literal["positive_value_required", "report_findings", "exhaust_bounded_scope"],
+    scope_completeness: Literal["complete", "partial"],
+    expected: NeedStatus,
+) -> None:
+    store, record = await _success_record()
+    requirement = _requirement().model_copy(update={"completion_mode": completion_mode})
+
+    ledger = await EvidenceResolver(
+        (_SemanticExtractor(result_kind="empty", scope_completeness=scope_completeness),)
+    ).resolve(
+        work_id="work-a",
+        task_revision=1,
+        frame_revision=1,
+        requirements=(requirement,),
+        records=(record,),
+        read_artifact=lambda artifact_id: store.get("run-1", artifact_id),
+    )
+
+    assert ledger.state_for(requirement.need_id).status is expected
 
 
 async def test_progress_digest_advances_for_new_attributed_source_not_duplicate_call() -> None:
@@ -234,7 +357,7 @@ async def test_progress_digest_advances_for_new_attributed_source_not_duplicate_
 
 
 @pytest.mark.parametrize("complete_second", [True, False])
-async def test_resolver_reduces_progressive_evidence_from_effective_coverage(
+async def test_resolver_does_not_join_fields_across_unrelated_action_scopes(
     complete_second: bool,
 ) -> None:
     store, records = await _success_records()
@@ -252,9 +375,73 @@ async def test_resolver_reduces_progressive_evidence_from_effective_coverage(
     )
 
     state = ledger.state_for(requirement.need_id)
+    assert state.status is NeedStatus.PARTIAL
+    assert state.missing_fields
+    assert len(state.evidence_binding_ids) == 2
+
+
+async def test_resolver_joins_fields_only_with_adapter_declared_scope_identity() -> None:
+    store, records = await _success_records()
+    requirement = _requirement(required_fields=("/value", "/source_time"))
+
+    ledger = await EvidenceResolver(
+        (_ProgressiveExtractor(complete_second=False, shared_scope=True),)
+    ).resolve(
+        work_id="work-a",
+        task_revision=1,
+        frame_revision=1,
+        requirements=(requirement,),
+        records=records,
+        read_artifact=lambda artifact_id: store.get("run-1", artifact_id),
+    )
+
+    state = ledger.state_for(requirement.need_id)
     assert state.status is NeedStatus.SATISFIED
     assert state.missing_fields == ()
-    assert len(state.evidence_binding_ids) == 2
+
+
+async def test_profile_surfaces_require_one_shared_scope_before_cross_plan_join() -> None:
+    store, records = await _success_records()
+    plans = tuple(
+        EvidenceMatchPlan(
+            plan_id=f"match-{key}",
+            producer_name="fetch",
+            producer_version="1",
+            profile_version="fetch-evidence/1",
+            surface_id=f"fetch.{key}",
+            required_fields=(pointer,),
+            parameter_matches=(
+                EvidenceParameterMatch(input_pointer="/key", allowed_values=(key,)),
+            ),
+        )
+        for key, pointer in (("a", "/value"), ("b", "/source_time"))
+    )
+    requirement = _requirement(required_fields=("/value", "/source_time")).model_copy(
+        update={"evidence_match_plans": plans, "minimum_proof": "scoped_semantic"}
+    )
+
+    unrelated = await EvidenceResolver((_ProgressiveExtractor(complete_second=False),)).resolve(
+        work_id="work-a",
+        task_revision=1,
+        frame_revision=1,
+        requirements=(requirement,),
+        records=records,
+        read_artifact=lambda artifact_id: store.get("run-1", artifact_id),
+    )
+    joined = await EvidenceResolver(
+        (_ProgressiveExtractor(complete_second=False, shared_scope=True),)
+    ).resolve(
+        work_id="work-a",
+        task_revision=1,
+        frame_revision=1,
+        requirements=(requirement,),
+        records=records,
+        read_artifact=lambda artifact_id: store.get("run-1", artifact_id),
+    )
+
+    assert unrelated.state_for(requirement.need_id).status is NeedStatus.PARTIAL
+    assert unrelated.state_for(requirement.need_id).missing_fields == ("$scope",)
+    assert joined.state_for(requirement.need_id).status is NeedStatus.SATISFIED
 
 
 async def test_resolver_preserves_partial_fields_and_retryable_failures() -> None:
@@ -352,7 +539,7 @@ def test_v1_need_ledger_is_explicitly_upcast_without_inventing_probes() -> None:
 
     ledger = load_need_ledger(legacy)
 
-    assert ledger.schema_version == 2
+    assert ledger.schema_version == 3
     assert ledger.probes == ()
     legacy_progress: list[dict[str, object]] = [
         {
@@ -428,7 +615,7 @@ async def test_current_data_is_not_claimed_fresh_by_structural_coverage() -> Non
     assert "$freshness" in ledger.state_for("need-a").missing_fields
 
 
-async def test_progress_digest_ignores_duplicate_partial_artifact_identities() -> None:
+async def test_progress_digest_advances_for_a_new_structural_query_scope() -> None:
     store, records = await _success_records()
     resolver = EvidenceResolver()
     requirement = _requirement(freshness="current")
@@ -452,7 +639,7 @@ async def test_progress_digest_ignores_duplicate_partial_artifact_identities() -
 
     assert duplicate_partial.evidence_revision == first.evidence_revision + 1
     assert len(duplicate_partial.bindings) == 2
-    assert duplicate_partial.progress_sha256() == first.progress_sha256()
+    assert duplicate_partial.progress_sha256() != first.progress_sha256()
 
 
 async def test_domain_extractor_can_report_contradiction_without_changing_core_rules() -> None:

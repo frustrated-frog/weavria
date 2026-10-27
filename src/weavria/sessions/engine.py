@@ -59,6 +59,7 @@ from weavria.core import (
 )
 from weavria.models import ModelCapabilities, SessionModelProvider
 from weavria.runtime import (
+    ActionInterventionPolicyFactory,
     AgentLoop,
     Clock,
     CompletionPolicy,
@@ -608,6 +609,7 @@ class SessionEngine:
         clarification_association: ClarificationAssociationPolicy | None = None,
         clarification_timeout_seconds: float | None = 86_400.0,
         progress_factory: ProgressPolicyFactory | None = None,
+        intervention_factory: ActionInterventionPolicyFactory | None = None,
         context_compiler: ContextCompilerConfig | None = None,
         token_counter: SessionTokenCounter | None = None,
         history_retrieval: HistoryRetrievalConfig | None = None,
@@ -692,6 +694,7 @@ class SessionEngine:
         self._clarification_association = clarification_association or ExplicitClarificationOnly()
         self._clarification_timeout = clarification_timeout_seconds
         self._progress_factory = progress_factory
+        self._intervention_factory = intervention_factory
         self._tasks: set[asyncio.Task[object]] = set()
         self._loops: dict[str, AgentLoop] = {}
         self._run_tasks: dict[str, asyncio.Task[object]] = {}
@@ -791,6 +794,11 @@ class SessionEngine:
                     "progress_policy_version": (
                         self._progress_factory.version
                         if self._progress_factory is not None
+                        else "agent-loop-default/1"
+                    ),
+                    "action_intervention_policy_version": (
+                        self._intervention_factory.version
+                        if self._intervention_factory is not None
                         else "agent-loop-default/1"
                     ),
                     "progress_assessment_version": getattr(
@@ -1005,6 +1013,11 @@ class SessionEngine:
                 progress=(
                     self._progress_factory.create(registry)
                     if self._progress_factory is not None
+                    else None
+                ),
+                intervention=(
+                    self._intervention_factory.create(registry)
+                    if self._intervention_factory is not None
                     else None
                 ),
                 progress_assessor=adapter,

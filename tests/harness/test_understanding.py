@@ -959,6 +959,11 @@ async def test_frame_revision_preserves_need_identity_and_rejects_stale_patch() 
     assert second.record.frame.revision == 2
     assert second.record.frame.capability_epoch == first.record.frame.capability_epoch
     assert second.record.frame.requirements[0].need_id == first.record.frame.requirements[0].need_id
+    assert any(
+        constraint.startswith("Accepted prior interpretation / active Work state")
+        and first.record.frame.specification.goal in constraint
+        for constraint in model.requests[1].task.constraints
+    )
     assert (
         second.record.frame.requirements[0].origin_ref
         == first.record.frame.requirements[0].origin_ref

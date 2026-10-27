@@ -23,6 +23,7 @@ class ErrorCategory(StrEnum):
     EVENT_SINK_FAILURE = "event_sink_failure"
     CONTEXT_BUDGET_EXCEEDED = "context_budget_exceeded"
     NO_PROGRESS = "no_progress"
+    COMPLETION_REJECTED = "completion_rejected"
 
 
 class ModelOutputDiagnostic(ContractModel):

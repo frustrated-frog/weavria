@@ -1,16 +1,22 @@
 """Typed release-dossier capability and application-owned evidence semantics."""
 
+import hashlib
+import json
 from datetime import datetime, timedelta
 from typing import Literal
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, JsonValue, field_validator
 
-from weavria.core import ErrorCategory, FeedbackBounds
+from weavria.artifacts import ArtifactSnapshot
+from weavria.core import ErrorCategory, FeedbackBounds, ToolRecord
 from weavria.harness import (
     CapabilityDescriptor,
     CapabilityEvidenceProfile,
+    EvidenceEvaluation,
     EvidenceParameterConstraint,
     EvidenceSurface,
+    InformationRequirement,
+    StructuralEvidenceExtractor,
 )
 from weavria.tools import (
     PolicyDecision,
@@ -150,6 +156,43 @@ class ReleaseDossierDiscoveryPolicy:
             and descriptor.risk == "low"
             and not descriptor.approval_required
             and descriptor.sensitivity == "private"
+        )
+
+
+class ReleaseDossierEvidenceExtractor:
+    """Prove facet applicability and immutable dossier scope at the application boundary."""
+
+    key = "release-dossier"
+    version = "1"
+
+    def __init__(self) -> None:
+        self._structural = StructuralEvidenceExtractor()
+
+    def supports(self, requirement: InformationRequirement, record: ToolRecord) -> bool:
+        del requirement
+        return record.exchange.action.tool_name == "read_release_dossier"
+
+    async def evaluate(
+        self,
+        requirement: InformationRequirement,
+        record: ToolRecord,
+        snapshot: ArtifactSnapshot,
+    ) -> EvidenceEvaluation:
+        structural = await self._structural.evaluate(requirement, record, snapshot)
+        output = ReleaseDossierOutput.model_validate_json(
+            json.dumps(snapshot.value, ensure_ascii=False, separators=(",", ":"))
+        )
+        identity = hashlib.sha256(output.source_id.encode()).hexdigest()
+        return EvidenceEvaluation(
+            relation=structural.relation,
+            pointers=structural.pointers,
+            missing_fields=structural.missing_fields,
+            freshness="valid",
+            source_identity_sha256=identity,
+            scope_identity_sha256=identity,
+            proof_strength="semantic",
+            result_kind=structural.result_kind,
+            scope_completeness="complete",
         )
 
 

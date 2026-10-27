@@ -12,6 +12,7 @@ from weavria.core import (
     CompletionAccept,
     CompletionAssessment,
     CompletionDecision,
+    CompletionRepair,
     CompletionUnverifiable,
     ErrorCategory,
     FinishAction,
@@ -134,20 +135,27 @@ class NoVerification:
 
 
 class LayeredCompletionPolicy:
-    """Enforce host invariants before allowing an application policy to add constraints."""
+    """Compose verification with publication checks without letting uncertainty bypass either."""
 
     def __init__(self, required: CompletionPolicy, extension: CompletionPolicy) -> None:
         self._required = required
         self._extension = extension
-        self.version = f"layered/1[{required.version};{extension.version}]"
+        self.version = f"layered/2[{required.version};{extension.version}]"
 
     async def verify(self, context: CompletionContext) -> CompletionDecision:
         adapter = TypeAdapter[CompletionDecision](CompletionDecision)
         required = adapter.validate_python(await self._required.verify(context))
-        if not isinstance(required, CompletionAccept):
+        # A repair rejects the candidate, so no publication can occur on this attempt.
+        # Unverifiable is different: the candidate may still be published and therefore
+        # must pass every extension constraint such as redaction and source markers.
+        if isinstance(required, CompletionRepair):
             return required
         extension = adapter.validate_python(await self._extension.verify(context))
-        if not isinstance(extension, CompletionAccept):
+        if isinstance(extension, CompletionRepair):
+            return extension
+        if isinstance(required, CompletionUnverifiable):
+            return required
+        if isinstance(extension, CompletionUnverifiable):
             return extension
         outcome = (
             "verified"

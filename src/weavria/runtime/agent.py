@@ -43,7 +43,6 @@ from weavria.core import (
     CompletionChecked,
     CompletionDiscarded,
     CompletionRepair,
-    CompletionUnverifiable,
     ContextCompilation,
     ContextSelected,
     ControlData,
@@ -194,6 +193,20 @@ class _NoProgressExhausted(RuntimeError):
     """The model repeated a semantically unchanged action after bounded feedback."""
 
 
+class _AdmissionReplanExhausted(RuntimeError):
+    """Hard admission failures did not converge within the bounded replan budget."""
+
+    def __init__(
+        self, reason: Literal["feedback_budget", "tool_budget", "capability_view"]
+    ) -> None:
+        self.reason = reason
+        super().__init__(reason)
+
+
+class _CompletionRepairStalled(RuntimeError):
+    """A rejected completion candidate remained invalid at an unchanged evidence frontier."""
+
+
 class _InterventionExhausted(RuntimeError):
     """The model repeatedly ignored a progress-bound reconsideration."""
 
@@ -213,6 +226,7 @@ class RunLimits:
     max_model_output_repairs: int = 2
     max_intervention_reconsiderations: int = 2
     max_no_progress_rejections: int = 2
+    max_admission_replans: int = 8
     max_stagnant_actions_per_family: int = 3
 
     def __post_init__(self) -> None:
@@ -230,6 +244,8 @@ class RunLimits:
             raise ValueError("intervention reconsideration limit must be a positive integer")
         if type(self.max_no_progress_rejections) is not int or self.max_no_progress_rejections < 1:
             raise ValueError("no-progress rejection limit must be a positive integer")
+        if type(self.max_admission_replans) is not int or self.max_admission_replans < 1:
+            raise ValueError("admission replan limit must be a positive integer")
         if (
             type(self.max_stagnant_actions_per_family) is not int
             or self.max_stagnant_actions_per_family < 1
@@ -411,6 +427,8 @@ class _AgentKernel:
         )
         self._rejection_repetitions = 0
         self._rejection_frontier: str | None = None
+        self._rejection_task_revision: int | None = None
+        self._admission_replans = 0
         self._events_json: list[str] = []
         self._plans: list[EvidencePlan | TurnEvidencePlan | ControlEvidencePlan] = []
         self._state: RunState | None = None
@@ -738,6 +756,35 @@ class _AgentKernel:
                     if exc.error.category is ErrorCategory.TIMEOUT
                     else "completion_failure",
                     error=exc.error,
+                )
+            if isinstance(exc, _CompletionRepairStalled):
+                return await self._end(
+                    RunStatus.FAILED,
+                    "completion_repair_stalled",
+                    error=RunError(
+                        category=ErrorCategory.COMPLETION_REJECTED,
+                        message=("Completion candidate remained invalid after bounded correction"),
+                    ),
+                )
+            if isinstance(exc, _AdmissionReplanExhausted):
+                category = (
+                    ErrorCategory.CONTEXT_BUDGET_EXCEEDED
+                    if exc.reason == "feedback_budget"
+                    else ErrorCategory.POLICY_DENIED
+                    if exc.reason == "capability_view"
+                    else ErrorCategory.NO_PROGRESS
+                )
+                message = (
+                    "Model proposals repeatedly exceeded the feedback context budget"
+                    if exc.reason == "feedback_budget"
+                    else "Model proposals remained outside the active capability view"
+                    if exc.reason == "capability_view"
+                    else "Model proposals repeatedly exceeded the remaining tool-call budget"
+                )
+                return await self._end(
+                    RunStatus.FAILED,
+                    "admission_replan_exhausted",
+                    error=RunError(category=category, message=message),
                 )
             if isinstance(exc, _NoProgressExhausted):
                 return await self._end(
@@ -1378,19 +1425,58 @@ class _AgentKernel:
                 self._feedback_reserve_floor = max(
                     self._feedback_reserve_floor, reservation.required_bytes
                 )
-            rejection_frontier = (
-                progress.fingerprint_sha256
-                if reason == "no_progress" and progress is not None
-                else hashlib.sha256(
-                    (f"{revision}:{reason}:{action_value_context.value_key_sha256}").encode()
-                ).hexdigest()
-            )
+            if self._rejection_task_revision != revision:
+                self._rejection_task_revision = revision
+                self._rejection_frontier = None
+                self._rejection_repetitions = 0
+                self._admission_replans = 0
+            if reason == "no_progress" and progress is not None:
+                rejection_state: object = {
+                    "reason": reason,
+                    "semantic_frontier": progress.fingerprint_sha256,
+                    "progress_reason": progress.reason,
+                    "canonical_action": progress.canonical_tool_key_sha256,
+                    "action_family": progress.action_family_sha256,
+                }
+            elif reason == "feedback_budget":
+                rejection_state = {
+                    "reason": reason,
+                    "deficit_bytes": max(0, reservation.required_bytes - reservation.budget_bytes),
+                    "required_bytes": reservation.required_bytes,
+                    "budget_bytes": reservation.budget_bytes,
+                    "proposed_calls": len(batch.calls),
+                }
+            elif reason == "tool_budget":
+                rejection_state = {
+                    "reason": reason,
+                    "deficit_calls": max(0, len(batch.calls) - remaining),
+                    "remaining_calls": remaining,
+                    "proposed_calls": len(batch.calls),
+                }
+            else:
+                rejection_state = {
+                    "reason": reason,
+                    "capability_epoch": capability_epoch,
+                    "invalid_tools": sorted(
+                        {call.tool_name for call in batch.calls if call.tool_name not in visible}
+                    ),
+                }
+            rejection_frontier = hashlib.sha256(
+                json.dumps(
+                    {"task_revision": revision, "state": rejection_state},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+            ).hexdigest()
             if self._rejection_frontier != rejection_frontier:
                 self._rejection_frontier = rejection_frontier
                 self._rejection_repetitions = 0
             self._rejection_repetitions += 1
-            if self._rejection_repetitions > self._limits.max_no_progress_rejections:
-                raise _NoProgressExhausted
+            self._admission_replans += 1
+            frontier_exhausted = (
+                self._rejection_repetitions > self._limits.max_no_progress_rejections
+            )
+            replan_exhausted = self._admission_replans > self._limits.max_admission_replans
             await self._accept(
                 BatchRejected(
                     notice=AdmissionNotice(
@@ -1433,6 +1519,10 @@ class _AgentKernel:
                 ),
                 expected_revision=revision,
             )
+            if frontier_exhausted or replan_exhausted:
+                if reason == "no_progress":
+                    raise _NoProgressExhausted
+                raise _AdmissionReplanExhausted(reason)
             return False, progress.action_identities if progress is not None else ()
         accepted = await self._accept(
             BatchAdmitted(
@@ -1453,6 +1543,8 @@ class _AgentKernel:
             self._feedback_reserve_revision = None
             self._rejection_frontier = None
             self._rejection_repetitions = 0
+            self._rejection_task_revision = None
+            self._admission_replans = 0
             self._progress.record_admission(progress)
         return accepted, progress.action_identities if progress is not None else ()
 
@@ -1490,21 +1582,21 @@ class _AgentKernel:
         if self.state.task.revision != task.revision:
             await self._accept(CompletionDiscarded())
             return None
+        repair_stalled = False
         if isinstance(assessment.decision, CompletionRepair):
             repair_sha256 = completion_repair_sha256(assessment.decision)
             frontier_sha256 = completion_frontier_sha256(self.state)
-            if (
+            repair_stalled = (
                 self.state.last_completion_repair_sha256 == repair_sha256
                 and self.state.last_completion_frontier_sha256 == frontier_sha256
-            ):
-                assessment = assessment.model_copy(
-                    update={"decision": CompletionUnverifiable(reason="completion_repair_stalled")}
-                )
+            )
         if not await self._accept(
             CompletionChecked(assessment=assessment), expected_revision=task.revision
         ):
             await self._accept(CompletionDiscarded())
             return None
+        if repair_stalled:
+            raise _CompletionRepairStalled
         return assessment
 
     async def _assess_progress(self, revision: int) -> ProgressAssessment | None:

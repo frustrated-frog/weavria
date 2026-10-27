@@ -860,12 +860,58 @@ async def test_repeated_identical_hard_rejection_stops_before_model_budget_exhau
     result = await agent.execute()
 
     assert result.status is RunStatus.FAILED
-    assert result.error is not None and result.error.category is ErrorCategory.NO_PROGRESS
+    assert (
+        result.error is not None and result.error.category is ErrorCategory.CONTEXT_BUDGET_EXCEEDED
+    )
     assert agent.state.model_calls == 3
     assert agent.state.tool_calls == 0
     rejected = [event.data for event in agent.events if isinstance(event.data, BatchRejected)]
-    assert len(rejected) == 2
+    assert len(rejected) == 3
     assert all(event.notice.reason == "feedback_budget" for event in rejected)
+    assert isinstance(agent.events[-1].data, RunEnded)
+    assert agent.events[-1].data.reason == "admission_replan_exhausted"
+    replay(agent)
+
+
+async def test_feedback_rejection_recognizes_bounded_capacity_improvement() -> None:
+    small = call("accepted", "x" * 50)
+    budget = reserve_feedback(
+        instructions=await sizing_instructions(),
+        task=TaskInput(goal="Read and report the value"),
+        records=(),
+        batch=ToolBatch(calls=(small,)),
+        bounds=FeedbackBounds(),
+        budget_bytes=99_999,
+    ).required_bytes
+    provider = FakeControlProvider(
+        (
+            batch(call("shrink-1", "x" * 4000)),
+            batch(call("shrink-2", "x" * 3000)),
+            batch(call("shrink-3", "x" * 2000)),
+            batch(small),
+            finish(),
+        )
+    )
+    agent = make_loop(
+        provider,
+        limits=RunLimits(
+            max_model_calls=8,
+            max_request_bytes=budget,
+            max_no_progress_rejections=1,
+            max_admission_replans=4,
+        ),
+    )
+
+    result = await agent.execute()
+
+    assert result.status is RunStatus.COMPLETED
+    rejected = [event.data for event in agent.events if isinstance(event.data, BatchRejected)]
+    assert len(rejected) == 3
+    deficits = [event.notice.required_bytes - event.notice.budget_bytes for event in rejected]
+    assert deficits == sorted(deficits, reverse=True)
+    assert len(set(deficits)) == 3
+    started = [event.data.call_id for event in agent.events if isinstance(event.data, ToolStarted)]
+    assert started == ["accepted"]
     replay(agent)
 
 
@@ -2341,20 +2387,22 @@ async def test_unverifiable_is_distinct_from_verified_and_retains_explanation() 
     replay(agent)
 
 
-async def test_repeated_unsatisfied_finish_without_new_evidence_converges_unverifiable() -> None:
+async def test_repeated_unsatisfied_finish_without_new_evidence_fails_closed() -> None:
     agent = make_loop(
         FakeControlProvider((batch(call("source")), finish("bad"), finish("still bad"))),
         completion=ValueVerifier(),
         limits=RunLimits(max_completion_repairs=1),
     )
     result = await agent.execute()
-    assert result.status is RunStatus.COMPLETED and result.output == "still bad"
-    assert result.task_outcome == "unverifiable" and result.assessment is not None
-    assert isinstance(result.assessment.decision, CompletionUnverifiable)
-    assert result.assessment.decision.reason == "completion_repair_stalled"
+    assert result.status is RunStatus.FAILED and result.output is None
+    assert result.error is not None
+    assert result.error.category is ErrorCategory.COMPLETION_REJECTED
+    assert result.task_outcome == "unverified" and result.assessment is None
+    checks = [event.data for event in agent.events if isinstance(event.data, CompletionChecked)]
+    assert [check.assessment.decision.kind for check in checks] == ["repair", "repair"]
     assert (
         isinstance(agent.events[-1].data, RunEnded)
-        and agent.events[-1].data.reason == "completion_checked"
+        and agent.events[-1].data.reason == "completion_repair_stalled"
     )
     replay(agent)
 

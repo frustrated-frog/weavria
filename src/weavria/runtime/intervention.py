@@ -21,6 +21,7 @@ from weavria.core import (
     TaskInput,
     ToolBatch,
 )
+from weavria.tools import ToolRegistry
 
 ACTION_VALUE_LEDGER_VERSION = "bayesian-action-value-ledger/2"
 
@@ -255,6 +256,15 @@ class ActionInterventionPolicy(Protocol):
     def version(self) -> str: ...
 
     async def evaluate(self, context: ActionInterventionContext) -> InterventionDecision: ...
+
+
+class ActionInterventionPolicyFactory(Protocol):
+    """Create isolated intervention policy state for one persistent Session Run."""
+
+    @property
+    def version(self) -> str: ...
+
+    def create(self, tools: ToolRegistry) -> ActionInterventionPolicy: ...
 
 
 class ProgressActionInterventionPolicy:

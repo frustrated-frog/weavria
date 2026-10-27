@@ -355,6 +355,7 @@ async def test_session_api_executes_real_runtime_and_reports_tool_trace(
         "max_model_output_repairs": 2,
         "max_intervention_reconsiderations": 2,
         "max_no_progress_rejections": 2,
+        "max_admission_replans": 8,
         "max_stagnant_actions_per_family": 3,
     }
     await market_http.aclose()

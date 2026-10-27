@@ -3,6 +3,7 @@
 from .dossier import (
     ReleaseDossier,
     ReleaseDossierDiscoveryPolicy,
+    ReleaseDossierEvidenceExtractor,
     ReleaseDossierInput,
     ReleaseDossierOutput,
     ReleaseDossierPolicy,
@@ -27,6 +28,7 @@ __all__ = [
     "ReleaseAnswerGrade",
     "ReleaseDossier",
     "ReleaseDossierDiscoveryPolicy",
+    "ReleaseDossierEvidenceExtractor",
     "ReleaseDossierInput",
     "ReleaseDossierOutput",
     "ReleaseDossierPolicy",

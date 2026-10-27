@@ -158,6 +158,9 @@ def create_app(
             model=resolved.model_name,
             max_output_tokens=resolved.model_max_output_tokens,
             json_mode=resolved.json_mode,
+            context_window_tokens=resolved.context_window_tokens,
+            context_encoding=resolved.context_encoding,
+            max_request_bytes=resolved.run_max_request_bytes,
         )
         understanding_model_config = OpenAICompatibleConfig(
             model=resolved.model_name,
