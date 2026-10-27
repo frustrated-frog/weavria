@@ -64,6 +64,7 @@ from weavria.runtime import (
     Clock,
     CompletionPolicy,
     EventAcceptanceError,
+    FinalizationPolicy,
     JournalCommitError,
     LayeredCompletionPolicy,
     ProgressPolicyFactory,
@@ -599,6 +600,7 @@ class SessionEngine:
         max_request_duration: float | None = None,
         scheduling: ToolScheduling | None = None,
         completion: CompletionPolicy | None = None,
+        finalization: FinalizationPolicy | None = None,
         policy: ToolPolicy | None = None,
         mode: EvidenceMode = EvidenceMode.RELEVANT,
         history_budget_bytes: int = 5000,
@@ -685,6 +687,9 @@ class SessionEngine:
             else completion
             if completion is not None
             else prepared_completion
+        )
+        self._finalization = finalization or cast(
+            FinalizationPolicy | None, getattr(task_preparation, "finalization_policy", None)
         )
         self._policy, self._mode = policy, mode
         self._history_budget, self._history_mode = history_budget_bytes, history_mode
@@ -783,6 +788,9 @@ class SessionEngine:
                     "history_mode": self._history_mode.value,
                     "instructions": self._instructions,
                     "tools": [d.model_dump(mode="json") for d in self._tools.descriptors],
+                    "finalization_version": self._finalization.version
+                    if self._finalization is not None
+                    else "none/1",
                     "completion_version": self._completion.version
                     if self._completion
                     else "none/1",
@@ -1004,6 +1012,7 @@ class SessionEngine:
                 limits=run_limits,
                 scheduling=self._scheduling,
                 completion=self._completion,
+                finalization=self._finalization,
                 policy=self._policy,
                 mode=self._mode,
                 clock=self._clock,

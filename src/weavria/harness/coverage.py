@@ -12,8 +12,10 @@ from pydantic import (
     ConfigDict,
     Field,
     JsonValue,
+    SerializerFunctionWrapHandler,
     StringConstraints,
     ValidationError,
+    model_serializer,
     model_validator,
 )
 
@@ -28,6 +30,8 @@ from weavria.core import (
     ToolCallAction,
 )
 from weavria.models import ModelCallError, ModelProvider, call_model
+
+from .targets import EvidenceTargetRule, TargetedContract
 
 if TYPE_CHECKING:
     from .understanding import CapabilityView, TaskSpecification, TaskUnderstandingInput
@@ -78,7 +82,7 @@ class EvidenceParameterConstraint(_CoverageContract):
         return self
 
 
-class EvidenceSurface(_CoverageContract):
+class EvidenceSurface(TargetedContract):
     """One versioned semantic fact family exposed by a capability adapter."""
 
     surface_id: _Identifier
@@ -86,9 +90,22 @@ class EvidenceSurface(_CoverageContract):
     demand_policy: Literal["broad_or_explicit", "explicit_only"] = "explicit_only"
     required_fields: tuple[str, ...] = Field(min_length=1, max_length=16)
     parameter_constraints: tuple[EvidenceParameterConstraint, ...] = Field(default=(), max_length=8)
+    schema_version: Literal[1, 2] = 1
+    target_rules: tuple[EvidenceTargetRule, ...] = Field(default=(), max_length=8)
+
+    @model_serializer(mode="wrap")
+    def preserve_v1_wire(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        data = handler(self)
+        if self.schema_version == 1:
+            data.pop("target_rules", None)
+        return data
 
     @model_validator(mode="after")
     def validate_surface(self) -> Self:
+        if self.target_rules and self.schema_version != 2:
+            raise ValueError("target rules require EvidenceSurface v2")
+        if len({rule.key for rule in self.target_rules}) != len(self.target_rules):
+            raise ValueError("evidence target keys must be unique")
         if len(set(self.required_fields)) != len(self.required_fields):
             raise ValueError("evidence-surface fields must be unique")
         if any(pointer and not pointer.startswith("/") for pointer in self.required_fields):

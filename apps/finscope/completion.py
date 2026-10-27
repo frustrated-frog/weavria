@@ -192,7 +192,7 @@ def _identity(value: str) -> str:
 class FinScopeAnswerPolicy:
     """Require provenance for FinScope reads and quality disclosure for market snapshots."""
 
-    version = "finscope-answer/3"
+    version = "finscope-answer/4"
 
     async def verify(
         self, context: CompletionContext
@@ -271,7 +271,12 @@ class FinScopeAnswerPolicy:
         if missing_markers:
             return CompletionRepair(
                 issue_codes=("missing_source_marker",),
-                guidance="Include every exact source marker used: " + " ".join(missing_markers),
+                # Source IDs remain complete in the accepted Artifacts read by this
+                # check. Keep the control channel bounded without truncating a marker.
+                guidance=(
+                    "Add the missing exact [来源:source_id] markers. Read source_id values "
+                    "from the accepted FinScope results; do not invent or truncate them."
+                ),
             )
         if market_sources and "数据质量" not in answer:
             return CompletionRepair(

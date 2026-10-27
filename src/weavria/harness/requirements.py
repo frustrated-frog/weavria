@@ -6,11 +6,22 @@ from collections.abc import Awaitable, Callable, Mapping
 from enum import StrEnum
 from typing import Annotated, Literal, Protocol, Self
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, StringConstraints, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    JsonValue,
+    SerializerFunctionWrapHandler,
+    StringConstraints,
+    model_serializer,
+    model_validator,
+)
 
 from weavria.artifacts import ArtifactSnapshot
 from weavria.core import ErrorCategory, ToolFailedObservation, ToolRecord
 from weavria.tools import resolve_pointer
+
+from .targets import EvidenceTargetBinding, TargetedContract, same_target_value
 
 _Identifier = Annotated[
     str,
@@ -64,7 +75,7 @@ class EvidenceParameterMatch(_SemanticContract):
         return self
 
 
-class EvidenceMatchPlan(_SemanticContract):
+class EvidenceMatchPlan(TargetedContract):
     """Executable applicability contract derived from a trusted capability profile."""
 
     plan_id: _Identifier
@@ -75,9 +86,20 @@ class EvidenceMatchPlan(_SemanticContract):
     required_fields: tuple[str, ...] = Field(min_length=1, max_length=16)
     parameter_matches: tuple[EvidenceParameterMatch, ...] = Field(default=(), max_length=8)
     minimum_proof: Literal["scoped_semantic"] = "scoped_semantic"
+    schema_version: Literal[1, 2] = 1
+    target_bindings: tuple[EvidenceTargetBinding, ...] = Field(default=(), max_length=8)
+
+    @model_serializer(mode="wrap")
+    def preserve_v1_wire(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        data = handler(self)
+        if self.schema_version == 1:
+            data.pop("target_bindings", None)
+        return data
 
     @model_validator(mode="after")
     def validate_plan(self) -> Self:
+        if self.target_bindings and self.schema_version != 2:
+            raise ValueError("target bindings require EvidenceMatchPlan v2")
         if len(set(self.required_fields)) != len(self.required_fields):
             raise ValueError("evidence match fields must be unique")
         if any(pointer and not pointer.startswith("/") for pointer in self.required_fields):
@@ -105,6 +127,20 @@ class InformationRequirement(_SemanticContract):
     minimum_proof: Literal["structural", "semantic", "scoped_semantic"] = "structural"
     depends_on: tuple[_Identifier, ...] = Field(default=(), max_length=16)
     origin_ref: _Identifier
+
+    def covered_by(self, bindings: tuple["EvidenceBinding", ...]) -> bool:
+        """Apply this requirement's scope, proof and result contract to selected evidence."""
+        return _scope_coverage(
+            self,
+            [
+                binding
+                for binding in bindings
+                if binding.need_id == self.need_id
+                and binding.relation in {"supports", "partially_supports"}
+                and binding.freshness != "stale"
+                and _proof_at_least(binding.proof_strength, self.minimum_proof)
+            ],
+        )[0]
 
     @model_validator(mode="after")
     def validate_requirement(self) -> Self:
@@ -553,7 +589,7 @@ class EvidenceResolver:
                 tool_name = record.exchange.action.tool_name
                 if tool_name not in requirement.capability_names:
                     continue
-                matched_plans = _matching_plans(requirement, record)
+                matched_plans = _matching_plans(requirement, record, task_revision)
                 if requirement.evidence_match_plans and not matched_plans:
                     requirement_probes.append(
                         _probe(
@@ -605,6 +641,24 @@ class EvidenceResolver:
                         )
                     continue
                 snapshot = await read_artifact(record.artifact.artifact_id)
+                verified_plans: list[EvidenceMatchPlan | None] = []
+                for plan in applicable_plans:
+                    if plan is not None and not _result_targets_match(plan, snapshot.value):
+                        requirement_probes.append(
+                            _probe(
+                                requirement=requirement,
+                                record=record,
+                                status="schema_mismatch",
+                                reason_code="evidence_target_mismatch",
+                                match_plan_id=plan.plan_id,
+                                attempt_identity_sha256=_attempt_identity(record, plan),
+                            )
+                        )
+                        continue
+                    verified_plans.append(plan)
+                applicable_plans = tuple(verified_plans)
+                if not applicable_plans:
+                    continue
                 extractor = next(
                     (
                         candidate
@@ -714,7 +768,13 @@ class EvidenceResolver:
                 else:
                     prior_ids = set(prior_state.evidence_binding_ids)
                     current_binding_ids = {binding.binding_id for binding in requirement_bindings}
-                    plan_ids = {plan.plan_id for plan in requirement.evidence_match_plans}
+                    plan_ids = {
+                        plan.plan_id
+                        for plan in requirement.evidence_match_plans
+                        if all(
+                            target.task_revision == task_revision for target in plan.target_bindings
+                        )
+                    }
                     requirement_bindings.extend(
                         binding
                         for binding in previous.bindings
@@ -805,6 +865,7 @@ def _probe_result(
 def _matching_plans(
     requirement: InformationRequirement,
     record: ToolRecord,
+    task_revision: int,
 ) -> tuple[EvidenceMatchPlan, ...]:
     if not requirement.evidence_match_plans:
         return ()
@@ -822,9 +883,32 @@ def _matching_plans(
         if all(
             _parameter_matches(authorization.normalized_arguments, selector)
             for selector in plan.parameter_matches
+        ) and all(
+            target.task_revision == task_revision
+            and _target_input_matches(authorization.normalized_arguments, target)
+            for target in plan.target_bindings
         ):
             matched.append(plan)
     return tuple(matched)
+
+
+def _target_input_matches(arguments: dict[str, JsonValue], target: EvidenceTargetBinding) -> bool:
+    try:
+        value = resolve_pointer(arguments, target.input_pointer)
+    except (KeyError, IndexError, ValueError):
+        return False
+    return any(same_target_value(value, expected) for expected in target.input_values)
+
+
+def _result_targets_match(plan: EvidenceMatchPlan, value: JsonValue) -> bool:
+    for target in plan.target_bindings:
+        try:
+            actual = resolve_pointer(value, target.output_pointer)
+        except (KeyError, IndexError, ValueError):
+            return False
+        if not same_target_value(actual, target.canonical_value):
+            return False
+    return True
 
 
 def _parameter_matches(arguments: dict[str, JsonValue], selector: EvidenceParameterMatch) -> bool:

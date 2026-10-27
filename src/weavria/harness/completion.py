@@ -64,7 +64,7 @@ class CandidateAnswerVerifier(Protocol):
 class TaskCompletionEvaluator:
     """Evaluate declared obligations without trusting model claims of completion."""
 
-    version = "task-obligations/7"
+    version = "task-obligations/8"
 
     def __init__(
         self,
@@ -184,6 +184,45 @@ class TaskCompletionEvaluator:
             item for item in required_states if item.status is not NeedStatus.SATISFIED
         )
         if incomplete:
+            if context.finalization is not None and context.finalization.mode == "limited":
+                if any(
+                    obligation.required
+                    and obligation.kind == "capability_result"
+                    and not obligation.need_ids
+                    and any(
+                        verdict.obligation_id == obligation.obligation_id
+                        and verdict.result == "unsatisfied"
+                        for verdict in verdicts
+                    )
+                    for obligation in frame.obligations
+                ):
+                    return CompletionEvaluation(
+                        disposition="repair",
+                        verdicts=verdicts,
+                        outcome="unverifiable",
+                        reason_code="missing_capability_result",
+                        next_required_actions=("The required action has not completed",),
+                    )
+                if (
+                    self._answer is not None
+                    and await self._answer.verify_answer(context, frame, ledger) == "reject"
+                ):
+                    return CompletionEvaluation(
+                        disposition="repair",
+                        verdicts=verdicts,
+                        outcome="unverifiable",
+                        reason_code="answer_verification_rejected",
+                        next_required_actions=(
+                            "Correct the candidate against the accepted evidence",
+                        ),
+                    )
+                return CompletionEvaluation(
+                    disposition="degraded_answer",
+                    verdicts=verdicts,
+                    outcome="unverifiable",
+                    reason_code="finalization_incomplete_evidence",
+                    next_required_actions=("Explain the remaining evidence limitations",),
+                )
             retryable = any(item.can_retry for item in incomplete)
             terminal_paths = all(
                 item.acquisition_status in {"unavailable", "contract_gap"} for item in incomplete
@@ -256,10 +295,12 @@ class TaskCompletionEvaluator:
 class TaskObligationCompletionPolicy:
     """Map rich obligation evaluation onto the Runtime v3 completion protocol."""
 
-    version = "task-obligation-completion/3"
-
     def __init__(self, evaluator: TaskCompletionEvaluator | None = None) -> None:
         self._evaluator = evaluator or TaskCompletionEvaluator()
+
+    @property
+    def version(self) -> str:
+        return f"task-obligation-completion/4[{self._evaluator.version}]"
 
     async def verify(self, context: CompletionContext) -> CompletionDecision:
         evaluation = await self._evaluator.evaluate(context)

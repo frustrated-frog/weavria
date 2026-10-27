@@ -3062,3 +3062,62 @@ async def test_full_fallback_keeps_latest_complete_feedback_when_it_fits_individ
     assert observation.output["representation"] == "full"
     assert observation.output["data"] == {"value": "x" * 2500}
     assert agent.plans[-1].request_bytes + agent.plans[-1].control_padding_bytes <= budget
+
+
+async def test_steering_wins_before_exhausted_rejection_is_accepted() -> None:
+    from weavria.core import TaskUpdate
+
+    started, release = asyncio.Event(), asyncio.Event()
+
+    class Journal:
+        def __init__(self) -> None:
+            self.interventions = 0
+            self.events: list[ControlEvent] = []
+
+        async def append(self, event: ControlEvent) -> None:
+            if isinstance(event.data, ActionInterventionChecked):
+                self.interventions += 1
+                if self.interventions == 2:
+                    started.set()
+                    await release.wait()
+            self.events.append(event)
+
+        async def append_revision(self, event: ControlEvent, update: TaskUpdate) -> None:
+            self.events.append(event)
+
+    budget = reserve_feedback(
+        instructions=await sizing_instructions(),
+        task=TaskInput(goal="Read and report the value"),
+        records=(),
+        batch=ToolBatch(calls=(call("small", "x" * 50),)),
+        bounds=FeedbackBounds(),
+        budget_bytes=99_999,
+    ).required_bytes
+    provider = FakeControlProvider(
+        (batch(call("first", "x" * 4000)), batch(call("obsolete", "x" * 4000)), finish("revised"))
+    )
+    journal = Journal()
+    agent = AgentLoop(
+        run_id="run",
+        task=TaskInput(goal="Read and report the value"),
+        instructions="Use evidence",
+        model=provider,
+        tools=ToolRegistry((echo_tool(),)),
+        artifacts=InMemoryArtifactStore(),
+        journal=journal,
+        limits=RunLimits(max_model_calls=6, max_request_bytes=budget, max_no_progress_rejections=1),
+    )
+    owner = asyncio.create_task(agent.execute())
+    await asyncio.wait_for(started.wait(), 1)
+    steering = asyncio.create_task(
+        agent.apply_directive(TaskDirective(input_id="revision", text="Use the revised value"))
+    )
+    # Queue the user transaction behind the in-flight durable acceptance.
+    await asyncio.sleep(0)
+    release.set()
+    result, update = await asyncio.gather(owner, steering)
+    assert update.task.revision == 2
+    assert result.status is RunStatus.COMPLETED and result.output == "revised"
+    assert agent.state.tool_calls == 0
+    assert len([event for event in journal.events if isinstance(event.data, BatchRejected)]) == 1
+    replay(agent)

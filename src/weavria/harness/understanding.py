@@ -12,9 +12,11 @@ from pydantic import (
     ConfigDict,
     Field,
     JsonValue,
+    SerializerFunctionWrapHandler,
     StringConstraints,
     ValidationError,
     field_validator,
+    model_serializer,
     model_validator,
 )
 
@@ -74,6 +76,13 @@ from .requirements import (
     InformationRequirement,
     stable_identifier,
 )
+from .targets import (
+    LiteralTargetResolver,
+    TargetedContract,
+    TargetResolver,
+    TargetSelection,
+    bind_targets,
+)
 
 _Text = Annotated[str, StringConstraints(min_length=1, max_length=512, pattern=r"\S")]
 _CapabilityName = Annotated[
@@ -128,7 +137,7 @@ class _VersionSixContract(BaseModel):
         return value
 
 
-class InformationNeed(_Contract):
+class InformationNeed(TargetedContract):
     """One fact dependency, separated from the capability used to obtain it."""
 
     description: _Text
@@ -140,9 +149,22 @@ class InformationNeed(_Contract):
     completion_mode: Literal[
         "positive_value_required", "report_findings", "exhaust_bounded_scope"
     ] = "positive_value_required"
+    schema_version: Literal[1, 2] = 1
+    targets: tuple[TargetSelection, ...] = Field(default=(), max_length=8)
+
+    @model_serializer(mode="wrap")
+    def preserve_v1_wire(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        data = handler(self)
+        if self.schema_version == 1:
+            data.pop("targets", None)
+        return data
 
     @model_validator(mode="after")
     def validate_freshness(self) -> Self:
+        if self.targets and (self.schema_version != 2 or self.source != "external"):
+            raise ValueError("external target selections require InformationNeed v2")
+        if len({item.key for item in self.targets}) != len(self.targets):
+            raise ValueError("information target selections must be unique")
         if self.freshness == "current" and self.source != "external":
             raise ValueError("current information must come from an external source")
         if len(set(self.required_fields)) != len(self.required_fields):
@@ -1187,7 +1209,10 @@ def _task_specification_request(
         "treat a partial page, unavailable source or unsupported query as not_found. For external "
         "information, capability_names identify the selected producers and required_fields "
         "are JSON Pointers into those capabilities' output_schema. Use evidence_surfaces as "
-        "the adapter-owned semantic map: when a surface is needed, retain its full "
+        "the adapter-owned semantic map: when target_rules are present, use InformationNeed "
+        "schema_version=2 and targets with zero-based Unicode spans in the original task goal "
+        "or its constraints, one per rule key. Never invent identifiers or select page text. "
+        "When a surface is needed, retain its full "
         "required_fields and producing capability. A broad_or_explicit surface may refine a "
         "genuinely broad user phrase when its fact family is necessary to fulfill that phrase. "
         "An explicit_only surface may be selected only when the original task or conversation "
@@ -1593,6 +1618,7 @@ class TaskUnderstandingEngine:
         coverage_validator: RequirementCoverageValidator | None = None,
         coverage_repairer: TaskSpecificationRepairer | None = None,
         evidence_profiles: tuple[CapabilityEvidenceProfile, ...] = (),
+        target_resolver: TargetResolver | None = None,
         max_coverage_repairs: int = 1,
         max_duration: float = 15.0,
         max_catalogue_bytes: int = 256_000,
@@ -1600,6 +1626,7 @@ class TaskUnderstandingEngine:
         if isinstance(max_duration, bool) or not math.isfinite(max_duration) or max_duration <= 0:
             raise ValueError("task understanding duration must be positive and finite")
         self._interpreter = interpreter
+        self._target_resolver = target_resolver or LiteralTargetResolver()
         self._question_selector = question_selector or ConsequenceAwareQuestionSelector()
         self._belief_updater = belief_updater or DeterministicBeliefUpdater()
         self._intent_decision_policy = intent_decision_policy or RiskAwareAskOrActPolicy()
@@ -1649,11 +1676,11 @@ class TaskUnderstandingEngine:
             )
         )
         return (
-            "task-understanding/7["
+            "task-understanding/8["
             f"{self._interpreter.version};{self._question_selector.version};"
             f"{self._belief_updater.version};{self._intent_decision_policy.version};"
             f"{coverage_version};{repairer_version};repairs={self._max_coverage_repairs};"
-            f"profiles={profiles or 'none'}]"
+            f"profiles={profiles or 'none'};targets={self._target_resolver.version}]"
         )
 
     async def prepare(
@@ -2059,14 +2086,25 @@ class TaskUnderstandingEngine:
                 raise ValueError("base frame belongs to another work")
             if base_frame.request_anchor.task_revision > snapshot.task.revision:
                 raise ValueError("base frame observes a future task revision")
-        requirements = _compile_requirements(
-            specification,
-            input_id=input_id,
-            work_id=accepted_work_id,
-            base_frame=base_frame,
-            capability_views=snapshot.capabilities,
-            requirement_coverage=requirement_coverage,
-        )
+        try:
+            requirements = _compile_requirements(
+                specification,
+                input_id=input_id,
+                work_id=accepted_work_id,
+                base_frame=base_frame,
+                capability_views=snapshot.capabilities,
+                requirement_coverage=requirement_coverage,
+                task=snapshot.task,
+                target_resolver=self._target_resolver,
+            )
+        except ValueError as exc:
+            raise TaskUnderstandingError(
+                RunError(
+                    category=ErrorCategory.INVALID_MODEL_RESPONSE,
+                    message="Task evidence selectors or targets could not be grounded",
+                    cause_type=type(exc).__name__,
+                )
+            ) from exc
         obligations = _compile_obligations(
             specification,
             requirements=requirements,
@@ -2227,6 +2265,12 @@ def _capability_view(
         if profile.capability_version != descriptor.version:
             raise ValueError("evidence profile targets a different capability version")
         for surface in profile.surfaces:
+            if any(
+                not schema_supports_pointer(descriptor.input_schema, rule.input_pointer)
+                or not schema_supports_pointer(descriptor.output_schema, rule.output_pointer)
+                for rule in surface.target_rules
+            ):
+                raise ValueError("evidence target exceeds capability input or output contract")
             if unsupported_evidence_fields(surface.required_fields, (descriptor.output_schema,)):
                 raise ValueError("evidence surface exceeds the capability output contract")
             if any(
@@ -2271,6 +2315,8 @@ def _compile_requirements(
     base_frame: TaskFrame | None,
     capability_views: tuple[CapabilityView, ...],
     requirement_coverage: RequirementCoverageReport | None,
+    task: TaskInput,
+    target_resolver: TargetResolver,
 ) -> tuple[InformationRequirement, ...]:
     existing: dict[str, list[InformationRequirement]] = {}
     if base_frame is not None:
@@ -2311,7 +2357,21 @@ def _compile_requirements(
             required_fields=need.required_fields,
             capabilities=capability_views,
             requirement_coverage=requirement_coverage,
+            targets=need.targets,
+            task=task,
+            input_id=input_id,
+            target_resolver=target_resolver,
         )
+        if not match_plans and (
+            need.targets
+            or any(
+                surface.target_rules
+                for capability in capability_views
+                if capability.name in capabilities
+                for surface in capability.evidence_surfaces
+            )
+        ):
+            raise ValueError("targeted evidence requires selected trusted surfaces")
         fingerprint = _requirement_fingerprint(
             need.description,
             need.source,
@@ -2423,6 +2483,10 @@ def _compile_evidence_match_plans(
     required_fields: tuple[str, ...],
     capabilities: tuple[CapabilityView, ...],
     requirement_coverage: RequirementCoverageReport | None,
+    targets: tuple[TargetSelection, ...],
+    task: TaskInput,
+    input_id: str,
+    target_resolver: TargetResolver,
 ) -> tuple[EvidenceMatchPlan, ...]:
     if requirement_coverage is None:
         return ()
@@ -2443,6 +2507,9 @@ def _compile_evidence_match_plans(
         for surface in capability.evidence_surfaces
     }
     selected_surfaces = tuple(catalogue[surface_id] for surface_id in selected_surface_ids)
+    target_keys = {rule.key for _, surface in selected_surfaces for rule in surface.target_rules}
+    if any(selection.key not in target_keys for selection in targets):
+        raise ValueError("task target selection is not declared by a selected evidence surface")
     assigned_fields = {
         surface.surface_id: list(surface.required_fields)
         for _capability, surface in selected_surfaces
@@ -2471,6 +2538,17 @@ def _compile_evidence_match_plans(
         if capability.name not in capability_names or capability.evidence_profile_version is None:
             raise ValueError("coverage surface is not grounded by its information need")
         plan_fields = tuple(dict.fromkeys(assigned_fields[surface.surface_id]))
+        bindings = bind_targets(
+            surface.target_rules, targets, task=task, input_id=input_id, resolver=target_resolver
+        )
+        if any(
+            not schema_allows_value_at_pointer(
+                capability.input_schema, binding.input_pointer, value
+            )
+            for binding in bindings
+            for value in binding.input_values
+        ):
+            raise ValueError("resolved task target exceeds the capability input contract")
         plan_payload = {
             "producer_name": capability.name,
             "producer_version": capability.version,
@@ -2480,15 +2558,22 @@ def _compile_evidence_match_plans(
             "parameter_matches": [
                 item.model_dump(mode="json") for item in surface.parameter_constraints
             ],
+            **(
+                {"target_bindings": [item.model_dump(mode="json") for item in bindings]}
+                if bindings
+                else {}
+            ),
         }
         plans.append(
             EvidenceMatchPlan(
+                schema_version=2 if bindings else 1,
                 plan_id=stable_identifier("match", plan_payload),
                 producer_name=capability.name,
                 producer_version=capability.version,
                 profile_version=capability.evidence_profile_version,
                 surface_id=surface.surface_id,
                 required_fields=plan_fields,
+                target_bindings=bindings,
                 parameter_matches=tuple(
                     EvidenceParameterMatch(
                         input_pointer=item.input_pointer,

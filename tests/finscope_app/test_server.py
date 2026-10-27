@@ -228,8 +228,10 @@ def _clarify() -> TaskSpecification:
     )
 
 
+@pytest.mark.parametrize("reserved_calls", [0, 2])
 async def test_session_api_executes_real_runtime_and_reports_tool_trace(
     tmp_path: Path,
+    reserved_calls: int,
 ) -> None:
     def market_response(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/api/market-pulse/2026-10-15"
@@ -284,6 +286,7 @@ async def test_session_api_executes_real_runtime_and_reports_tool_trace(
         finscope_base_url="http://finscope.test",
         allowed_parent_origin="http://localhost:5173",
         state_path=tmp_path / "sessions.sqlite3",
+        finalization_model_calls=reserved_calls,
     )
     app = create_app(
         settings,
@@ -357,6 +360,8 @@ async def test_session_api_executes_real_runtime_and_reports_tool_trace(
         "max_no_progress_rejections": 2,
         "max_admission_replans": 8,
         "max_stagnant_actions_per_family": 3,
+        "finalization_model_calls": reserved_calls,
+        "finalization_seconds": 10.0,
     }
     await market_http.aclose()
 

@@ -32,6 +32,7 @@ from weavria.core import (
     EvidenceDeliveryManifest,
     EvidenceInitialAccess,
     ExecutionEvent,
+    FinalizationStarted,
     FinishAction,
     InterventionNotice,
     JournalEvent,
@@ -129,12 +130,21 @@ class RunState:
     context_call_ids: tuple[str, ...] = ()
     context_request_sha256: str | None = None
     delivery_manifest_json: str | None = None
+    finalization_json: str | None = None
     recovery_limits_json: str | None = None
     recovery_rounds: int = 0
     recovery_bytes: int = 0
     recovery_ranges_json: tuple[str, ...] = ()
     recovery_seen_json: tuple[str, ...] = ()
     recovery_attempts: tuple[tuple[str, str], ...] = ()
+
+    @property
+    def finalization(self) -> FinalizationStarted | None:
+        return (
+            FinalizationStarted.model_validate_json(self.finalization_json)
+            if self.finalization_json
+            else None
+        )
 
     @property
     def recovery_limits(self) -> RecoveryLimits | None:
@@ -271,6 +281,7 @@ def reduce_event(state: RunState | None, event: JournalEvent) -> RunState:
         next_state = replace(
             next_state,
             control_json=None,
+            finalization_json=None,
             progress_assessment_json=None,
             pending_progress_sequence=None,
             intervention_json=None,
@@ -297,6 +308,19 @@ def reduce_event(state: RunState | None, event: JournalEvent) -> RunState:
             )
         phase = Phase.READY if state.phase is Phase.CONTEXT else state.phase
         return replace(next_state, task_json=data.task.model_dump_json(), phase=phase)
+    if isinstance(data, FinalizationStarted):
+        _require(
+            state.phase in {Phase.READY, Phase.MODEL}, "finalization requires a decision boundary"
+        )
+        _require(
+            data.task_revision == state.task.revision, "finalization belongs to an obsolete task"
+        )
+        _require(state.finalization is None, "finalization already started")
+        known = {record.exchange.action.call_id for record in state.records}
+        _require(
+            set(data.evidence_call_ids) <= known, "finalization references unaccepted evidence"
+        )
+        return replace(next_state, phase=Phase.READY, finalization_json=data.model_dump_json())
     if isinstance(data, ContextSelected):
         _require(state.phase is Phase.READY, "context must be built at a decision boundary")
         if state.journal_version >= 3:
@@ -496,6 +520,10 @@ def _reduce_turn(
     data: TurnDecided | ToolStarted | ToolRecorded | CallSkipped | TurnSettled,
 ) -> RunState:
     if isinstance(data, TurnDecided):
+        _require(
+            state.finalization is None or isinstance(data.turn.decision, FinishAction),
+            "finalization only accepts Finish candidates",
+        )
         _require(
             state.phase is Phase.MODEL and state.model_revision == state.task.revision,
             "turn is out of phase or belongs to an obsolete task",

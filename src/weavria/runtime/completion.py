@@ -15,6 +15,7 @@ from weavria.core import (
     CompletionRepair,
     CompletionUnverifiable,
     ErrorCategory,
+    FinalizationStarted,
     FinishAction,
     RunError,
     TaskInput,
@@ -36,7 +37,13 @@ class CompletionContext:
         store: ArtifactStore,
         task_observation: TaskObservation | None = None,
         semantic_state: dict[str, JsonValue] | None = None,
+        finalization: FinalizationStarted | None = None,
     ) -> None:
+        if finalization is not None and finalization.task_revision != task.revision:
+            raise ValueError("finalization belongs to another task revision")
+        self._finalization_json = (
+            finalization.model_dump_json() if finalization is not None else None
+        )
         self._run_id = run_id
         self._task = TaskInput.model_validate(task).model_dump_json()
         self._candidate = FinishAction.model_validate(candidate).model_dump_json()
@@ -61,6 +68,14 @@ class CompletionContext:
         self._store = store
         self._reads: list[str] = []
         self._open = True
+
+    @property
+    def finalization(self) -> FinalizationStarted | None:
+        return (
+            FinalizationStarted.model_validate_json(self._finalization_json)
+            if self._finalization_json
+            else None
+        )
 
     @property
     def task(self) -> TaskInput:

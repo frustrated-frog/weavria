@@ -26,6 +26,7 @@ from .capabilities import CapabilityQuery, CapabilityResolver
 from .clarification import BlockingAmbiguityPolicy, ClarificationPolicy
 from .completion import TaskCompletionEvaluator, TaskObligationCompletionPolicy
 from .context import project_context_focus
+from .finalization import NeedFinalizationPolicy
 from .progress import NeedProgressEvaluator
 from .requirements import (
     EvidenceResolver,
@@ -69,6 +70,10 @@ class TaskAwareSessionPreparer:
         self._completion = TaskObligationCompletionPolicy(
             TaskCompletionEvaluator(evidence=self._evidence)
         )
+
+    @property
+    def finalization_policy(self) -> NeedFinalizationPolicy:
+        return NeedFinalizationPolicy(self._evidence)
 
     @property
     def completion_policy(self) -> TaskObligationCompletionPolicy:

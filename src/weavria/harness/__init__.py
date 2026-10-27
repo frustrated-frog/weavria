@@ -45,6 +45,7 @@ from .coverage import (
     compile_requirement_coverage,
     task_specification_sha256,
 )
+from .finalization import NeedFinalizationPolicy
 from .intent import (
     BeliefUpdater,
     ClarificationAnswerOption,
@@ -94,6 +95,14 @@ from .requirements import (
     load_need_ledger,
 )
 from .session import TaskAwareSessionPreparer
+from .targets import (
+    EvidenceTargetBinding,
+    EvidenceTargetRule,
+    LiteralTargetResolver,
+    TargetResolution,
+    TargetResolver,
+    TargetSelection,
+)
 from .understanding import (
     CapabilityNeed,
     CapabilityView,
@@ -167,6 +176,8 @@ __all__ = [
     "EvidenceProbe",
     "EvidenceResolver",
     "EvidenceSurface",
+    "EvidenceTargetBinding",
+    "EvidenceTargetRule",
     "InformationNeed",
     "InformationRequirement",
     "IntentActionValue",
@@ -176,6 +187,7 @@ __all__ = [
     "IntentDecisionPolicy",
     "IntentHypothesis",
     "IntentUncertainty",
+    "LiteralTargetResolver",
     "MemoryExtractor",
     "MemoryFormationEngine",
     "MemoryFormationError",
@@ -185,6 +197,7 @@ __all__ = [
     "ModelRequirementCoverageValidator",
     "ModelTaskInterpreter",
     "NeedFailure",
+    "NeedFinalizationPolicy",
     "NeedLedger",
     "NeedProgressEvaluator",
     "NeedState",
@@ -204,6 +217,9 @@ __all__ = [
     "SessionMemoryBinding",
     "SessionMemoryIngestor",
     "StructuralEvidenceExtractor",
+    "TargetResolution",
+    "TargetResolver",
+    "TargetSelection",
     "TaskAwareAgent",
     "TaskAwareExecution",
     "TaskAwareSessionPreparer",

@@ -4,6 +4,7 @@ from .agent import AgentLoop, AgentRun, Clock, LegacyAgentLoop, RunLimits, Syste
 from .budget import RootBudget
 from .completion import CompletionContext, CompletionPolicy, LayeredCompletionPolicy, NoVerification
 from .controller import ProgressAssessor, TurnPreparation, TurnPreparer, prepare_task, resolve_turn
+from .finalization import FinalizationAssessment, FinalizationPolicy
 from .intervention import (
     ACTION_VALUE_LEDGER_VERSION,
     ActionInterventionContext,
@@ -49,6 +50,8 @@ __all__ = [
     "CompletionContext",
     "CompletionPolicy",
     "EventAcceptanceError",
+    "FinalizationAssessment",
+    "FinalizationPolicy",
     "HardStopActionInterventionPolicy",
     "InterventionJournal",
     "JournalCommitError",

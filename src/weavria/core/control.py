@@ -423,6 +423,18 @@ class CompletionDiscarded(ContractModel):
     reason: Literal["task_changed"] = "task_changed"
 
 
+class FinalizationStarted(ContractModel):
+    """Enter bounded synthesis without authorizing a candidate for publication."""
+
+    kind: Literal["finalization_started"] = "finalization_started"
+    task_revision: int = Field(ge=1)
+    policy_version: NonBlankString
+    mode: Literal["complete", "limited"]
+    reason: Literal["evidence_ready", "resource_reserve", "tool_budget", "model_timeout"]
+    evidence_call_ids: tuple[NonBlankString, ...] = ()
+    missing_need_ids: tuple[NonBlankString, ...] = ()
+
+
 class ProgressAssessed(ContractModel):
     """Persist the full signal vector before its compact control projection is consumed."""
 
@@ -522,6 +534,7 @@ type ControlData = Annotated[
     | VerificationStarted
     | CompletionChecked
     | CompletionDiscarded
+    | FinalizationStarted
     | RunEnded,
     Field(discriminator="kind"),
 ]

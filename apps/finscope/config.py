@@ -31,6 +31,8 @@ class FinScopeSettings:
     run_max_tool_calls: int = 20
     run_max_request_bytes: int = 64_000
     run_max_duration_seconds: float = 180.0
+    finalization_model_calls: int = 0
+    finalization_seconds: float = 10.0
 
     def __post_init__(self) -> None:
         _validate_http_url("model_base_url", self.model_base_url)
@@ -73,6 +75,17 @@ class FinScopeSettings:
         ):
             raise ValueError("run counter and request limits must be positive integers")
         if (
+            type(self.finalization_model_calls) is not int
+            or not 0 <= self.finalization_model_calls < self.run_max_model_calls
+        ):
+            raise ValueError("finalization reserve must leave an exploration call")
+        if (
+            isinstance(self.finalization_seconds, bool)
+            or not math.isfinite(self.finalization_seconds)
+            or self.finalization_seconds <= 0
+        ):
+            raise ValueError("finalization duration must be positive and finite")
+        if (
             not math.isfinite(self.model_timeout_seconds)
             or not math.isfinite(self.understanding_max_duration_seconds)
             or not math.isfinite(self.request_timeout_seconds)
@@ -113,6 +126,8 @@ class FinScopeSettings:
             ),
             context_window_tokens=int(os.environ.get("WEAVRIA_CONTEXT_WINDOW_TOKENS", "32768")),
             context_encoding=os.environ.get("WEAVRIA_CONTEXT_ENCODING", "cl100k_base").strip(),
+            finalization_model_calls=int(os.environ.get("WEAVRIA_FINALIZATION_MODEL_CALLS", "0")),
+            finalization_seconds=float(os.environ.get("WEAVRIA_FINALIZATION_SECONDS", "10")),
             run_max_model_calls=int(os.environ.get("WEAVRIA_RUN_MAX_MODEL_CALLS", "20")),
             run_max_tool_calls=int(os.environ.get("WEAVRIA_RUN_MAX_TOOL_CALLS", "20")),
             run_max_request_bytes=int(os.environ.get("WEAVRIA_RUN_MAX_REQUEST_BYTES", "64000")),

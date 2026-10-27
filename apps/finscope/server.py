@@ -241,6 +241,8 @@ def create_app(
             instructions=_instructions(),
             limits=RunLimits(
                 max_model_calls=resolved.run_max_model_calls,
+                finalization_model_calls=resolved.finalization_model_calls,
+                finalization_seconds=resolved.finalization_seconds,
                 max_tool_calls=resolved.run_max_tool_calls,
                 max_request_bytes=resolved.run_max_request_bytes,
                 max_duration=resolved.run_max_duration_seconds,
