@@ -881,7 +881,7 @@ class TaskInterpreter(Protocol):
 class ModelTaskInterpreter:
     """Ask a model for one typed task specification through a synthetic tool call."""
 
-    version = "model-task-understanding/7"
+    version = "model-task-understanding/8"
 
     def __init__(
         self,
@@ -1043,10 +1043,16 @@ class ModelTaskInterpreter:
         request = TaskUnderstandingInput.model_validate_json(
             TaskUnderstandingInput.model_validate(request).model_dump_json()
         )
+        surfaces = {
+            surface.surface_id: (capability.name, surface)
+            for capability in request.capabilities
+            for surface in capability.evidence_surfaces
+        }
         feedback = {
             "verdict": report.verdict,
             "blocking_obligations": [
                 {
+                    "obligation_id": finding.obligation_id,
                     "obligation": next(
                         item.description
                         for item in report.obligations
@@ -1057,6 +1063,21 @@ class ModelTaskInterpreter:
                     "information_need_indices": finding.information_need_indices,
                     "completion_criterion_indices": finding.completion_criterion_indices,
                     "evidence_surface_ids": finding.evidence_surface_ids,
+                    "host_adjustment_reasons": [
+                        reason
+                        for adjustment in report.host_adjustments
+                        if adjustment.obligation_id == finding.obligation_id
+                        for reason in adjustment.reason_codes
+                    ],
+                    "surface_bindings": [
+                        {
+                            "surface_id": surface_id,
+                            "capability_name": surfaces[surface_id][0],
+                            "required_fields": surfaces[surface_id][1].required_fields,
+                        }
+                        for surface_id in finding.evidence_surface_ids
+                        if surface_id in surfaces
+                    ],
                 }
                 for finding in report.blocking_findings
             ],
@@ -1072,6 +1093,9 @@ class ModelTaskInterpreter:
             instruction_suffix=(
                 " This is the single semantic repair attempt. Preserve the user's original "
                 "scope and route, but add or refine the independently missing obligations. "
+                "Address the host_adjustment_reasons for each obligation: required obligations "
+                "need required information needs, and selected surfaces need their exact "
+                "producer and fields, as shown in surface_bindings. "
                 "For every referenced evidence surface, copy its producing capability name "
                 "into information_needs.capability_names and its required_fields into the "
                 "corresponding need. If the user asks to mark missing or absent findings, use "
@@ -2442,6 +2466,12 @@ def _coverage_failure_summary(report: RequirementCoverageReport) -> str:
     counts: dict[str, int] = {}
     for finding in report.blocking_findings:
         counts[finding.reason_code] = counts.get(finding.reason_code, 0) + 1
+    blocking = {finding.obligation_id for finding in report.blocking_findings}
+    for adjustment in report.host_adjustments:
+        if adjustment.obligation_id in blocking:
+            for reason in adjustment.reason_codes:
+                key = f"host.{reason}"
+                counts[key] = counts.get(key, 0) + 1
     return ",".join(f"{reason}={counts[reason]}" for reason in sorted(counts)) or "unknown=1"
 
 

@@ -190,9 +190,13 @@ def _identity(value: str) -> str:
 
 
 class FinScopeAnswerPolicy:
-    """Require provenance for FinScope reads and quality disclosure for market snapshots."""
+    """Check accepted source envelopes and market disclosure, without prescribing citations.
 
-    version = "finscope-answer/4"
+    These checks do not establish that every answer claim follows from a source.
+    Task obligations and any independent answer verifier remain separate checks.
+    """
+
+    version = "finscope-answer/5"
 
     async def verify(
         self, context: CompletionContext
@@ -257,33 +261,12 @@ class FinScopeAnswerPolicy:
                 ),
             )
         answer = context.candidate.output
-        source_ids = tuple(
-            dict.fromkeys(
-                (
-                    *(source.source_id for source in market_sources),
-                    *(source.source_id for source in workspace_sources),
-                )
-            )
-        )
-        missing_markers = tuple(
-            f"[来源:{source_id}]" for source_id in source_ids if f"[来源:{source_id}]" not in answer
-        )
-        if missing_markers:
-            return CompletionRepair(
-                issue_codes=("missing_source_marker",),
-                # Source IDs remain complete in the accepted Artifacts read by this
-                # check. Keep the control channel bounded without truncating a marker.
-                guidance=(
-                    "Add the missing exact [来源:source_id] markers. Read source_id values "
-                    "from the accepted FinScope results; do not invent or truncate them."
-                ),
-            )
         if market_sources and "数据质量" not in answer:
             return CompletionRepair(
                 issue_codes=("missing_quality",),
                 guidance="State the snapshot data quality explicitly",
             )
-        return CompletionAccept(outcome="verified")
+        return CompletionAccept(outcome="unverified")
 
 
 # Preserve the original app-level import while the policy now covers the full workspace.

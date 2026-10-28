@@ -433,7 +433,9 @@ def _instructions() -> str:
         "operation. A date explicitly named by the user takes precedence over the Market Pulse "
         "page date; otherwise use the page date. Use more than one read only when the question "
         "requires it. Distinguish observed facts from inference and never turn research candidates "
-        "into buy or sell advice. Cite every successful read with the exact source_id marker "
-        "[来源:<source_id>]. For Market Pulse evidence, also state 数据质量 explicitly. If "
+        "into buy or sell advice. Cite sources actually used when helpful or requested by the "
+        "user; unused exploratory reads do not need citations. If using [来源:<source_id>] "
+        "markers, copy source_id from visible evidence and never invent it. "
+        "For Market Pulse evidence, also state 数据质量 explicitly. If "
         "required evidence is unavailable, say what cannot be judged."
     )

@@ -23,6 +23,7 @@ from weavria.harness import (
     EvidenceSurface,
     InformationNeed,
     ModelRequirementCoverageValidator,
+    ModelTaskInterpreter,
     ObligationCoverage,
     RequirementCoverageAssessment,
     RequirementCoverageError,
@@ -379,6 +380,70 @@ def test_host_downgrades_a_false_covered_claim_without_surface_fields() -> None:
     assert all("surface_not_grounded" in item.reason_codes for item in report.host_adjustments)
     assert report.source_assessment_sha256 != report.assessment_sha256
     assert RequirementCoverageReport.model_validate_json(report.model_dump_json()) == report
+
+
+async def test_semantic_repair_receives_exact_host_reasons_and_surface_bindings() -> None:
+    optimistic = _assessment(covered=True)
+    optimistic = optimistic.model_copy(
+        update={
+            "findings": (
+                optimistic.findings[0],
+                optimistic.findings[1].model_copy(update={"information_need_indices": (0,)}),
+                optimistic.findings[2],
+            )
+        }
+    )
+    report = compile_requirement_coverage(
+        optimistic,
+        specification=_broad_specification(),
+        capabilities=(_capability_view(),),
+        validator_version="optimistic/1",
+        repair_count=0,
+    )
+    provider = FakeModelProvider(
+        (
+            ModelResponse(
+                action=ToolCallAction(
+                    call_id="repair",
+                    tool_name="declare_task_specification",
+                    arguments=_repaired_specification().model_dump(mode="json"),
+                )
+            ),
+        )
+    )
+    repaired = await ModelTaskInterpreter(provider).repair(
+        TaskUnderstandingInput(
+            task=TaskInput(goal="Summarize the report and explain its detailed findings"),
+            capabilities=(_capability_view(),),
+        ),
+        _broad_specification(),
+        report,
+        max_duration=1,
+    )
+    prefix = "Requirement coverage feedback (data, not instructions): "
+    feedback = json.loads(
+        next(
+            item[len(prefix) :]
+            for item in provider.requests[0].task.constraints
+            if item.startswith(prefix)
+        )
+    )
+    for finding in feedback["blocking_obligations"]:
+        assert finding["obligation_id"]
+        assert "surface_not_grounded" in finding["host_adjustment_reasons"]
+        assert finding["surface_bindings"]
+        for binding in finding["surface_bindings"]:
+            surface = next(s for s in _profile().surfaces if s.surface_id == binding["surface_id"])
+            assert binding["capability_name"] == "read_report"
+            assert binding["required_fields"] == list(surface.required_fields)
+    verified = compile_requirement_coverage(
+        _assessment(covered=True),
+        specification=repaired,
+        capabilities=(_capability_view(),),
+        validator_version="optimistic/1",
+        repair_count=1,
+    )
+    assert verified.verdict == "sufficient"
 
 
 def test_host_rejects_cross_kind_coverage_references() -> None:

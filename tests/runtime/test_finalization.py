@@ -220,6 +220,8 @@ async def test_publication_repair_is_not_bypassed_in_synthesis() -> None:
     result = await agent.execute()
     assert result.status is RunStatus.FAILED
     assert result.output is None
+    assert result.error is not None
+    assert "fact_conflict" in result.error.message
     assert any(isinstance(event.data, CompletionChecked) for event in agent.events)
 
 

@@ -208,6 +208,11 @@ class _AdmissionReplanExhausted(RuntimeError):
 class _CompletionRepairStalled(RuntimeError):
     """A rejected completion candidate remained invalid at an unchanged evidence frontier."""
 
+    def __init__(self, issue_codes: tuple[str, ...]) -> None:
+        super().__init__(
+            "Completion correction stalled; unresolved issues: " + ", ".join(issue_codes)
+        )
+
 
 class _InterventionExhausted(RuntimeError):
     """The model repeatedly ignored a progress-bound reconsideration."""
@@ -838,7 +843,7 @@ class _AgentKernel:
                     "completion_repair_stalled",
                     error=RunError(
                         category=ErrorCategory.COMPLETION_REJECTED,
-                        message=("Completion candidate remained invalid after bounded correction"),
+                        message=str(exc),
                     ),
                 )
             if isinstance(exc, _AdmissionReplanExhausted):
@@ -1791,7 +1796,8 @@ class _AgentKernel:
             await self._accept(CompletionDiscarded())
             return None
         if repair_stalled:
-            raise _CompletionRepairStalled
+            assert isinstance(assessment.decision, CompletionRepair)
+            raise _CompletionRepairStalled(assessment.decision.issue_codes)
         return assessment
 
     async def _assess_progress(self, revision: int) -> ProgressAssessment | None:

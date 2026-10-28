@@ -10,12 +10,15 @@ from apps.finscope.market import MarketPulseClient
 from apps.finscope.server import MessageOutput, SessionCreated, create_app
 from apps.finscope.workspace import FinScopeWorkspaceClient
 from weavria.core import (
+    CompletionChecked,
+    FinalizationStarted,
     FinishAction,
     Message,
     MessageRole,
     ModelResponse,
     ModelTurn,
     SessionContextCompiled,
+    SessionRunEvent,
     ToolBatch,
     ToolCallAction,
     ToolExchange,
@@ -271,11 +274,6 @@ async def test_session_api_executes_real_runtime_and_reports_tool_trace(
                 )
             ),
             ModelTurn(decision=FinishAction(output="当前为震荡轮动。数据质量: READY。")),
-            ModelTurn(
-                decision=FinishAction(
-                    output="当前为震荡轮动。数据质量: READY。[来源:market-pulse:2026-10-15]"
-                )
-            ),
         )
     )
     interpreter = FakeModelProvider((_declaration(_market_execution()), _market_coverage()))
@@ -329,7 +327,17 @@ async def test_session_api_executes_real_runtime_and_reports_tool_trace(
     assert payload.status == "completed", payload.model_dump_json()
     assert payload.task_outcome == "unverified"
     assert payload.answer is not None
-    assert payload.answer.endswith("[来源:market-pulse:2026-10-15]")
+    assert payload.answer == "当前为震荡轮动。数据质量: READY。"
+    assert len(provider.requests) == 2
+    execution_events = [
+        event.data.event.data for event in events if isinstance(event.data, SessionRunEvent)
+    ]
+    assert not any(
+        isinstance(event, CompletionChecked) and event.assessment.decision.kind == "repair"
+        for event in execution_events
+    )
+    if reserved_calls:
+        assert any(isinstance(event, FinalizationStarted) for event in execution_events)
     assert [tool.model_dump() for tool in payload.tools] == [
         {
             "call_id": "market-read-1",
@@ -404,11 +412,6 @@ async def test_workspace_context_executes_private_get_tool_with_provenance(
                 )
             ),
             ModelTurn(decision=FinishAction(output="最近保存了光模块资本开支线索。")),
-            ModelTurn(
-                decision=FinishAction(
-                    output="最近保存了光模块资本开支线索。[来源:finscope:catalogue:articles]"
-                )
-            ),
         )
     )
     interpreter = FakeModelProvider((_declaration(_article_catalogue_execution()),))
@@ -452,7 +455,9 @@ async def test_workspace_context_executes_private_get_tool_with_provenance(
     assert response.status_code == 200
     assert payload.status == "completed"
     assert payload.answer is not None
-    assert payload.answer.endswith("[来源:finscope:catalogue:articles]")
+    assert payload.answer == "最近保存了光模块资本开支线索。"
+    assert payload.task_outcome == "unverified"
+    assert len(provider.requests) == 2
     assert [tool.tool_name for tool in payload.tools] == ["read_finscope_catalogue"]
     assert [(request.method, request.url.path) for request in requests] == [
         ("GET", "/api/articles/paged")

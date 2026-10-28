@@ -101,8 +101,10 @@ Agent 页只显示本地配置指引，不会尝试访问远端服务。Sidecar 
 - 任务理解只接受能够落到显式生产能力 `output_schema` 的证据字段；Profile 参数值也必须与工具
   输入 Schema 相容。成功工具结果即使零字段匹配也会留下 Evidence Probe，并以契约不匹配
   收敛，不再重复调用直到耗尽完成预算。
-- execute 回答必须读取所需 FinScope 证据并包含精确来源标记，否则验收策略要求修正；使用
-  Market Pulse 时还必须显示数据质量。direct / clarify 回答明确标为 unverifiable，不伪装成
+- execute 回答继续检查所需 FinScope 证据；正文按用户需要引用实际采用的来源，不要求罗列全部
+  探索查询。原始 Artifact、source_id 和验收读取记录仍保留在内部证据链。应用策略只检查来源包络
+  和已有的市场质量披露，接受时标为 unverified，不将字符串标记齐全视作事实核验。使用 Market
+  Pulse 时仍需显示数据质量。direct / clarify 回答明确标为 unverifiable，不伪装成
   已验证结论。
 - HTTP Host 当前提供同步消息接口，不提供流式 Token 或实时事件推送。
 - Sidecar 只返回结构化 JSON；Markdown 展示、交互状态和错误提示由宿主应用负责。
