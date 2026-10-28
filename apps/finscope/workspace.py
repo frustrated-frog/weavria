@@ -579,7 +579,14 @@ class FinScopeCatalogueInput(_WorkspaceModel):
 
 
 class FinScopeResourceInput(_WorkspaceModel):
-    kind: ResourceKind
+    kind: ResourceKind = Field(
+        description=(
+            "Resource namespace must match the source catalogue: events -> event; "
+            "reaction_events -> investment_reaction using the returned id, or "
+            "reaction_event using sourceOriginKey; news_window -> news_window_detail. "
+            "These IDs are not interchangeable across namespaces."
+        )
+    )
     identifier: str = Field(
         min_length=1,
         max_length=64,
@@ -841,7 +848,9 @@ def finscope_workspace_tools(client: FinScopeWorkspaceClient) -> tuple[Registere
                 "Read one typed FinScope resource or its fixed subview by validated identifiers. "
                 "Supported kinds span every current workspace domain; the caller cannot provide "
                 "a URL, path, method, or arbitrary query parameter. Financial instrument "
-                "resources require the id from financial_instruments, not the stock code."
+                "resources require the id from financial_instruments, not the stock code. "
+                "reaction_events search results use kind=investment_reaction with their id; "
+                "kind=event belongs to a different catalogue."
             ),
             intent_signals=(
                 "详情 原文 上下文 历史 证据",

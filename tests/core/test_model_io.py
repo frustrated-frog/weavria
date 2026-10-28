@@ -1,3 +1,5 @@
+import json
+
 import pytest
 from pydantic import ValidationError
 
@@ -121,3 +123,30 @@ def test_current_constraints_are_separate_from_historical_text() -> None:
 def test_model_response_still_accepts_exactly_one_known_action(action: object) -> None:
     with pytest.raises(ValidationError):
         ModelResponse.model_validate({"action": action})
+
+
+def test_task_observation_v2_is_explicit_bounded_and_preserves_v1() -> None:
+    legacy = TaskObservation(
+        observation_id="frame",
+        input_id="input",
+        task_revision=1,
+        frame_revision=1,
+        producer_version="test/1",
+        payload={"value": "small"},
+    )
+    assert legacy.schema_version == 1
+    assert TaskObservation.model_validate_json(legacy.model_dump_json()) == legacy
+    medium = {
+        **legacy.model_dump(mode="json"),
+        "schema_version": 2,
+        "payload": {"value": "x" * 17_000},
+    }
+    restored = TaskObservation.model_validate_json(json.dumps(medium))
+    assert restored.schema_version == 2 and restored.payload["value"] == "x" * 17_000
+    with pytest.raises(ValidationError, match="16384"):
+        TaskObservation.model_validate_json(json.dumps({**medium, "schema_version": 1}))
+    with pytest.raises(ValidationError, match="65536"):
+        TaskObservation.model_validate({**medium, "payload": {"value": "x" * 66_000}})
+    for version in (True, 2.0, "2", 3):
+        with pytest.raises(ValidationError):
+            TaskObservation.model_validate({**medium, "schema_version": version})

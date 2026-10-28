@@ -405,8 +405,11 @@ async def test_semantic_repair_receives_exact_host_reasons_and_surface_bindings(
             ModelResponse(
                 action=ToolCallAction(
                     call_id="repair",
-                    tool_name="declare_task_specification",
-                    arguments=_repaired_specification().model_dump(mode="json"),
+                    tool_name="repair_task_specification",
+                    arguments=_repaired_specification().model_dump(
+                        mode="json",
+                        include={"information_needs", "capability_needs", "completion_criteria"},
+                    ),
                 )
             ),
         )
@@ -849,3 +852,102 @@ async def test_model_coverage_validator_does_not_repeat_nonrepairable_output_fai
     assert len(raised.value.attempts) == 1
     assert raised.value.attempts[0].output is not None
     assert raised.value.attempts[0].output.repairable is False
+
+
+@pytest.mark.parametrize("separate_producers", [False, True])
+async def test_grouped_coverage_binds_each_need_only_to_its_own_surfaces(
+    separate_producers: bool,
+) -> None:
+    tools = _tools()
+    profiles = (_profile(),)
+    specification = _repaired_specification()
+    detail_surface = "report.details"
+    if separate_producers:
+        tools = ToolRegistry(
+            (
+                tools.get("read_report"),
+                TypedTool(
+                    name="read_details",
+                    version="2",
+                    description="Read detailed report findings",
+                    input_type=_Input,
+                    output_type=_Output,
+                    execute=_read_report,
+                ),
+            )
+        )
+        detail_surface = "details.value"
+        profiles = (
+            _profile().model_copy(update={"surfaces": (_profile().surfaces[0],)}),
+            CapabilityEvidenceProfile(
+                capability_name="read_details",
+                capability_version="2",
+                profile_version="details/1",
+                surfaces=(
+                    _profile().surfaces[1].model_copy(update={"surface_id": detail_surface}),
+                ),
+            ),
+        )
+        specification = specification.model_copy(
+            update={
+                "information_needs": (
+                    specification.information_needs[0],
+                    specification.information_needs[1].model_copy(
+                        update={"capability_names": ("read_details",)}
+                    ),
+                ),
+                "capability_needs": (
+                    *specification.capability_needs,
+                    CapabilityNeed(
+                        name="read_details", purpose="Read details", necessity="required"
+                    ),
+                ),
+            }
+        )
+    assessment = RequirementCoverageAssessment(
+        obligations=(
+            SemanticObligation(
+                obligation_id="report",
+                description="Return summary and detailed findings",
+                kind="information",
+                origin="task_goal",
+            ),
+        ),
+        findings=(
+            ObligationCoverage(
+                obligation_id="report",
+                status="covered",
+                information_need_indices=(0, 1),
+                evidence_surface_ids=("report.summary", detail_surface),
+                reason_code="covered_by_need",
+            ),
+        ),
+    )
+    engine = TaskUnderstandingEngine(
+        ModelTaskInterpreter(
+            FakeModelProvider(
+                (
+                    ModelResponse(
+                        action=ToolCallAction(
+                            call_id="specification",
+                            tool_name="declare_task_specification",
+                            arguments=specification.model_dump(mode="json"),
+                        )
+                    ),
+                )
+            )
+        ),
+        coverage_validator=_SequenceValidator((assessment,)),
+        evidence_profiles=profiles,
+        max_coverage_repairs=0,
+    )
+    prepared = await engine.prepare(
+        input_id="grouped-coverage", task=TaskInput(goal="Read the report"), history=(), tools=tools
+    )
+    summary, details = prepared.record.frame.requirements
+    assert [
+        (p.producer_name, p.surface_id, p.required_fields) for p in summary.evidence_match_plans
+    ] == [("read_report", "report.summary", ("/summary",))]
+    assert [
+        (p.producer_name, p.surface_id, p.required_fields) for p in details.evidence_match_plans
+    ] == [("read_details" if separate_producers else "read_report", detail_surface, ("/details",))]

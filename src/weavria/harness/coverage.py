@@ -356,7 +356,7 @@ class TaskSpecificationRepairer(Protocol):
 class ModelRequirementCoverageValidator:
     """Use a separate structured model pass to audit semantic task coverage."""
 
-    version = "model-requirement-coverage/3"
+    version = "model-requirement-coverage/4"
 
     def __init__(
         self,
@@ -438,6 +438,16 @@ class ModelRequirementCoverageValidator:
             "needed to fulfill that phrase. An explicit_only surface requires a semantic demand "
             "stated in the original task or conversation; the candidate specification and "
             "capability catalogue cannot create that demand. Compare every required obligation "
+            "with the actual user request, not requirements invented in an assistant answer or "
+            "the candidate. Prior assistant formatting never creates a user citation obligation. "
+            "This is planning coverage, not evidence acquisition: resource identifiers or input "
+            "values discoverable by later tools need not already be known. A selector means an "
+            "output JSON Pointer in required_fields, not a resource kind, search scope or ID. "
+            "For a free-form data container, retain the adapter's declared container pointer; "
+            "do not demand undeclared nested keys. An explicit need for the requested fact, "
+            "its producing capability, the matching evidence surface and all surface fields "
+            "suffice for coverage when its completion condition is also adequate. Compare "
+            "every obligation "
             "with the indexed "
             "information_needs and completion_criteria in the candidate. Zero-based indices "
             "must reference the candidate exactly. Information obligations may reference only "

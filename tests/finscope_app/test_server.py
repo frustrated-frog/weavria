@@ -369,7 +369,7 @@ async def test_session_api_executes_real_runtime_and_reports_tool_trace(
         "max_admission_replans": 8,
         "max_stagnant_actions_per_family": 3,
         "finalization_model_calls": reserved_calls,
-        "finalization_seconds": 10.0,
+        "finalization_seconds": 30.0,
     }
     await market_http.aclose()
 
@@ -567,7 +567,7 @@ async def test_finscope_retries_ungrounded_model_evidence_path_before_execution(
     assert payload.status == "completed"
     assert payload.task_outcome == "unverified"
     assert len(interpreter.requests) == 3
-    assert "one or more selectors are unsupported" in interpreter.requests[1].instructions
+    assert "one or more selectors are unsupported" in interpreter.requests[1].task.constraints[-1]
     assert "/regime" not in interpreter.requests[1].instructions
     assert "Independently audit" in interpreter.requests[2].instructions
     observation = provider.requests[0].current.task_observation
@@ -912,7 +912,9 @@ async def test_invalid_task_understanding_returns_safe_gateway_error(tmp_path: P
 
     assert response.status_code == 502
     assert response.json() == {
-        "detail": "Task interpreter returned finish instead of a specification"
+        "detail": (
+            "Task interpreter returned finish instead of a specification [InvalidTaskSpecification]"
+        )
     }
     assert len(interpreter.requests) == 2
     assert provider.requests == ()
@@ -952,3 +954,69 @@ async def test_sidecar_exposes_api_without_hosting_application_ui(tmp_path: Path
     assert widget.status_code == 404
     assert widget_asset.status_code == 404
     await market_http.aclose()
+
+
+async def test_factory_forwards_execution_and_understanding_reasoning_independently(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests: list[dict[str, object]] = []
+    closed = False
+    specification = TaskSpecification(
+        route="direct",
+        intent="Answer greeting",
+        goal="Reply to greeting",
+        completion_criteria=(CompletionCriterion(kind="response", description="Greet"),),
+    )
+
+    class Transport:
+        async def complete(self, body: dict[str, object]) -> object:
+            requests.append(body)
+            content = (
+                _declaration(specification).model_dump_json()
+                if len(requests) == 1
+                else '{"decision":{"kind":"finish","output":"你好"}}'
+            )
+            return {"choices": [{"message": {"content": content}, "finish_reason": "stop"}]}
+
+        async def aclose(self) -> None:
+            nonlocal closed
+            closed = True
+
+    def transport_factory(base_url: str, *, api_key: str, timeout_seconds: float) -> Transport:
+        return Transport()
+
+    monkeypatch.setattr("apps.finscope.server.HTTPChatCompletionTransport", transport_factory)
+    app = create_app(
+        FinScopeSettings(
+            model_base_url="http://model.test",
+            model_name="fake",
+            model_api_key="",
+            model_reasoning_effort="none",
+            understanding_reasoning_effort="low",
+            state_path=tmp_path / "sessions.sqlite3",
+        ),
+        requirement_coverage=False,
+    )
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://sidecar.test"
+        ) as client:
+            session_id = (await client.post("/api/sessions")).json()["session_id"]
+            response = await client.post(
+                f"/api/sessions/{session_id}/messages",
+                json={
+                    "input_id": "reasoning-profile",
+                    "text": "你好",
+                    "context": {
+                        "schema_version": 1,
+                        "surface": "finscope_workspace",
+                        "current_view": "agent",
+                        "navigation": {"view": "agent", "label": "Agent"},
+                    },
+                },
+            )
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "completed"
+    assert [request["reasoning_effort"] for request in requests] == ["low", "none"]
+    assert [request["max_tokens"] for request in requests] == [8192, 4096]
+    assert closed

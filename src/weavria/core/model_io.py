@@ -2,7 +2,7 @@
 
 from typing import Literal, Self
 
-from pydantic import Field, JsonValue, model_validator
+from pydantic import BaseModel, Field, JsonValue, field_validator, model_validator
 
 from ._schema import ContractModel, NonBlankString
 from .actions import AgentAction, ToolCallAction
@@ -36,13 +36,21 @@ class ApplicationObservation(ContractModel):
         return self
 
 
-class TaskObservation(ContractModel):
+class TaskObservation(BaseModel):
     """A bounded, low-trust semantic projection tied to one accepted user input.
 
     The payload can guide a model but cannot replace ``TaskInput`` or authorize an
     effect. Its producer and schema remain explicit so Runtime traces never confuse
     model interpretation with host-owned requirements.
     """
+
+    model_config = ContractModel.model_config
+    schema_version: Literal[1, 2] = 1
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def validate_version_type(cls, value: object) -> object:
+        return ContractModel.validate_version_type(value)
 
     kind: Literal["task_understanding"] = "task_understanding"
     observation_id: NonBlankString
@@ -63,8 +71,9 @@ class TaskObservation(ContractModel):
 
     @model_validator(mode="after")
     def validate_size(self) -> Self:
-        if len(self.model_dump_json().encode()) > 16_384:
-            raise ValueError("task observation exceeds 16384 encoded bytes")
+        limit = 16_384 if self.schema_version == 1 else 65_536
+        if len(self.model_dump_json().encode()) > limit:
+            raise ValueError(f"task observation exceeds {limit} encoded bytes")
         return self
 
 

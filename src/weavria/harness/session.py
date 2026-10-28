@@ -40,10 +40,10 @@ from .understanding import (
     apply_frame_patch,
     canonicalize_task_frame,
     create_frame_patch,
-    dump_task_frame,
     load_task_frame,
     load_task_frame_patch,
     reduce_frame_patch,
+    task_frame_observation,
 )
 
 
@@ -221,15 +221,7 @@ class TaskAwareSessionPreparer:
                 evidence_revision=ledger.evidence_revision,
                 need_state_sha256=ledger.progress_sha256(),
             )
-            observation = TaskObservation(
-                observation_id=frame.frame_id,
-                input_id=context.input_id,
-                task_revision=context.task.revision,
-                frame_revision=frame.revision,
-                producer_version=frame.interpreter_version,
-                payload_schema="weavria.task-frame/6",
-                payload=dump_task_frame(frame),
-            )
+            observation = task_frame_observation(frame)
         if base is not None:
             assert preparation.patch is not None
             transition_patch_model = create_frame_patch(base, frame, preparation.patch.cause)
@@ -349,15 +341,7 @@ class TaskAwareSessionPreparer:
             evidence_revision=ledger.evidence_revision,
             need_state_sha256=ledger.progress_sha256(),
         )
-        observation = TaskObservation(
-            observation_id=frame.frame_id,
-            input_id=context.input_id,
-            task_revision=context.task.revision,
-            frame_revision=frame.revision,
-            producer_version=frame.interpreter_version,
-            payload_schema="weavria.task-frame/6",
-            payload=dump_task_frame(frame),
-        )
+        observation = task_frame_observation(frame)
         return SessionTaskPreparation(
             preparation_version=self.version,
             visible_tool_names=visible,
@@ -460,12 +444,4 @@ class TaskFrameSemanticReducer:
         base = load_task_frame(current.observation.payload)
         patch = load_task_frame_patch(transition.patch)
         target = reduce_frame_patch(base, patch)
-        return TaskObservation(
-            observation_id=target.frame_id,
-            input_id=target.request_anchor.input_id,
-            task_revision=target.request_anchor.task_revision,
-            frame_revision=target.revision,
-            producer_version=target.interpreter_version,
-            payload_schema="weavria.task-frame/6",
-            payload=dump_task_frame(target),
-        )
+        return task_frame_observation(target)

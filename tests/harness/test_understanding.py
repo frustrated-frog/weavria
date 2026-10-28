@@ -7,6 +7,7 @@ from pydantic import BaseModel, ConfigDict, JsonValue, ValidationError
 
 from weavria.artifacts import InMemoryArtifactStore
 from weavria.core import (
+    ApplicationObservation,
     CompletionAccept,
     CompletionNotice,
     CompletionRepair,
@@ -464,7 +465,7 @@ async def test_model_interpreter_repairs_one_invalid_specification_with_bounded_
     assert len(provider.requests) == 2
     repair = provider.requests[1].instructions
     assert "rejected by trusted host validation" in repair
-    assert "direct tasks cannot require capabilities" in repair
+    assert "direct tasks cannot require capabilities" in provider.requests[1].task.constraints[-1]
     assert "SENSITIVE-RAW-MODEL-VALUE" not in repair
 
 
@@ -505,7 +506,7 @@ async def test_model_interpreter_repairs_evidence_selector_outside_output_contra
     assert preparation.record.frame.requirements[0].required_fields == ("/text",)
     assert len(provider.requests) == 2
     repair = provider.requests[1].instructions
-    assert "selectors must address" in repair
+    assert "selectors must address" in provider.requests[1].task.constraints[-1]
     assert "/title" not in repair
     catalogue = next(
         value
@@ -865,7 +866,10 @@ async def test_capability_catalogue_has_an_explicit_input_budget() -> None:
     assert raised.value.error.category is ErrorCategory.CONTEXT_BUDGET_EXCEEDED
 
 
-async def test_valid_but_oversized_specification_fails_at_the_typed_boundary() -> None:
+@pytest.mark.parametrize("oversized", [False, True])
+async def test_large_specification_uses_versioned_capacity_and_rejects_overflow(
+    oversized: bool,
+) -> None:
     long_text = "界" * 512
     names = tuple(f"read_{index}" for index in range(8))
     specification = TaskSpecification(
@@ -909,12 +913,38 @@ async def test_valid_but_oversized_specification_fails_at_the_typed_boundary() -
         ModelTaskInterpreter(FakeModelProvider((_declaration(specification),)))
     )
 
+    context = (
+        tuple(
+            ApplicationObservation(
+                observation_id=f"navigation-{index}",
+                input_id="oversized-frame",
+                provider="test",
+                payload_schema="navigation/1",
+                payload={"text": "x" * 12_000},
+            )
+            for index in range(2)
+        )
+        if oversized
+        else ()
+    )
+    if not oversized:
+        prepared = await engine.prepare(
+            input_id="oversized-frame",
+            task=TaskInput(goal="Read values"),
+            history=(),
+            tools=tools,
+        )
+        assert prepared.observation.schema_version == 2
+        assert 16_384 < len(prepared.observation.model_dump_json().encode()) <= 65_536
+        return
+
     with pytest.raises(TaskUnderstandingError) as raised:
         await engine.prepare(
             input_id="oversized-frame",
             task=TaskInput(goal="Read values"),
             history=(),
             tools=tools,
+            application_context=context,
         )
 
     assert raised.value.error.category is ErrorCategory.INVALID_MODEL_RESPONSE
@@ -1522,3 +1552,69 @@ def test_tool_registry_selection_is_ordered_and_fails_closed() -> None:
         tools.select(("read_document", "read_document"))
     with pytest.raises(ValueError, match="not registered"):
         tools.select(("unknown",))
+
+
+async def test_frame_reducer_preserves_legacy_envelope_and_reproduces_v2_transition() -> None:
+    import hashlib
+
+    from weavria.core import SemanticSnapshot, SemanticTransition, SemanticVersion
+    from weavria.harness.session import TaskFrameSemanticReducer
+
+    engine = TaskUnderstandingEngine(
+        ModelTaskInterpreter(FakeModelProvider((_declaration(_direct()), _declaration(_direct()))))
+    )
+    first = await engine.prepare(
+        input_id="first", task=TaskInput(goal="Explain"), history=(), tools=_tools()
+    )
+    assert first.observation.schema_version == 1
+    second = await engine.prepare(
+        input_id="second",
+        task=TaskInput(goal="Explain again", revision=2),
+        history=(),
+        tools=_tools(),
+        base_frame=first.record.frame,
+        work_id=first.record.frame.work_id,
+        application_context=tuple(
+            ApplicationObservation(
+                observation_id=f"context-{index}",
+                input_id="second",
+                provider="test",
+                payload_schema="navigation/1",
+                payload={"text": "x" * 10_000},
+            )
+            for index in range(2)
+        ),
+    )
+    assert second.observation.schema_version == 2
+    assert second.patch is not None
+    patch = second.patch.model_dump(mode="json")
+    snapshot = SemanticSnapshot(
+        session_id="session",
+        work_id=first.record.frame.work_id,
+        input_id="first",
+        run_id="run",
+        version=SemanticVersion(
+            task_revision=1,
+            frame_revision=1,
+            capability_epoch=1,
+            evidence_revision=1,
+            semantic_sequence=1,
+        ),
+        observation=first.observation,
+        need_ledger={},
+    )
+    transition = SemanticTransition(
+        kind="frame_patch",
+        work_id=second.record.frame.work_id,
+        expected_semantic_sequence=1,
+        base_frame_id=first.record.frame.frame_id,
+        target_frame_id=second.record.frame.frame_id,
+        cause="new_user_input",
+        patch=patch,
+        patch_sha256=hashlib.sha256(
+            json.dumps(patch, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest(),
+    )
+    reduced = TaskFrameSemanticReducer().reduce_observation(snapshot, transition)
+    assert reduced == second.observation
+    assert first.observation.schema_version == 1

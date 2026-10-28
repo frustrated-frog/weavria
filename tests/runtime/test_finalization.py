@@ -5,9 +5,11 @@ import pytest
 from pydantic import BaseModel, Field
 
 from weavria.artifacts import InMemoryArtifactStore
+from weavria.context import ControlContextBuilder, ControlEvidencePlan, EvidenceContextBuilder
 from weavria.core import (
     CompletionChecked,
     CompletionRepair,
+    ControlFeedback,
     ControlRequest,
     ErrorCategory,
     FinalizationStarted,
@@ -17,8 +19,11 @@ from weavria.core import (
     RunStatus,
     TaskDirective,
     TaskInput,
+    TaskObservation,
     ToolBatch,
     ToolCallAction,
+    ToolRecord,
+    TurnFeedback,
     minimum_exchange,
 )
 from weavria.harness import (
@@ -63,6 +68,7 @@ async def setup(
     provider: FakeControlProvider | None = None,
     store: InMemoryArtifactStore | None = None,
     required_action: bool = False,
+    context_builder: ControlContextBuilder | None = None,
 ) -> tuple[AgentLoop, FakeControlProvider]:
     async def read(arguments: Input, context: ToolContext) -> Output:
         return Output(value=arguments.key)
@@ -142,6 +148,7 @@ async def setup(
         ),
         completion=completion or TaskObligationCompletionPolicy(),
         finalization=NeedFinalizationPolicy(),
+        context_builder=context_builder,
     )
     return agent, provider
 
@@ -357,3 +364,114 @@ async def test_synthesis_cannot_replace_an_unfinished_required_action() -> None:
     assert result.status is RunStatus.FAILED and result.output is None
     assert agent.state.finalization is None
     assert not any(isinstance(event.data, FinalizationStarted) for event in agent.events)
+
+
+async def test_stalled_information_repair_can_use_reserved_synthesis() -> None:
+    turns = (
+        read(),
+        finish("premature"),
+        finish("still missing"),
+        finish("Only value is established"),
+    )
+    baseline, _ = await setup(turns, fields=("/value", "/details/extra"), max_calls=8, reserve=0)
+    baseline_result = await baseline.execute()
+    assert baseline_result.status is RunStatus.FAILED and baseline_result.output is None
+    agent, provider = await setup(
+        turns, fields=("/value", "/details/extra"), max_calls=8, reserve=1
+    )
+    result = await agent.execute()
+    assert result.status is RunStatus.COMPLETED and result.task_outcome == "unverifiable"
+    assert result.output == "Only value is established"
+    assert agent.state.model_calls == 4 and agent.state.tool_calls == 1
+    assert agent.state.finalization is not None and agent.state.finalization.mode == "limited"
+    assert "FINALIZATION" in provider.requests[-1].instructions
+
+
+async def test_stalled_repair_synthesis_still_enforces_publication_veto() -> None:
+    class Reject:
+        version = "reject/1"
+
+        async def verify(self, context: CompletionContext) -> CompletionRepair:
+            return CompletionRepair(issue_codes=("fact_conflict",), guidance="Correct the claim")
+
+    agent, _ = await setup(
+        (read(), finish(), finish(), finish(), finish()),
+        fields=("/value", "/details/extra"),
+        max_calls=8,
+        reserve=1,
+        completion=LayeredCompletionPolicy(TaskObligationCompletionPolicy(), Reject()),
+    )
+    result = await agent.execute()
+    assert agent.state.finalization is not None
+    assert result.status is not RunStatus.COMPLETED and result.output is None
+
+
+async def test_stalled_repair_cannot_skip_an_independent_required_action() -> None:
+    agent, _ = await setup(
+        (read(), finish(), finish()),
+        fields=("/value", "/details/extra"),
+        max_calls=8,
+        reserve=1,
+        required_action=True,
+    )
+    result = await agent.execute()
+    assert result.status is RunStatus.FAILED and result.output is None
+    assert agent.state.finalization is None
+
+
+async def test_context_preparation_cannot_spend_the_synthesis_reserve() -> None:
+    closed = asyncio.Event()
+    store = InMemoryArtifactStore()
+
+    class SlowExploration(EvidenceContextBuilder):
+        async def build_control(
+            self,
+            *,
+            run_id: str,
+            instructions: str,
+            task: TaskInput,
+            task_observation: TaskObservation | None = None,
+            records: tuple[ToolRecord, ...],
+            max_request_bytes: int,
+            feedback: TurnFeedback | None = None,
+            control: ControlFeedback | None = None,
+            required_call_ids: tuple[str, ...] = (),
+            feedback_reserve_floor_bytes: int = 0,
+        ) -> ControlEvidencePlan:
+            if records and "FINALIZATION" not in instructions:
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    closed.set()
+            return await super().build_control(
+                run_id=run_id,
+                instructions=instructions,
+                task=task,
+                task_observation=task_observation,
+                records=records,
+                max_request_bytes=max_request_bytes,
+                feedback=feedback,
+                control=control,
+                required_call_ids=required_call_ids,
+                feedback_reserve_floor_bytes=feedback_reserve_floor_bytes,
+            )
+
+    limits = RunLimits(
+        max_model_calls=5,
+        max_request_bytes=24_000,
+        max_duration=0.5,
+        max_completion_duration=0.08,
+        finalization_model_calls=1,
+        finalization_seconds=0.25,
+    )
+    agent, _ = await setup(
+        (read(), finish("Only value is established")),
+        fields=("/value", "/details/extra"),
+        limits=limits,
+        store=store,
+        context_builder=SlowExploration(store),
+    )
+    result = await agent.execute()
+    assert closed.is_set()
+    assert result.status is RunStatus.COMPLETED and result.task_outcome == "unverifiable"
+    assert agent.state.model_calls == 2 and agent.state.tool_calls == 1

@@ -139,3 +139,31 @@ def test_understanding_reasoning_effort_can_be_omitted(
 def test_run_budgets_must_be_positive(factory: Callable[[], FinScopeSettings]) -> None:
     with pytest.raises(ValueError, match=r"run counter|timeouts"):
         factory()
+
+
+@pytest.mark.parametrize("effort", ["", "none", "low", "medium", "high", "max", "omit"])
+def test_execution_reasoning_is_explicit_and_separate_from_understanding(
+    monkeypatch: pytest.MonkeyPatch, effort: str
+) -> None:
+    monkeypatch.setenv("WEAVRIA_MODEL_BASE_URL", "https://model.example/v1")
+    monkeypatch.setenv("WEAVRIA_MODEL_NAME", "model")
+    monkeypatch.setenv("WEAVRIA_MODEL_REASONING_EFFORT", effort)
+    monkeypatch.setenv("WEAVRIA_UNDERSTANDING_REASONING_EFFORT", "low")
+    settings = FinScopeSettings.from_env()
+    assert settings.model_reasoning_effort == (None if effort == "omit" else effort or "none")
+    assert settings.understanding_reasoning_effort == "low"
+
+
+def test_execution_reasoning_rejects_unsupported_values(monkeypatch: pytest.MonkeyPatch) -> None:
+    with pytest.raises(ValueError, match="reasoning effort"):
+        FinScopeSettings(
+            model_base_url="https://model.example/v1",
+            model_name="model",
+            model_api_key="",
+            model_reasoning_effort="extreme",  # type: ignore[arg-type]
+        )
+    monkeypatch.setenv("WEAVRIA_MODEL_BASE_URL", "https://model.example/v1")
+    monkeypatch.setenv("WEAVRIA_MODEL_NAME", "model")
+    monkeypatch.setenv("WEAVRIA_MODEL_REASONING_EFFORT", "extreme")
+    with pytest.raises(ValueError, match="WEAVRIA_MODEL_REASONING_EFFORT"):
+        FinScopeSettings.from_env()

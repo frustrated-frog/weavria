@@ -23,6 +23,7 @@ class FinScopeSettings:
     request_timeout_seconds: float = 15.0
     json_mode: bool = False
     model_max_output_tokens: int = 4096
+    model_reasoning_effort: UnderstandingReasoningEffort | None = "none"
     understanding_model_max_output_tokens: int = 8192
     understanding_reasoning_effort: UnderstandingReasoningEffort | None = "none"
     context_window_tokens: int = 32_768
@@ -33,7 +34,7 @@ class FinScopeSettings:
     model_max_request_bytes: int | None = None
     run_max_duration_seconds: float = 180.0
     finalization_model_calls: int = 0
-    finalization_seconds: float = 10.0
+    finalization_seconds: float = 30.0
 
     def __post_init__(self) -> None:
         _validate_http_url("model_base_url", self.model_base_url)
@@ -43,15 +44,9 @@ class FinScopeSettings:
             raise ValueError("model_name is required")
         if not self.context_encoding.strip():
             raise ValueError("context_encoding is required")
-        if self.understanding_reasoning_effort not in {
-            None,
-            "none",
-            "low",
-            "medium",
-            "high",
-            "max",
-        }:
-            raise ValueError("understanding reasoning effort is unsupported")
+        for effort in (self.model_reasoning_effort, self.understanding_reasoning_effort):
+            if effort not in {None, "none", "low", "medium", "high", "max"}:
+                raise ValueError("model reasoning effort is unsupported")
         if (
             type(self.model_max_output_tokens) is not int
             or type(self.understanding_model_max_output_tokens) is not int
@@ -123,6 +118,7 @@ class FinScopeSettings:
             json_mode=os.environ.get("WEAVRIA_MODEL_JSON_MODE", "false").lower()
             in {"1", "true", "yes"},
             model_max_output_tokens=int(os.environ.get("WEAVRIA_MODEL_MAX_OUTPUT_TOKENS", "4096")),
+            model_reasoning_effort=_reasoning_effort_from_env("WEAVRIA_MODEL_REASONING_EFFORT"),
             understanding_model_max_output_tokens=int(
                 os.environ.get("WEAVRIA_UNDERSTANDING_MAX_OUTPUT_TOKENS", "8192")
             ),
@@ -132,7 +128,7 @@ class FinScopeSettings:
             context_window_tokens=int(os.environ.get("WEAVRIA_CONTEXT_WINDOW_TOKENS", "32768")),
             context_encoding=os.environ.get("WEAVRIA_CONTEXT_ENCODING", "cl100k_base").strip(),
             finalization_model_calls=int(os.environ.get("WEAVRIA_FINALIZATION_MODEL_CALLS", "0")),
-            finalization_seconds=float(os.environ.get("WEAVRIA_FINALIZATION_SECONDS", "10")),
+            finalization_seconds=float(os.environ.get("WEAVRIA_FINALIZATION_SECONDS", "30")),
             run_max_model_calls=int(os.environ.get("WEAVRIA_RUN_MAX_MODEL_CALLS", "20")),
             run_max_tool_calls=int(os.environ.get("WEAVRIA_RUN_MAX_TOOL_CALLS", "20")),
             run_max_request_bytes=int(os.environ.get("WEAVRIA_RUN_MAX_REQUEST_BYTES", "1048576")),

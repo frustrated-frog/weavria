@@ -337,3 +337,23 @@ def test_workspace_evidence_profiles_cover_each_registered_private_tool() -> Non
         surface.parameter_constraints[0].input_pointer == "/scope"
         for surface in search_profile.surfaces
     )
+
+
+async def test_reaction_search_id_uses_its_own_resource_namespace() -> None:
+    requests: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"success": True, "data": {"id": 17}})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as http:
+        client = FinScopeWorkspaceClient("http://finscope.test", client=http)
+        await client.read_resource(
+            FinScopeResourceInput(kind="investment_reaction", identifier="17")
+        )
+        await client.read_resource(
+            FinScopeResourceInput(kind="reaction_event", identifier="NEWS:source17")
+        )
+    assert requests[0].url.path == "/api/investment-reactions/17"
+    assert requests[1].url.path == "/api/investment-reactions/event"
+    assert dict(requests[1].url.params) == {"key": "NEWS:source17"}

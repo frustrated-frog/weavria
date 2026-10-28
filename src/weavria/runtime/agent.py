@@ -589,7 +589,21 @@ class _AgentKernel:
                         # evidence. Rebuild every decision from the turn's hard capacity
                         # so an admission rejection can reclaim that optional space.
                         self._request_budget = self._request_capacity
-                        plan = await self._finalization_context(task, deadline)
+                        if (
+                            self._limits.finalization_model_calls
+                            and self.state.finalization is None
+                        ):
+                            try:
+                                async with asyncio.timeout(
+                                    max(0, self._remaining(deadline) - self._finalization_reserve)
+                                ):
+                                    plan = await self._finalization_context(task, deadline)
+                            except TimeoutError:
+                                plan = await self._finalization_context(
+                                    task, deadline, force_reserve=True
+                                )
+                        else:
+                            plan = await self._finalization_context(task, deadline)
                         if plan is None:
                             if task.revision != self.state.task.revision:
                                 continue
@@ -957,7 +971,7 @@ class _AgentKernel:
             context.close()
 
     async def _finalization_context(
-        self, task: TaskInput, deadline: float
+        self, task: TaskInput, deadline: float, *, force_reserve: bool = False
     ) -> EvidencePlan | TurnEvidencePlan | ControlEvidencePlan | None:
         if not self._limits.finalization_model_calls:
             return await self._build_context(task)
@@ -965,7 +979,8 @@ class _AgentKernel:
         existing = self.state.finalization
         before = await self._assess_finalization(task)
         reserve_reached = (
-            self._limits.max_model_calls - self.state.model_calls
+            force_reserve
+            or self._limits.max_model_calls - self.state.model_calls
             <= self._limits.finalization_model_calls
             or self._remaining(deadline) <= self._finalization_reserve
         )
@@ -1797,6 +1812,10 @@ class _AgentKernel:
             return None
         if repair_stalled:
             assert isinstance(assessment.decision, CompletionRepair)
+            if self._limits.finalization_model_calls and self.state.finalization is None:
+                await self._finalization_context(task, deadline, force_reserve=True)
+                if self.state.finalization is not None:
+                    return assessment
             raise _CompletionRepairStalled(assessment.decision.issue_codes)
         return assessment
 

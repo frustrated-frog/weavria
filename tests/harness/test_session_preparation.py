@@ -1258,3 +1258,57 @@ async def test_joint_compiler_uses_accepted_ledger_progress_without_changing_tas
     assert reports[1].uncovered_demand_ids == ()
     with pytest.raises(ValueError, match="accepted semantic snapshot"):
         preparer.context_focus(snapshots[0].model_copy(update={"work_id": "another-work"}))
+
+
+@pytest.mark.parametrize("request_bytes", [12_000, 131_072])
+async def test_v2_task_observation_preserves_request_budget_and_evidence_refresh(
+    tmp_path: Path, request_bytes: int
+) -> None:
+    base = _execute()
+    specification = base.model_copy(
+        update={
+            "intent": "界" * 512,
+            "goal": "界" * 512,
+            "information_needs": tuple(
+                base.information_needs[0].model_copy(update={"description": "界" * 512})
+                for _ in range(8)
+            ),
+        }
+    )
+    interpreter = FakeModelProvider((_declaration(specification),))
+    model = _ExecuteSessionModel()
+    preparer = TaskAwareSessionPreparer(TaskUnderstandingEngine(ModelTaskInterpreter(interpreter)))
+    database = tmp_path / "v2-session.db"
+    async with SessionEngine(
+        database,
+        model=model,
+        tools=_registry(),
+        task_preparation=preparer,
+        limits=RunLimits(max_request_bytes=request_bytes),
+    ) as engine:
+        await engine.create("v2")
+        result = await engine.send(
+            "v2",
+            "Read alpha.",
+            input_id="input-1",
+        )
+        events = await engine.store.events("v2")
+    assert result.report.status is (
+        RunStatus.COMPLETED if request_bytes == 131_072 else RunStatus.BUDGET_EXHAUSTED
+    )
+    commits = [
+        event.data.snapshot for event in events if isinstance(event.data, SessionSemanticCommitted)
+    ]
+    assert commits and all(item.observation.schema_version == 2 for item in commits)
+    if request_bytes == 131_072:
+        assert commits[-1].version.evidence_revision > commits[0].version.evidence_revision
+    else:
+        assert model.requests == []
+    async with SessionEngine(
+        database,
+        model=FakeSessionProvider(()),
+        tools=_registry(),
+        task_preparation=preparer,
+    ) as reopened:
+        restored = await reopened.store.semantic_head("v2", commits[-1].work_id)
+    assert restored == commits[-1]
