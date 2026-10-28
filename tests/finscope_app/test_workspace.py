@@ -49,6 +49,40 @@ async def test_workspace_client_dispatches_only_fixed_get_routes() -> None:
     assert catalogue.method == resource.method == search.method == "GET"
 
 
+@pytest.mark.parametrize(
+    ("status", "category", "retryable"),
+    (
+        (400, ErrorCategory.INVALID_TOOL_ARGUMENTS, False),
+        (422, ErrorCategory.INVALID_TOOL_ARGUMENTS, False),
+        (404, ErrorCategory.TOOL_FAILURE, False),
+        (429, ErrorCategory.TOOL_FAILURE, True),
+        (503, ErrorCategory.TOOL_FAILURE, True),
+    ),
+)
+async def test_http_failures_preserve_status_and_argument_vs_source_semantics(
+    status: int,
+    category: ErrorCategory,
+    retryable: bool,
+) -> None:
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(status, json={"message": "private backend diagnostic"})
+        )
+    ) as http:
+        client = FinScopeWorkspaceClient("http://finscope.test", client=http)
+        with pytest.raises(ToolFault) as raised:
+            await client.read_resource(
+                FinScopeResourceInput(
+                    kind="financial_instrument_reports",
+                    identifier="831",
+                )
+            )
+    assert raised.value.category is category
+    assert raised.value.retryable is retryable
+    assert f"HTTP {status}" in str(raised.value)
+    assert "private backend diagnostic" not in str(raised.value)
+
+
 async def test_every_catalogue_area_dispatches_through_the_fixed_get_manifest() -> None:
     requests: list[httpx.Request] = []
 

@@ -580,7 +580,17 @@ class FinScopeCatalogueInput(_WorkspaceModel):
 
 class FinScopeResourceInput(_WorkspaceModel):
     kind: ResourceKind
-    identifier: str = Field(min_length=1, max_length=64, pattern=_IDENTIFIER_PATTERN)
+    identifier: str = Field(
+        min_length=1,
+        max_length=64,
+        pattern=_IDENTIFIER_PATTERN,
+        description=(
+            "Copy the resource identifier from its catalogue. Financial instrument subviews "
+            "require financial_instruments[].id, never a stock code or company name. "
+            "If the target is absent from that catalogue, report the gap rather than "
+            "guessing an ID."
+        ),
+    )
     secondary_identifier: str | None = Field(
         default=None,
         min_length=1,
@@ -614,12 +624,21 @@ class FinScopeResourceInput(_WorkspaceModel):
 
 class FinScopeSearchInput(_WorkspaceModel):
     scope: SearchScope
-    query: str = Field(min_length=1, max_length=120)
+    query: str = Field(
+        min_length=1,
+        max_length=120,
+        description=(
+            "Company keywords for general scopes. next_session_predictions, "
+            "single_stock_forecasts and attribution_history require a security code "
+            "from accepted evidence, not a company name."
+        ),
+    )
     qualifier: str | None = Field(
         default=None,
         min_length=1,
         max_length=32,
         pattern=_IDENTIFIER_PATTERN,
+        description="Required for attribution_history: instrument type, for example STOCK.",
     )
     page: int = Field(default=0, ge=0, le=10_000)
     limit: int = Field(default=20, ge=1, le=50)
@@ -729,8 +748,18 @@ class FinScopeWorkspaceClient:
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
             raise ToolFault(
-                ErrorCategory.TOOL_FAILURE,
-                "FinScope workspace data is unavailable",
+                ErrorCategory.INVALID_TOOL_ARGUMENTS
+                if status in (400, 422)
+                else ErrorCategory.TOOL_FAILURE,
+                (
+                    f"FinScope rejected workspace query parameters (HTTP {status}); "
+                    "check the declared fields and identifiers"
+                    if status in (400, 422)
+                    else "FinScope workspace resource was not found (HTTP 404); "
+                    "resolve the identifier from its matching catalogue"
+                    if status == 404
+                    else f"FinScope workspace data is unavailable (HTTP {status})"
+                ),
                 retryable=status == 429 or status >= 500,
             ) from exc
         except (httpx.TimeoutException, httpx.TransportError) as exc:
@@ -811,7 +840,8 @@ def finscope_workspace_tools(client: FinScopeWorkspaceClient) -> tuple[Registere
             description=(
                 "Read one typed FinScope resource or its fixed subview by validated identifiers. "
                 "Supported kinds span every current workspace domain; the caller cannot provide "
-                "a URL, path, method, or arbitrary query parameter."
+                "a URL, path, method, or arbitrary query parameter. Financial instrument "
+                "resources require the id from financial_instruments, not the stock code."
             ),
             intent_signals=(
                 "详情 原文 上下文 历史 证据",
@@ -835,7 +865,9 @@ def finscope_workspace_tools(client: FinScopeWorkspaceClient) -> tuple[Registere
             description=(
                 "Search a fixed FinScope scope: companies, knowledge, sectors, news, reaction "
                 "events, quant candidates, forecasts, or attribution history. Search text is "
-                "encoded only as a bounded query parameter."
+                "encoded only as a bounded query parameter. Forecast and attribution scopes "
+                "require a security code instead of a company name; attribution_history also "
+                "requires qualifier for the instrument type."
             ),
             intent_signals=(
                 "搜索公司 查公司 股票公司",
