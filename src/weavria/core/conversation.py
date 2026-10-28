@@ -234,6 +234,7 @@ class ConversationView(BaseModel):
         "context-compiler/5",
         "context-compiler/6",
         "context-compiler/7",
+        "context-compiler/8",
     ] = "conversation/2"
 
     @model_validator(mode="after")

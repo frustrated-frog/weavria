@@ -1,7 +1,7 @@
 """Explicit model-window accounting independent of the Runtime's byte contract."""
 
 from dataclasses import dataclass
-from typing import Literal, Protocol
+from typing import Literal, Protocol, runtime_checkable
 
 from weavria.core import ModelRequest, SessionRequest
 
@@ -32,10 +32,20 @@ class SessionTokenCounter(Protocol):
         """Return a sufficient serialized-request ceiling for future feedback.
 
         When ``request`` is provided, implementations may account exactly for
-        trusted, invariant transport content while keeping unknown future data
-        on a conservative byte-per-token bound.
+        invariant conversation, task and task observation as well as instructions
+        exactly. Only history, feedback and control may change within that bound.
         """
         ...
+
+
+@runtime_checkable
+class SessionRequestSizer(Protocol):
+    """Optional adapter accounting for the final HTTP body separately from model tokens."""
+
+    @property
+    def session_request_byte_limit(self) -> int | None: ...
+
+    def session_request_bytes(self, request: SessionRequest) -> int: ...
 
 
 class ModelRequestTokenCounter(Protocol):

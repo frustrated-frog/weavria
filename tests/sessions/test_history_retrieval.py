@@ -112,7 +112,7 @@ async def test_old_history_discovery_multi_span_delivery_and_request_commit(
         reports = [e.data.compilation for e in events if isinstance(e.data, SessionContextCompiled)]
         assert len(reports) == 1
         report = reports[0]
-        assert report.schema_version == 3 and report.retrieval is not None
+        assert report.schema_version == 8 and report.retrieval is not None
         assert report.retrieval.index_complete and report.retrieval.search_complete
         assert report.retrieval.indexed_turns == 72
         assert len(report.retrieval.candidates) <= 6

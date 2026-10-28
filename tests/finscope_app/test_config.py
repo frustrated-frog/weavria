@@ -15,6 +15,25 @@ def test_parent_origin_rejects_paths() -> None:
         )
 
 
+def test_request_memory_and_optional_http_body_limits_are_independent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("WEAVRIA_MODEL_BASE_URL", "https://model.example/v1")
+    monkeypatch.setenv("WEAVRIA_MODEL_NAME", "model")
+    monkeypatch.delenv("WEAVRIA_RUN_MAX_REQUEST_BYTES", raising=False)
+    monkeypatch.delenv("WEAVRIA_MODEL_MAX_REQUEST_BYTES", raising=False)
+    defaults = FinScopeSettings.from_env()
+    assert defaults.run_max_request_bytes == 1_048_576
+    assert defaults.model_max_request_bytes is None
+    monkeypatch.setenv("WEAVRIA_MODEL_MAX_REQUEST_BYTES", "64000")
+    explicit = FinScopeSettings.from_env()
+    assert explicit.run_max_request_bytes == defaults.run_max_request_bytes
+    assert explicit.model_max_request_bytes == 64_000
+    monkeypatch.setenv("WEAVRIA_MODEL_MAX_REQUEST_BYTES", "0")
+    with pytest.raises(ValueError, match="body limit"):
+        FinScopeSettings.from_env()
+
+
 def test_context_window_requires_output_and_safety_capacity() -> None:
     with pytest.raises(ValueError, match="context window"):
         FinScopeSettings(

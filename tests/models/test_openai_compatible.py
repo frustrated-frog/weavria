@@ -130,6 +130,8 @@ async def test_adapter_enforces_byte_limit_without_token_window() -> None:
     diagnostic = raised.value.request_diagnostic
     assert diagnostic is not None and not diagnostic.admitted
     assert diagnostic.request_bytes > diagnostic.request_budget_bytes == 64
+    assert "HTTP body bytes" in raised.value.error.message
+    assert "input tokens" not in raised.value.error.message
     assert transport.requests == []
 
 

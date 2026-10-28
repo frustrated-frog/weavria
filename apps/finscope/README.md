@@ -31,7 +31,7 @@ export WEAVRIA_CONTEXT_WINDOW_TOKENS="32768"
 export WEAVRIA_CONTEXT_ENCODING="cl100k_base"
 export WEAVRIA_RUN_MAX_MODEL_CALLS="20"
 export WEAVRIA_RUN_MAX_TOOL_CALLS="20"
-export WEAVRIA_RUN_MAX_REQUEST_BYTES="64000"
+export WEAVRIA_RUN_MAX_REQUEST_BYTES="1048576"
 export WEAVRIA_RUN_MAX_DURATION_SECONDS="180"
 export WEAVRIA_FINSCOPE_BASE_URL="http://127.0.0.1:8080"
 export WEAVRIA_ALLOWED_PARENT_ORIGIN="http://localhost:5173"
@@ -57,11 +57,19 @@ Sidecar 默认启用 Weavria 的联合上下文编译、持久历史检索与主
 预留和分词编码必须与实际模型配置保持一致；若供应商使用不同 tokenizer，应通过上述环境变量
 显式改成兼容编码，不要把默认值当成供应商能力探测结果。
 
-本地真实模型验证默认允许 20 次模型调用、20 次工具调用、64,000 字节单次请求预算和 180 秒
+本地真实模型验证默认允许 20 次模型调用、20 次工具调用、1 MiB 序列化请求内存上限和 180 秒
 Agent 执行时间。任务理解阶段另有 180 秒上限；两阶段受二者之和形成的单次请求硬 Deadline
 约束，因此任一阶段未用完的时间不会扩大另一阶段自己的上限。它们是宿主运行策略而不是金融
 业务规则，可通过 `WEAVRIA_RUN_MAX_*` 与 `WEAVRIA_UNDERSTANDING_MAX_DURATION_SECONDS`
 环境变量调整；Context Compiler 仍会独立遵守模型上下文窗口和输出预留。
+
+`WEAVRIA_RUN_MAX_REQUEST_BYTES` 是主机资源上限，不代表模型的上下文容量。HTTP 请求体会因协议
+和 JSON 字符串嵌套而大于内部请求。若网关确有字节限制，可单独设置
+`WEAVRIA_MODEL_MAX_REQUEST_BYTES`；默认留空。Compiler 与 Provider 使用同一个最终请求体编码器
+计量，Compiler 在发送前缩减可选历史或证据视图，工具原始结果仍保存在 Artifact 中，不重执行工具。
+已知任务和会话前缀按稳定 BPE Token 计量，只有未知反馈后缀采用最坏字节上界，避免大型 Task Frame
+反复挤掉实际能够容纳的工具批次。真正无法容纳的必需内容仍明确失败。详情见
+[ADR 0054](../../docs/decisions/0054-统一请求计量与反馈前缀预算.md)。
 
 FinScope 前端设置 `VITE_WEAVRIA_AGENT_URL=http://127.0.0.1:8765` 后，市场页悬浮窗与左侧
 Agent 问答页会通过原生 FinScope 组件调用这些接口。完整页和悬浮窗复用同一持久会话；未配置时

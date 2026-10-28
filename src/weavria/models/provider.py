@@ -97,7 +97,16 @@ class ModelInputError(ValueError):
 
     def __init__(self, diagnostic: ModelRequestDiagnostic) -> None:
         self.diagnostic = ModelRequestDiagnostic.model_validate(diagnostic)
-        super().__init__("model request exceeds its declared context budget")
+        failed: list[str] = []
+        if diagnostic.input_tokens > diagnostic.input_budget_tokens:
+            failed.append(
+                f"input tokens {diagnostic.input_tokens}/{diagnostic.input_budget_tokens}"
+            )
+        if diagnostic.request_bytes > diagnostic.request_budget_bytes:
+            failed.append(
+                f"HTTP body bytes {diagnostic.request_bytes}/{diagnostic.request_budget_bytes}"
+            )
+        super().__init__("model request budget exceeded: " + ", ".join(failed))
 
 
 class TurnModelProvider(Protocol):
@@ -281,7 +290,7 @@ async def _invoke_model[Input: BaseModel, Response: BaseModel](
         raise ModelCallError(
             RunError(
                 category=ErrorCategory.CONTEXT_BUDGET_EXCEEDED,
-                message="Model request exceeds its declared context budget",
+                message=str(exc),
                 cause_type=type(exc).__name__,
             ),
             request_diagnostic=exc.diagnostic,

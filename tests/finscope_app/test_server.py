@@ -349,7 +349,7 @@ async def test_session_api_executes_real_runtime_and_reports_tool_trace(
     assert stored_config["limits"] == {
         "max_model_calls": 20,
         "max_tool_calls": 20,
-        "max_request_bytes": 64_000,
+        "max_request_bytes": 1_048_576,
         "max_duration": 180.0,
         "max_model_duration": 60.0,
         "max_completion_duration": 5.0,

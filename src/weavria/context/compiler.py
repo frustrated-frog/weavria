@@ -31,6 +31,7 @@ from .budget import (
     ContextCapacityError,
     ContextCompilerConfig,
     ContextTokenBudgetError,
+    SessionRequestSizer,
     SessionTokenCounter,
 )
 from .compiler_sources import (
@@ -256,8 +257,16 @@ class SessionContextCompiler:
         padding = CONTROL_FEEDBACK_BYTES - len(
             base.control.model_dump_json().encode() if base.control else b"null"
         )
+        sizer = self.counter if isinstance(self.counter, SessionRequestSizer) else None
+        transport_limit = sizer.session_request_byte_limit if sizer is not None else None
+        if transport_limit is not None and (
+            type(transport_limit) is not int or transport_limit <= 0
+        ):
+            raise ContextBuildError("transport byte limit must be positive or absent")
         policy_version = (
-            7
+            8
+            if sizer is not None
+            else 7
             if records
             else 6
             if feedback_reserve_floor_bytes
@@ -273,7 +282,9 @@ class SessionContextCompiler:
             session_id=session_id,
             through_sequence=sequence,
             omitted_turns=total_turns,
-            policy_version="context-compiler/7"
+            policy_version="context-compiler/8"
+            if policy_version == 8
+            else "context-compiler/7"
             if policy_version == 7
             else "context-compiler/6"
             if policy_version == 6
@@ -313,9 +324,24 @@ class SessionContextCompiler:
                 json.dumps(value, ensure_ascii=False, separators=(",", ":"))
             )
 
+        def transport_bytes(request: SessionRequest) -> int | None:
+            if sizer is None:
+                return None
+            size = sizer.session_request_bytes(request)
+            if type(size) is not int or size <= 0:
+                raise ContextBuildError("transport sizer returned an invalid count")
+            return size
+
         def measure(selected: dict[int, int]) -> AllocationCost:
             request = render(selected)
             size = len(request.model_dump_json().encode()) + padding + next_step_reserve_bytes
+            if sizer is not None and transport_limit is not None:
+                # One extra JSON string layer can double unknown serialized bytes.
+                measured = transport_bytes(request)
+                assert measured is not None
+                transport_size = measured + 2 * (padding + next_step_reserve_bytes)
+                if transport_size > transport_limit:
+                    return AllocationCost(self.config.input_tokens + 1, max_request_bytes + 1)
             # No expensive BPE evaluation of obviously byte-infeasible candidates.
             tokens = (
                 self.counter.count(request) + padding + next_step_reserve_bytes
@@ -346,17 +372,23 @@ class SessionContextCompiler:
             max_steps=self.config.max_allocation_steps,
         )
 
-        def require(cost: AllocationCost) -> None:
+        def require(cost: AllocationCost, selected: dict[int, int]) -> None:
             if cost.bytes > max_request_bytes:
+                if sizer is not None and transport_limit is not None:
+                    measured = transport_bytes(render(selected))
+                    assert measured is not None
+                    size = measured + 2 * (padding + next_step_reserve_bytes)
+                    if size > transport_limit:
+                        raise ContextBudgetError(size, transport_limit)
                 raise ContextBudgetError(cost.bytes, max_request_bytes)
             if cost.tokens > self.config.input_tokens:
                 raise ContextTokenBudgetError(cost.tokens, self.config.input_tokens)
 
         minimum = allocator.mandatory()
-        require(await allocator.cost(minimum))
+        require(await allocator.cost(minimum), minimum)
         selected = await allocator.allocate(minimum)
         cost = await allocator.cost(selected)
-        require(cost)
+        require(cost, selected)
         request = render(selected)
         encoded = request.model_dump_json()
         request_sha256 = digest(encoded)
@@ -425,5 +457,7 @@ class SessionContextCompiler:
             retrieval=retrieval,
             recovery_ranges=recovery_ranges,
             delivery_manifest=delivery_manifest,
+            transport_request_bytes=transport_bytes(request),
+            transport_budget_bytes=transport_limit,
         )
         return CompiledSessionContext(encoded, report.model_dump_json())

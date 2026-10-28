@@ -29,7 +29,8 @@ class FinScopeSettings:
     context_encoding: str = "cl100k_base"
     run_max_model_calls: int = 20
     run_max_tool_calls: int = 20
-    run_max_request_bytes: int = 64_000
+    run_max_request_bytes: int = 1_048_576
+    model_max_request_bytes: int | None = None
     run_max_duration_seconds: float = 180.0
     finalization_model_calls: int = 0
     finalization_seconds: float = 10.0
@@ -74,6 +75,10 @@ class FinScopeSettings:
             )
         ):
             raise ValueError("run counter and request limits must be positive integers")
+        if self.model_max_request_bytes is not None and (
+            type(self.model_max_request_bytes) is not int or self.model_max_request_bytes <= 0
+        ):
+            raise ValueError("model request body limit must be positive or absent")
         if (
             type(self.finalization_model_calls) is not int
             or not 0 <= self.finalization_model_calls < self.run_max_model_calls
@@ -130,7 +135,12 @@ class FinScopeSettings:
             finalization_seconds=float(os.environ.get("WEAVRIA_FINALIZATION_SECONDS", "10")),
             run_max_model_calls=int(os.environ.get("WEAVRIA_RUN_MAX_MODEL_CALLS", "20")),
             run_max_tool_calls=int(os.environ.get("WEAVRIA_RUN_MAX_TOOL_CALLS", "20")),
-            run_max_request_bytes=int(os.environ.get("WEAVRIA_RUN_MAX_REQUEST_BYTES", "64000")),
+            run_max_request_bytes=int(os.environ.get("WEAVRIA_RUN_MAX_REQUEST_BYTES", "1048576")),
+            model_max_request_bytes=(
+                int(value)
+                if (value := os.environ.get("WEAVRIA_MODEL_MAX_REQUEST_BYTES", "").strip())
+                else None
+            ),
             run_max_duration_seconds=float(
                 os.environ.get("WEAVRIA_RUN_MAX_DURATION_SECONDS", "180")
             ),

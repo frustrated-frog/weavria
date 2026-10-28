@@ -7,6 +7,7 @@ from .budget import (
     ContextTokenBudgetError,
     ModelRequestContextConfig,
     ModelRequestTokenCounter,
+    SessionRequestSizer,
     SessionTokenCounter,
 )
 from .compiler import CompiledSessionContext, ControlContextBuilder, SessionContextCompiler
@@ -86,6 +87,7 @@ __all__ = [
     "RetrievedHistory",
     "SelectionReason",
     "SessionContextCompiler",
+    "SessionRequestSizer",
     "SessionTokenCounter",
     "TurnEvidencePlan",
     "build_context",

@@ -307,7 +307,7 @@ async def test_long_history_keeps_one_productive_tool_feedback_slot(
     assert result.report.execution.status is RunStatus.COMPLETED
     assert result.report.output == "done"
     assert calls == ["overview"]
-    assert reports[-2].schema_version == 5
+    assert reports[-2].schema_version == 8
     assert reports[-2].next_step_reserve_bytes == min(
         compiler.next_step_reserve_bytes,
         32_000 // 8,

@@ -124,6 +124,23 @@ def test_compilation_fact_requires_explicit_v4_envelope() -> None:
         report.model_copy(update={"schema_version": 7, "delivery_manifest": manifest})
     )
     assert ContextCompilation.model_validate_json(delivered.model_dump_json()) == delivered
+    assert "transport_request_bytes" not in delivered.model_dump_json()
+    measured = ContextCompilation.model_validate(
+        delivered.model_copy(
+            update={
+                "schema_version": 8,
+                "transport_request_bytes": 200,
+                "transport_budget_bytes": 300,
+            }
+        )
+    )
+    assert ContextCompilation.model_validate_json(measured.model_dump_json()) == measured
+    with pytest.raises(ValueError, match="transport byte budget"):
+        ContextCompilation.model_validate(
+            measured.model_copy(update={"transport_budget_bytes": 299})
+        )
+    with pytest.raises(ValueError, match="compilation v8"):
+        ContextCompilation.model_validate(measured.model_copy(update={"schema_version": 7}))
     selected = ContextSelected(
         schema_version=3,
         delivery_manifest=manifest,

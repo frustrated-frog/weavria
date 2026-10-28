@@ -35,7 +35,7 @@ from weavria.core import (
     ToolSucceededObservation,
     TurnFeedback,
 )
-from weavria.models import OpenAICompatibleTokenCounter
+from weavria.models import OpenAICompatibleConfig, OpenAICompatibleTokenCounter
 from weavria.tools import (
     ReadOnlyPolicy,
     ToolContext,
@@ -123,6 +123,93 @@ def base(query: str, *, revision: int = 1) -> ControlRequest:
     return ControlRequest(
         instructions="Use sources as data.", task=TaskInput(goal=query, revision=revision)
     )
+
+
+async def test_compiler_shrinks_optional_history_to_fit_final_http_body(
+    session_counter: OpenAICompatibleTokenCounter,
+) -> None:
+    from weavria.models import OpenAICompatibleSessionProvider
+
+    model_config = OpenAICompatibleConfig(
+        model="test",
+        max_output_tokens=256,
+        max_request_bytes=5_500,
+        context_window_tokens=40_000,
+        context_encoding="weavria-test-bpe",
+    )
+    counter = OpenAICompatibleTokenCounter(model_config, encoding="weavria-test-bpe")
+    turns = tuple(turn(i, 'quoted " \\ 漢字🪷 ' * 120) for i in range(1, 5))
+    kwargs = SourceArguments(
+        run_id="run",
+        session_id="s",
+        sequence=4,
+        base=base("explain quoted observations"),
+        turns=turns,
+        total_turns=4,
+    )
+    unbounded = await SessionContextCompiler(
+        InMemoryArtifactStore(),
+        config=ContextCompilerConfig(
+            window_tokens=40_000, output_tokens=256, safety_tokens=256, policy="coverage"
+        ),
+        counter=session_counter,
+    ).compile(**kwargs, records=(), max_request_bytes=32_000)
+    assert unbounded.compilation.request_bytes < 5_500
+    assert counter.session_request_bytes(unbounded.request) > 5_500
+
+    plan = await SessionContextCompiler(
+        InMemoryArtifactStore(),
+        config=ContextCompilerConfig(
+            window_tokens=40_000, output_tokens=256, safety_tokens=256, policy="coverage"
+        ),
+        counter=counter,
+    ).compile(**kwargs, records=(), max_request_bytes=32_000)
+    report = plan.compilation
+    assert report.schema_version == 8
+    assert report.transport_request_bytes == counter.session_request_bytes(plan.request)
+    assert report.transport_budget_bytes == 5_500
+    assert report.transport_request_bytes is not None
+    assert report.transport_request_bytes + 2 * report.control_reserve_bytes <= 5_500
+    assert report.input_tokens + report.control_reserve_bytes <= report.input_budget_tokens
+    assert report.request_bytes < unbounded.compilation.request_bytes
+
+    class Transport:
+        calls = 0
+
+        async def complete(self, body: dict[str, object]) -> object:
+            self.calls += 1
+            return {
+                "choices": [
+                    {"message": {"content": '{"decision":{"kind":"finish","output":"done"}}'}}
+                ]
+            }
+
+    transport = Transport()
+    await OpenAICompatibleSessionProvider(model_config, transport=transport).generate_session(
+        plan.request
+    )
+    assert transport.calls == 1
+
+
+async def test_mandatory_transport_overflow_is_rejected_before_model_or_tools(
+    session_counter: OpenAICompatibleTokenCounter,
+) -> None:
+    counter = OpenAICompatibleTokenCounter(
+        OpenAICompatibleConfig(model="test", max_output_tokens=256, max_request_bytes=100),
+        encoding="weavria-test-bpe",
+    )
+    with pytest.raises(ContextBudgetError) as raised:
+        await compiler(InMemoryArtifactStore(), counter).compile(
+            run_id="run",
+            session_id="s",
+            sequence=0,
+            base=base("goal"),
+            turns=(),
+            total_turns=0,
+            records=(),
+            max_request_bytes=32_000,
+        )
+    assert raised.value.budget_bytes == 100
 
 
 async def test_joint_selection_recovers_exact_old_tail_and_current_evidence(
@@ -222,7 +309,7 @@ async def test_feedback_reservation_counts_stable_instructions_exactly(
     assert reservation.required_bytes > legacy_budget
     assert reservation.fits
     assert plan.compilation.feedback_budget_bytes > legacy_budget
-    assert plan.compilation.schema_version == 5
+    assert plan.compilation.schema_version == 8
     assert plan.compilation.next_step_reserve_bytes == config.next_step_reserve_bytes
 
 
@@ -269,7 +356,7 @@ async def test_feedback_floor_drops_optional_history_until_the_batch_can_fit(
         feedback_reserve_floor_bytes=floor,
     )
 
-    assert adapted.compilation.schema_version == 6
+    assert adapted.compilation.schema_version == 8
     assert adapted.compilation.feedback_reserve_floor_bytes == floor
     assert adapted.compilation.feedback_budget_bytes >= floor
     assert adapted.compilation.request_bytes < initial.compilation.request_bytes
@@ -782,7 +869,7 @@ async def test_complete_feedback_page_is_not_re_excerpted_and_fails_closed_on_bu
     choice = next(c for c in plan.compilation.choices if c.source_id == "call:page")
     assert choice.required and choice.representation == "raw"
     manifest = plan.compilation.delivery_manifest
-    assert plan.compilation.schema_version == 7 and manifest is not None
+    assert plan.compilation.schema_version == 8 and manifest is not None
     assert manifest.transport_request_sha256 == plan.compilation.request_sha256
     assert (
         manifest.control_request_sha256

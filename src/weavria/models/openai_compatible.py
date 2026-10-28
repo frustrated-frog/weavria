@@ -295,6 +295,11 @@ class OpenAICompatibleSessionProvider:
             raise ModelInputError(diagnostic)
 
 
+def _transport_request_bytes(body: dict[str, Any]) -> int:
+    """Use one UTF-8 JSON measurement for provider admission and context compilation."""
+    return len(json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+
 def _request_admission_diagnostic(
     config: OpenAICompatibleConfig,
     body: dict[str, Any],
@@ -310,7 +315,7 @@ def _request_admission_diagnostic(
         else 2**63 - 1
     )
     request_budget = config.max_request_bytes or 2**63 - 1
-    request_bytes = len(json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    request_bytes = _transport_request_bytes(body)
     return ModelRequestDiagnostic(
         counter_version=counter_version,
         input_tokens=input_tokens,
@@ -536,7 +541,7 @@ class OpenAICompatibleTokenCounter:
 
     @property
     def version(self) -> str:
-        return f"openai-compatible-session/2[{self._tokenizer.version};frame={self._framing}]"
+        return f"openai-compatible-session/3[{self._tokenizer.version};frame={self._framing}]"
 
     @property
     def output_tokens(self) -> int:
@@ -559,7 +564,16 @@ class OpenAICompatibleTokenCounter:
     def model_request_bytes(self, request: ModelRequest) -> int:
         """Measure the complete UTF-8 JSON body sent to the compatible endpoint."""
         body = _model_request_body(self._config, ModelRequest.model_validate(request))
-        return len(json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode())
+        return _transport_request_bytes(body)
+
+    @property
+    def session_request_byte_limit(self) -> int | None:
+        return self._config.max_request_bytes
+
+    def session_request_bytes(self, request: SessionRequest) -> int:
+        """Measure the same final body used by provider admission and transport."""
+        body = _session_request_body(self._config, SessionRequest.model_validate(request))
+        return _transport_request_bytes(body)
 
     def request_byte_ceiling(
         self,
@@ -567,20 +581,26 @@ class OpenAICompatibleTokenCounter:
         *,
         request: SessionRequest | None = None,
     ) -> int:
-        """Bound future serialized requests without charging known instructions twice.
+        """Bound future feedback while retaining this request's fixed context.
 
-        Byte BPE uses at most one token per UTF-8 byte. Without a request, keep
-        the legacy whole-payload bound. With a request, count the invariant
-        system protocol and trusted instructions exactly, then reserve one token
-        for every unknown user-payload byte. The returned value remains in the
-        serialized ``SessionRequest`` byte domain used by context admission.
-        Future requests must retain the same instructions and schema.
+        Without a request, retain the legacy whole-payload bound. Otherwise count
+        invariant system content and a stable BPE prefix, charging the mutable
+        history/feedback/control suffix at one token per byte. The result is in
+        the serialized SessionRequest domain and includes the optional HTTP cap.
+        Conversation, task, observation, instructions and schema must stay fixed.
         """
         if type(input_tokens) is not int or input_tokens < 0:
             raise ValueError("input token allowance must be a nonnegative integer")
         if request is None:
             return max(0, input_tokens - len(_SESSION_PROTOCOL.encode()) - self._framing)
-        validated = SessionRequest.model_validate(request)
+        source = SessionRequest.model_validate(request)
+        validated = source.model_copy(
+            update={
+                "current": source.current.model_copy(
+                    update={"history": (), "feedback": None, "control": None}
+                )
+            }
+        )
         body = _session_request_body(self._config, validated)
         system = body["messages"][0]["content"]
         user = body["messages"][1]["content"]
@@ -588,8 +608,23 @@ class OpenAICompatibleTokenCounter:
         lifted_instruction_bytes = len(validated.model_dump_json().encode()) - len(user.encode())
         if lifted_instruction_bytes < 0:
             raise ValueError("transport payload exceeds its normalized request")
-        user_budget = max(
+        suffix = ',"history":[],"feedback":null,"control":null}}'
+        if not user.endswith(suffix):
+            raise ValueError("session feedback fields no longer form the mutable suffix")
+        prefix = user[: -len(suffix)] + ',"history":'
+        ceiling = max(
             0,
-            input_tokens - self._framing - self._tokenizer.count(system),
+            input_tokens
+            - self._framing
+            - self._tokenizer.count(system)
+            - self._tokenizer.prefix_token_bound(prefix)
+            + len(prefix.encode())
+            + lifted_instruction_bytes,
         )
-        return user_budget + lifted_instruction_bytes
+        if self._config.max_request_bytes is not None:
+            base_bytes = len(validated.model_dump_json().encode())
+            available = self._config.max_request_bytes - self.session_request_bytes(validated)
+            # UTF-8 JSON nesting adds at most one escape per serialized byte.
+            transport_ceiling = base_bytes + available // 2 if available >= 0 else 0
+            ceiling = min(ceiling, transport_ceiling)
+        return ceiling

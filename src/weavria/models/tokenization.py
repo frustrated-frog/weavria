@@ -15,3 +15,16 @@ class BPETokenizer:
     def count(self, text: str) -> int:
         # Source text resembling a control token must remain ordinary untrusted text.
         return len(self._encoding.encode_ordinary(text))
+
+    def prefix_token_bound(self, text: str) -> int:
+        """Bound a fixed prefix followed by arbitrary bytes without assuming BPE additivity.
+
+        Only stable tokens survive arbitrary continuations. Charge each remaining
+        byte as one token; control-token-looking source text remains ordinary data.
+        """
+        stable, _ = self._encoding.encode_with_unstable(text, disallowed_special=())
+        prefix = self._encoding.decode_bytes(stable)
+        encoded = text.encode()
+        if not encoded.startswith(prefix):
+            raise ValueError("tokenizer returned a non-prefix stable encoding")
+        return len(stable) + len(encoded) - len(prefix)

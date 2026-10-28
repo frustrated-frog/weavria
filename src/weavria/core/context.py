@@ -31,7 +31,7 @@ class ContextCompilation(BaseModel):
     """Bind allocation diagnostics to the exact complete request sent to a provider."""
 
     model_config = ContractModel.model_config
-    schema_version: Literal[1, 2, 3, 4, 5, 6, 7] = 1
+    schema_version: Literal[1, 2, 3, 4, 5, 6, 7, 8] = 1
 
     policy_version: NonBlankString
     counter_version: NonBlankString
@@ -58,6 +58,8 @@ class ContextCompilation(BaseModel):
     retrieval: HistoryRetrievalReport | None = None
     recovery_ranges: tuple[RecoveryRange, ...] = Field(default=(), max_length=8)
     delivery_manifest: EvidenceDeliveryManifest | None = None
+    transport_request_bytes: int | None = Field(default=None, gt=0)
+    transport_budget_bytes: int | None = Field(default=None, gt=0)
 
     @field_validator("schema_version", mode="before")
     @classmethod
@@ -80,6 +82,9 @@ class ContextCompilation(BaseModel):
             data.pop("feedback_reserve_floor_bytes", None)
         if self.schema_version < 7:
             data.pop("delivery_manifest", None)
+        if self.schema_version < 8:
+            data.pop("transport_request_bytes", None)
+            data.pop("transport_budget_bytes", None)
         return data
 
     @model_validator(mode="after")
@@ -96,8 +101,27 @@ class ContextCompilation(BaseModel):
             raise ValueError("next-step reserve requires compilation v5")
         if self.feedback_reserve_floor_bytes and self.schema_version < 6:
             raise ValueError("feedback reserve floor requires compilation v6")
-        if (self.schema_version == 7) != (self.delivery_manifest is not None):
+        if self.schema_version < 8 and (
+            (self.schema_version == 7) != (self.delivery_manifest is not None)
+        ):
             raise ValueError("evidence delivery manifest requires compilation v7")
+        if (self.schema_version >= 8) != (self.transport_request_bytes is not None):
+            raise ValueError("transport accounting requires compilation v8")
+        if (
+            self.schema_version >= 8
+            and any(choice.source_id.startswith("call:") for choice in self.choices)
+            and self.delivery_manifest is None
+        ):
+            raise ValueError("tool evidence requires a delivery manifest")
+        if self.transport_budget_bytes is not None:
+            if self.transport_request_bytes is None:
+                raise ValueError("transport budget requires measured transport bytes")
+            if (
+                self.transport_request_bytes
+                + 2 * (self.control_reserve_bytes + self.next_step_reserve_bytes)
+                > self.transport_budget_bytes
+            ):
+                raise ValueError("compiled request exceeds its transport byte budget")
         if self.feedback_budget_bytes < self.feedback_reserve_floor_bytes:
             raise ValueError("compiled feedback budget is below its required floor")
         choices = {c.source_id: c for c in self.choices}

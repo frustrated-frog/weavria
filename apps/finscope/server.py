@@ -160,7 +160,7 @@ def create_app(
             json_mode=resolved.json_mode,
             context_window_tokens=resolved.context_window_tokens,
             context_encoding=resolved.context_encoding,
-            max_request_bytes=resolved.run_max_request_bytes,
+            max_request_bytes=resolved.model_max_request_bytes,
         )
         understanding_model_config = OpenAICompatibleConfig(
             model=resolved.model_name,
@@ -169,7 +169,7 @@ def create_app(
             reasoning_effort=resolved.understanding_reasoning_effort,
             context_window_tokens=resolved.context_window_tokens,
             context_encoding=resolved.context_encoding,
-            max_request_bytes=resolved.run_max_request_bytes,
+            max_request_bytes=resolved.model_max_request_bytes,
         )
         active_provider = provider
         if active_provider is None:
@@ -224,7 +224,10 @@ def create_app(
             ModelRequestContextConfig(
                 window_tokens=resolved.context_window_tokens,
                 output_tokens=resolved.understanding_model_max_output_tokens,
-                max_request_bytes=resolved.run_max_request_bytes,
+                max_request_bytes=min(
+                    resolved.run_max_request_bytes,
+                    resolved.model_max_request_bytes or resolved.run_max_request_bytes,
+                ),
                 max_history_bytes=8_000,
                 max_history_entries=16,
             ),
