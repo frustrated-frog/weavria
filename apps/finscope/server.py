@@ -35,7 +35,7 @@ from weavria.models.openai_compatible import (
     OpenAICompatibleTokenCounter,
 )
 from weavria.models.provider import ModelProvider, SessionModelProvider
-from weavria.runtime import RunLimits
+from weavria.runtime import RunLimits, TaskModelProjector
 from weavria.sessions import SessionConflictError, SessionEngine
 from weavria.tools import ToolRegistry
 
@@ -138,6 +138,7 @@ def create_app(
     workspace_client: FinScopeWorkspaceClient | None = None,
     requirement_coverage: bool = True,
     evidence_guidance: bool | None = None,
+    task_model_projector: TaskModelProjector | None = None,
 ) -> FastAPI:
     """Create a sidecar. Uvicorn should invoke this as an application factory."""
     if type(requirement_coverage) is not bool:
@@ -302,6 +303,9 @@ def create_app(
             task_preparation_version=task_preparer.version,
             requirement_coverage=requirement_coverage,
             evidence_guidance=use_evidence_guidance,
+            task_model_projector_version=(
+                task_model_projector.version if task_model_projector is not None else None
+            ),
         )
         engine = SessionEngine(
             resolved.state_path,
@@ -321,6 +325,8 @@ def create_app(
             token_counter=token_counter,
             history_retrieval=history,
             context_recovery=recovery,
+            # 显式实验注入沿用 Runtime 的通用投影端口,应用默认仍发送完整状态。
+            task_model_projector=task_model_projector,
         )
         await engine.__aenter__()
         app.state.runtime = _Runtime(engine)

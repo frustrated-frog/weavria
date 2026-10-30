@@ -46,7 +46,7 @@ from weavria.evaluation import (
     RecordingHTTPTransport,
     summarize_samples,
 )
-from weavria.harness import load_need_ledger, load_task_frame
+from weavria.harness import TaskModelViewProjector, load_need_ledger, load_task_frame
 from weavria.models import (
     ModelCapabilities,
     ModelProvider,
@@ -66,6 +66,7 @@ _MAX_MODEL_CALLS = 20
 _MAX_TOOL_CALLS = 20
 _MAX_REQUEST_BYTES = 64_000
 _MAX_DURATION_SECONDS = 180.0
+_FINALIZATION_SECONDS = 30.0
 UnderstandingMode = Literal["fixed", "live", "forced-broad"]
 CoverageMode = Literal["off", "profile", "model"]
 
@@ -295,6 +296,8 @@ async def evaluate(
     history_turns: Literal[0, 8],
     understanding: UnderstandingMode,
     coverage: CoverageMode,
+    projected: bool = False,
+    finalization_model_calls: int = 0,
 ) -> dict[str, object]:
     repository = Path(__file__).parents[1]
     fixture = repository / "tests" / "fixtures" / "finscope_weekly_summary_v2.json"
@@ -378,6 +381,8 @@ async def evaluate(
                 run_max_tool_calls=_MAX_TOOL_CALLS,
                 run_max_request_bytes=_MAX_REQUEST_BYTES,
                 run_max_duration_seconds=_MAX_DURATION_SECONDS,
+                finalization_model_calls=finalization_model_calls,
+                finalization_seconds=_FINALIZATION_SECONDS,
             )
             app = create_app(
                 settings,
@@ -386,6 +391,7 @@ async def evaluate(
                 market_client=MarketPulseClient("http://finscope.test", client=market_http),
                 requirement_coverage=coverage == "model",
                 evidence_guidance=coverage != "off",
+                task_model_projector=TaskModelViewProjector() if projected else None,
             )
             async with app.router.lifespan_context(app):
                 async with httpx.AsyncClient(
@@ -436,11 +442,12 @@ async def evaluate(
     return {
         "schema_version": 1,
         "dataset_version": "finscope-weekly-summary/2",
-        "evaluator_version": "finscope-weekly-live/5",
+        "evaluator_version": "finscope-weekly-live/6",
         "dataset_sha256": FROZEN_WEEKLY_SUMMARY_V2_SHA256,
         "model": model_name,
         "configuration": {
             "temperature": 0.0,
+            "reasoning_effort": model_config.reasoning_effort,
             "json_mode": json_mode,
             "max_output_tokens": _MODEL_MAX_OUTPUT_TOKENS,
             "understanding_max_output_tokens": (_UNDERSTANDING_MODEL_MAX_OUTPUT_TOKENS),
@@ -456,6 +463,9 @@ async def evaluate(
             "history_turns": history_turns,
             "understanding": understanding,
             "requirement_coverage": coverage,
+            "projected": projected,
+            "finalization_model_calls": finalization_model_calls,
+            "finalization_seconds": _FINALIZATION_SECONDS,
         },
         "response_status": response_status,
         "execution_status": payload.status if payload is not None else None,
@@ -494,6 +504,8 @@ def main() -> None:
         default="live",
     )
     parser.add_argument("--coverage", choices=("off", "profile", "model"), default="model")
+    parser.add_argument("--task-model-view", action="store_true")
+    parser.add_argument("--finalization-model-calls", type=int, choices=(0, 2), default=0)
     args = parser.parse_args()
     history_turns = 8 if args.history_turns == 8 else 0
     understanding: UnderstandingMode = (
@@ -513,6 +525,8 @@ def main() -> None:
                     history_turns=history_turns,
                     understanding=understanding,
                     coverage=coverage,
+                    projected=args.task_model_view,
+                    finalization_model_calls=args.finalization_model_calls,
                 )
             ),
             ensure_ascii=False,

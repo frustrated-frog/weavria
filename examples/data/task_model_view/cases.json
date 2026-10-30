@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "dataset_version": "task-view-live/1",
+  "cases": [
+    {
+      "case_id": "single_lookup",
+      "request": "读取稳定归档中的 code。最终只输出 JSON 对象，唯一键为 code，值必须来自工具，不得猜测。",
+      "data": {"code": "EMBER-742"},
+      "expected": {"code": "EMBER-742"}
+    },
+    {
+      "case_id": "eight_fields",
+      "request": "读取稳定项目归档的 title、owner、deadline、region、risk、build、tests、license 八个字段。最后只输出包含这八个键的 JSON 对象。每个值必须有工具依据，不要重复读取已经成功取得的字段。",
+      "data": {"title": "Atlas-7", "owner": "Robin-Q", "deadline": "2030-05-01", "region": "north-2", "risk": "low", "build": "b284", "tests": "48/48", "license": "approved"},
+      "expected": {"title": "Atlas-7", "owner": "Robin-Q", "deadline": "2030-05-01", "region": "north-2", "risk": "low", "build": "b284", "tests": "48/48", "license": "approved"}
+    },
+    {
+      "case_id": "primary_failure",
+      "request": "从稳定归档读取 title 和 owner。先读 primary；若某字段的 primary 失败，可以读取同字段的 mirror。最终只输出 title 和 owner 两个键的 JSON 对象，值必须有工具依据，不得把失败当成空值。",
+      "data": {"title": "Cedar-4", "owner": "Mina-Z"},
+      "expected": {"title": "Cedar-4", "owner": "Mina-Z"},
+      "primary_failures": ["owner"]
+    },
+    {
+      "case_id": "history_tight_window",
+      "request": "重新读取稳定归档的 owner 和 deadline，以本次工具结果为准。历史中的旧值可能过时。最终只输出 owner 和 deadline 两个键的 JSON 对象，不要复用旧答案。",
+      "data": {"owner": "Dana-P", "deadline": "2031-06-18"},
+      "expected": {"owner": "Dana-P", "deadline": "2031-06-18"},
+      "history_turns": 10,
+      "window_tokens": 12288,
+      "max_request_bytes": 32000
+    },
+    {
+      "case_id": "mid_run_revision",
+      "request": "读取稳定项目归档的 title 和 owner。最后只输出 title 和 owner 两个键的 JSON 对象，不得猜测。",
+      "data": {"title": "Cedar-4", "owner": "Mina-Z", "revision_token": "R2-CEDAR"},
+      "expected": {"revision_token": "R2-CEDAR"},
+      "steering": "变更任务：不再需要 title 或 owner。请只读取 revision_token，最终只输出唯一键 revision_token 的 JSON 对象，其值必须来自工具。"
+    }
+  ]
+}

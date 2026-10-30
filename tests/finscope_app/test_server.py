@@ -40,6 +40,7 @@ from weavria.harness import (
     RequirementCoverageAssessment,
     SemanticObligation,
     TaskFrame,
+    TaskModelViewProjector,
     TaskSpecification,
 )
 from weavria.models import (
@@ -236,12 +237,16 @@ def _clarify() -> TaskSpecification:
     )
 
 
-@pytest.mark.parametrize(("reserved_calls", "commit_timeout"), [(0, False), (2, False), (2, True)])
+@pytest.mark.parametrize(
+    ("reserved_calls", "commit_timeout", "projected"),
+    [(0, False, False), (2, False, False), (2, True, False), (2, False, True)],
+)
 async def test_session_api_executes_real_runtime_and_reports_tool_trace(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     reserved_calls: int,
     commit_timeout: bool,
+    projected: bool,
 ) -> None:
     def market_response(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/api/market-pulse/2026-10-15"
@@ -300,6 +305,7 @@ async def test_session_api_executes_real_runtime_and_reports_tool_trace(
         provider=provider,
         interpreter_provider=interpreter,
         market_client=market,
+        task_model_projector=TaskModelViewProjector() if projected else None,
     )
 
     entered, release = asyncio.Event(), threading.Event()
@@ -401,10 +407,17 @@ async def test_session_api_executes_real_runtime_and_reports_tool_trace(
     assert interpreted.goal == "今天是什么市场阶段?"
     assert "2026-10-15" in interpreter.requests[0].task.constraints[-1]
     runtime_observation = provider.requests[0].current.task_observation
-    assert runtime_observation is not None
-    runtime_frame = TaskFrame.model_validate_json(json.dumps(runtime_observation.payload))
+    if projected:
+        view = provider.requests[0].current.task_model_view
+        assert runtime_observation is None and view is not None
+        assert "2026-10-15" in json.dumps(view.definition["navigation_context"])
+        assert provider.requests[-1].current.task_model_view is not None
+        assert provider.requests[-1].current.task_model_view.phase == "synthesis"
+    else:
+        assert runtime_observation is not None
+        runtime_frame = TaskFrame.model_validate_json(json.dumps(runtime_observation.payload))
+        assert runtime_frame.application_context[0].payload["business_date"] == "2026-10-15"
     assert provider.requests[0].current.task.goal == "今天是什么市场阶段?"
-    assert runtime_frame.application_context[0].payload["business_date"] == "2026-10-15"
     assert any(isinstance(event.data, SessionContextCompiled) for event in events)
     assert stored_config["limits"] == {
         "max_model_calls": 20,

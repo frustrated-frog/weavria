@@ -28,6 +28,7 @@ def build_runtime_profile(
     task_preparation_version: str,
     requirement_coverage: bool,
     evidence_guidance: bool,
+    task_model_projector_version: str | None = None,
 ) -> dict[str, JsonValue]:
     """Fingerprint an explicit allow-list; URLs, paths and credentials never enter it."""
     configuration: dict[str, JsonValue] = {
@@ -60,9 +61,13 @@ def build_runtime_profile(
         "requirement_coverage": requirement_coverage,
         "evidence_guidance": evidence_guidance,
     }
+    if task_model_projector_version is not None:
+        configuration["task_model_projector_version"] = task_model_projector_version
     identity: dict[str, JsonValue] = {
         "schema_version": 1,
-        "profile_version": "finscope-runtime/1",
+        "profile_version": "finscope-runtime/2"
+        if task_model_projector_version is not None
+        else "finscope-runtime/1",
         "configuration": configuration,
     }
     encoded = json.dumps(

@@ -13,7 +13,9 @@ from weavria.core import RecoveryLimits
 from weavria.runtime import RunLimits
 
 
-def profile(settings: FinScopeSettings, *, coverage: bool = True) -> dict[str, JsonValue]:
+def profile(
+    settings: FinScopeSettings, *, coverage: bool = True, projector_version: str | None = None
+) -> dict[str, JsonValue]:
     return build_runtime_profile(
         settings,
         limits=RunLimits(
@@ -32,6 +34,7 @@ def profile(settings: FinScopeSettings, *, coverage: bool = True) -> dict[str, J
         task_preparation_version="preparation/1",
         requirement_coverage=coverage,
         evidence_guidance=coverage,
+        task_model_projector_version=projector_version,
     )
 
 
@@ -73,6 +76,20 @@ def test_profile_changes_with_the_actual_policy_configuration(field: str) -> Non
     else:
         candidate = profile(settings, coverage=False)
     assert candidate["sha256"] != baseline["sha256"]
+
+
+def test_projection_is_explicitly_fingerprinted_and_legacy_profile_stays_unchanged() -> None:
+    settings = FinScopeSettings(
+        model_base_url="http://model.test", model_name="fake", model_api_key=""
+    )
+    baseline, projected = (
+        profile(settings),
+        profile(settings, projector_version="task-model-view/1"),
+    )
+    assert baseline["profile_version"] == "finscope-runtime/1"
+    assert projected["profile_version"] == "finscope-runtime/2"
+    assert projected["sha256"] != baseline["sha256"]
+    assert "task_model_projector_version" not in json.dumps(baseline)
 
 
 def test_example_loads_the_recommended_profile_without_changing_library_defaults(
