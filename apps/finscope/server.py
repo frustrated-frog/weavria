@@ -1,5 +1,7 @@
 """Local HTTP sidecar for the FinScope application adapter."""
 
+import json
+import logging
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from typing import Annotated, Literal
@@ -46,6 +48,7 @@ from .config import FinScopeSettings
 from .market import MarketPulseClient, market_pulse_evidence_profile, market_pulse_tool
 from .model import HTTPChatCompletionTransport
 from .policy import FinScopeReadOnlyPolicy
+from .runtime_profile import build_runtime_profile
 from .workspace import (
     FinScopeWorkspaceClient,
     finscope_workspace_evidence_profiles,
@@ -238,66 +241,94 @@ def create_app(
             active_interpreter,
             context_compiler=understanding_context,
         )
+        task_preparer = TaskAwareSessionPreparer(
+            TaskUnderstandingEngine(
+                task_interpreter,
+                coverage_validator=(
+                    ModelRequirementCoverageValidator(
+                        active_interpreter,
+                        context_compiler=understanding_context,
+                    )
+                    if requirement_coverage
+                    else None
+                ),
+                coverage_repairer=task_interpreter if requirement_coverage else None,
+                evidence_profiles=(
+                    (
+                        market_pulse_evidence_profile(),
+                        *finscope_workspace_evidence_profiles(),
+                    )
+                    if use_evidence_guidance
+                    else ()
+                ),
+                max_duration=resolved.understanding_max_duration_seconds,
+            ),
+            evidence=EvidenceResolver(
+                (MarketPulseEvidenceExtractor(), FinScopeWorkspaceEvidenceExtractor())
+            ),
+            capabilities=CapabilityResolver(policy=access_policy),
+        )
+        limits = RunLimits(
+            max_model_calls=resolved.run_max_model_calls,
+            finalization_model_calls=resolved.finalization_model_calls,
+            finalization_seconds=resolved.finalization_seconds,
+            max_tool_calls=resolved.run_max_tool_calls,
+            max_request_bytes=resolved.run_max_request_bytes,
+            max_duration=resolved.run_max_duration_seconds,
+            max_model_duration=resolved.model_timeout_seconds,
+            max_completion_duration=5.0,
+            max_completion_repairs=2,
+        )
+        context = ContextCompilerConfig(
+            window_tokens=resolved.context_window_tokens,
+            output_tokens=resolved.model_max_output_tokens,
+        )
+        history = HistoryRetrievalConfig()
+        recovery = RecoveryLimits()
+        answer_policy = FinScopeAnswerPolicy()
+        profile = build_runtime_profile(
+            resolved,
+            limits=limits,
+            context=context,
+            history=history,
+            recovery=recovery,
+            completion_version=answer_policy.version,
+            finalization_version=task_preparer.finalization_policy.version,
+            execution_provider=f"{type(active_provider).__module__}.{type(active_provider).__qualname__}",
+            understanding_provider=(
+                f"{type(active_interpreter).__module__}.{type(active_interpreter).__qualname__}"
+            ),
+            token_counter_version=token_counter.version,
+            task_preparation_version=task_preparer.version,
+            requirement_coverage=requirement_coverage,
+            evidence_guidance=use_evidence_guidance,
+        )
         engine = SessionEngine(
             resolved.state_path,
             model=active_provider,
             tools=tools,
             instructions=_instructions(),
-            limits=RunLimits(
-                max_model_calls=resolved.run_max_model_calls,
-                finalization_model_calls=resolved.finalization_model_calls,
-                finalization_seconds=resolved.finalization_seconds,
-                max_tool_calls=resolved.run_max_tool_calls,
-                max_request_bytes=resolved.run_max_request_bytes,
-                max_duration=resolved.run_max_duration_seconds,
-                max_model_duration=resolved.model_timeout_seconds,
-                max_completion_duration=5.0,
-                max_completion_repairs=2,
-            ),
+            limits=limits,
             max_request_duration=(
                 resolved.understanding_max_duration_seconds + resolved.run_max_duration_seconds
             ),
-            completion=FinScopeAnswerPolicy(),
+            completion=answer_policy,
             policy=access_policy,
             history_budget_bytes=8_000,
-            task_preparation=TaskAwareSessionPreparer(
-                TaskUnderstandingEngine(
-                    task_interpreter,
-                    coverage_validator=(
-                        ModelRequirementCoverageValidator(
-                            active_interpreter,
-                            context_compiler=understanding_context,
-                        )
-                        if requirement_coverage
-                        else None
-                    ),
-                    coverage_repairer=task_interpreter if requirement_coverage else None,
-                    evidence_profiles=(
-                        (
-                            market_pulse_evidence_profile(),
-                            *finscope_workspace_evidence_profiles(),
-                        )
-                        if use_evidence_guidance
-                        else ()
-                    ),
-                    max_duration=resolved.understanding_max_duration_seconds,
-                ),
-                evidence=EvidenceResolver(
-                    (MarketPulseEvidenceExtractor(), FinScopeWorkspaceEvidenceExtractor())
-                ),
-                capabilities=CapabilityResolver(policy=access_policy),
-            ),
-            context_compiler=ContextCompilerConfig(
-                window_tokens=resolved.context_window_tokens,
-                output_tokens=resolved.model_max_output_tokens,
-            ),
+            task_preparation=task_preparer,
+            configuration_metadata=profile,
+            context_compiler=context,
             token_counter=token_counter,
-            history_retrieval=HistoryRetrievalConfig(),
-            context_recovery=RecoveryLimits(),
+            history_retrieval=history,
+            context_recovery=recovery,
         )
         await engine.__aenter__()
         app.state.runtime = _Runtime(engine)
         try:
+            logging.getLogger("uvicorn.error").info(
+                "FinScope effective runtime configuration: %s",
+                json.dumps(profile, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+            )
             yield
         finally:
             await engine.close()

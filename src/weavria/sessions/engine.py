@@ -179,6 +179,8 @@ class _SessionAdapter:
         self._history: tuple[ConversationTurn, ...] = ()
         self._history_sequence = 0
         self._history_count = 0
+        self._prepared_task_revision: int | None = None
+        self._finalizing = False
         self._retrieval_config = history_retrieval
         self._recovery_limits = context_recovery
 
@@ -228,6 +230,31 @@ class _SessionAdapter:
             if self._retrieval_config is None
             else ()
         )
+        return self._prepare_context_view(task, sequence, count, history, finalizing=False)
+
+    def prepare_finalization(self, task: TaskInput) -> TurnPreparation | None:
+        """Use committed same-revision semantics and cached history without store I/O."""
+        if self._prepared_task_revision != task.revision or (
+            self._semantic is not None and self._semantic.version.task_revision != task.revision
+        ):
+            return None
+        return self._prepare_context_view(
+            task,
+            self._history_sequence,
+            self._history_count,
+            self._history,
+            finalizing=True,
+        )
+
+    def _prepare_context_view(
+        self,
+        task: TaskInput,
+        sequence: int,
+        count: int,
+        history: tuple[ConversationTurn, ...],
+        *,
+        finalizing: bool,
+    ) -> TurnPreparation:
         visible = self._tools.select(self._visible_tool_names)
         template = AgentLoop.request_template_for(
             task,
@@ -248,7 +275,6 @@ class _SessionAdapter:
         if budget <= 0 and self._compiler is None:
             raise ContextBudgetError(wire_fixed + control_growth, self._budget)
         if self._compiler is not None:
-            self._history, self._history_sequence, self._history_count = history, sequence, count
             view = empty
         else:
             plan = select_conversation(
@@ -267,6 +293,10 @@ class _SessionAdapter:
         # Only one attempt is active; discard obsolete prepared views after the
         # previous model call/verification has joined, retaining bounded state.
         self._prepared = {task.revision: view}
+        self._history, self._history_sequence, self._history_count = history, sequence, count
+        self._prepared_task_revision = task.revision
+        self._finalizing = finalizing
+        self._compilation = None
         return TurnPreparation(
             task.revision,
             self._budget - overhead,
@@ -367,7 +397,7 @@ class _SessionAdapter:
             else None
         )
         retrieval = None
-        if self._retrieval_config is not None:
+        if self._retrieval_config is not None and not self._finalizing:
             discovered = await self._store.retrieve_history(
                 self._session_id,
                 task_revision=task.revision,
@@ -407,7 +437,7 @@ class _SessionAdapter:
                         compiler.config.next_step_reserve_bytes,
                         self._budget // 8,
                     )
-                    if self._reserve_next_step
+                    if self._reserve_next_step and not self._finalizing
                     else 0
                 ),
                 feedback_reserve_floor_bytes=floor,
@@ -508,7 +538,6 @@ class _SessionAdapter:
         )
         if prepared.preparation_version != self._task_preparer.version:
             raise ValueError("semantic refresh version does not match its provider")
-        self._clarification_plan = prepared.clarification_plan
         snapshot = SemanticSnapshot(
             session_id=self._session_id,
             work_id=prepared.work_id,
@@ -545,6 +574,7 @@ class _SessionAdapter:
         self._task_observation = snapshot.observation
         self._semantic = snapshot
         self._semantic_record_count = len(records)
+        self._clarification_plan = prepared.clarification_plan
 
     @property
     def semantic(self) -> SemanticSnapshot | None:
@@ -616,6 +646,7 @@ class SessionEngine:
         token_counter: SessionTokenCounter | None = None,
         history_retrieval: HistoryRetrievalConfig | None = None,
         context_recovery: RecoveryLimits | None = None,
+        configuration_metadata: dict[str, JsonValue] | None = None,
     ) -> None:
         if (context_compiler is None) != (token_counter is None):
             raise ValueError("context compiler and token counter must be configured together")
@@ -627,6 +658,21 @@ class SessionEngine:
         self._recovery_limits = (
             RecoveryLimits.model_validate_json(context_recovery.model_dump_json())
             if context_recovery
+            else None
+        )
+        # Host-owned diagnostic metadata is snapshotted, never model input or
+        # authorization. Callers must exclude credentials and private content.
+        self._configuration_metadata_json = (
+            json.dumps(
+                TypeAdapter(dict[str, JsonValue]).validate_python(
+                    configuration_metadata, strict=True
+                ),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            if configuration_metadata is not None
             else None
         )
         self._compiler_config, self._token_counter = context_compiler, token_counter
@@ -747,7 +793,9 @@ class SessionEngine:
             config = json.dumps(
                 {
                     "schema_version": (
-                        4
+                        5
+                        if self._configuration_metadata_json is not None
+                        else 4
                         if self._recovery_limits is not None
                         else 3
                         if self._retrieval_config is not None
@@ -758,6 +806,11 @@ class SessionEngine:
                         else 2
                         if self._compiler_config is not None
                         else 1
+                    ),
+                    **(
+                        {"configuration_metadata": json.loads(self._configuration_metadata_json)}
+                        if self._configuration_metadata_json is not None
+                        else {}
                     ),
                     **(
                         {"history_retrieval": asdict(self._retrieval_config)}

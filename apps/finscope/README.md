@@ -23,6 +23,7 @@ export WEAVRIA_MODEL_BASE_URL="https://api.deepseek.com"
 export WEAVRIA_MODEL_NAME="deepseek-flash"
 export WEAVRIA_MODEL_API_KEY="..."
 export WEAVRIA_MODEL_JSON_MODE="true"
+export WEAVRIA_MODEL_REASONING_EFFORT="none"
 export WEAVRIA_MODEL_MAX_OUTPUT_TOKENS="4096"
 export WEAVRIA_UNDERSTANDING_MAX_OUTPUT_TOKENS="8192"
 export WEAVRIA_UNDERSTANDING_REASONING_EFFORT="none"
@@ -33,10 +34,16 @@ export WEAVRIA_RUN_MAX_MODEL_CALLS="20"
 export WEAVRIA_RUN_MAX_TOOL_CALLS="20"
 export WEAVRIA_RUN_MAX_REQUEST_BYTES="1048576"
 export WEAVRIA_RUN_MAX_DURATION_SECONDS="180"
+export WEAVRIA_FINALIZATION_MODEL_CALLS="2"
+export WEAVRIA_FINALIZATION_SECONDS="30"
 export WEAVRIA_FINSCOPE_BASE_URL="http://127.0.0.1:8080"
 export WEAVRIA_ALLOWED_PARENT_ORIGIN="http://localhost:5173"
 uv run --extra finscope python -m apps.finscope
 ```
+
+上述命令与 [.env.example](.env.example) 使用相同的推荐设置。程序只读取进程环境，不会自动
+加载 `.env.example`；使用本地环境文件时，需要由启动脚本显式加载，并将含密钥的文件留在 Git
+之外。启动日志中的配置摘要可以用来确认运行中的实际设置。
 
 示例中的 DeepSeek 模型启用 JSON 模式，以减少协议输出截断或混入说明文本的概率；适配器仍
 会对最终结构进行独立校验。若模型只遗漏了可无歧义推导、且不超过 8 个的末尾 `}`/`]`，
@@ -63,6 +70,13 @@ Agent 执行时间。任务理解阶段另有 180 秒上限；两阶段受二者
 业务规则，可通过 `WEAVRIA_RUN_MAX_*` 与 `WEAVRIA_UNDERSTANDING_MAX_DURATION_SECONDS`
 环境变量调整；Context Compiler 仍会独立遵守模型上下文窗口和输出预留。
 
+推荐从同一父预算中预留 2 次模型调用和 30 秒，用于停止探索后的证据收尾。普通回合准备中的
+语义刷新、历史读取、上下文编译，以及工具结算后的进度分析，都受探索截止时间约束。准备超时后
+先等待取消清理，再用当前任务版本已提交的状态编译收尾视图；不会重新调用阻塞的语义刷新或历史
+检索。没有安全快照或可交付证据时仍明确终止。通用 `RunLimits` 与未设置环境变量的
+`FinScopeSettings` 保留关闭预留的兼容默认值；`WEAVRIA_FINALIZATION_MODEL_CALLS=0` 可显式
+运行该基线。此预留不会增加父预算，也不保证模型必然完成回答。
+
 `WEAVRIA_RUN_MAX_REQUEST_BYTES` 是主机资源上限，不代表模型的上下文容量。HTTP 请求体会因协议
 和 JSON 字符串嵌套而大于内部请求。若网关确有字节限制，可单独设置
 `WEAVRIA_MODEL_MAX_REQUEST_BYTES`；默认留空。Compiler 与 Provider 使用同一个最终请求体编码器
@@ -70,6 +84,14 @@ Agent 执行时间。任务理解阶段另有 180 秒上限；两阶段受二者
 已知任务和会话前缀按稳定 BPE Token 计量，只有未知反馈后缀采用最坏字节上界，避免大型 Task Frame
 反复挤掉实际能够容纳的工具批次。真正无法容纳的必需内容仍明确失败。详情见
 [ADR 0054](../../docs/decisions/0054-统一请求计量与反馈前缀预算.md)。
+
+启动成功时，日志输出 `FinScope effective runtime configuration` JSON，包含调用与时间上限、
+两阶段推理设置、上下文配置、接入类型、策略版本和 `sha256`。同一摘要保存在新 Run 的
+`runs.config.configuration_metadata` 中，配置版本为 5；重复 `input_id` 继续返回原 Run 与原配置。
+摘要按明确字段名单构造，排除密钥、URL 和本地路径，不进入模型请求或用户回答。指纹用于比较
+宿主声明的运行设置，不能替代源码版本、任务数据、模型服务版本或成果核验；注入 Provider 时，
+记录其类型，不探查其内部设置。实现和故障验证见
+[ADR 0059](../../docs/decisions/0059-完整准备时限与运行配置留证.md)。
 
 FinScope 前端设置 `VITE_WEAVRIA_AGENT_URL=http://127.0.0.1:8765` 后，市场页悬浮窗与左侧
 Agent 问答页会通过原生 FinScope 组件调用这些接口。完整页和悬浮窗复用同一持久会话；未配置时
@@ -93,8 +115,9 @@ Agent 页只显示本地配置指引，不会尝试访问远端服务。Sidecar 
   `WEAVRIA_UNDERSTANDING_MAX_OUTPUT_TOKENS`，避免大型规格或覆盖图与最终回答争用同一输出预留。
   任务理解必须在有限预算内生成严格结构化规格，因此默认发送
   `WEAVRIA_UNDERSTANDING_REASONING_EFFORT=none`，避免兼容端点把输出预算全部用于隐藏思考。
-  该设置只作用于任务理解阶段，不改变最终回答模型；若供应商不接受此参数，可显式设置为
-  `omit`，让适配器不发送该字段。此策略由 FinScope 宿主声明，不依赖模型名称推断能力。依据：
+  执行阶段由独立的 `WEAVRIA_MODEL_REASONING_EFFORT` 控制，也默认 `none`；两者互不覆盖。
+  若供应商不接受此参数，可分别显式设置为 `omit`，让适配器不发送对应字段。
+  此策略由 FinScope 宿主声明，不依赖模型名称推断能力。依据：
   [DeepSeek Thinking Mode](https://api-docs.deepseek.com/guides/thinking_mode/) 与
   [Chat Completion API](https://api-docs.deepseek.com/api/create-chat-completion/)
   （访问日期：2026-10-27）。

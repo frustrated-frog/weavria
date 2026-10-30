@@ -1020,3 +1020,64 @@ async def test_factory_forwards_execution_and_understanding_reasoning_independen
     assert [request["reasoning_effort"] for request in requests] == ["low", "none"]
     assert [request["max_tokens"] for request in requests] == [8192, 4096]
     assert closed
+
+
+async def test_startup_profile_matches_persisted_run_and_excludes_credentials(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import logging
+
+    caplog.set_level(logging.INFO, logger="uvicorn.error")
+    specification = TaskSpecification(
+        route="direct",
+        intent="Greet",
+        goal="Reply to greeting",
+        completion_criteria=(CompletionCriterion(kind="response", description="Reply"),),
+    )
+    model = FakeSessionProvider((ModelTurn(decision=FinishAction(output="Hello")),))
+    interpreter = FakeModelProvider((_declaration(specification),))
+    settings = FinScopeSettings(
+        model_base_url="http://model.test/v1?api_key=PRIVATE-ROUTE",
+        model_name="fake",
+        model_api_key="PRIVATE-KEY",
+        state_path=tmp_path / "PRIVATE-STATE.sqlite3",
+        finalization_model_calls=2,
+        finalization_seconds=30,
+    )
+    app = create_app(settings, provider=model, interpreter_provider=interpreter)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app), base_url="http://sidecar.test"
+        ) as client:
+            session = (await client.post("/api/sessions")).json()["session_id"]
+            response = await client.post(
+                f"/api/sessions/{session}/messages",
+                json={
+                    "input_id": "profile-test",
+                    "text": "Hello",
+                    "context": {
+                        "schema_version": 1,
+                        "surface": "finscope_workspace",
+                        "current_view": "agent",
+                        "navigation": {"view": "agent", "label": "Agent"},
+                    },
+                },
+            )
+    assert response.status_code == 200 and response.json()["status"] == "completed"
+    records = [record.getMessage() for record in caplog.records if record.name == "uvicorn.error"]
+    profile_log = next(
+        text for text in records if text.startswith("FinScope effective runtime configuration:")
+    )
+    profile = json.loads(profile_log.split(": ", 1)[1])
+    with sqlite3.connect(settings.state_path) as database:
+        saved = json.loads(database.execute("SELECT config FROM runs").fetchone()[0])
+    assert saved["schema_version"] == 5
+    assert saved["configuration_metadata"] == profile
+    assert saved["limits"] == profile["configuration"]["limits"]
+    assert saved["context_compiler"] == profile["configuration"]["context_compiler"]
+    assert profile["configuration"]["limits"]["finalization_model_calls"] == 2
+    assert profile["configuration"]["execution_reasoning_effort"] == "none"
+    assert "PRIVATE" not in profile_log and "PRIVATE" not in json.dumps(saved)
+    for request in (*model.requests, *interpreter.requests):
+        assert profile["sha256"] not in request.model_dump_json()

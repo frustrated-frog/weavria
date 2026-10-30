@@ -129,6 +129,7 @@ from .completion import (
     check_completion,
 )
 from .controller import (
+    FinalizationPreparer,
     ProgressAssessor,
     TurnPreparation,
     TurnPreparer,
@@ -402,6 +403,7 @@ class _AgentKernel:
             raise ValueError("context recovery requires a recovery compiler builder")
         self._journal = journal
         self._preparation = preparation
+        self._prepared_task_revision: int | None = None
         self._task_observation = (
             TaskObservation.model_validate_json(task_observation.model_dump_json())
             if task_observation is not None
@@ -436,7 +438,7 @@ class _AgentKernel:
         )
         self._tool_ceiling = tools
         self._visible_tools = tools
-        self._capability_epoch = 0
+        self._capability_epoch: int = 0
         self._instruction_source = instructions
         self._executor = ToolExecutor(
             run_id,
@@ -573,37 +575,7 @@ class _AgentKernel:
                         return await self._end(RunStatus.BUDGET_EXHAUSTED, "model_calls")
                     task = self.state.task
                     try:
-                        if self._preparation is not None:
-                            prepared = await self._preparation.prepare_turn(task)
-                            if (
-                                prepared.task_revision != task.revision
-                                or type(prepared.request_budget_bytes) is not int
-                                or not 0
-                                < prepared.request_budget_bytes
-                                <= self._limits.max_request_bytes
-                            ):
-                                raise ValueError("invalid turn preparation budget or revision")
-                            self._request_capacity = prepared.request_budget_bytes
-                            self._apply_turn_preparation(prepared, task)
-                        # A compiled view may spend capacity on optional conversation or
-                        # evidence. Rebuild every decision from the turn's hard capacity
-                        # so an admission rejection can reclaim that optional space.
-                        self._request_budget = self._request_capacity
-                        if (
-                            self._limits.finalization_model_calls
-                            and self.state.finalization is None
-                        ):
-                            try:
-                                async with asyncio.timeout(
-                                    max(0, self._remaining(deadline) - self._finalization_reserve)
-                                ):
-                                    plan = await self._finalization_context(task, deadline)
-                            except TimeoutError:
-                                plan = await self._finalization_context(
-                                    task, deadline, force_reserve=True
-                                )
-                        else:
-                            plan = await self._finalization_context(task, deadline)
+                        plan = await self._prepare_decision_context(task, deadline)
                         if plan is None:
                             if task.revision != self.state.task.revision:
                                 continue
@@ -811,7 +783,9 @@ class _AgentKernel:
                         )
                         if self._journal_version >= 3:
                             assert isinstance(response, ModelTurn)
-                            progress_assessment = await self._assess_progress(task.revision)
+                            progress_assessment = await self._prepare_progress_assessment(
+                                task.revision, deadline
+                            )
                             await self._resolve(
                                 "execution",
                                 response,
@@ -943,6 +917,56 @@ class _AgentKernel:
         result = self.state.result
         assert result is not None
         return result
+
+    async def _prepare_decision_context(
+        self, task: TaskInput, deadline: float
+    ) -> EvidencePlan | TurnEvidencePlan | ControlEvidencePlan | None:
+        if not self._limits.finalization_model_calls:
+            return await self._prepare_ordinary_context(task, deadline)
+        if (
+            self.state.finalization is not None
+            or self._remaining(deadline) <= self._finalization_reserve
+            or self._limits.max_model_calls - self.state.model_calls
+            <= self._limits.finalization_model_calls
+        ):
+            return await self._prepare_finalization_context(task, deadline)
+        scope = asyncio.timeout(max(0, self._remaining(deadline) - self._finalization_reserve))
+        try:
+            async with scope:
+                return await self._prepare_ordinary_context(task, deadline)
+        except TimeoutError:
+            if not scope.expired():
+                raise
+            # The cancelled preparation has joined. Never reuse an obsolete
+            # projection, or repeat the blocked refresh using synthesis time.
+            return await self._prepare_finalization_context(task, deadline)
+
+    async def _prepare_ordinary_context(
+        self, task: TaskInput, deadline: float
+    ) -> EvidencePlan | TurnEvidencePlan | ControlEvidencePlan | None:
+        if self._preparation is not None:
+            prepared = await self._preparation.prepare_turn(task)
+            if task.revision != self.state.task.revision:
+                return None
+            self._apply_turn_preparation(prepared, task)
+        self._request_budget = self._request_capacity
+        return await self._finalization_context(task, deadline)
+
+    async def _prepare_finalization_context(
+        self, task: TaskInput, deadline: float
+    ) -> EvidencePlan | TurnEvidencePlan | ControlEvidencePlan | None:
+        if task.revision != self.state.task.revision:
+            return None
+        if isinstance(self._preparation, FinalizationPreparer):
+            prepared = self._preparation.prepare_finalization(task)
+            if prepared is None:
+                return None
+            self._apply_turn_preparation(prepared, task)
+        elif self._preparation is not None and self._prepared_task_revision != task.revision:
+            return None
+        # Compiled views cannot permanently reduce the host's hard capacity.
+        self._request_budget = self._request_capacity
+        return await self._finalization_context(task, deadline, force_reserve=True)
 
     async def _assess_finalization(
         self, task: TaskInput, plan: ControlEvidencePlan | None = None
@@ -1183,6 +1207,12 @@ class _AgentKernel:
         )
 
     def _apply_turn_preparation(self, prepared: TurnPreparation, task: TaskInput) -> None:
+        if (
+            prepared.task_revision != task.revision
+            or type(prepared.request_budget_bytes) is not int
+            or not 0 < prepared.request_budget_bytes <= self._limits.max_request_bytes
+        ):
+            raise ValueError("invalid turn preparation budget or revision")
         if prepared.task_observation is not None:
             if prepared.task_observation.task_revision != task.revision:
                 raise ValueError("turn observation belongs to another task revision")
@@ -1197,6 +1227,8 @@ class _AgentKernel:
         if prepared.visible_tool_names is None:
             if prepared.capability_epoch is not None:
                 raise ValueError("capability epoch requires a visible tool view")
+            self._request_capacity = prepared.request_budget_bytes
+            self._prepared_task_revision = task.revision
             return
         if prepared.capability_epoch is None or prepared.capability_epoch < self._capability_epoch:
             raise ValueError("capability view epoch is absent or stale")
@@ -1210,6 +1242,8 @@ class _AgentKernel:
         self._instructions = _instructions_for(
             self._instruction_source, visible, self._journal_version
         )
+        self._request_capacity = prepared.request_budget_bytes
+        self._prepared_task_revision = task.revision
 
     async def _intervene_batch(
         self, batch: ToolBatch, deadline: float
@@ -1818,6 +1852,25 @@ class _AgentKernel:
                     return assessment
             raise _CompletionRepairStalled(assessment.decision.issue_codes)
         return assessment
+
+    async def _prepare_progress_assessment(
+        self, revision: int, deadline: float
+    ) -> ProgressAssessment | None:
+        if not self._limits.finalization_model_calls:
+            return await self._assess_progress(revision)
+        exploration_seconds = self._remaining(deadline) - self._finalization_reserve
+        if exploration_seconds <= 0:
+            return None
+        scope = asyncio.timeout(exploration_seconds)
+        try:
+            async with scope:
+                return await self._assess_progress(revision)
+        except TimeoutError:
+            if not scope.expired():
+                raise
+            # Tool records remain accepted; optional analysis cannot consume the
+            # time reserved for delivering them or publish a partial assessment.
+            return None
 
     async def _assess_progress(self, revision: int) -> ProgressAssessment | None:
         if self._progress_assessor is None or revision != self.state.task.revision:

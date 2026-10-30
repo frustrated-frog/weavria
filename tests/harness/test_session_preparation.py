@@ -1,3 +1,4 @@
+import asyncio
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -6,7 +7,7 @@ from typing import Literal
 import pytest
 from pydantic import BaseModel, ConfigDict
 
-from weavria.context import ContextCompilerConfig
+from weavria.context import ContextCompilerConfig, HistoryRetrievalConfig
 from weavria.core import (
     ActionInterventionChecked,
     AdmissionNotice,
@@ -63,7 +64,7 @@ from weavria.models import (
     OpenAICompatibleTokenCounter,
 )
 from weavria.runtime import RunLimits
-from weavria.sessions import SessionEngine
+from weavria.sessions import SessionEngine, SessionSemanticContext, SessionTaskPreparation
 from weavria.tools import ToolContext, ToolFault, ToolRegistry, TypedTool
 
 
@@ -1312,3 +1313,79 @@ async def test_v2_task_observation_preserves_request_budget_and_evidence_refresh
     ) as reopened:
         restored = await reopened.store.semantic_head("v2", commits[-1].work_id)
     assert restored == commits[-1]
+
+
+@pytest.mark.parametrize("blocked_stage", ["history_head", "uncommitted_refresh"])
+async def test_reserved_preparation_uses_only_committed_session_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    session_counter: OpenAICompatibleTokenCounter,
+    blocked_stage: str,
+) -> None:
+    closed = asyncio.Event()
+    interpreter = FakeModelProvider((_declaration(_execute()),))
+    model = _ExecuteSessionModel()
+
+    class Preparer(TaskAwareSessionPreparer):
+        async def refresh(self, context: SessionSemanticContext) -> SessionTaskPreparation:
+            candidate = await super().refresh(context)
+            if blocked_stage == "uncommitted_refresh":
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    closed.set()
+            return candidate
+
+    preparer = Preparer(TaskUnderstandingEngine(ModelTaskInterpreter(interpreter)))
+    async with SessionEngine(
+        tmp_path / "reserved.db",
+        model=model,
+        tools=_registry(),
+        task_preparation=preparer,
+        limits=RunLimits(
+            max_model_calls=5,
+            max_duration=1.2,
+            max_request_bytes=50_000,
+            finalization_model_calls=1,
+            finalization_seconds=0.6,
+            max_completion_duration=0.15,
+        ),
+        max_request_duration=2.4,
+        context_compiler=ContextCompilerConfig(window_tokens=24_000, output_tokens=256),
+        token_counter=session_counter,
+        history_retrieval=HistoryRetrievalConfig(),
+    ) as engine:
+        original_head = engine.store.head
+        head_calls = 0
+
+        async def slow_head(session_id: str) -> tuple[int, int]:
+            nonlocal head_calls
+            head_calls += 1
+            if model.requests and blocked_stage == "history_head":
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    closed.set()
+            return await original_head(session_id)
+
+        monkeypatch.setattr(engine.store, "head", slow_head)
+        await engine.create("s")
+        result = await engine.send("s", "Read alpha", input_id="input-1")
+        events = await engine.store.events("s", limit=256)
+    assert closed.is_set()
+    commits = [
+        event.data.snapshot for event in events if isinstance(event.data, SessionSemanticCommitted)
+    ]
+    if blocked_stage == "history_head":
+        assert result.report.status is RunStatus.COMPLETED
+        assert len(model.requests) == 2 and head_calls == 2
+        final = model.requests[-1].current
+        assert "FINALIZATION" in final.instructions
+        assert final.task_observation == commits[-1].observation
+        assert commits[-1].version.evidence_revision > commits[0].version.evidence_revision
+        compilations = [e.data for e in events if isinstance(e.data, SessionContextCompiled)]
+        assert compilations[-1].compilation.next_step_reserve_bytes == 0
+    else:
+        assert result.report.status is RunStatus.BUDGET_EXHAUSTED
+        assert result.report.output is None and len(model.requests) == 1
+        assert commits[-1].version.evidence_revision == commits[0].version.evidence_revision

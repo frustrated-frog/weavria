@@ -2,7 +2,7 @@
 
 import hashlib
 from dataclasses import dataclass
-from typing import Literal, Protocol
+from typing import Literal, Protocol, runtime_checkable
 
 from pydantic import JsonValue
 
@@ -41,6 +41,17 @@ class TurnPreparer(Protocol):
     """
 
     async def prepare_turn(self, task: TaskInput) -> TurnPreparation: ...
+
+
+@runtime_checkable
+class FinalizationPreparer(Protocol):
+    """Project already committed state without I/O, refresh, or new authorization.
+
+    Optional companion to TurnPreparer. Return None when no safe snapshot for the
+    current task revision is available. The Runtime revalidates the returned view.
+    """
+
+    def prepare_finalization(self, task: TaskInput) -> TurnPreparation | None: ...
 
 
 class ProgressAssessor(Protocol):

@@ -1,4 +1,6 @@
 import asyncio
+import json
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -22,7 +24,7 @@ from weavria.core import (
     ToolFailedObservation,
     ToolSucceededObservation,
 )
-from weavria.models import ModelCapabilities, ModelOutputError
+from weavria.models import FakeSessionProvider, ModelCapabilities, ModelOutputError
 from weavria.sessions import SessionBusyError, SessionConflictError, SessionEngine
 from weavria.tools import ToolContext, ToolRegistry, TypedTool
 
@@ -632,3 +634,37 @@ async def test_unknown_database_schema_is_preserved_and_releases_owner_lock(tmp_
         conn.execute("PRAGMA user_version=0")
     async with SQLiteSessionStore(path) as store:
         await store.create("s")
+
+
+async def test_configuration_metadata_is_snapshotted_outside_model_input(tmp_path: Path) -> None:
+    flags: dict[str, JsonValue] = {"enabled": True}
+    metadata: dict[str, JsonValue] = {"profile": "configuration-only-host-sentinel", "flags": flags}
+    model = FakeSessionProvider((finish("first result"),))
+    path = tmp_path / "metadata.db"
+    engine = SessionEngine(
+        path, model=model, tools=ToolRegistry(()), configuration_metadata=metadata
+    )
+    metadata["profile"] = "changed externally"
+    flags["enabled"] = False
+    async with engine:
+        await engine.create("s")
+        original = await engine.send("s", "First question", input_id="first")
+    assert "configuration-only-host-sentinel" not in model.requests[0].model_dump_json()
+    replacement = FakeSessionProvider((finish("second result"),))
+    async with SessionEngine(
+        path, model=replacement, tools=ToolRegistry(()), configuration_metadata={"profile": "new"}
+    ) as reopened:
+        repeated = await reopened.send("s", "First question", input_id="first")
+        await reopened.send("s", "Next question", input_id="second")
+    assert repeated == original and len(replacement.requests) == 1
+    with sqlite3.connect(path) as connection:
+        configs = [
+            json.loads(row[0])
+            for row in connection.execute("SELECT config FROM runs ORDER BY ordinal")
+        ]
+    assert [config["schema_version"] for config in configs] == [5, 5]
+    assert configs[0]["configuration_metadata"] == {
+        "profile": "configuration-only-host-sentinel",
+        "flags": {"enabled": True},
+    }
+    assert configs[1]["configuration_metadata"] == {"profile": "new"}

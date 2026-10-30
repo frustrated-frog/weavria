@@ -43,6 +43,8 @@ from weavria.runtime import (
     CompletionPolicy,
     LayeredCompletionPolicy,
     RunLimits,
+    TurnPreparation,
+    TurnPreparer,
     reduce_event,
 )
 from weavria.tools import ToolContext, ToolRegistry, TypedTool
@@ -69,6 +71,7 @@ async def setup(
     store: InMemoryArtifactStore | None = None,
     required_action: bool = False,
     context_builder: ControlContextBuilder | None = None,
+    preparation: TurnPreparer | None = None,
 ) -> tuple[AgentLoop, FakeControlProvider]:
     async def read(arguments: Input, context: ToolContext) -> Output:
         return Output(value=arguments.key)
@@ -149,6 +152,7 @@ async def setup(
         completion=completion or TaskObligationCompletionPolicy(),
         finalization=NeedFinalizationPolicy(),
         context_builder=context_builder,
+        preparation=preparation,
     )
     return agent, provider
 
@@ -475,3 +479,165 @@ async def test_context_preparation_cannot_spend_the_synthesis_reserve() -> None:
     assert closed.is_set()
     assert result.status is RunStatus.COMPLETED and result.task_outcome == "unverifiable"
     assert agent.state.model_calls == 2 and agent.state.tool_calls == 1
+
+
+async def test_turn_preparer_cannot_spend_the_synthesis_reserve() -> None:
+    closed = asyncio.Event()
+
+    class SlowSecondPreparation:
+        calls = 0
+
+        async def prepare_turn(self, task: TaskInput) -> TurnPreparation:
+            self.calls += 1
+            if self.calls == 2:
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    closed.set()
+            return TurnPreparation(task.revision, 24_000)
+
+    preparer = SlowSecondPreparation()
+    agent, provider = await setup(
+        (read(), finish("Only the established value is available")),
+        fields=("/value", "/details/extra"),
+        preparation=preparer,
+        limits=RunLimits(
+            max_model_calls=5,
+            max_request_bytes=24_000,
+            max_duration=0.5,
+            max_completion_duration=0.08,
+            finalization_model_calls=1,
+            finalization_seconds=0.25,
+        ),
+    )
+    result = await agent.execute()
+    assert closed.is_set()
+    assert result.status is RunStatus.COMPLETED and result.task_outcome == "unverifiable"
+    assert preparer.calls == 2 and len(provider.requests) == 2
+    assert "FINALIZATION" in provider.requests[-1].instructions
+
+
+async def test_timeout_after_steering_does_not_synthesize_from_the_old_preparation() -> None:
+    entered, closed = asyncio.Event(), asyncio.Event()
+
+    class Preparation:
+        calls = 0
+
+        async def prepare_turn(self, task: TaskInput) -> TurnPreparation:
+            self.calls += 1
+            if self.calls > 1:
+                entered.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    closed.set()
+            return TurnPreparation(task.revision, 24_000)
+
+    agent, provider = await setup(
+        (read(), finish("obsolete answer")),
+        fields=("/value", "/details/extra"),
+        preparation=Preparation(),
+        limits=RunLimits(
+            max_model_calls=5,
+            max_request_bytes=24_000,
+            max_duration=0.5,
+            max_completion_duration=0.08,
+            finalization_model_calls=1,
+            finalization_seconds=0.25,
+        ),
+    )
+    owner = asyncio.create_task(agent.execute())
+    await asyncio.wait_for(entered.wait(), 1)
+    await agent.apply_directive(TaskDirective(input_id="revision", text="Use a different target"))
+    result = await owner
+    assert closed.is_set() and agent.state.task.revision == 2
+    assert result.status is RunStatus.BUDGET_EXHAUSTED and result.output is None
+    assert len(provider.requests) == 1 and len(agent.state.records) == 1
+    assert not any(isinstance(event.data, FinalizationStarted) for event in agent.events)
+
+
+async def test_first_preparation_timeout_has_no_safe_view_to_finalize() -> None:
+    closed = asyncio.Event()
+
+    class Preparation:
+        async def prepare_turn(self, task: TaskInput) -> TurnPreparation:
+            try:
+                await asyncio.Event().wait()
+            finally:
+                closed.set()
+            raise AssertionError("unreachable")
+
+    agent, provider = await setup(
+        (finish("unsupported"),),
+        preparation=Preparation(),
+        limits=RunLimits(
+            max_model_calls=5,
+            max_request_bytes=24_000,
+            max_duration=0.5,
+            finalization_model_calls=1,
+            finalization_seconds=0.25,
+        ),
+    )
+    result = await agent.execute()
+    assert closed.is_set() and provider.requests == ()
+    assert result.status is RunStatus.BUDGET_EXHAUSTED and result.output is None
+
+
+async def test_preparer_dependency_timeout_is_not_a_reserve_deadline() -> None:
+    class Preparation:
+        calls = 0
+
+        async def prepare_turn(self, task: TaskInput) -> TurnPreparation:
+            self.calls += 1
+            if self.calls == 2:
+                raise TimeoutError("dependency deadline")
+            return TurnPreparation(task.revision, 24_000)
+
+    agent, provider = await setup(
+        (read(), finish("must not publish")),
+        fields=("/value", "/details/extra"),
+        preparation=Preparation(),
+    )
+    result = await agent.execute()
+    assert result.status is RunStatus.FAILED and result.output is None
+    assert result.error is not None and result.error.category is ErrorCategory.TIMEOUT
+    assert len(provider.requests) == 1 and len(agent.state.records) == 1
+    assert not any(isinstance(event.data, FinalizationStarted) for event in agent.events)
+
+
+async def test_external_cancel_during_reserved_turn_preparation_does_not_finalize() -> None:
+    entered, closed = asyncio.Event(), asyncio.Event()
+
+    class Preparation:
+        calls = 0
+
+        async def prepare_turn(self, task: TaskInput) -> TurnPreparation:
+            self.calls += 1
+            if self.calls == 2:
+                entered.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    closed.set()
+            return TurnPreparation(task.revision, 24_000)
+
+    agent, provider = await setup(
+        (read(), finish("must not publish")),
+        fields=("/value", "/details/extra"),
+        preparation=Preparation(),
+        limits=RunLimits(
+            max_model_calls=5,
+            max_request_bytes=24_000,
+            max_duration=5,
+            finalization_model_calls=1,
+            finalization_seconds=2,
+        ),
+    )
+    owner = asyncio.create_task(agent.execute())
+    await asyncio.wait_for(entered.wait(), 1)
+    owner.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await owner
+    assert closed.is_set() and len(provider.requests) == 1
+    assert agent.state.result is not None and agent.state.result.status is RunStatus.CANCELLED
+    assert not any(isinstance(event.data, FinalizationStarted) for event in agent.events)
