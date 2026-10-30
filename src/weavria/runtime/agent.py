@@ -719,7 +719,7 @@ class _AgentKernel:
                         await self._accept(DecisionDiscarded())
                         continue
                     if isinstance(decision, RecoverContext):
-                        await self._recover_context(decision, task)
+                        await self._recover_context(decision, task, deadline)
                         continue
                     if isinstance(decision, FinishAction):
                         if self._journal_version >= 3:
@@ -1134,9 +1134,11 @@ class _AgentKernel:
         except TimeoutError as exc:
             raise _ContextDependencyTimeout("Context dependency timed out") from exc
 
-    async def _recover_context(self, request: RecoverContext, task: TaskInput) -> None:
-        builder, state = self._control_builder, self.state
-        assert isinstance(builder, RecoveryContextBuilder) and state.recovery_limits is not None
+    async def _recover_context(
+        self, request: RecoverContext, task: TaskInput, deadline: float
+    ) -> None:
+        state = self.state
+        assert state.recovery_limits is not None
         limits = state.recovery_limits
         corpus = hashlib.sha256(("[" + ",".join(state.records_json) + "]").encode()).hexdigest()
         request_sha = hashlib.sha256(request.model_dump_json().encode()).hexdigest()
@@ -1148,51 +1150,86 @@ class _AgentKernel:
             if (request_sha, corpus) in state.recovery_attempts
             else None
         )
-        if status is not None:
-            result = RecoveryResolved(
-                task_revision=task.revision,
-                corpus_sha256=corpus,
-                notice=RecoveryNotice(
-                    request_sha256=request_sha,
-                    status=status,
-                    round=state.recovery_rounds,
-                    remaining_rounds=max(0, limits.max_rounds - state.recovery_rounds),
-                    ranges=0,
-                    recovered_bytes=0,
-                ),
-            )
-        else:
-            result = await builder.plan_recovery(
-                request=request,
-                run_id=self._run_id,
-                revision=task.revision,
-                records=state.records,
-                seen=state.recovery_seen,
-                limits=limits,
+        result = RecoveryResolved(
+            task_revision=task.revision,
+            corpus_sha256=corpus,
+            notice=RecoveryNotice(
+                request_sha256=request_sha,
+                status=status or "budget",
                 round=state.recovery_rounds,
-                used_bytes=state.recovery_bytes,
-            )
-            if result.ranges and task.revision == self.state.task.revision:
-                try:
-                    preflight = await self._build_context(task, recovery=result)
-                    if (
-                        not isinstance(preflight, ControlEvidencePlan)
-                        or preflight.compilation_json is None
-                    ):
-                        raise ValueError("recovery preflight requires a compilation receipt")
-                    validate_recovery_view(preflight.request, result.ranges)
-                    report = ContextCompilation.model_validate_json(preflight.compilation_json)
-                    if report.schema_version < 4 or report.recovery_ranges != result.ranges:
-                        raise ValueError("recovery preflight changed the planned ranges")
-                    requested = preflight.request_bytes + preflight.control_padding_bytes
-                    if requested > preflight.budget_bytes:
-                        raise ContextBudgetError(requested, preflight.budget_bytes)
-                except (ContextBudgetError, ContextTokenBudgetError, ContextCapacityError):
-                    result = self._recovery_outcome(result, "budget")
+                remaining_rounds=max(0, limits.max_rounds - state.recovery_rounds),
+                ranges=0,
+                recovered_bytes=0,
+            ),
+        )
+        if status is None:
+            if not self._limits.finalization_model_calls:
+                result = await self._plan_recovery(request, task, state)
+            else:
+                exploration_seconds = self._remaining(deadline) - self._finalization_reserve
+                if exploration_seconds > 0:
+                    scope = asyncio.timeout(exploration_seconds)
+                    try:
+                        async with scope:
+                            result = await self._plan_recovery(
+                                request,
+                                task,
+                                state,
+                                exploration_deadline=deadline - self._finalization_reserve,
+                            )
+                    except TimeoutError:
+                        if not scope.expired():
+                            raise
+                        # Planning/preflight has joined. Settle the accepted
+                        # decision without installing a partial recovery lease.
         async with self._commit_lock:
             if task.revision != self.state.task.revision:
                 result = self._recovery_outcome(result, "stale")
             await self._accept_locked(result)
+
+    async def _plan_recovery(
+        self,
+        request: RecoverContext,
+        task: TaskInput,
+        state: RunState,
+        *,
+        exploration_deadline: float | None = None,
+    ) -> RecoveryResolved:
+        """Prepare and preflight a candidate without accepting recovery ranges."""
+        builder, limits = self._control_builder, state.recovery_limits
+        assert isinstance(builder, RecoveryContextBuilder) and limits is not None
+        result = await builder.plan_recovery(
+            request=request,
+            run_id=self._run_id,
+            revision=task.revision,
+            records=state.records,
+            seen=state.recovery_seen,
+            limits=limits,
+            round=state.recovery_rounds,
+            used_bytes=state.recovery_bytes,
+        )
+        if exploration_deadline is not None and self._clock.monotonic() >= exploration_deadline:
+            return self._recovery_outcome(result, "budget")
+        if result.ranges and task.revision == self.state.task.revision:
+            try:
+                preflight = await self._build_context(task, recovery=result)
+                if (
+                    not isinstance(preflight, ControlEvidencePlan)
+                    or preflight.compilation_json is None
+                ):
+                    raise ValueError("recovery preflight requires a compilation receipt")
+                validate_recovery_view(preflight.request, result.ranges)
+                report = ContextCompilation.model_validate_json(preflight.compilation_json)
+                if report.schema_version < 4 or report.recovery_ranges != result.ranges:
+                    raise ValueError("recovery preflight changed the planned ranges")
+                requested = preflight.request_bytes + preflight.control_padding_bytes
+                if requested > preflight.budget_bytes:
+                    raise ContextBudgetError(requested, preflight.budget_bytes)
+            except (ContextBudgetError, ContextTokenBudgetError, ContextCapacityError):
+                result = self._recovery_outcome(result, "budget")
+        if exploration_deadline is not None and self._clock.monotonic() >= exploration_deadline:
+            return self._recovery_outcome(result, "budget")
+        return result
 
     @staticmethod
     def _recovery_outcome(
