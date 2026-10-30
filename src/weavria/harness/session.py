@@ -88,7 +88,7 @@ class TaskAwareSessionPreparer:
     @property
     def version(self) -> str:
         return (
-            "task-aware-session/6["
+            "task-aware-session/7["
             f"{self._understanding.version};{self._evidence.version};"
             f"{self._capabilities.version};{self._clarification.version}]"
         )
@@ -159,11 +159,20 @@ class TaskAwareSessionPreparer:
             trigger="clarification_answer" if base is not None else "initial",
         )
         candidates = context.tools.select(capability_view.allowed_tool_names)
+        # Discovery metadata is input to interpretation, not the Runtime tool view.
+        # Prefer complete recall for small inventories. Understanding admits the real
+        # request before choosing between this inventory and the ranked fallback.
+        inventory = self._capabilities.preparation_catalogue(context.tools)
+        fallback = None
+        if inventory is not None and inventory.descriptors != candidates.descriptors:
+            fallback = candidates
+            candidates = inventory
         preparation = await self._understanding.prepare(
             input_id=context.input_id,
             task=context.task,
             history=history,
             tools=candidates,
+            fallback_tools=fallback,
             work_id=base.work_id if base is not None else None,
             base_frame=base,
             cause=context.cause,

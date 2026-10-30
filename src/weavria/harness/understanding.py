@@ -5,7 +5,7 @@ import hashlib
 import json
 import math
 from dataclasses import dataclass
-from typing import Annotated, Literal, Protocol, Self
+from typing import Annotated, Literal, Protocol, Self, runtime_checkable
 
 from pydantic import (
     BaseModel,
@@ -888,10 +888,17 @@ class TaskInterpreter(Protocol):
     ) -> TaskSpecification: ...
 
 
+@runtime_checkable
+class TaskUnderstandingInputAdmission(Protocol):
+    """Optional pure preflight for choosing a discovery catalogue, without model I/O."""
+
+    def input_fits(self, request: TaskUnderstandingInput) -> bool: ...
+
+
 class ModelTaskInterpreter:
     """Compile validated declarations with one shared, deadline-bound correction path."""
 
-    version = "model-task-understanding/9"
+    version = "model-task-understanding/10"
 
     def __init__(
         self,
@@ -901,6 +908,17 @@ class ModelTaskInterpreter:
     ) -> None:
         self._provider = provider
         self._context_compiler = context_compiler
+
+    def input_fits(self, request: TaskUnderstandingInput) -> bool:
+        """Admit the initial request with the same compiler used for actual dispatch."""
+        if self._context_compiler is None:
+            return True
+        model_request, _ = _task_specification_request(request)
+        try:
+            self._context_compiler.compile(model_request)
+        except ModelRequestContextError:
+            return False
+        return True
 
     async def interpret(
         self, request: TaskUnderstandingInput, *, max_duration: float
@@ -1784,11 +1802,17 @@ class TaskUnderstandingEngine:
             )
         )
         return (
-            "task-understanding/10["
+            "task-understanding/11["
             f"{self._interpreter.version};{self._question_selector.version};"
             f"{self._belief_updater.version};{self._intent_decision_policy.version};"
             f"{coverage_version};{repairer_version};repairs={self._max_coverage_repairs};"
             f"profiles={profiles or 'none'};targets={self._target_resolver.version}]"
+        )
+
+    def _capability_views(self, tools: ToolRegistry) -> tuple[CapabilityView, ...]:
+        return tuple(
+            _capability_view(descriptor, self._evidence_profiles.get(descriptor.name))
+            for descriptor in tools.descriptors
         )
 
     async def prepare(
@@ -1804,7 +1828,23 @@ class TaskUnderstandingEngine:
         application_context: tuple[ApplicationObservation, ...] = (),
         prior_clarification_question: str | None = None,
         prior_clarification_id: str | None = None,
+        fallback_tools: ToolRegistry | None = None,
     ) -> TaskPreparation:
+        """Interpret host candidates; optionally shrink the catalogue before model I/O.
+
+        ``fallback_tools`` must contain identical registrations from ``tools``. It is
+        considered only for catalogue or initial-request capacity, never after a model
+        failure, semantic rejection, or timeout. Existing callers retain strict admission.
+        """
+        if fallback_tools is not None:
+            names = {item.name for item in tools.descriptors}
+            if any(
+                item.name not in names or tools.get(item.name) is not fallback_tools.get(item.name)
+                for item in fallback_tools.descriptors
+            ):
+                raise ValueError(
+                    "fallback catalogue must be an unchanged subset of host candidates"
+                )
         if any(item.input_id != input_id for item in application_context):
             raise ValueError("application context belongs to another input")
         if prior_clarification_question is not None and base_frame is None:
@@ -1823,10 +1863,7 @@ class TaskUnderstandingEngine:
                 prior_clarification_question_id = (
                     base_frame.clarification_decision.selected_question_id
                 )
-        views = tuple(
-            _capability_view(descriptor, self._evidence_profiles.get(descriptor.name))
-            for descriptor in tools.descriptors
-        )
+        views = self._capability_views(tools)
         request = TaskUnderstandingInput(
             task=task,
             history=history,
@@ -1836,14 +1873,17 @@ class TaskUnderstandingEngine:
             prior_clarification_question_id=prior_clarification_question_id,
             prior_clarification_question=prior_clarification_question,
         )
+        if fallback_tools is not None and (
+            _catalogue_bytes(views) > self._max_catalogue_bytes
+            or (
+                isinstance(self._interpreter, TaskUnderstandingInputAdmission)
+                and not self._interpreter.input_fits(request)
+            )
+        ):
+            tools = fallback_tools
+            request = request.model_copy(update={"capabilities": self._capability_views(tools)})
         snapshot = TaskUnderstandingInput.model_validate_json(request.model_dump_json())
-        catalogue_bytes = len(
-            json.dumps(
-                [item.model_dump(mode="json") for item in snapshot.capabilities],
-                ensure_ascii=False,
-                separators=(",", ":"),
-            ).encode()
-        )
+        catalogue_bytes = _catalogue_bytes(snapshot.capabilities)
         if catalogue_bytes > self._max_catalogue_bytes:
             raise TaskUnderstandingError(
                 RunError(
@@ -2353,6 +2393,16 @@ class TaskUnderstandingEngine:
             or selected != capability_names
         ):
             raise ValueError("resolved task action disagrees with the accepted belief posterior")
+
+
+def _catalogue_bytes(capabilities: tuple[CapabilityView, ...]) -> int:
+    return len(
+        json.dumps(
+            [item.model_dump(mode="json") for item in capabilities],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode()
+    )
 
 
 def _capability_view(

@@ -338,3 +338,45 @@ def test_catalogue_digest_is_order_sensitive_and_content_addressed() -> None:
     )
     assert first.catalogue_sha256 == same.catalogue_sha256
     assert first.catalogue_sha256 != changed.catalogue_sha256
+
+
+def test_preparation_inventory_filters_policy_before_its_count_bound() -> None:
+    registry = ToolRegistry(
+        (
+            _tool("public_choice", "An inspectable operation"),
+            *(
+                _tool(f"private_{index}", "Hidden operation", sensitivity="private")
+                for index in range(20)
+            ),
+        )
+    )
+    inventory = CapabilityResolver(max_candidates=1).preparation_catalogue(registry)
+
+    assert inventory is not None
+    assert tuple(item.name for item in inventory.descriptors) == ("public_choice",)
+    assert len(registry.descriptors) == 21
+
+
+def test_preparation_inventory_does_not_arbitrarily_page_large_catalogues() -> None:
+    registry = ToolRegistry(
+        tuple(_tool(f"choice_{index}", "Inspectable operation") for index in range(3))
+    )
+    assert CapabilityResolver(max_candidates=2).preparation_catalogue(registry) is None
+    complete = CapabilityResolver(max_candidates=3).preparation_catalogue(registry)
+    assert complete is not None
+    assert tuple(item.name for item in complete.descriptors) == ("choice_0", "choice_1", "choice_2")
+
+
+def test_preparation_inventory_respects_an_explicit_host_discovery_policy() -> None:
+    class OnlyWeather:
+        version = "weather-only/1"
+
+        def can_discover(self, descriptor: CapabilityDescriptor) -> bool:
+            return descriptor.name == "read_weather"
+
+    registry = ToolRegistry(
+        (_tool("read_weather", "Read weather"), _tool("read_clock", "Read clock"))
+    )
+    inventory = CapabilityResolver(policy=OnlyWeather()).preparation_catalogue(registry)
+    assert inventory is not None
+    assert tuple(item.name for item in inventory.descriptors) == ("read_weather",)

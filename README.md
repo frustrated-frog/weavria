@@ -27,6 +27,7 @@ uv run python examples/execution_context.py
 uv run python examples/execution_context.py --json
 uv run python examples/task_understanding.py
 uv run python examples/task_understanding.py --json
+uv run python -m examples.capability_preparation
 uv run python examples/agent_loop.py
 uv run python examples/agent_loop.py --json
 uv run python examples/control_loop.py
@@ -39,6 +40,11 @@ uv run python examples/progress_control.py
 示例实际读取本地资料、保存成果、调用读取工具，并从模型可见内容计算答案。相同任务与预算下比较完整历史、近期窗口和相关片段策略，检查答案来源、调用成本、依赖闭包与状态回放。这是确定性的信息交付实验，不是真实 LLM 能力评测。
 
 当前设计、源码流程、实验结果和局限见 [执行驱动的模型上下文](docs/model-context-selection.md)、[通用任务理解与能力解析](docs/task-understanding.md)、[ADR 0003](docs/decisions/0003-execution-backed-context.md) 与 [ADR 0009](docs/decisions/0009-task-understanding-capability-resolution.md)。公开端口分别位于 `weavria.core`、`models`、`tools`、`artifacts`、`context`、`runtime`、`sessions` 与 `harness`。
+
+会话任务准备会在发现策略、数量和容量允许时向解释器提供完整小目录，避免同义表达或语言差异
+在理解前就丢掉可用工具；执行阶段仍只暴露已选能力。扩展目录无法通过实际请求准入时先退回
+排序目录，不额外调用模型。冻结消融与限制见
+[任务准备的有界能力目录与执行隔离](docs/decisions/0063-任务准备的有界能力目录与执行隔离.md)。
 
 `SessionEngine` 另可显式启用联合上下文编译：每次模型决策前按任务需求，在完整请求的 BPE Token 与字节预算内共同分配历史交互和当前工具证据，保留原文地址，支持精确区间回读。编译报告与发送快照在同一事务提交。运行 `uv run python examples/context_compiler.py` 可比较全量、新近优先、独立相关性和覆盖策略；该实验衡量原文信息交付，未验证真实模型成功率。配置、算法、失败案例与兼容边界见 [上下文编译与信息恢复](docs/上下文编译与信息恢复.md)。 当前策略支持有界表示交换，并使反馈预留、工具可读来源与回放共享同一证据闭包；容量诊断与百万字符资源探针见 [上下文编译修复与资源边界](docs/上下文编译修复与资源边界.md)。
 

@@ -305,7 +305,7 @@ class SchemaAwareSelector:
 class CapabilityResolver:
     """Compose policy filtering, bounded recall fallbacks and schema-aware selection."""
 
-    version = "capability-resolver/3"
+    version = "capability-resolver/4"
 
     def __init__(
         self,
@@ -321,6 +321,23 @@ class CapabilityResolver:
         self._selector = selector or SchemaAwareSelector()
         self._policy = policy or PublicCapabilityPolicy()
         self._limit = max_candidates
+
+    def preparation_catalogue(self, registry: ToolRegistry) -> ToolRegistry | None:
+        """Offer a complete small discovery catalogue, never an execution grant.
+
+        Lexical scores cannot distinguish irrelevance from different wording or languages.
+        A semantic interpreter may inspect the complete policy-visible inventory when it
+        fits the same count bound as ordinary discovery. Large inventories remain on the
+        ranked path; returning an arbitrary first page would hide that recall limitation.
+        The caller must also admit the resulting schemas against its understanding budget.
+        """
+        catalogue = CatalogSnapshot.from_registry(registry)
+        names = tuple(
+            item.name
+            for item in catalogue.capabilities
+            if self._policy.can_discover(item) and item.availability == "available"
+        )
+        return registry.select(names) if len(names) <= self._limit else None
 
     def resolve(
         self,

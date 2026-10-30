@@ -9,7 +9,9 @@ from weavria.harness import load_task_frame
 @pytest.fixture
 async def cases() -> tuple[PreparedCase, ...]:
     prepared, failures = await prepared_cases()
-    assert len(prepared) + len(failures) == 6
+    assert failures == ()
+    assert len(prepared) == 6
+    assert "current_time" in {case.case_id for case in prepared}
     assert {case.family for case in prepared} == {"generic_tools", "release_readiness"}
     return prepared
 
