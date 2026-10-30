@@ -154,6 +154,7 @@ from .semantics import (
     SessionSemanticCommitted,
     WorkStatus,
 )
+from .task_view import TaskModelView, TaskModelViewReceipt, TaskModelViewSource, task_view_digest
 from .turns import (
     CallFeedback,
     CallSkipped,
@@ -294,6 +295,9 @@ __all__ = [
     "SourceUse",
     "TaskDirective",
     "TaskInput",
+    "TaskModelView",
+    "TaskModelViewReceipt",
+    "TaskModelViewSource",
     "TaskObservation",
     "TaskPreparationAttemptDiagnostic",
     "TaskRevised",
@@ -324,6 +328,7 @@ __all__ = [
     "minimum_exchange",
     "parse_action",
     "recovery_digest",
+    "task_view_digest",
     "transition_status",
 ]
 

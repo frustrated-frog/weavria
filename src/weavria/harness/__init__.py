@@ -103,6 +103,7 @@ from .targets import (
     TargetResolver,
     TargetSelection,
 )
+from .task_view import TaskModelViewProjector
 from .understanding import (
     CapabilityNeed,
     CapabilityView,
@@ -228,6 +229,7 @@ __all__ = [
     "TaskFrame",
     "TaskFramePatch",
     "TaskInterpreter",
+    "TaskModelViewProjector",
     "TaskObligationCompletionPolicy",
     "TaskPreparation",
     "TaskSpecification",

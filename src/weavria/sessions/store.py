@@ -51,6 +51,7 @@ from weavria.core import (
     SessionTaskPreparationFailed,
     SessionTaskUpdated,
     SourceUse,
+    TaskModelViewReceipt,
     TaskPreparationAttemptDiagnostic,
     TaskRevised,
     TaskUpdate,
@@ -59,6 +60,7 @@ from weavria.core import (
     ToolRecord,
     ToolRecorded,
     TurnResolution,
+    task_view_digest,
 )
 from weavria.runtime import Clock, Phase, RunState, SystemClock, reduce_event, settle_mutation
 from weavria.tools import ToolExecutionError
@@ -1353,6 +1355,40 @@ class SQLiteSessionStore:
                         validate_recovery_view(request.current, state.recovery_ranges)
                     except ContextBuildError as exc:
                         raise SessionConflictError(str(exc)) from exc
+                view = request.current.task_model_view
+                if view is not None:
+                    if (
+                        compilation is None
+                        or compilation.task_model_view
+                        != TaskModelViewReceipt.from_view(view, request.current.instructions)
+                    ):
+                        raise SessionConflictError(
+                            "model projection does not match its compilation receipt"
+                        )
+                    # 在请求快照的同一事务读取语义头。编译后若已接受更新, 旧视图不能
+                    # 仅凭 task_revision 相同就被发送, 也不能只核对它自己声明的摘要。
+                    semantic_row = conn.execute(
+                        "SELECT data FROM semantic_heads WHERE session_id=? AND work_id=?",
+                        (session_id, view.source.work_id),
+                    ).fetchone()
+                    head = (
+                        SemanticSnapshot.model_validate_json(semantic_row[0])
+                        if semantic_row
+                        else None
+                    )
+                    if (
+                        head is None
+                        or head.run_id != run_id
+                        or head.version != view.source.version
+                        or hashlib.sha256(head.observation.model_dump_json().encode()).hexdigest()
+                        != view.source.observation_sha256
+                        or task_view_digest(head.need_ledger) != view.source.ledger_sha256
+                        or task_view_digest(head.visible_tool_names)
+                        != view.source.visible_tools_sha256
+                    ):
+                        raise SessionConflictError(
+                            "model projection is stale or does not match accepted state"
+                        )
                 notice = SessionContextPrepared(
                     run_id=run_id,
                     model_call=state.model_calls,

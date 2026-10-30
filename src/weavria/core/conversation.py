@@ -235,6 +235,7 @@ class ConversationView(BaseModel):
         "context-compiler/6",
         "context-compiler/7",
         "context-compiler/8",
+        "context-compiler/9",
     ] = "conversation/2"
 
     @model_validator(mode="after")
@@ -247,7 +248,7 @@ class ConversationView(BaseModel):
 
 
 class SessionRequest(BaseModel):
-    """v5 envelope: conversation v2 includes authored updates; current control stays v3."""
+    """v5 envelope with conversation v2 and independently versioned control requests."""
 
     model_config = ContractModel.model_config
     schema_version: Literal[5] = 5

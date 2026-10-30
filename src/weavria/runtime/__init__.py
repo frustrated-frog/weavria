@@ -43,6 +43,7 @@ from .progress import (
 )
 from .scheduling import ToolScheduling
 from .state import EventAcceptanceError, Phase, RunState, reduce_event
+from .task_view import TaskModelProjector
 
 __all__ = [
     "ACTION_VALUE_LEDGER_VERSION",
@@ -82,6 +83,7 @@ __all__ = [
     "SemanticProgressPolicy",
     "SemanticProgressPolicyFactory",
     "SystemClock",
+    "TaskModelProjector",
     "ToolScheduling",
     "TurnPreparation",
     "TurnPreparer",

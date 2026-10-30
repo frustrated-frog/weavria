@@ -541,7 +541,7 @@ class OpenAICompatibleTokenCounter:
 
     @property
     def version(self) -> str:
-        return f"openai-compatible-session/3[{self._tokenizer.version};frame={self._framing}]"
+        return f"openai-compatible-session/4[{self._tokenizer.version};frame={self._framing}]"
 
     @property
     def output_tokens(self) -> int:
@@ -594,6 +594,20 @@ class OpenAICompatibleTokenCounter:
         if request is None:
             return max(0, input_tokens - len(_SESSION_PROTOCOL.encode()) - self._framing)
         source = SessionRequest.model_validate(request)
+        if source.current.schema_version == 5:
+            # v5 的进度和工具说明都会变化,不能沿用“观察是固定 BPE 前缀”的证明。
+            # 第一版采用整个规范请求每字节最多一个 Token 的保守上界;实际请求仍按
+            # BPE 计量。调用者另将视图和说明的最大增长计入反馈预留,覆盖后续变化。
+            ceiling = max(0, input_tokens - len(_SESSION_PROTOCOL.encode()) - self._framing)
+            if self._config.max_request_bytes is not None:
+                # 进度/说明会替换旧值,等长替换也可能增加转义。用空内容的固定 HTTP
+                # 包络加“两倍规范 JSON 字节”证明,避免把当前值的转义比例当成未来上界。
+                body = _session_request_body(self._config, source)
+                body["messages"][0]["content"] = _SESSION_PROTOCOL
+                body["messages"][1]["content"] = ""
+                overhead = _transport_request_bytes(body)
+                ceiling = min(ceiling, max(0, self._config.max_request_bytes - overhead) // 2)
+            return ceiling
         validated = source.model_copy(
             update={
                 "current": source.current.model_copy(

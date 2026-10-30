@@ -2,7 +2,7 @@
 
 import json
 from dataclasses import asdict, dataclass
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from weavria.artifacts import ArtifactStore
 from weavria.core import (
@@ -21,6 +21,7 @@ from weavria.core import (
     RecoveryResolved,
     SessionRequest,
     TaskInput,
+    TaskModelViewReceipt,
     TaskObservation,
     ToolRecord,
     TurnFeedback,
@@ -62,6 +63,22 @@ class ControlContextBuilder(Protocol):
         feedback: TurnFeedback | None = None,
         control: ControlFeedback | None = None,
         required_call_ids: tuple[str, ...] = (),
+        feedback_reserve_floor_bytes: int = 0,
+    ) -> ControlEvidencePlan: ...
+
+
+@runtime_checkable
+class BaseControlContextBuilder(Protocol):
+    """Build from an intact request so new protocol fields cannot be silently lost."""
+
+    async def build_control_request(
+        self,
+        *,
+        base: ControlRequest,
+        records: tuple[ToolRecord, ...],
+        max_request_bytes: int,
+        required_call_ids: tuple[str, ...] = (),
+        recovery_ranges: tuple[RecoveryRange, ...] = (),
         feedback_reserve_floor_bytes: int = 0,
     ) -> ControlEvidencePlan: ...
 
@@ -158,7 +175,7 @@ class SessionContextCompiler:
         Cancellation propagates without publishing a partial plan. The caller
         owns deadline enforcement and persistence before model transport.
         """
-        if recovery_ranges and base.schema_version != 4:
+        if recovery_ranges and not base.recovery_enabled:
             raise ContextBuildError("recovery requires control request v4")
         required_call_ids = tuple(
             dict.fromkeys((*required_call_ids, *(p.call_id for p in recovery_ranges)))
@@ -263,8 +280,23 @@ class SessionContextCompiler:
             type(transport_limit) is not int or transport_limit <= 0
         ):
             raise ContextBuildError("transport byte limit must be positive or absent")
+        # 动态视图的预留是必需容量, 不是可以被分配器裁掉的历史或证据来源。
+        # 报告记录同一份增长证明, 发送留证时再与实际视图和已提交语义头核对。
+        view_receipt = (
+            TaskModelViewReceipt.from_view(base.task_model_view, base.instructions)
+            if base.task_model_view
+            else None
+        )
+        view_growth = view_receipt.growth_reserve_bytes if view_receipt else 0
+        # Session 的来源水位和省略轮次数也可能增长。v5 在反馈容量之外另留两个
+        # 64 位十进制计数的余量, 不把当前一位数字的包络当成下一轮固定开销。
+        envelope_growth = 38 if view_receipt else 0
+        if view_receipt is not None and (sequence > 2**63 - 1 or total_turns > 2**63 - 1):
+            raise ContextBuildError("model-view envelope counters exceed their encoding bound")
         policy_version = (
-            8
+            9
+            if view_receipt is not None
+            else 8
             if sizer is not None
             else 7
             if records
@@ -273,7 +305,7 @@ class SessionContextCompiler:
             else 5
             if next_step_reserve_bytes
             else 4
-            if base.schema_version == 4
+            if base.recovery_enabled
             else 3
             if retrieval is not None or self.config.max_history_spans > 1
             else 2
@@ -282,7 +314,9 @@ class SessionContextCompiler:
             session_id=session_id,
             through_sequence=sequence,
             omitted_turns=total_turns,
-            policy_version="context-compiler/8"
+            policy_version="context-compiler/9"
+            if policy_version == 9
+            else "context-compiler/8"
             if policy_version == 8
             else "context-compiler/7"
             if policy_version == 7
@@ -334,17 +368,22 @@ class SessionContextCompiler:
 
         def measure(selected: dict[int, int]) -> AllocationCost:
             request = render(selected)
-            size = len(request.model_dump_json().encode()) + padding + next_step_reserve_bytes
+            size = (
+                len(request.model_dump_json().encode())
+                + padding
+                + next_step_reserve_bytes
+                + view_growth
+            )
             if sizer is not None and transport_limit is not None:
                 # One extra JSON string layer can double unknown serialized bytes.
                 measured = transport_bytes(request)
                 assert measured is not None
-                transport_size = measured + 2 * (padding + next_step_reserve_bytes)
+                transport_size = measured + 2 * (padding + next_step_reserve_bytes + view_growth)
                 if transport_size > transport_limit:
                     return AllocationCost(self.config.input_tokens + 1, max_request_bytes + 1)
             # No expensive BPE evaluation of obviously byte-infeasible candidates.
             tokens = (
-                self.counter.count(request) + padding + next_step_reserve_bytes
+                self.counter.count(request) + padding + next_step_reserve_bytes + view_growth
                 if size <= max_request_bytes
                 else self.config.input_tokens + 1
             )
@@ -358,7 +397,7 @@ class SessionContextCompiler:
                     self.config.input_tokens,
                     request=request,
                 )
-                available = max(0, min(max_request_bytes, ceiling) - overhead)
+                available = max(0, min(max_request_bytes, ceiling) - overhead - envelope_growth)
                 if available < feedback_reserve_floor_bytes:
                     return AllocationCost(self.config.input_tokens + 1, max_request_bytes + 1)
             return AllocationCost(tokens, size)
@@ -377,7 +416,7 @@ class SessionContextCompiler:
                 if sizer is not None and transport_limit is not None:
                     measured = transport_bytes(render(selected))
                     assert measured is not None
-                    size = measured + 2 * (padding + next_step_reserve_bytes)
+                    size = measured + 2 * (padding + next_step_reserve_bytes + view_growth)
                     if size > transport_limit:
                         raise ContextBudgetError(size, transport_limit)
                 raise ContextBudgetError(cost.bytes, max_request_bytes)
@@ -407,7 +446,7 @@ class SessionContextCompiler:
             else None
         )
         actual_tokens = self.counter.count(request)
-        if actual_tokens + padding + next_step_reserve_bytes != cost.tokens:
+        if actual_tokens + padding + next_step_reserve_bytes + view_growth != cost.tokens:
             raise ContextBuildError("token counter changed within one compilation")
         overhead = len(encoded.encode()) - len(request.current.model_dump_json().encode())
         ceiling = self.counter.request_byte_ceiling(
@@ -434,7 +473,9 @@ class SessionContextCompiler:
             control_reserve_bytes=padding,
             next_step_reserve_bytes=next_step_reserve_bytes,
             feedback_reserve_floor_bytes=feedback_reserve_floor_bytes,
-            feedback_budget_bytes=max(1, min(max_request_bytes, ceiling) - overhead),
+            feedback_budget_bytes=max(
+                1, min(max_request_bytes, ceiling) - overhead - envelope_growth
+            ),
             utility=allocator.utility(selected),
             evaluations=allocator.evaluations,
             allocation_steps=allocator.steps,
@@ -459,5 +500,6 @@ class SessionContextCompiler:
             delivery_manifest=delivery_manifest,
             transport_request_bytes=transport_bytes(request),
             transport_budget_bytes=transport_limit,
+            task_model_view=view_receipt,
         )
         return CompiledSessionContext(encoded, report.model_dump_json())

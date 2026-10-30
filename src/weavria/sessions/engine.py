@@ -25,6 +25,7 @@ from weavria.context import (
     EvidenceMode,
     HistoryRetrievalConfig,
     SessionContextCompiler,
+    SessionRequestSizer,
     SessionTokenCounter,
     select_conversation,
 )
@@ -71,6 +72,7 @@ from weavria.runtime import (
     RootBudget,
     RunLimits,
     SystemClock,
+    TaskModelProjector,
     ToolScheduling,
     TurnPreparation,
     settle_mutation,
@@ -150,6 +152,7 @@ class _SessionAdapter:
         token_counter: SessionTokenCounter | None,
         history_retrieval: HistoryRetrievalConfig | None,
         context_recovery: RecoveryLimits | None = None,
+        task_model_projector: TaskModelProjector | None = None,
     ) -> None:
         self._provider, self._budget = provider, budget
         self._store, self._run_id = store, run_id
@@ -183,6 +186,29 @@ class _SessionAdapter:
         self._finalizing = False
         self._retrieval_config = history_retrieval
         self._recovery_limits = context_recovery
+        self._task_model_projector = task_model_projector
+        self._view_layout: tuple[int, str, str, str, int, int] | None = None
+        # 注册表是本次 Run 的不可变上限。把所有潜在工具说明的编码上界算进预留,
+        # 才能覆盖执行后自动发现备用工具时的说明增长,而不把它们提前暴露给模型。
+        self._max_instruction_bytes = (
+            max(
+                len(
+                    json.dumps(
+                        AgentLoop.request_template_for(
+                            TaskInput(goal="capacity"),
+                            instructions,
+                            tools,
+                            recovery=context_recovery is not None,
+                            finalizing=finalizing,
+                        ).instructions,
+                        ensure_ascii=False,
+                    ).encode()
+                )
+                for finalizing in (False, True)
+            )
+            if task_model_projector is not None
+            else 0
+        )
 
     @property
     def capabilities(self) -> ModelCapabilities:
@@ -265,7 +291,9 @@ class _SessionAdapter:
             and self._task_observation.task_revision == task.revision
             else None,
             recovery=self._recovery_limits is not None,
+            finalizing=finalizing,
         )
+        template = self._project_model_request(template, finalizing=finalizing)
         empty = ConversationView(session_id=self._session_id, through_sequence=sequence)
         wire_fixed = len(
             SessionRequest(conversation=empty, current=template).model_dump_json().encode()
@@ -346,17 +374,12 @@ class _SessionAdapter:
         ranges: tuple[RecoveryRange, ...],
         feedback_reserve_floor_bytes: int = 0,
     ) -> ControlEvidencePlan:
-        if self._recovery_limits is None or base.schema_version != 4:
+        if self._recovery_limits is None or not base.recovery_enabled:
             raise ValueError("recovery is not enabled")
-        return await self.build_control(
-            run_id=self._run_id,
-            instructions=base.instructions,
-            task=base.task,
-            task_observation=base.task_observation,
+        return await self.build_control_request(
+            base=base,
             records=records,
             max_request_bytes=max_request_bytes,
-            feedback=base.feedback,
-            control=base.control,
             required_call_ids=required_call_ids,
             recovery_ranges=ranges,
             feedback_reserve_floor_bytes=feedback_reserve_floor_bytes,
@@ -379,7 +402,6 @@ class _SessionAdapter:
     ) -> ControlEvidencePlan:
         if self._compiler is None or run_id != self._run_id:
             raise ValueError("context compiler is not bound to this run")
-        compiler = self._compiler
         base = ControlRequest(
             schema_version=4 if self._recovery_limits is not None else 3,
             instructions=instructions,
@@ -387,6 +409,73 @@ class _SessionAdapter:
             task_observation=task_observation,
             control=control,
         ).model_copy(update={"feedback": feedback})
+        return await self.build_control_request(
+            base=base,
+            records=records,
+            max_request_bytes=max_request_bytes,
+            required_call_ids=required_call_ids,
+            recovery_ranges=recovery_ranges,
+            feedback_reserve_floor_bytes=feedback_reserve_floor_bytes,
+        )
+
+    def _project_model_request(self, base: ControlRequest, *, finalizing: bool) -> ControlRequest:
+        if self._task_model_projector is None:
+            return base
+        if self._semantic is None:
+            raise ValueError("model projection requires committed semantic state")
+        view = self._task_model_projector.project(
+            base.task,
+            self._semantic,
+            phase="synthesis" if finalizing else "decision",
+            max_instruction_bytes=self._max_instruction_bytes,
+        )
+        if view.projector_version != self._task_model_projector.version:
+            raise ValueError("model view version does not match its configured projector")
+        layout = (
+            base.task.revision,
+            view.source.work_id,
+            view.projector_version,
+            view.definition_sha256,
+            view.max_progress_bytes,
+            view.max_instruction_bytes,
+        )
+        if (
+            self._view_layout is not None
+            and self._view_layout[0] == base.task.revision
+            and self._view_layout != layout
+        ):
+            raise ValueError("task model definition or capacity changed without a task revision")
+        self._view_layout = layout
+        # 此处还是无历史的编译模板, feedback 的配对结果稍后由 Compiler 选入。
+        # 先校验任务视图信封, 再携带原 feedback; 最终完整请求仍需通过配对校验。
+        projected = ControlRequest.model_validate(
+            {
+                **base.model_dump(),
+                "schema_version": 5,
+                "task_observation": None,
+                "task_model_view": view,
+                "allow_context_recovery": base.recovery_enabled,
+                "feedback": None,
+            }
+        )
+        return projected.model_copy(update={"feedback": base.feedback})
+
+    async def build_control_request(
+        self,
+        *,
+        base: ControlRequest,
+        records: tuple[ToolRecord, ...],
+        max_request_bytes: int,
+        required_call_ids: tuple[str, ...] = (),
+        recovery_ranges: tuple[RecoveryRange, ...] = (),
+        feedback_reserve_floor_bytes: int = 0,
+    ) -> ControlEvidencePlan:
+        if self._compiler is None:
+            raise ValueError("model-view builder requires the context compiler")
+        compiler = self._compiler
+        base = self._project_model_request(base, finalizing=self._finalizing)
+        task = base.task
+        run_id = self._run_id
         projector = cast(
             Callable[[SemanticSnapshot], ContextFocus] | None,
             getattr(self._task_preparer, "context_focus", None),
@@ -653,6 +742,7 @@ class SessionEngine:
         history_retrieval: HistoryRetrievalConfig | None = None,
         context_recovery: RecoveryLimits | None = None,
         configuration_metadata: dict[str, JsonValue] | None = None,
+        task_model_projector: TaskModelProjector | None = None,
     ) -> None:
         if (context_compiler is None) != (token_counter is None):
             raise ValueError("context compiler and token counter must be configured together")
@@ -661,6 +751,15 @@ class SessionEngine:
                 raise ValueError("compiler output reserve is below the provider output cap")
         if context_recovery is not None and context_compiler is None:
             raise ValueError("context recovery requires the context compiler")
+        if task_model_projector is not None and (
+            task_preparation is None or context_compiler is None
+        ):
+            raise ValueError(
+                "task model projection requires task preparation and the context compiler"
+            )
+        if task_model_projector is not None and not isinstance(token_counter, SessionRequestSizer):
+            raise ValueError("task model projection requires complete transport byte accounting")
+        self._task_model_projector = task_model_projector
         self._recovery_limits = (
             RecoveryLimits.model_validate_json(context_recovery.model_dump_json())
             if context_recovery
@@ -1048,6 +1147,7 @@ class SessionEngine:
                 self._token_counter,
                 self._retrieval_config,
                 self._recovery_limits,
+                self._task_model_projector,
             )
             remaining = min(
                 self._limits.max_duration,

@@ -10,7 +10,12 @@ from .budget import (
     SessionRequestSizer,
     SessionTokenCounter,
 )
-from .compiler import CompiledSessionContext, ControlContextBuilder, SessionContextCompiler
+from .compiler import (
+    BaseControlContextBuilder,
+    CompiledSessionContext,
+    ControlContextBuilder,
+    SessionContextCompiler,
+)
 from .conversation import ConversationPlan, project_turn, select_conversation
 from .delivery import delivery_range_is_covered, delivery_ranges, first_delivery_gap
 from .demand import ContextDemand, ContextFocus, EvidenceAnchor
@@ -53,6 +58,7 @@ from .selection import (
 )
 
 __all__ = [
+    "BaseControlContextBuilder",
     "CompiledSessionContext",
     "ContextBudgetError",
     "ContextBuildError",

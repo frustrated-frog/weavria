@@ -44,6 +44,7 @@ def reserve_feedback(
     budget_bytes: int,
     evidence_access: EvidenceAccessView | None = None,
     feedback_envelopes: tuple[FeedbackEnvelopeBound, ...] | None = None,
+    base_request: ControlRequest | None = None,
 ) -> FeedbackReservation:
     """Reserve worst outcome per call, full possible closure and bounded control channel.
 
@@ -74,12 +75,19 @@ def reserve_feedback(
             raise ContextBuildError("feedback access view disagrees with accepted evidence")
         selected = set(evidence_access.call_ids)
         records = tuple(r for r in records if r.exchange.action.call_id in selected)
-    base = ControlRequest(
-        instructions=instructions,
-        task=task,
-        task_observation=task_observation,
-    )
+    if base_request is not None:
+        if base_request.task != task or base_request.instructions != instructions:
+            raise ContextBuildError("feedback template belongs to another task or instruction view")
+        base = base_request.model_copy(update={"history": (), "feedback": None, "control": None})
+    else:
+        base = ControlRequest(
+            instructions=instructions, task=task, task_observation=task_observation
+        )
     size = len(base.model_dump_json().encode())
+    if base.task_model_view is not None:
+        # 宿主仍用完整状态判断进度;这里必须计量实际发送的投影,并预留其动态增长。
+        # 否则工具成功后才出现的缺口、版本和新能力说明可能使最低反馈无法交付。
+        size += base.task_model_view.growth_reserve_bytes(instructions)
     parent_sizes = [len(minimum_exchange(r).model_dump_json().encode()) for r in records]
     if feedback_envelopes is None:
         envelopes: tuple[FeedbackEnvelopeBound, ...] = ()

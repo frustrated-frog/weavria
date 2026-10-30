@@ -1,6 +1,7 @@
 """v3 execution control: explicit admission and candidate-completion decisions."""
 
 import hashlib
+import json
 from datetime import datetime
 from typing import Annotated, Literal, Self
 
@@ -37,6 +38,7 @@ from .model_io import HistoryEntry, TaskInput, TaskObservation, validate_task_ob
 from .outcomes import AgentResult
 from .progress import ProgressAssessment
 from .recovery import RecoveryNotice, RecoveryResolved
+from .task_view import TaskModelView
 from .turns import CallSkipped, TurnDecided, TurnFeedback, TurnSettled, validate_turn_feedback
 
 CONTROL_FEEDBACK_BYTES = 1024
@@ -298,13 +300,31 @@ class ControlRequest(BaseModel):
     """v3 observations include auditable rejection and correction, without role elevation."""
 
     model_config = ContractModel.model_config
-    schema_version: Literal[3, 4] = 3
+    schema_version: Literal[3, 4, 5] = 3
     instructions: str
     task: TaskInput
     task_observation: TaskObservation | None = None
+    task_model_view: TaskModelView | None = None
+    allow_context_recovery: bool = False
     history: tuple[HistoryEntry, ...] = ()
     feedback: TurnFeedback | None = None
     control: ControlFeedback | None = None
+
+    @property
+    def recovery_enabled(self) -> bool:
+        return self.schema_version == 4 or (
+            self.schema_version == 5 and self.allow_context_recovery
+        )
+
+    @model_serializer(mode="wrap")
+    def preserve_legacy_request(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        # 旧请求不能因为新增了两个空字段就改变字节与摘要。只有 v5 发送新表示,
+        # 并通过下方校验保证完整观察和模型视图不会同时进入一次请求。
+        data = handler(self)
+        if self.schema_version < 5:
+            data.pop("task_model_view", None)
+            data.pop("allow_context_recovery", None)
+        return data
 
     @field_validator("schema_version", mode="before")
     @classmethod
@@ -313,7 +333,26 @@ class ControlRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_observations(self) -> Self:
-        if self.schema_version < 4 and isinstance(self.control, RecoveryNotice):
+        if self.schema_version < 5 and (
+            self.task_model_view is not None or self.allow_context_recovery
+        ):
+            raise ValueError("model task views and explicit recovery flags require request v5")
+        if self.schema_version == 5:
+            if self.task_model_view is None or self.task_observation is not None:
+                raise ValueError("request v5 requires a model view instead of the full observation")
+            source = self.task_model_view.source
+            if (
+                source.version.task_revision != self.task.revision
+                or source.task_sha256
+                != hashlib.sha256(self.task.model_dump_json().encode()).hexdigest()
+            ):
+                raise ValueError("task model view belongs to another task")
+            if (
+                len(json.dumps(self.instructions, ensure_ascii=False).encode())
+                > self.task_model_view.max_instruction_bytes
+            ):
+                raise ValueError("instructions exceed the task view growth bound")
+        if not self.recovery_enabled and isinstance(self.control, RecoveryNotice):
             raise ValueError("recovery feedback requires ControlRequest v4")
         validate_turn_feedback(self.task, self.history, self.feedback)
         validate_task_observation(self.task, self.task_observation)

@@ -149,7 +149,8 @@ async def call_session_model(
         ModelTurn,
         max_duration,
     )
-    _validate_recovery(result, request.current.schema_version == 4)
+    # 新请求格式不自动授予恢复能力; v5 必须读取显式特性位。
+    _validate_recovery(result, request.current.recovery_enabled)
     _validate_batch_capabilities(result, capabilities)
     return result
 
@@ -166,7 +167,7 @@ async def call_controlled_model(
         ModelTurn,
         max_duration,
     )
-    _validate_recovery(result, request.schema_version == 4)
+    _validate_recovery(result, request.recovery_enabled)
     _validate_batch_capabilities(result, capabilities)
     return result
 

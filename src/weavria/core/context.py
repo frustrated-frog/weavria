@@ -15,6 +15,7 @@ from ._schema import ContractModel, NonBlankString
 from .delivery import EvidenceDeliveryManifest
 from .recovery import RecoveryRange
 from .retrieval import HistoryRetrievalReport
+from .task_view import TaskModelViewReceipt
 
 
 class ContextChoice(ContractModel):
@@ -31,7 +32,7 @@ class ContextCompilation(BaseModel):
     """Bind allocation diagnostics to the exact complete request sent to a provider."""
 
     model_config = ContractModel.model_config
-    schema_version: Literal[1, 2, 3, 4, 5, 6, 7, 8] = 1
+    schema_version: Literal[1, 2, 3, 4, 5, 6, 7, 8, 9] = 1
 
     policy_version: NonBlankString
     counter_version: NonBlankString
@@ -60,6 +61,7 @@ class ContextCompilation(BaseModel):
     delivery_manifest: EvidenceDeliveryManifest | None = None
     transport_request_bytes: int | None = Field(default=None, gt=0)
     transport_budget_bytes: int | None = Field(default=None, gt=0)
+    task_model_view: TaskModelViewReceipt | None = None
 
     @field_validator("schema_version", mode="before")
     @classmethod
@@ -85,10 +87,20 @@ class ContextCompilation(BaseModel):
         if self.schema_version < 8:
             data.pop("transport_request_bytes", None)
             data.pop("transport_budget_bytes", None)
+        if self.schema_version < 9:
+            data.pop("task_model_view", None)
         return data
 
     @model_validator(mode="after")
     def validate_allocation(self) -> Self:
+        if (self.schema_version == 9) != (self.task_model_view is not None):
+            raise ValueError("task model view receipts require compilation v9")
+        growth = self.task_model_view.growth_reserve_bytes if self.task_model_view else 0
+        if (
+            self.task_model_view is not None
+            and self.task_model_view.source.version.task_revision != self.task_revision
+        ):
+            raise ValueError("task model receipt belongs to another revision")
         if self.schema_version == 1 and (self.allocation_steps or self.allocation_exhausted):
             raise ValueError("allocation work diagnostics require compilation v2")
         if self.retrieval is not None and (
@@ -118,7 +130,7 @@ class ContextCompilation(BaseModel):
                 raise ValueError("transport budget requires measured transport bytes")
             if (
                 self.transport_request_bytes
-                + 2 * (self.control_reserve_bytes + self.next_step_reserve_bytes)
+                + 2 * (self.control_reserve_bytes + self.next_step_reserve_bytes + growth)
                 > self.transport_budget_bytes
             ):
                 raise ValueError("compiled request exceeds its transport byte budget")
@@ -134,14 +146,14 @@ class ContextCompilation(BaseModel):
             ):
                 raise ValueError("recovery range must remain readable and mandatory")
         token_reserve = (
-            self.control_reserve_bytes + self.next_step_reserve_bytes
+            self.control_reserve_bytes + self.next_step_reserve_bytes + growth
             if self.schema_version >= 5
             else 0
         )
         if self.input_tokens + token_reserve > self.input_budget_tokens:
             raise ValueError("compiled request exceeds its input token budget")
         if (
-            self.request_bytes + self.control_reserve_bytes + self.next_step_reserve_bytes
+            self.request_bytes + self.control_reserve_bytes + self.next_step_reserve_bytes + growth
             > self.budget_bytes
         ):
             raise ValueError("compiled request omits its control byte reserve")
