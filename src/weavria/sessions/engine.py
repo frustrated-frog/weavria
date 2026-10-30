@@ -556,10 +556,14 @@ class _SessionAdapter:
             work_status=prepared.work_status,
             pending_clarification=None,
         )
-        snapshot = await self._store.commit_semantic(
-            snapshot,
-            expected=self._semantic.version,
-            transition=prepared.transition,
+        # Join the whole commit before publishing cancellation: a worker may
+        # commit successfully after the caller's exploration deadline expires.
+        snapshot, cancelled = await settle_mutation(
+            self._store.commit_semantic(
+                snapshot,
+                expected=self._semantic.version,
+                transition=prepared.transition,
+            )
         )
         support_names = tuple(
             descriptor.name
@@ -575,6 +579,8 @@ class _SessionAdapter:
         self._semantic = snapshot
         self._semantic_record_count = len(records)
         self._clarification_plan = prepared.clarification_plan
+        if cancelled:
+            raise asyncio.CancelledError
 
     @property
     def semantic(self) -> SemanticSnapshot | None:

@@ -1,5 +1,9 @@
 import asyncio
 import json
+import sqlite3
+import threading
+from collections.abc import Generator
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal
@@ -19,11 +23,13 @@ from weavria.core import (
     ModelTurn,
     ProgressAssessed,
     ProgressNotice,
+    RunEnded,
     RunStatus,
     SessionClarificationChanged,
     SessionContextCompiled,
     SessionInterrupted,
     SessionRequest,
+    SessionResult,
     SessionRunEvent,
     SessionSemanticCommitted,
     SessionTaskPreparationFailed,
@@ -64,7 +70,12 @@ from weavria.models import (
     OpenAICompatibleTokenCounter,
 )
 from weavria.runtime import RunLimits
-from weavria.sessions import SessionEngine, SessionSemanticContext, SessionTaskPreparation
+from weavria.sessions import (
+    SessionEngine,
+    SessionSemanticContext,
+    SessionTaskPreparation,
+    SQLiteSessionStore,
+)
 from weavria.tools import ToolContext, ToolFault, ToolRegistry, TypedTool
 
 
@@ -1389,3 +1400,149 @@ async def test_reserved_preparation_uses_only_committed_session_state(
         assert result.report.status is RunStatus.BUDGET_EXHAUSTED
         assert result.report.output is None and len(model.requests) == 1
         assert commits[-1].version.evidence_revision == commits[0].version.evidence_revision
+
+
+@pytest.mark.parametrize(
+    ("cancellation", "rollback"),
+    [
+        ("reserve", False),
+        ("reserve", True),
+        ("external", False),
+        ("external", True),
+        ("none", True),
+    ],
+)
+async def test_semantic_transaction_settles_before_cancellation_is_published(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    session_counter: OpenAICompatibleTokenCounter,
+    cancellation: str,
+    rollback: bool,
+) -> None:
+    entered, release, joined = asyncio.Event(), threading.Event(), threading.Event()
+    armed = threading.Event()
+    cancellation_requested = asyncio.Event()
+    event_loop = asyncio.get_running_loop()
+    gated = False
+    model = _ExecuteSessionModel()
+    path = tmp_path / "transaction-cancellation.db"
+    preparer = TaskAwareSessionPreparer(
+        TaskUnderstandingEngine(
+            ModelTaskInterpreter(FakeModelProvider((_declaration(_execute()),)))
+        )
+    )
+
+    class GatedStore(SQLiteSessionStore):
+        @contextmanager
+        def _transaction(self) -> Generator[sqlite3.Connection]:
+            nonlocal gated
+            with super()._transaction() as connection:
+                yield connection
+                if not armed.is_set() or gated:
+                    return
+                row = connection.execute("SELECT semantic_sequence FROM semantic_heads").fetchone()
+                if row != (2,):
+                    return
+                gated = True
+                assert connection.in_transaction
+                event_loop.call_soon_threadsafe(entered.set)
+                try:
+                    if not release.wait(5):
+                        raise AssertionError("semantic transaction was not released")
+                    if rollback:
+                        raise sqlite3.OperationalError("injected semantic rollback")
+                finally:
+                    joined.set()
+
+    monkeypatch.setattr("weavria.sessions.engine.SQLiteSessionStore", GatedStore)
+    async with SessionEngine(
+        path,
+        model=model,
+        tools=_registry(),
+        task_preparation=preparer,
+        limits=RunLimits(
+            max_model_calls=5,
+            max_duration=2,
+            max_request_bytes=50_000,
+            finalization_model_calls=1,
+            finalization_seconds=1,
+        ),
+        max_request_duration=4,
+        context_compiler=ContextCompilerConfig(window_tokens=24_000, output_tokens=256),
+        token_counter=session_counter,
+    ) as engine:
+        await engine.create("s")
+        armed.set()
+
+        class ObservedTask(asyncio.Task[SessionResult]):
+            def cancel(self, msg: object = None) -> bool:
+                accepted = super().cancel(msg)
+                if accepted:
+                    cancellation_requested.set()
+                return accepted
+
+        running = ObservedTask(engine.send("s", "Read alpha", input_id="input-1"))
+        try:
+            await asyncio.wait_for(entered.wait(), 3)
+            if cancellation == "external":
+                running.cancel()
+                await asyncio.sleep(0)
+                running.cancel()
+            if cancellation != "none":
+                await asyncio.wait_for(cancellation_requested.wait(), 3)
+                assert not running.done(), "caller must join the SQLite transaction"
+            release.set()
+            if cancellation == "external":
+                with pytest.raises(asyncio.CancelledError):
+                    await running
+                result = None
+            else:
+                result = await running
+        finally:
+            release.set()
+            if not running.done():
+                running.cancel()
+            await asyncio.gather(running, return_exceptions=True)
+        assert joined.is_set()
+        events = await engine.store.events("s", limit=256)
+        commits = [e.data.snapshot for e in events if isinstance(e.data, SessionSemanticCommitted)]
+        refreshes = [
+            e.data
+            for e in events
+            if isinstance(e.data, SessionSemanticCommitted)
+            and e.data.transition is not None
+            and e.data.transition.kind == "evidence_refresh"
+        ]
+        assert bool(refreshes) is not rollback
+        head = await engine.store.semantic_head("s", commits[-1].work_id)
+        assert head == commits[-1]
+        records = await engine.store.run_records("s", commits[-1].run_id)
+        assert len(records) == 1
+        facts = [e.data.event.data for e in events if isinstance(e.data, SessionRunEvent)]
+        terminal_run = next(f.result for f in facts if isinstance(f, RunEnded))
+        if cancellation == "external":
+            assert terminal_run.status is RunStatus.CANCELLED
+            assert len(model.requests) == 1
+        else:
+            assert result is not None
+            if rollback:
+                assert result.report.status is (
+                    RunStatus.BUDGET_EXHAUSTED if cancellation == "reserve" else RunStatus.FAILED
+                )
+                assert result.report.output is None and len(model.requests) == 1
+                assert head is not None and head.work_status == "blocked"
+            else:
+                assert result.report.status is RunStatus.COMPLETED
+                assert head is not None and head.work_status == "succeeded"
+                assert len(model.requests) == 2
+                assert (
+                    model.requests[-1].current.task_observation
+                    == refreshes[-1].snapshot.observation
+                )
+                assert "FINALIZATION" in model.requests[-1].current.instructions
+    async with SessionEngine(
+        path, model=model, tools=_registry(), task_preparation=preparer
+    ) as reopened:
+        repeated = await reopened.send("s", "Read alpha", input_id="input-1")
+        assert await reopened.store.semantic_head("s", commits[-1].work_id) == head
+        assert repeated.report.execution == terminal_run

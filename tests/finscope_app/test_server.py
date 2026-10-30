@@ -1,5 +1,9 @@
+import asyncio
 import json
 import sqlite3
+import threading
+from collections.abc import Generator
+from contextlib import contextmanager
 from pathlib import Path
 
 import httpx
@@ -44,6 +48,7 @@ from weavria.models import (
     OpenAICompatibleConfig,
     OpenAICompatibleTokenCounter,
 )
+from weavria.sessions import SQLiteSessionStore
 
 
 def test_task_understanding_feature_switches_are_strict_booleans() -> None:
@@ -231,10 +236,12 @@ def _clarify() -> TaskSpecification:
     )
 
 
-@pytest.mark.parametrize("reserved_calls", [0, 2])
+@pytest.mark.parametrize(("reserved_calls", "commit_timeout"), [(0, False), (2, False), (2, True)])
 async def test_session_api_executes_real_runtime_and_reports_tool_trace(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     reserved_calls: int,
+    commit_timeout: bool,
 ) -> None:
     def market_response(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/api/market-pulse/2026-10-15"
@@ -285,6 +292,8 @@ async def test_session_api_executes_real_runtime_and_reports_tool_trace(
         allowed_parent_origin="http://localhost:5173",
         state_path=tmp_path / "sessions.sqlite3",
         finalization_model_calls=reserved_calls,
+        run_max_duration_seconds=4 if commit_timeout else 180,
+        finalization_seconds=2 if commit_timeout else 30,
     )
     app = create_app(
         settings,
@@ -293,6 +302,31 @@ async def test_session_api_executes_real_runtime_and_reports_tool_trace(
         market_client=market,
     )
 
+    entered, release = asyncio.Event(), threading.Event()
+    armed = threading.Event()
+    loop = asyncio.get_running_loop()
+    gated = False
+
+    class GatedStore(SQLiteSessionStore):
+        @contextmanager
+        def _transaction(self) -> Generator[sqlite3.Connection]:
+            nonlocal gated
+            with super()._transaction() as connection:
+                yield connection
+                if not armed.is_set() or gated:
+                    return
+                if connection.execute(
+                    "SELECT semantic_sequence FROM semantic_heads"
+                ).fetchone() != (2,):
+                    return
+                gated = True
+                assert connection.in_transaction
+                loop.call_soon_threadsafe(entered.set)
+                if not release.wait(5):
+                    raise AssertionError("semantic transaction was not released")
+
+    if commit_timeout:
+        monkeypatch.setattr("weavria.sessions.engine.SQLiteSessionStore", GatedStore)
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://sidecar.test"
@@ -300,21 +334,39 @@ async def test_session_api_executes_real_runtime_and_reports_tool_trace(
             created_response = await client.post("/api/sessions")
             assert created_response.status_code == 201
             created = SessionCreated.model_validate(created_response.json())
-            response = await client.post(
-                f"/api/sessions/{created.session_id}/messages",
-                json={
-                    "input_id": "message-1",
-                    "text": "今天是什么市场阶段?",
-                    "context": {
-                        "schema_version": 1,
-                        "surface": "market_pulse",
-                        "business_date": "2026-10-15",
-                        "current_view": "panorama",
-                        "quality_status": "READY",
-                        "generated_at": "2026-10-15T15:40:00",
+            armed.set()
+            running = asyncio.create_task(
+                client.post(
+                    f"/api/sessions/{created.session_id}/messages",
+                    json={
+                        "input_id": "message-1",
+                        "text": "今天是什么市场阶段?",
+                        "context": {
+                            "schema_version": 1,
+                            "surface": "market_pulse",
+                            "business_date": "2026-10-15",
+                            "current_view": "panorama",
+                            "quality_status": "READY",
+                            "generated_at": "2026-10-15T15:40:00",
+                        },
                     },
-                },
+                )
             )
+            timer: asyncio.TimerHandle | None = None
+            try:
+                if commit_timeout:
+                    await asyncio.wait_for(entered.wait(), 3)
+                    # Keep the real SQLite transaction open across the exploration
+                    # deadline, leaving the synthesis half of the parent budget.
+                    timer = loop.call_later(settings.finalization_seconds + 0.05, release.set)
+                response = await running
+            finally:
+                release.set()
+                if timer is not None:
+                    timer.cancel()
+                if not running.done():
+                    running.cancel()
+                await asyncio.gather(running, return_exceptions=True)
             events = await app.state.runtime.engine.store.events(created.session_id, limit=256)
 
     with sqlite3.connect(settings.state_path) as database:
@@ -358,7 +410,7 @@ async def test_session_api_executes_real_runtime_and_reports_tool_trace(
         "max_model_calls": 20,
         "max_tool_calls": 20,
         "max_request_bytes": 1_048_576,
-        "max_duration": 180.0,
+        "max_duration": settings.run_max_duration_seconds,
         "max_model_duration": 60.0,
         "max_completion_duration": 5.0,
         "max_intervention_duration": 5.0,
@@ -369,7 +421,7 @@ async def test_session_api_executes_real_runtime_and_reports_tool_trace(
         "max_admission_replans": 8,
         "max_stagnant_actions_per_family": 3,
         "finalization_model_calls": reserved_calls,
-        "finalization_seconds": 30.0,
+        "finalization_seconds": settings.finalization_seconds,
     }
     await market_http.aclose()
 
