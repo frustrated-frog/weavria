@@ -1357,14 +1357,19 @@ class SQLiteSessionStore:
                         raise SessionConflictError(str(exc)) from exc
                 view = request.current.task_model_view
                 if view is not None:
-                    if (
-                        compilation is None
-                        or compilation.task_model_view
-                        != TaskModelViewReceipt.from_view(view, request.current.instructions)
+                    receipt = compilation.task_model_view if compilation is not None else None
+                    if receipt is None or receipt != TaskModelViewReceipt.from_view(
+                        view, request.current.instructions, schema_version=receipt.schema_version
                     ):
                         raise SessionConflictError(
                             "model projection does not match its compilation receipt"
                         )
+                    # v2 预留依赖宿主的 Finish-only 状态,不能仅相信投影自报阶段。
+                    # v1 仍按原来的完整增长证明校验,历史记录不被静默重新解释。
+                    if receipt.schema_version == 2 and view.phase != (
+                        "synthesis" if state.finalization is not None else "decision"
+                    ):
+                        raise SessionConflictError("model projection phase disagrees with runtime")
                     # 在请求快照的同一事务读取语义头。编译后若已接受更新, 旧视图不能
                     # 仅凭 task_revision 相同就被发送, 也不能只核对它自己声明的摘要。
                     semantic_row = conn.execute(

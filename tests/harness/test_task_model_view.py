@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import sqlite3
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Literal
 
@@ -11,11 +12,15 @@ import pytest
 from pydantic import BaseModel, ValidationError
 
 from labs.task_model_view_design import PreparedCase, prepared_cases
-from weavria.context import ContextCompilerConfig
+from weavria.context import ContextCompilerConfig, HistoryRetrievalConfig
 from weavria.core import (
     CompletionAccept,
+    CompletionNotice,
+    CompletionRepair,
     ControlRequest,
     ErrorCategory,
+    EvidenceDeliveryManifest,
+    FinalizationStarted,
     FinishAction,
     ModelTurn,
     RecoverContext,
@@ -31,6 +36,7 @@ from weavria.core import (
     TaskModelView,
     ToolBatch,
     ToolCallAction,
+    ToolExchange,
     task_view_digest,
 )
 from weavria.harness import (
@@ -39,6 +45,7 @@ from weavria.harness import (
     EvidenceProbe,
     InformationNeed,
     NeedFailure,
+    NeedFinalizationPolicy,
     NeedStatus,
     TaskAwareSessionPreparer,
     TaskModelViewProjector,
@@ -56,7 +63,14 @@ from weavria.models import (
     OpenAICompatibleSessionProvider,
     OpenAICompatibleTokenCounter,
 )
-from weavria.runtime import CompletionContext, JournalCommitError, RunLimits
+from weavria.runtime import (
+    CompletionContext,
+    CompletionPolicy,
+    FinalizationAssessment,
+    FinalizationPolicy,
+    JournalCommitError,
+    RunLimits,
+)
 from weavria.sessions import SessionEngine
 from weavria.tools import ToolContext, ToolRegistry, TypedTool
 
@@ -181,9 +195,9 @@ class _Output(BaseModel):
     value: str
 
 
-def _tools() -> ToolRegistry:
+def _tools(*, output_padding: int = 0) -> ToolRegistry:
     async def read(arguments: _Input, context: ToolContext) -> _Output:
-        return _Output(value="record:" + arguments.key)
+        return _Output(value="record:" + arguments.key + " x" * output_padding)
 
     return ToolRegistry(
         (
@@ -296,7 +310,7 @@ async def test_session_sends_only_view_but_keeps_full_host_state_and_exact_snaps
     ]
     assert len(reports) == 2
     for request, report in zip(model.requests, reports, strict=True):
-        assert report.schema_version == 9
+        assert report.schema_version == 10
         assert report.task_model_view is not None
         view = request.current.task_model_view
         assert view is not None
@@ -334,17 +348,26 @@ def _engine(
     projector: TaskModelViewProjector | None = None,
     recovery: bool = False,
     limits: RunLimits | None = None,
+    history_retrieval: HistoryRetrievalConfig | None = None,
+    completion: CompletionPolicy | None = None,
+    finalization: FinalizationPolicy | None = None,
+    tools: ToolRegistry | None = None,
+    context_config: ContextCompilerConfig | None = None,
 ) -> SessionEngine:
     return SessionEngine(
         path,
         model=model,
-        tools=_tools(),
+        tools=tools or _tools(),
         task_preparation=TaskAwareSessionPreparer(TaskUnderstandingEngine(_Interpreter())),
-        context_compiler=ContextCompilerConfig(window_tokens=64_000, output_tokens=256),
+        context_compiler=context_config
+        or ContextCompilerConfig(window_tokens=64_000, output_tokens=256),
         token_counter=_counter(),
         context_recovery=RecoveryLimits() if recovery else None,
         task_model_projector=projector or TaskModelViewProjector(),
         limits=limits,
+        history_retrieval=history_retrieval,
+        completion=completion,
+        finalization=finalization,
     )
 
 
@@ -434,8 +457,10 @@ async def test_recovery_round_keeps_the_projected_request_and_explicit_feature_f
     assert all(request.current.recovery_enabled for request in model.requests)
 
 
-async def test_reserved_finalization_receives_synthesis_view_and_preserves_full_needs(
+@pytest.mark.parametrize("max_calls", [2, 5])
+async def test_finalization_receives_synthesis_view_and_preserves_full_needs(
     tmp_path: Path,
+    max_calls: int,
 ) -> None:
     model = FakeSessionProvider(
         (
@@ -451,10 +476,19 @@ async def test_reserved_finalization_receives_synthesis_view_and_preserves_full_
             ModelTurn(decision=FinishAction(output="record:alpha")),
         )
     )
-    limits = RunLimits(max_model_calls=2, finalization_model_calls=1, finalization_seconds=2)
-    async with _engine(tmp_path / "final.db", model, limits=limits) as engine:
+    limits = RunLimits(
+        max_model_calls=max_calls, finalization_model_calls=1, finalization_seconds=2
+    )
+    async with _engine(
+        tmp_path / "final.db", model, limits=limits, history_retrieval=HistoryRetrievalConfig()
+    ) as engine:
         await engine.create("s")
         result = await engine.send("s", "Read alpha", input_id="i")
+        reports = [
+            e.data.compilation
+            for e in await engine.store.events("s")
+            if isinstance(e.data, SessionContextCompiled)
+        ]
     assert result.report.status is RunStatus.COMPLETED, result.report
     first = model.requests[0].current.task_model_view
     last = model.requests[-1].current.task_model_view
@@ -464,6 +498,278 @@ async def test_reserved_finalization_receives_synthesis_view_and_preserves_full_
     assert result.report.task_outcome == "unverified"
     assert "FINALIZATION" in model.requests[-1].current.instructions
     assert "Available tools:" not in model.requests[-1].current.instructions
+    assert len(reports) == 2
+    assert reports[0].retrieval is not None and reports[0].next_step_reserve_bytes > 0
+    assert reports[-1].retrieval is None and reports[-1].next_step_reserve_bytes == 0
+    assert reports[-1].task_model_view is not None
+    assert reports[-1].task_model_view.growth_reserve_bytes == 0
+    assert reports[-1].control_reserve_bytes > 0
+
+
+def _read_turn(key: str = "alpha", call_id: str = "read") -> ModelTurn:
+    return ModelTurn(
+        decision=ToolBatch(
+            calls=(
+                ToolCallAction(call_id=call_id, tool_name="read_record", arguments={"key": key}),
+            )
+        )
+    )
+
+
+async def test_projector_cannot_override_the_host_phase(tmp_path: Path) -> None:
+    class IgnoresPhase(TaskModelViewProjector):
+        def project(
+            self,
+            task: TaskInput,
+            snapshot: SemanticSnapshot,
+            *,
+            phase: Literal["decision", "synthesis"],
+            max_instruction_bytes: int,
+        ) -> TaskModelView:
+            return super().project(
+                task, snapshot, phase="decision", max_instruction_bytes=max_instruction_bytes
+            )
+
+    model = FakeSessionProvider((_read_turn(), ModelTurn(decision=FinishAction(output="unused"))))
+    async with _engine(
+        tmp_path / "wrong-phase.db",
+        model,
+        projector=IgnoresPhase(),
+        limits=RunLimits(max_model_calls=5, finalization_model_calls=1),
+    ) as engine:
+        await engine.create("s")
+        result = await engine.send("s", "Read alpha", input_id="i")
+    assert result.report.status is RunStatus.FAILED
+    assert len(model.requests) == 1
+    assert result.report.execution.error is not None
+    assert result.report.execution.error.category is ErrorCategory.RUNTIME_INVARIANT_VIOLATION
+    assert result.report.execution.error.cause_type == "ValueError"
+
+
+async def test_same_session_trace_delivers_large_required_value_under_a_tighter_budget(
+    tmp_path: Path,
+) -> None:
+    async def run(
+        name: str, budget: int
+    ) -> tuple[list[SessionContextCompiled], FakeSessionProvider]:
+        model = FakeSessionProvider((_read_turn(), ModelTurn(decision=FinishAction(output="done"))))
+        async with _engine(
+            tmp_path / name,
+            model,
+            tools=_tools(output_padding=8_000),
+            context_config=ContextCompilerConfig(
+                window_tokens=64_000, output_tokens=256, policy="full"
+            ),
+            limits=RunLimits(
+                max_model_calls=5, finalization_model_calls=1, max_request_bytes=budget
+            ),
+        ) as engine:
+            await engine.create("s")
+            result = await engine.send("s", "Read alpha", input_id="i")
+            events = await engine.store.events("s")
+        assert result.report.status is RunStatus.COMPLETED, result.report
+        assert len(model.requests) == 2
+        assert len(model.requests[-1].current.history) == 1
+        return [e.data for e in events if isinstance(e.data, SessionContextCompiled)], model
+
+    wide, model = await run("wide.db", 64_000)
+    first, final = (event.compilation for event in wide)
+    assert first.task_model_view is not None
+    final_view = model.requests[-1].current.task_model_view
+    assert final_view is not None
+    # 从宽预算的实际发送报告求可行窄界,避免把测试绑在 UUID 或分词器的常数上。
+    # 同一读操作与同一完整字段仍需交付;旧增长公式则会越过这个界。
+    narrow_budget = (
+        max(
+            first.request_bytes
+            + first.control_reserve_bytes
+            + first.next_step_reserve_bytes
+            + first.task_model_view.growth_reserve_bytes,
+            final.request_bytes + final.control_reserve_bytes,
+        )
+        + 128
+    )
+    assert narrow_budget < final.request_bytes + final.control_reserve_bytes + (
+        final_view.growth_reserve_bytes(model.requests[-1].current.instructions)
+    )
+    narrow, narrow_model = await run("narrow.db", narrow_budget)
+    final_report = narrow[-1].compilation
+    assert final_report.delivery_manifest is not None
+    assert final_report.delivery_manifest.deliveries[0].complete
+    exchange = narrow_model.requests[-1].current.history[0]
+    assert isinstance(exchange, ToolExchange)
+    assert len(exchange.observation.model_dump_json().encode()) > 16_000
+
+
+async def test_failed_synthesis_preflight_returns_to_decision_without_sticky_phase(
+    tmp_path: Path,
+) -> None:
+    class MissingDeliveryOnce(NeedFinalizationPolicy):
+        rejected = False
+
+        async def assess(
+            self,
+            context: CompletionContext,
+            *,
+            request: ControlRequest | None,
+            manifest: EvidenceDeliveryManifest | None,
+        ) -> FinalizationAssessment:
+            assessed = await super().assess(context, request=request, manifest=manifest)
+            if request is not None and assessed.mode == "complete" and not self.rejected:
+                # 在真实编译之后注入一次交付不足,检查预检失败不会污染后续阶段。
+                self.rejected = True
+                return replace(assessed, eligible=False, mode="unavailable")
+            return assessed
+
+    class Recording(TaskModelViewProjector):
+        def __init__(self) -> None:
+            self.phases: list[str] = []
+
+        def project(
+            self,
+            task: TaskInput,
+            snapshot: SemanticSnapshot,
+            *,
+            phase: Literal["decision", "synthesis"],
+            max_instruction_bytes: int,
+        ) -> TaskModelView:
+            self.phases.append(phase)
+            return super().project(
+                task, snapshot, phase=phase, max_instruction_bytes=max_instruction_bytes
+            )
+
+    model = FakeSessionProvider((_read_turn(), ModelTurn(decision=FinishAction(output="value"))))
+    projector, policy = Recording(), MissingDeliveryOnce()
+    async with _engine(
+        tmp_path / "preflight.db",
+        model,
+        projector=projector,
+        finalization=policy,
+        history_retrieval=HistoryRetrievalConfig(),
+        limits=RunLimits(max_model_calls=5, finalization_model_calls=1),
+    ) as engine:
+        await engine.create("s")
+        result = await engine.send("s", "Read alpha", input_id="i")
+        events = await engine.store.events("s")
+    assert result.report.status is RunStatus.COMPLETED, result.report
+    assert policy.rejected and projector.phases[-2:] == ["synthesis", "decision"]
+    last = model.requests[-1].current
+    assert last.task_model_view is not None and last.task_model_view.phase == "decision"
+    assert "FINALIZATION" not in last.instructions
+    assert not any(isinstance(e.data, FinalizationStarted) for e in events)
+    reports = [e.data.compilation for e in events if isinstance(e.data, SessionContextCompiled)]
+    assert reports[-1].retrieval is not None and reports[-1].next_step_reserve_bytes > 0
+    assert reports[-1].task_model_view is not None
+    assert reports[-1].task_model_view.growth_reserve_bytes > 0
+
+
+async def test_synthesis_completion_repair_keeps_same_view_and_bounded_feedback(
+    tmp_path: Path,
+) -> None:
+    class RepairOnce:
+        version = "repair-once/1"
+        attempts = 0
+
+        async def verify(self, context: CompletionContext) -> CompletionRepair | CompletionAccept:
+            self.attempts += 1
+            if self.attempts == 1:
+                return CompletionRepair(issue_codes=("fact_conflict",), guidance="x" * 256)
+            return CompletionAccept(outcome="unverified")
+
+    model = FakeSessionProvider(
+        (
+            _read_turn(),
+            ModelTurn(decision=FinishAction(output="bad")),
+            ModelTurn(decision=FinishAction(output="corrected")),
+        )
+    )
+    async with _engine(
+        tmp_path / "repair.db",
+        model,
+        completion=RepairOnce(),
+        limits=RunLimits(max_model_calls=6, finalization_model_calls=2),
+    ) as engine:
+        await engine.create("s")
+        result = await engine.send("s", "Read alpha", input_id="i")
+        reports = [
+            e.data.compilation
+            for e in await engine.store.events("s")
+            if isinstance(e.data, SessionContextCompiled)
+        ]
+    assert result.report.status is RunStatus.COMPLETED, result.report
+    assert result.report.output == "corrected"
+    before, after = model.requests[1:]
+    assert isinstance(after.current.control, CompletionNotice)
+    assert before.current.task_model_view == after.current.task_model_view
+    assert after.current.task_model_view is not None
+    assert after.current.task_model_view.phase == "synthesis"
+    for report in reports[1:]:
+        assert report.task_model_view is not None
+        assert report.task_model_view.growth_reserve_bytes == 0
+        assert report.next_step_reserve_bytes == 0
+    assert reports[1].control_reserve_bytes > reports[2].control_reserve_bytes > 0
+
+
+@pytest.mark.parametrize("steering", [False, True])
+async def test_synthesis_inflight_cancellation_and_revision_invalidation(
+    tmp_path: Path,
+    steering: bool,
+) -> None:
+    entered, cleaned, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    class Gated(FakeSessionProvider):
+        async def generate_session(self, request: SessionRequest) -> ModelTurn:
+            if len(self.requests) == 1:
+                entered.set()
+                try:
+                    await release.wait()
+                finally:
+                    cleaned.set()
+            return await super().generate_session(request)
+
+    model = Gated(
+        (
+            _read_turn(),
+            ModelTurn(decision=FinishAction(output="obsolete")),
+            ModelTurn(decision=FinishAction(output="record:alpha")),
+        )
+    )
+    async with _engine(
+        tmp_path / "synthesis-inflight.db",
+        model,
+        limits=RunLimits(max_model_calls=8, finalization_model_calls=1),
+    ) as engine:
+        await engine.create("s")
+        running = asyncio.create_task(engine.send("s", "Read alpha", input_id="i"))
+        try:
+            async with asyncio.timeout(3):
+                await entered.wait()
+                if steering:
+                    await engine.steer(
+                        "s", "Use the same record; answer briefly", input_id="update"
+                    )
+                    release.set()
+                    result = await running
+                    assert result.report.status is RunStatus.COMPLETED, result.report
+                    assert result.report.output == "record:alpha"
+                    revised = [r.current for r in model.requests if r.current.task.revision == 2]
+                    assert revised and revised[0].task_model_view is not None
+                    assert revised[0].task_model_view != model.requests[1].current.task_model_view
+                    assert all(
+                        r.task_model_view is not None
+                        and r.task_model_view.source.version.task_revision == 2
+                        for r in revised
+                    )
+                else:
+                    running.cancel()
+                    with pytest.raises(asyncio.CancelledError):
+                        await running
+                    assert len(model.requests) == 1
+        finally:
+            if not running.done():
+                running.cancel()
+                await asyncio.gather(running, return_exceptions=True)
+        assert cleaned.is_set()
 
 
 class _BlockingModel(FakeSessionProvider):

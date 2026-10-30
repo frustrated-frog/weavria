@@ -32,7 +32,7 @@ class ContextCompilation(BaseModel):
     """Bind allocation diagnostics to the exact complete request sent to a provider."""
 
     model_config = ContractModel.model_config
-    schema_version: Literal[1, 2, 3, 4, 5, 6, 7, 8, 9] = 1
+    schema_version: Literal[1, 2, 3, 4, 5, 6, 7, 8, 9, 10] = 1
 
     policy_version: NonBlankString
     counter_version: NonBlankString
@@ -93,8 +93,12 @@ class ContextCompilation(BaseModel):
 
     @model_validator(mode="after")
     def validate_allocation(self) -> Self:
-        if (self.schema_version == 9) != (self.task_model_view is not None):
-            raise ValueError("task model view receipts require compilation v9")
+        if (self.schema_version >= 9) != (self.task_model_view is not None):
+            raise ValueError("task model view receipts require compilation v9 or later")
+        if self.task_model_view is not None and self.task_model_view.schema_version != (
+            2 if self.schema_version == 10 else 1
+        ):
+            raise ValueError("phase-aware receipts require compilation v10")
         growth = self.task_model_view.growth_reserve_bytes if self.task_model_view else 0
         if (
             self.task_model_view is not None

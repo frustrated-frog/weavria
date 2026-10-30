@@ -1094,6 +1094,7 @@ class _AgentKernel:
                 ).model_copy(update={"feedback": self.state.feedback})
                 return await self._control_builder.build_control_request(
                     base=base,
+                    phase="synthesis" if finalizing else "decision",
                     records=self.state.records,
                     max_request_bytes=self._request_budget,
                     required_call_ids=required_call_ids,

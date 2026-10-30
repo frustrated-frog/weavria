@@ -4,7 +4,15 @@ import hashlib
 import json
 from typing import Literal, Self
 
-from pydantic import Field, JsonValue, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    JsonValue,
+    SerializerFunctionWrapHandler,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 from ._schema import ContractModel, NonBlankString
 from .semantics import SemanticVersion
@@ -72,7 +80,7 @@ class TaskModelView(ContractModel):
         )
 
     def growth_reserve_bytes(self, instructions: str) -> int:
-        """Additional normalized request bytes reserved before dispatching tools."""
+        """Full exploration capacity; also preserves the v1 receipt calculation."""
         return (
             self.maximum_bytes
             - len(self.model_dump_json().encode())
@@ -80,10 +88,18 @@ class TaskModelView(ContractModel):
             - len(_encoded(instructions))
         )
 
+    def phase_growth_reserve_bytes(self, instructions: str) -> int:
+        """Reserve only changes allowed before the next request in this phase."""
+        # 收尾只允许重交完成候选,不会新增工具结果或扩展目录。纠错由独立的
+        # control reserve 承担; steering 则使本视图失效,重新构建新的任务版本。
+        return 0 if self.phase == "synthesis" else self.growth_reserve_bytes(instructions)
 
-class TaskModelViewReceipt(ContractModel):
+
+class TaskModelViewReceipt(BaseModel):
     """Content-free link between projection source, capacity proof and sent request."""
 
+    model_config = ContractModel.model_config
+    schema_version: Literal[1, 2] = 1
     source: TaskModelViewSource
     projector_version: NonBlankString
     definition_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
@@ -91,17 +107,46 @@ class TaskModelViewReceipt(ContractModel):
     growth_reserve_bytes: int = Field(ge=0)
     max_view_bytes: int = Field(gt=0)
     max_instruction_bytes: int = Field(gt=0)
+    phase: Literal["decision", "synthesis"] | None = None
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def validate_version_type(cls, value: object) -> object:
+        return ContractModel.validate_version_type(value)
+
+    @model_serializer(mode="wrap")
+    def preserve_v1_wire(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        data = handler(self)
+        if self.schema_version == 1:
+            data.pop("phase", None)
+        return data
+
+    @model_validator(mode="after")
+    def validate_phase(self) -> Self:
+        if (self.schema_version == 2) != (self.phase is not None):
+            raise ValueError("phase-aware growth requires a v2 receipt")
+        if self.phase == "synthesis" and self.growth_reserve_bytes:
+            raise ValueError("synthesis cannot reserve exploration growth")
+        return self
 
     @classmethod
-    def from_view(cls, view: TaskModelView, instructions: str) -> "TaskModelViewReceipt":
+    def from_view(
+        cls, view: TaskModelView, instructions: str, *, schema_version: Literal[1, 2] = 2
+    ) -> "TaskModelViewReceipt":
         return cls(
+            schema_version=schema_version,
             source=view.source,
             projector_version=view.projector_version,
             definition_sha256=view.definition_sha256,
             view_sha256=hashlib.sha256(view.model_dump_json().encode()).hexdigest(),
-            growth_reserve_bytes=view.growth_reserve_bytes(instructions),
+            growth_reserve_bytes=(
+                view.phase_growth_reserve_bytes(instructions)
+                if schema_version == 2
+                else view.growth_reserve_bytes(instructions)
+            ),
             max_view_bytes=view.maximum_bytes,
             max_instruction_bytes=view.max_instruction_bytes,
+            phase=view.phase if schema_version == 2 else None,
         )
 
 

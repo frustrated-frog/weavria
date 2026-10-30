@@ -2,7 +2,7 @@
 
 import json
 from dataclasses import asdict, dataclass
-from typing import Protocol, runtime_checkable
+from typing import Literal, Protocol, runtime_checkable
 
 from weavria.artifacts import ArtifactStore
 from weavria.core import (
@@ -69,12 +69,13 @@ class ControlContextBuilder(Protocol):
 
 @runtime_checkable
 class BaseControlContextBuilder(Protocol):
-    """Build from an intact request so new protocol fields cannot be silently lost."""
+    """Build from an intact request and the host's phase for this compilation."""
 
     async def build_control_request(
         self,
         *,
         base: ControlRequest,
+        phase: Literal["decision", "synthesis"],
         records: tuple[ToolRecord, ...],
         max_request_bytes: int,
         required_call_ids: tuple[str, ...] = (),
@@ -280,8 +281,8 @@ class SessionContextCompiler:
             type(transport_limit) is not int or transport_limit <= 0
         ):
             raise ContextBuildError("transport byte limit must be positive or absent")
-        # 动态视图的预留是必需容量, 不是可以被分配器裁掉的历史或证据来源。
-        # 报告记录同一份增长证明, 发送留证时再与实际视图和已提交语义头核对。
+        # 容量上界保持不变,本次预留则取决于宿主阶段。收尾不再支付工具目录和
+        # 进度的探索增长;完成纠错仍由 padding 覆盖,不能随之释放控制反馈空间。
         view_receipt = (
             TaskModelViewReceipt.from_view(base.task_model_view, base.instructions)
             if base.task_model_view
@@ -294,7 +295,7 @@ class SessionContextCompiler:
         if view_receipt is not None and (sequence > 2**63 - 1 or total_turns > 2**63 - 1):
             raise ContextBuildError("model-view envelope counters exceed their encoding bound")
         policy_version = (
-            9
+            10
             if view_receipt is not None
             else 8
             if sizer is not None
@@ -314,8 +315,8 @@ class SessionContextCompiler:
             session_id=session_id,
             through_sequence=sequence,
             omitted_turns=total_turns,
-            policy_version="context-compiler/9"
-            if policy_version == 9
+            policy_version="context-compiler/10"
+            if policy_version == 10
             else "context-compiler/8"
             if policy_version == 8
             else "context-compiler/7"

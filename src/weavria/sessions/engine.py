@@ -8,7 +8,7 @@ from collections.abc import Callable
 from dataclasses import asdict, replace
 from datetime import timedelta
 from pathlib import Path
-from typing import Self, cast
+from typing import Literal, Self, cast
 
 from pydantic import JsonValue, TypeAdapter
 
@@ -183,7 +183,6 @@ class _SessionAdapter:
         self._history_sequence = 0
         self._history_count = 0
         self._prepared_task_revision: int | None = None
-        self._finalizing = False
         self._retrieval_config = history_retrieval
         self._recovery_limits = context_recovery
         self._task_model_projector = task_model_projector
@@ -323,7 +322,6 @@ class _SessionAdapter:
         self._prepared = {task.revision: view}
         self._history, self._history_sequence, self._history_count = history, sequence, count
         self._prepared_task_revision = task.revision
-        self._finalizing = finalizing
         self._compilation = None
         return TurnPreparation(
             task.revision,
@@ -378,6 +376,7 @@ class _SessionAdapter:
             raise ValueError("recovery is not enabled")
         return await self.build_control_request(
             base=base,
+            phase="decision",
             records=records,
             max_request_bytes=max_request_bytes,
             required_call_ids=required_call_ids,
@@ -411,6 +410,7 @@ class _SessionAdapter:
         ).model_copy(update={"feedback": feedback})
         return await self.build_control_request(
             base=base,
+            phase="decision",
             records=records,
             max_request_bytes=max_request_bytes,
             required_call_ids=required_call_ids,
@@ -431,6 +431,8 @@ class _SessionAdapter:
         )
         if view.projector_version != self._task_model_projector.version:
             raise ValueError("model view version does not match its configured projector")
+        if view.phase != ("synthesis" if finalizing else "decision"):
+            raise ValueError("model view phase does not match the host build phase")
         layout = (
             base.task.revision,
             view.source.work_id,
@@ -464,6 +466,7 @@ class _SessionAdapter:
         self,
         *,
         base: ControlRequest,
+        phase: Literal["decision", "synthesis"],
         records: tuple[ToolRecord, ...],
         max_request_bytes: int,
         required_call_ids: tuple[str, ...] = (),
@@ -473,7 +476,10 @@ class _SessionAdapter:
         if self._compiler is None:
             raise ValueError("model-view builder requires the context compiler")
         compiler = self._compiler
-        base = self._project_model_request(base, finalizing=self._finalizing)
+        # 阶段属于本次构建,不能由上次 prepare 留下的状态推断。提前收尾预编译
+        # 可能因证据交付不足退回决策,因此这里也不能把阶段安装成持久缓存。
+        finalizing = phase == "synthesis"
+        base = self._project_model_request(base, finalizing=finalizing)
         task = base.task
         run_id = self._run_id
         projector = cast(
@@ -486,7 +492,7 @@ class _SessionAdapter:
             else None
         )
         retrieval = None
-        if self._retrieval_config is not None and not self._finalizing:
+        if self._retrieval_config is not None and not finalizing:
             discovered = await self._store.retrieve_history(
                 self._session_id,
                 task_revision=task.revision,
@@ -526,7 +532,7 @@ class _SessionAdapter:
                         compiler.config.next_step_reserve_bytes,
                         self._budget // 8,
                     )
-                    if self._reserve_next_step and not self._finalizing
+                    if self._reserve_next_step and not finalizing
                     else 0
                 ),
                 feedback_reserve_floor_bytes=floor,
