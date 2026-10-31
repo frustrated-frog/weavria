@@ -20,6 +20,7 @@ from .execution import (
     ToolRegistry,
     TypedTool,
 )
+from .schema_view import model_schema_view
 
 __all__ = [
     "ArtifactReadInput",
@@ -37,5 +38,6 @@ __all__ = [
     "ToolRegistry",
     "TypedTool",
     "artifact_read_tool",
+    "model_schema_view",
     "resolve_pointer",
 ]

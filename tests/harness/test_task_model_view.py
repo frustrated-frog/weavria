@@ -37,6 +37,7 @@ from weavria.core import (
     ToolBatch,
     ToolCallAction,
     ToolExchange,
+    ToolSucceededObservation,
     task_view_digest,
 )
 from weavria.harness import (
@@ -1033,6 +1034,87 @@ async def test_growth_and_transport_ceiling_cover_replacement_values_and_large_v
     assert len(outer.model_dump_json().encode()) <= ceiling
     assert counter.count(outer) <= 64_000
     assert counter.session_request_bytes(outer) <= 128_000
+
+
+@pytest.mark.parametrize("text", ["thither", "界🙂é", '\\"\x00\n<|endoftext|>'])
+@pytest.mark.parametrize("wire_limit", [None, 24_000])
+async def test_v5_feedback_ceiling_survives_mutable_replacements_at_the_byte_boundary(
+    cases: tuple[PreparedCase, ...], text: str, wire_limit: int | None
+) -> None:
+    from weavria.core import ConversationView, SessionRequest
+
+    case = next(case for case in cases if case.case_id == "document_lookup")
+    view = TaskModelViewProjector().project(
+        case.task, case.snapshot, phase="decision", max_instruction_bytes=1000
+    )
+    base = SessionRequest(
+        conversation=ConversationView(session_id="s", through_sequence=1),
+        current=ControlRequest(
+            schema_version=5, task=case.task, instructions="host", task_model_view=view
+        ),
+    )
+    counter = OpenAICompatibleTokenCounter(
+        OpenAICompatibleConfig(model="test", max_output_tokens=256, max_request_bytes=wire_limit),
+        encoding="cl100k_base",
+    )
+    allowance = 12_000
+    ceiling = counter.request_byte_ceiling(allowance, request=base)
+    # 不只测当前输入:保持任务/定义/所选对话,替换说明、阶段、摘要、版本和进度,
+    # 再把未知工具反馈填到承诺的字节边界。转义与多语言均不得绕过 Token/HTTP 上界。
+    changing = view.model_copy(
+        update={
+            "phase": "synthesis",
+            "progress": {
+                "payload": text * (view.max_progress_bytes // (len(json.dumps(text)) + 8))
+            },
+            "source": view.source.model_copy(
+                update={
+                    "observation_sha256": "f" * 64,
+                    "ledger_sha256": "a" * 64,
+                    "version": SemanticVersion(
+                        task_revision=case.task.revision,
+                        frame_revision=2**63 - 1,
+                        capability_epoch=2**63 - 1,
+                        evidence_revision=2**63 - 1,
+                        semantic_sequence=2**63 - 1,
+                    ),
+                }
+            ),
+        }
+    )
+
+    def future(count: int) -> SessionRequest:
+        return base.model_copy(
+            update={
+                "current": ControlRequest(
+                    schema_version=5,
+                    task=case.task,
+                    instructions=text * 30,
+                    task_model_view=changing,
+                    history=(
+                        ToolExchange(
+                            action=ToolCallAction(call_id="c", tool_name="read", arguments={}),
+                            observation=ToolSucceededObservation(
+                                call_id="c", tool_name="read", output={"value": text * count}
+                            ),
+                        ),
+                    ),
+                )
+            }
+        )
+
+    low, high = 0, ceiling
+    while low < high:
+        middle = (low + high + 1) // 2
+        if len(future(middle).model_dump_json().encode()) <= ceiling:
+            low = middle
+        else:
+            high = middle - 1
+    trial = future(low)
+    assert low > 0 and len(trial.model_dump_json().encode()) <= ceiling
+    assert counter.count(trial) <= allowance
+    if wire_limit is not None:
+        assert counter.session_request_bytes(trial) <= wire_limit
 
 
 async def test_definition_changes_without_task_revision_fail_before_transport(

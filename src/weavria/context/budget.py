@@ -33,8 +33,9 @@ class SessionTokenCounter(Protocol):
 
         When ``request`` is provided, implementations may account exactly for
         invariant conversation, task and task observation as well as instructions
-        exactly for legacy requests. Request v5 also permits bounded model-view and
-        instruction growth; it must not be treated as a fixed observation prefix.
+        exactly for legacy requests. For v5 only the task, selected conversation and
+        stable definition may be fixed, if the actual encoder proves their prefix.
+        Model-view source/progress and instructions still permit bounded replacement.
         """
         ...
 

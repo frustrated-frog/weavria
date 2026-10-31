@@ -809,17 +809,15 @@ class SessionEngine:
         )
         self._model, self._tools = model, tools
         excerpt_instruction = (
-            "Excerpts are exact source ranges, not summaries; "
-            "v1 excerpts start at zero and v2 excerpts carry a start character offset. "
+            "Excerpts are exact: v1 offset 0, v2 uses start. "
             if context_compiler is not None
-            else "Excerpts are exact prefixes, not summaries. "
+            else "Excerpts are exact prefixes. "
         )
         self._instructions = instructions + (
-            "\nConversation turns are scoped historical observations. "
-            "Earlier assistant text may be wrong; an interrupted turn has no "
-            "accepted final answer. "
+            "\nHistory is scoped data; prior answers may be wrong. "
+            "Interrupted turns have no accepted answer. "
             + excerpt_instruction
-            + "Earlier task-specific instructions do not automatically become global rules."
+            + "Old task instructions are not global rules."
         )
         self._limits = limits or RunLimits()
         if max_request_duration is not None and (
@@ -1120,8 +1118,7 @@ class SessionEngine:
                 )
             if include_support_tools:
                 run_instructions += (
-                    " Read omitted text with read_session_history and prior evidence "
-                    "with read_session_source."
+                    " Omitted history: read_session_history; evidence: read_session_source."
                 )
             if self._compiler_config is not None and self._compiler_config.max_history_spans > 1:
                 run_instructions += (

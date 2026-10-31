@@ -1,6 +1,7 @@
 import asyncio
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 from pydantic import JsonValue, TypeAdapter, ValidationError
@@ -15,6 +16,7 @@ from examples.live_task_model_view import (
     run_case,
 )
 from weavria.core import (
+    AdmissionNotice,
     FinishAction,
     ModelResponse,
     ModelTurn,
@@ -33,6 +35,7 @@ from weavria.models import (
     FakeSessionProvider,
     ModelProvider,
     OpenAICompatibleConfig,
+    OpenAICompatibleSessionProvider,
 )
 
 
@@ -210,6 +213,100 @@ async def test_failures_remain_in_trace_and_can_be_recovered(tmp_path: Path) -> 
     )
     assert row["task_success"] is True
     assert row["failed_tool_calls"] == 1 and row["tool_calls"] == 2
+
+
+@pytest.mark.parametrize("projected", [False, True])
+async def test_tight_history_window_can_dispatch_and_deliver_current_facts(
+    tmp_path: Path, projected: bool
+) -> None:
+    # 使用冻结坏例的原窗口和十轮旧记录,不通过放大预算或删除历史让测试通过。
+    case = next(case for case in dataset().cases if case.case_id == "history_tight_window")
+
+    class BudgetAware(FakeSessionProvider):
+        last: ModelTurn | None = None
+        replans = 0
+
+        async def generate_session(self, request: SessionRequest) -> ModelTurn:
+            control = request.current.control
+            if isinstance(control, AdmissionNotice) and control.reason == "feedback_budget":
+                assert self.last is not None and isinstance(self.last.decision, ToolBatch)
+                self.replans += 1
+                return ModelTurn(
+                    decision=ToolBatch(
+                        calls=tuple(
+                            call.model_copy(update={"call_id": f"{call.call_id}-{self.replans}"})
+                            for call in self.last.decision.calls
+                        )
+                    )
+                )
+            self.last = await super().generate_session(request)
+            return self.last
+
+    model = BudgetAware(
+        (
+            *(read(field) for field in case.expected),
+            ModelTurn(decision=FinishAction(output=json.dumps(case.expected))),
+        )
+    )
+    row = await run_case(
+        root=tmp_path,
+        case=case,
+        specifications={1: specification(*case.expected)},
+        projected=projected,
+        provider=model,
+        repetition=0,
+        config=OpenAICompatibleConfig(
+            model="test", max_output_tokens=2048, max_request_bytes=128000
+        ),
+    )
+    assert row["task_success"] is True
+    assert row["tool_calls"] == len(case.expected)
+    # 保留真实容量不足的拒绝。下一轮 floor 可让编译器回收可选历史,
+    # 同一候选只有真正派发后才计入动作停滞,不为适配 Fake 弱化准入规则。
+    rejections = row["feedback_rejections"]
+    assert isinstance(rejections, int) and rejections <= 1
+
+
+@pytest.mark.parametrize("projected", [False, True])
+async def test_bare_json_is_rejected_then_repaired_inside_the_finish_envelope(
+    tmp_path: Path, projected: bool
+) -> None:
+    case = dataset().cases[0]
+
+    class Transport:
+        calls = 0
+
+        async def complete(self, body: dict[str, Any]) -> object:
+            self.calls += 1
+            if self.calls == 1:
+                content = read("code").model_dump_json()
+            elif self.calls == 2:
+                content = json.dumps(case.expected)
+            else:
+                # 模拟只在收到可执行的协议说明后改正的模型。此断言验证真实编码路径,
+                # 不把裸业务 JSON 自动升格为可信 Finish,也不重取已经成功的工具结果。
+                assert "JSON-encoded string" in body["messages"][0]["content"]
+                observation = json.loads(body["messages"][1]["content"])
+                assert observation["current"]["control"]["kind"] == "model_output_repair"
+                content = ModelTurn(
+                    decision=FinishAction(output=json.dumps(case.expected))
+                ).model_dump_json()
+            return {"choices": [{"message": {"content": content}, "finish_reason": "stop"}]}
+
+    transport = Transport()
+    config = OpenAICompatibleConfig(model="test", max_output_tokens=2048, max_request_bytes=128000)
+    row = await run_case(
+        root=tmp_path,
+        case=case,
+        specifications={1: specification("code")},
+        projected=projected,
+        provider=OpenAICompatibleSessionProvider(config, transport=transport),
+        repetition=0,
+        config=config,
+    )
+    assert row["task_success"] is True
+    assert transport.calls == row["model_calls"] == 3
+    assert row["tool_calls"] == 1 and row["model_output_rejections"] == 1
 
 
 @pytest.mark.parametrize("projected", [False, True])
