@@ -196,6 +196,9 @@ def legacy_review_schema(*, families: bool) -> dict[str, object]:
     schema = MemoryReview.model_json_schema()
     schema["properties"].pop("generation", None)
     schema["properties"].pop("resolutions", None)
+    schema["properties"].pop("conditions", None)
+    schema["$defs"].pop("MemoryConditionAlignment", None)
+    schema["$defs"].pop("MemoryConditionLink", None)
     schema["$defs"].pop("MemoryResolution", None)
     schema["properties"]["schema_version"] = {"type": "integer", "const": 3 if families else 2}
     schema["$defs"].pop("MemoryGenerationReport", None)

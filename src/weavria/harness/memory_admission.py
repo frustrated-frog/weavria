@@ -25,7 +25,12 @@ from weavria.memory import (
     MemoryVersion,
 )
 
-from .memory_alignment import align_candidate, align_family
+from .memory_alignment import (
+    align_candidate,
+    align_family,
+    analyze_conditions,
+    equivalent_conditions,
+)
 from .memory_partition import partition_mutations
 from .memory_sets import compile_fact_sets
 
@@ -96,10 +101,17 @@ class ConservativeMemoryAdmission:
 
     version = "conservative-memory-admission/3"
 
-    def __init__(self, *, set_reconciliation: bool = False) -> None:
+    def __init__(
+        self, *, set_reconciliation: bool = False, semantic_conditions: bool = False
+    ) -> None:
+        if semantic_conditions and not set_reconciliation:
+            raise ValueError("semantic conditions require fact-set reconciliation")
+        self._semantic_conditions = semantic_conditions
         self._set_reconciliation = set_reconciliation
         if set_reconciliation:
             self.version = "fact-set-memory-admission/3"
+        if semantic_conditions:
+            self.version = "fact-set-memory-admission/4:conditions"
 
     def compile(
         self,
@@ -115,6 +127,8 @@ class ConservativeMemoryAdmission:
         review = MemoryReview.model_validate_json(review.model_dump_json())
         if review.resolutions and not self._set_reconciliation:
             raise MemoryFormationError("set resolutions require the fact-set admission policy")
+        if review.conditions and not self._semantic_conditions:
+            raise MemoryFormationError("condition relations require the semantic condition policy")
         indices = [j.candidate_index for j in review.judgments]
         if sorted(indices) != list(range(len(extraction.candidates))):
             raise MemoryFormationError("review must cover each candidate exactly once")
@@ -124,6 +138,7 @@ class ConservativeMemoryAdmission:
         eligible: dict[int, MemoryCandidate] = {}
         alignments = {a.candidate_index: a for a in review.alignments}
         families = {a.candidate_index: a for a in review.families}
+        conditions = {a.candidate_index: a for a in review.conditions}
         judgments = {j.candidate_index: j for j in review.judgments}
         groups: dict[str, list[int]] = defaultdict(list)
         for judgment in review.judgments:
@@ -146,6 +161,18 @@ class ConservativeMemoryAdmission:
                     candidate_index=i, status="deferred", reason="unresolved"
                 )
                 continue
+            if i in conditions:
+                condition_anchor = targets.get(conditions[i].target_id)
+                analysis = (
+                    analyze_conditions(request, candidate, condition_anchor, conditions[i])
+                    if condition_anchor is not None
+                    else None
+                )
+                if analysis is None or analysis.relation == "inconsistent":
+                    decisions[i] = MemoryAdmission(
+                        candidate_index=i, status="deferred", reason="condition_not_equivalent"
+                    )
+                    continue
             if i in families:
                 family = families[i]
                 anchor = targets.get(family.target_id)
@@ -159,6 +186,14 @@ class ConservativeMemoryAdmission:
                     continue
                 # 归组不授予覆盖权。后面的重叠检查仍会阻止同条件的新事实
                 # 绕过 equivalent/conflict/correction 路径;原候选保存在 extraction。
+                if (
+                    i in conditions
+                    and anchor is not None
+                    and equivalent_conditions(request, candidate, anchor, conditions[i])
+                ):
+                    aligned_family = aligned_family.model_copy(
+                        update={"qualifiers": anchor.assertion.qualifiers}
+                    )
                 candidate = aligned_family
             target = targets.get(judgment.target_id or "")
             if target is not None and review.schema_version >= 2 and i not in alignments:
@@ -176,6 +211,7 @@ class ConservativeMemoryAdmission:
                         equivalent=judgment.relation == "equivalent",
                         # 对应描述字段角色,只有 equivalent 允许规范化成旧值。
                         # 冲突与修订都保留候选值,再计算整个集合的时间变换。
+                        conditions=conditions.get(i),
                         allow_value_alignment=self._set_reconciliation
                         and judgment.relation in ("correction", "change", "conflict"),
                     )
@@ -184,7 +220,11 @@ class ConservativeMemoryAdmission:
                 )
                 if aligned is None:
                     decisions[i] = MemoryAdmission(
-                        candidate_index=i, status="deferred", reason="different_conditions"
+                        candidate_index=i,
+                        status="deferred",
+                        reason="condition_not_equivalent"
+                        if i in conditions
+                        else "different_conditions",
                     )
                     continue
                 candidate = aligned

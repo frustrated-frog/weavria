@@ -7,10 +7,13 @@ from pydantic import ValidationError
 from weavria.memory import (
     MemoryAlignment,
     MemoryCandidate,
+    MemoryConditionAlignment,
+    MemoryConditionResult,
     MemoryFamilyAlignment,
     MemoryFieldMatch,
     MemoryFormationInput,
     MemoryVersion,
+    compare_memory_conditions,
 )
 
 
@@ -28,6 +31,7 @@ def align_candidate(
     *,
     equivalent: bool,
     allow_value_alignment: bool = False,
+    conditions: MemoryConditionAlignment | None = None,
 ) -> MemoryCandidate | None:
     """Require revision binding, complete two-sided coverage and literal focal evidence.
 
@@ -46,6 +50,26 @@ def align_candidate(
         allowed_special.add(("/value", "/value"))
     if equivalent and candidate.value != old.value and ("/value", "/value") not in pairs:
         return None
+    if conditions is not None:
+        # 主体/属性的同一性与条件的合取等价分别成立,才可复用目标规范形式。
+        if (
+            pairs - allowed_special != {("/predicate", "/predicate")}
+            or not equivalent_conditions(request, candidate, target, conditions)
+            or not grounded_matches(request, candidate, alignment.matches)
+            or not isinstance(old.value if equivalent else candidate.value, str)
+        ):
+            return None
+        return MemoryCandidate.model_validate(
+            {
+                **candidate.model_dump(),
+                "subject": old.subject,
+                "predicate": old.predicate,
+                "qualifiers": old.qualifiers,
+                "value": old.value
+                if equivalent and ("/value", "/value") in pairs
+                else candidate.value,
+            }
+        )
     regular = pairs - allowed_special
     if {left for left, _ in regular} != candidate_paths or {
         right for _, right in regular
@@ -154,3 +178,45 @@ def align_family(
             "predicate": old.predicate,
         }
     )
+
+
+def analyze_conditions(
+    request: MemoryFormationInput,
+    candidate: MemoryCandidate,
+    target: MemoryVersion,
+    conditions: MemoryConditionAlignment,
+) -> MemoryConditionResult | None:
+    """语义边绑定原候选与旧版本;归一化只改表示,不改变条件合取的可适用范围。"""
+    if (
+        conditions.target_id != target.assertion.memory_id
+        or conditions.target_revision != target.revision
+        or any(not isinstance(value, str) for value in target.assertion.qualifiers.values())
+        or not grounded_matches(
+            request,
+            candidate,
+            (
+                MemoryFieldMatch(
+                    candidate_path="/subject",
+                    target_path="/subject",
+                    citations=conditions.citations,
+                ),
+            ),
+        )
+    ):
+        return None
+    try:
+        return compare_memory_conditions(
+            candidate.qualifiers, target.assertion.qualifiers, conditions.links
+        )
+    except ValueError:
+        return None
+
+
+def equivalent_conditions(
+    request: MemoryFormationInput,
+    candidate: MemoryCandidate,
+    target: MemoryVersion,
+    conditions: MemoryConditionAlignment,
+) -> bool:
+    result = analyze_conditions(request, candidate, target, conditions)
+    return result is not None and result.relation == "equivalent"

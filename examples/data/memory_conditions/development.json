@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "dataset_version": "memory-conditions-development/1",
+  "split": "development",
+  "cases": [
+    {
+      "id": "onboarding",
+      "first": "本项目面向新加入团队的同事的培训材料，长期使用PDF格式。",
+      "second": "更正长期设置：本项目面向刚入职的团队成员的培训材料应使用HTML格式，之前的PDF记录有误。",
+      "relationship": "same",
+      "old_value": "PDF",
+      "new_value": "HTML"
+    },
+    {
+      "id": "solo",
+      "first": "我的长期旅行偏好：独自出行时住旅舍。",
+      "second": "更正我的长期偏好：一个人旅行时住酒店，之前记录的旅舍不准确。",
+      "relationship": "same",
+      "old_value": "旅舍",
+      "new_value": "酒店",
+      "scope_kind": "user"
+    },
+    {
+      "id": "request",
+      "first": "本项目所有请求的默认日志级别为INFO。",
+      "second": "另外，本项目失败请求的日志级别长期设为ERROR。",
+      "relationship": "separate",
+      "old_value": "INFO",
+      "new_value": "ERROR"
+    },
+    {
+      "id": "shift",
+      "first": "本项目白班的设备检查时间长期定为08:00。",
+      "second": "另有独立规定：本项目夜班的设备检查时间为20:00。",
+      "relationship": "separate",
+      "old_value": "08:00",
+      "new_value": "20:00"
+    }
+  ]
+}

@@ -1,5 +1,11 @@
 """Explicitly admitted, scoped, bitemporal memory; no automatic conversation extraction."""
 
+from .conditions import (
+    MemoryConditionLink,
+    MemoryConditionProof,
+    MemoryConditionResult,
+    compare_memory_conditions,
+)
 from .contracts import (
     MemoryAccess,
     MemoryAccessError,
@@ -36,6 +42,7 @@ from .formation import (
     MemoryCandidate,
     MemoryCitation,
     MemoryClaimModality,
+    MemoryConditionAlignment,
     MemoryDocument,
     MemoryExtraction,
     MemoryFamilyAlignment,
@@ -65,6 +72,10 @@ __all__ = [
     "MemoryCapacityError",
     "MemoryCitation",
     "MemoryClaimModality",
+    "MemoryConditionAlignment",
+    "MemoryConditionLink",
+    "MemoryConditionProof",
+    "MemoryConditionResult",
     "MemoryConflictError",
     "MemoryCursor",
     "MemoryDocument",
@@ -101,6 +112,7 @@ __all__ = [
     "MemoryStorageError",
     "MemoryVersion",
     "SQLiteMemoryStore",
+    "compare_memory_conditions",
     "fact_key",
     "rewrite_fact_set",
 ]

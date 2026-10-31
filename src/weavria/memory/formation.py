@@ -16,6 +16,7 @@ from pydantic import (
     model_validator,
 )
 
+from .conditions import MemoryConditionLink
 from .contracts import (
     Identifier,
     MemoryBatch,
@@ -292,16 +293,27 @@ class MemoryResolution(MemoryModel):
         return self
 
 
+class MemoryConditionAlignment(MemoryModel):
+    """一次冻结锚点上的条件语义图;引用只记录一次,不随图边重复原文。"""
+
+    candidate_index: int = Field(ge=0, lt=8)
+    target_id: Identifier
+    target_revision: int = Field(ge=1)
+    links: tuple[MemoryConditionLink, ...] = Field(default=(), max_length=256)
+    citations: tuple[MemoryCitation, ...] = Field(min_length=1, max_length=8)
+
+
 class MemoryReview(BaseModel):
     """Versioned semantic review; v1/v2 wire bytes remain unchanged."""
 
     model_config = MemoryModel.model_config
-    schema_version: Literal[1, 2, 3, 4, 5] = 1
+    schema_version: Literal[1, 2, 3, 4, 5, 6] = 1
     judgments: tuple[MemoryJudgment, ...] = Field(default=(), max_length=8)
     alignments: tuple[MemoryAlignment, ...] = Field(default=(), max_length=8)
     families: tuple[MemoryFamilyAlignment, ...] = Field(default=(), max_length=8)
     generation: MemoryGenerationReport | None = None
     resolutions: tuple[MemoryResolution, ...] = Field(default=(), max_length=8)
+    conditions: tuple[MemoryConditionAlignment, ...] = Field(default=(), max_length=8)
 
     @field_validator("schema_version", mode="before")
     @classmethod
@@ -324,6 +336,17 @@ class MemoryReview(BaseModel):
             for r in self.resolutions
         ):
             raise ValueError("resolution must bind its correction judgment and anchor")
+        if self.conditions and self.schema_version < 6:
+            raise ValueError("condition semantics requires review v6")
+        anchors = {
+            a.candidate_index: (a.target_id, a.target_revision)
+            for a in (*self.alignments, *self.families)
+        }
+        if len({c.candidate_index for c in self.conditions}) != len(self.conditions) or any(
+            anchors.get(c.candidate_index) != (c.target_id, c.target_revision)
+            for c in self.conditions
+        ):
+            raise ValueError("condition graph must bind one aligned snapshot anchor")
         if self.schema_version == 1 and self.alignments:
             raise ValueError("field alignment requires review v2")
         if self.schema_version < 3 and self.families:
@@ -360,6 +383,8 @@ class MemoryReview(BaseModel):
             data.pop("generation", None)
         if self.schema_version < 5:
             data.pop("resolutions", None)
+        if self.schema_version < 6:
+            data.pop("conditions", None)
         return data
 
 
@@ -381,6 +406,7 @@ type MemoryAdmissionReason = Literal[
     "incomplete_resolution",
     "mixed_validity",
     "competing_resolutions",
+    "condition_not_equivalent",
 ]
 
 

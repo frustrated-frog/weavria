@@ -1,0 +1,72 @@
+{
+  "schema_version": 1,
+  "dataset_version": "memory-conditions-validation/1",
+  "split": "validation",
+  "cases": [
+    {
+      "id": "offline",
+      "first": "本项目离线环境中的缓存保留策略长期设为清空。",
+      "second": "纠正记录：本项目没有网络连接时的缓存保留策略应该是保留，之前清空的记录错误。",
+      "relationship": "same",
+      "old_value": "清空",
+      "new_value": "保留"
+    },
+    {
+      "id": "audio",
+      "first": "本项目针对听觉障碍观众的讲解方案长期采用音频。",
+      "second": "更正这项方案：本项目针对听力受损观众的讲解应该采用字幕，音频的旧记录有误。",
+      "relationship": "same",
+      "old_value": "音频",
+      "new_value": "字幕"
+    },
+    {
+      "id": "archive",
+      "first": "本项目已经完成归档的文件，长期采用gzip压缩。",
+      "second": "修正此前记录：本项目已存入档案的文件应采用zstd压缩，gzip写错了。",
+      "relationship": "same",
+      "old_value": "gzip",
+      "new_value": "zstd"
+    },
+    {
+      "id": "weekday",
+      "first": "我的长期习惯：周一到周五的通勤方式是公交。",
+      "second": "更正我的习惯记录：星期一至星期五的通勤方式是地铁，公交记错了。",
+      "relationship": "same",
+      "old_value": "公交",
+      "new_value": "地铁",
+      "scope_kind": "user"
+    },
+    {
+      "id": "museum",
+      "first": "本项目未满18岁的参观者，其预约入口长期设置为A。",
+      "second": "本项目另外规定：年满18岁的参观者使用预约入口B。",
+      "relationship": "separate",
+      "old_value": "A",
+      "new_value": "B"
+    },
+    {
+      "id": "priority",
+      "first": "本项目所有后台任务长期使用队列standard。",
+      "second": "补充一个独立例外：本项目高优先级的后台任务使用队列urgent。",
+      "relationship": "separate",
+      "old_value": "standard",
+      "new_value": "urgent"
+    },
+    {
+      "id": "negation",
+      "first": "本项目启用了匿名访问的页面，缓存策略长期设为public。",
+      "second": "独立规则：本项目没有启用匿名访问的页面，缓存策略设为private。",
+      "relationship": "separate",
+      "old_value": "public",
+      "new_value": "private"
+    },
+    {
+      "id": "roles",
+      "first": "本项目由外部人员撰写的文档长期使用模板R。",
+      "second": "独立规定：本项目供外部人员阅读的文档使用模板S。",
+      "relationship": "separate",
+      "old_value": "R",
+      "new_value": "S"
+    }
+  ]
+}

@@ -14,6 +14,7 @@ from weavria.memory import (
 from weavria.models import ModelCallError, ModelProvider, call_model
 
 from .memory_admission import MemoryFormationError, ground_memory_candidates
+from .memory_condition_wire import ConditionSetReviewWire
 from .memory_evidence import index_memory_evidence
 from .memory_generation import MemoryGenerationPolicy, MemoryProposalError, generate_memory
 from .memory_review_wire import (
@@ -231,7 +232,11 @@ class ModelMemoryReviewer:
         family_alignment: bool = False,
         generation: MemoryGenerationPolicy | None = None,
         set_reconciliation: bool = False,
+        semantic_conditions: bool = False,
     ) -> None:
+        if semantic_conditions and not set_reconciliation:
+            raise ValueError("semantic conditions require set reconciliation")
+        self._semantic_conditions = semantic_conditions
         if set_reconciliation and (generation is None or not family_alignment):
             raise ValueError("set reconciliation requires generation and family alignment")
         self.provider = provider
@@ -246,6 +251,10 @@ class ModelMemoryReviewer:
         if set_reconciliation:
             assert generation is not None
             self.version = f"model-memory-reviewer/6.1:sets:{configuration_id};{generation.version}"
+            if semantic_conditions:
+                self.version = (
+                    f"model-memory-reviewer/7:conditions:{configuration_id};{generation.version}"
+                )
 
     async def review(
         self,
@@ -345,9 +354,17 @@ class ModelMemoryReviewer:
                 "no stored counterpart to map a standalone new fact onto. Only WITH an anchor, "
                 "mapping pairs candidate and target paths: /subject, /predicate, /value, "
                 "/qualifiers/<JSON-pointer-escaped-key>. Pair /subject with /subject. "
-                "For new-family map only subject and predicate. For other "
-                "target relations cover predicate and EVERY qualifier on BOTH sides; a condition "
-                "embedded in a predicate may map to an explicit qualifier. Never equate genuinely "
+                "For new-family map only subject and predicate. "
+                + (
+                    "For other target relations map only subject and the full predicate meaning; "
+                    "do not map qualifier paths. Do not claim predicate equivalence if it hides "
+                    "a different condition. "
+                    if self._semantic_conditions
+                    else "For other target relations cover predicate and EVERY qualifier "
+                    "on BOTH sides; "
+                    "a condition embedded in a predicate may map to an explicit qualifier. "
+                )
+                + "Never equate genuinely "
                 "different conditions. For equivalent values add /value to /value if "
                 "wording differs. "
                 "citations are indices in THIS candidate's citations supporting these "
@@ -361,6 +378,49 @@ class ModelMemoryReviewer:
                 "all fragments. Do not generate fragments or choose a winner for "
                 "unresolved conflict."
             )
+            if self._semantic_conditions:
+                # 条件图替代完整 qualifier 路径对应;没有写入领域例子或同义词表。
+                instructions += (
+                    " For each anchor, compare applicability conditions separately "
+                    "in condition_links: "
+                    "[left SIDE, left qualifier KEY, right SIDE, right qualifier KEY, relation]. "
+                    "SIDE is candidate or target; within-side links are allowed for redundant "
+                    "conditions. Each atom means the complete role-and-value restriction in its "
+                    "source context. equivalent means mutual entailment; entails means the left "
+                    "restriction implies the right restriction; disjoint means both cannot hold "
+                    "at once. Omit uncertain pairs. "
+                    "Do not confuse semantic similarity with entailment. Preserve negation and "
+                    "distinguish attribution from applicability; never drop an existing qualifier. "
+                    "Supply supported links needed for coverage, including repeated "
+                    "or redundant restrictions; the host computes closure, mutual coverage and "
+                    "contradictions. Identical keys and values get automatic identity links. "
+                    "Empty condition sets express no explicit restriction. "
+                    "No anchor means no links. "
+                    "mapping still establishes subject/predicate identity and optional value "
+                    "equivalence; citations support both mapping and condition links."
+                )
+                wire, report = await generate_memory(
+                    self.provider,
+                    ConditionSetReviewWire,
+                    "review_memory",
+                    instructions,
+                    payload,
+                    max_duration,
+                    stage="review",
+                    policy=self._generation,
+                    validate=lambda w: w.interpret(extraction, snapshot),
+                )
+                interpreted, conditions = wire.interpret(extraction, snapshot)
+                result = interpreted.expand(extraction, families=True)
+                return MemoryReview.model_validate(
+                    {
+                        **result.model_dump(),
+                        "schema_version": 6,
+                        "generation": report,
+                        "resolutions": interpreted.expand_resolutions(extraction),
+                        "conditions": conditions,
+                    }
+                )
             fact_wire, report = await generate_memory(
                 self.provider,
                 FactSetReviewWire,
