@@ -1,0 +1,16 @@
+{
+  "schema_version":1,
+  "dataset_version":"memory-recall-consumption/1",
+  "cases":[
+    {"id":"01","question":"项目文档 language：现在为 README 选择使用的语言。只给出语言名称。","answer":"English","sources":["exception"],"claims":[{"id":"default","predicate":"document language","value":"Chinese","text":"项目文档默认使用 Chinese。"},{"id":"exception","predicate":"document language","value":"English","text":"公开首页使用 English。","qualifiers":{"document":"README"}}]},
+    {"id":"02","question":"项目文档 language：现在为内部设计说明选择语言。只给出语言名称。","answer":"Chinese","sources":["default"],"claims":[{"id":"default","predicate":"document language","value":"Chinese","text":"项目文档默认使用 Chinese。"},{"id":"exception","predicate":"document language","value":"English","text":"公开首页使用 English。","qualifiers":{"document":"README"}}]},
+    {"id":"03","question":"项目维护脚本 shell 应使用什么？只给出 shell 名称；未解决争议时回答 unknown。","answer":"unknown","sources":[],"claims":[{"id":"old","predicate":"shell","value":"zsh","text":"维护脚本 shell 使用 zsh。"},{"id":"competing","predicate":"shell","value":"bash","text":"维护脚本 shell 使用 bash。","operation":"contest","target":"old"}]},
+    {"id":"04","question":"项目日志 timezone 应采用哪个时区？只给出标准时区标识。","answer":"Asia/Shanghai","sources":["new"],"claims":[{"id":"old","predicate":"timezone","value":"UTC","text":"项目日志 timezone 使用 UTC。","until":10},{"id":"new","predicate":"timezone","value":"Asia/Shanghai","text":"项目日志 timezone 从 1 月 10 日起改为 Asia/Shanghai。","since":10}]},
+    {"id":"05","day":5,"question":"项目日志 timezone 应采用哪个时区？只给出标准时区标识。","answer":"UTC","sources":["old"],"claims":[{"id":"old","predicate":"timezone","value":"UTC","text":"项目日志 timezone 使用 UTC。","until":10},{"id":"new","predicate":"timezone","value":"Asia/Shanghai","text":"项目日志 timezone 从 1 月 10 日起改为 Asia/Shanghai。","since":10}]},
+    {"id":"06","question":"项目 database 当前应采用哪个数据库？只给出数据库名称。","answer":"SQLite","sources":["corrected"],"claims":[{"id":"old","predicate":"database","value":"PostgreSQL","text":"项目 database 使用 PostgreSQL。"},{"id":"corrected","predicate":"database","value":"SQLite","text":"纠正：项目 database 一直使用 SQLite，之前写错了。","operation":"supersede","target":"old"}]},
+    {"id":"07","question":"项目 logging level 当前使用哪一级？只给出级别名。","answer":"unknown","sources":[],"claims":[{"id":"expired","predicate":"logging level","value":"DEBUG","text":"项目 logging level 在 1 月 1 日至 10 日使用 DEBUG。","until":10}]},
+    {"id":"08","question":"项目 formatting command 应执行哪个命令？只给出完整命令。","answer":"ruff format .","sources":["format"],"claims":[{"id":"format","predicate":"formatting command","value":"ruff format .","text":"项目 formatting command 为 ruff format .。"}]},
+    {"id":"09","question":"项目 CI 应运行哪个测试工具？只给出工具名称。","answer":"pytest","sources":["test"],"claims":[{"id":"test","predicate":"verification runner","value":"pytest","text":"持续集成的验证运行器选用 pytest。"}]},
+    {"id":"10","question":"项目 deployment region 应使用哪个区域？只给出区域代码。","answer":"unknown","sources":[],"claims":[{"id":"unknown-time","predicate":"deployment region","value":"eu-west-1","text":"过去提过 deployment region 为 eu-west-1，但无法确认何时有效。","since":null}]}
+  ]
+}

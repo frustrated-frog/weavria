@@ -2,6 +2,7 @@
 
 from .actions import AgentAction, FinishAction, ToolCallAction, parse_action
 from .context import ContextChoice, ContextCompilation, SessionContextCompiled
+from .context_supply import ContextBundle, ContextSupply, ContextSupplyReport
 from .control import (
     COMPLETION_GUIDANCE_JSON_BYTES,
     CONTROL_FEEDBACK_BYTES,
@@ -197,9 +198,12 @@ __all__ = [
     "CompletionNotice",
     "CompletionRepair",
     "CompletionUnverifiable",
+    "ContextBundle",
     "ContextChoice",
     "ContextCompilation",
     "ContextSelected",
+    "ContextSupply",
+    "ContextSupplyReport",
     "ContinuationSignal",
     "ControlData",
     "ControlEvent",

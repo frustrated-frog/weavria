@@ -21,6 +21,7 @@ class ErrorCategory(StrEnum):
     POLICY_DENIED = "policy_denied"
     RUNTIME_INVARIANT_VIOLATION = "runtime_invariant_violation"
     EVENT_SINK_FAILURE = "event_sink_failure"
+    CONTEXT_SOURCE_FAILURE = "context_source_failure"
     CONTEXT_BUDGET_EXCEEDED = "context_budget_exceeded"
     NO_PROGRESS = "no_progress"
     COMPLETION_REJECTED = "completion_rejected"

@@ -4,7 +4,9 @@ import asyncio
 import hashlib
 import json
 import sqlite3
+from collections.abc import AsyncIterator
 from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
@@ -12,11 +14,12 @@ import pytest
 from pydantic import BaseModel, ValidationError
 
 from labs.task_model_view_design import PreparedCase, prepared_cases
-from weavria.context import ContextCompilerConfig, HistoryRetrievalConfig
+from weavria.context import ContextCompilerConfig, ContextSource, HistoryRetrievalConfig
 from weavria.core import (
     CompletionAccept,
     CompletionNotice,
     CompletionRepair,
+    ContextBundle,
     ControlRequest,
     ErrorCategory,
     EvidenceDeliveryManifest,
@@ -45,6 +48,7 @@ from weavria.harness import (
     CompletionCriterion,
     EvidenceProbe,
     InformationNeed,
+    MemoryContextSource,
     NeedFailure,
     NeedFinalizationPolicy,
     NeedStatus,
@@ -58,6 +62,15 @@ from weavria.harness import (
     load_task_frame,
 )
 from weavria.harness.understanding import task_frame_observation
+from weavria.memory import (
+    MemoryAccess,
+    MemoryAssertion,
+    MemoryBatch,
+    MemoryMutation,
+    MemoryScope,
+    MemorySource,
+    SQLiteMemoryStore,
+)
 from weavria.models import (
     FakeSessionProvider,
     OpenAICompatibleConfig,
@@ -81,6 +94,59 @@ async def cases() -> tuple[PreparedCase, ...]:
     cases, failures = await prepared_cases()
     assert not failures
     return cases
+
+
+@pytest.fixture
+async def memory_source(tmp_path: Path) -> AsyncIterator[MemoryContextSource]:
+    # 用真实存储形成同键的一般规则和例外,验证它们经过模型投影后仍完整交付。
+    # Fake 模型只验证协议与生命周期,不能据此证明模型会正确应用例外。
+    scope = MemoryScope(tenant_id="tenant", kind="project", key="archive")
+    access = MemoryAccess(principal_id="host", readable_scopes=(scope,), writable_scopes=(scope,))
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    source = MemorySource(
+        source_id="archive-rule",
+        scope=scope,
+        reference="prior/input/1",
+        content_sha256="a" * 64,
+        origin="user",
+        observed_at=now,
+    )
+    general = MemoryAssertion(
+        memory_id="general",
+        scope=scope,
+        subject="archive",
+        predicate="format",
+        value="full",
+        text="Read requested archived value in full",
+        source_ids=(source.source_id,),
+        authority="user_statement",
+        confidence=1.0,
+        epistemic_status="stated",
+        valid_from=now,
+    )
+    exception = general.model_copy(
+        update={
+            "memory_id": "exception",
+            "value": "brief",
+            "text": "alpha brief",
+            "qualifiers": {"key": "alpha"},
+        }
+    )
+    async with SQLiteMemoryStore(tmp_path / "recall.db") as store:
+        await store.commit(
+            access,
+            MemoryBatch(
+                batch_id="seed",
+                scope=scope,
+                policy_version="test/1",
+                sources=(source,),
+                mutations=tuple(
+                    MemoryMutation(operation="add", assertion=a, reason="explicit")
+                    for a in (general, exception)
+                ),
+            ),
+        )
+        yield MemoryContextSource(store, access=access, scope=scope, valid_at=lambda: now)
 
 
 async def test_projection_preserves_definitions_and_does_not_mutate_host_state(
@@ -354,6 +420,7 @@ def _engine(
     finalization: FinalizationPolicy | None = None,
     tools: ToolRegistry | None = None,
     context_config: ContextCompilerConfig | None = None,
+    context_source: ContextSource | None = None,
 ) -> SessionEngine:
     return SessionEngine(
         path,
@@ -364,6 +431,7 @@ def _engine(
         or ContextCompilerConfig(window_tokens=64_000, output_tokens=256),
         token_counter=_counter(),
         context_recovery=RecoveryLimits() if recovery else None,
+        context_source=context_source,
         task_model_projector=projector or TaskModelViewProjector(),
         limits=limits,
         history_retrieval=history_retrieval,
@@ -458,10 +526,13 @@ async def test_recovery_round_keeps_the_projected_request_and_explicit_feature_f
     assert all(request.current.recovery_enabled for request in model.requests)
 
 
+@pytest.mark.parametrize("with_memory", [False, True])
 @pytest.mark.parametrize("max_calls", [2, 5])
 async def test_finalization_receives_synthesis_view_and_preserves_full_needs(
     tmp_path: Path,
     max_calls: int,
+    with_memory: bool,
+    memory_source: MemoryContextSource,
 ) -> None:
     model = FakeSessionProvider(
         (
@@ -481,7 +552,11 @@ async def test_finalization_receives_synthesis_view_and_preserves_full_needs(
         max_model_calls=max_calls, finalization_model_calls=1, finalization_seconds=2
     )
     async with _engine(
-        tmp_path / "final.db", model, limits=limits, history_retrieval=HistoryRetrievalConfig()
+        tmp_path / "final.db",
+        model,
+        limits=limits,
+        history_retrieval=HistoryRetrievalConfig(),
+        context_source=memory_source if with_memory else None,
     ) as engine:
         await engine.create("s")
         result = await engine.send("s", "Read alpha", input_id="i")
@@ -505,6 +580,21 @@ async def test_finalization_receives_synthesis_view_and_preserves_full_needs(
     assert reports[-1].task_model_view is not None
     assert reports[-1].task_model_view.growth_reserve_bytes == 0
     assert reports[-1].control_reserve_bytes > 0
+    if with_memory:
+        assert all(r.schema_version == 11 and r.supply is not None for r in reports)
+        assert all(r.task_model_view and r.task_model_view.schema_version == 2 for r in reports)
+        for request in model.requests:
+            assert request.schema_version == 6 and len(request.bundles) == 1
+            group = request.bundles[0].content["group"]
+            assert isinstance(group, dict)
+            members = group["members"]
+            assert isinstance(members, list) and len(members) == 2
+        with sqlite3.connect(tmp_path / "final.db") as conn:
+            saved = [
+                SessionRequest.model_validate_json(row[0])
+                for row in conn.execute("SELECT data FROM request_views ORDER BY rowid")
+            ]
+        assert tuple(saved) == model.requests
 
 
 def _read_turn(key: str = "alpha", call_id: str = "read") -> ModelTurn:
@@ -664,8 +754,11 @@ async def test_failed_synthesis_preflight_returns_to_decision_without_sticky_pha
     assert reports[-1].task_model_view.growth_reserve_bytes > 0
 
 
+@pytest.mark.parametrize("with_memory", [False, True])
 async def test_synthesis_completion_repair_keeps_same_view_and_bounded_feedback(
     tmp_path: Path,
+    with_memory: bool,
+    memory_source: MemoryContextSource,
 ) -> None:
     class RepairOnce:
         version = "repair-once/1"
@@ -688,6 +781,7 @@ async def test_synthesis_completion_repair_keeps_same_view_and_bounded_feedback(
         tmp_path / "repair.db",
         model,
         completion=RepairOnce(),
+        context_source=memory_source if with_memory else None,
         limits=RunLimits(max_model_calls=6, finalization_model_calls=2),
     ) as engine:
         await engine.create("s")
@@ -701,6 +795,7 @@ async def test_synthesis_completion_repair_keeps_same_view_and_bounded_feedback(
     assert result.report.output == "corrected"
     before, after = model.requests[1:]
     assert isinstance(after.current.control, CompletionNotice)
+    assert before.bundles == after.bundles
     assert before.current.task_model_view == after.current.task_model_view
     assert after.current.task_model_view is not None
     assert after.current.task_model_view.phase == "synthesis"
@@ -1037,9 +1132,10 @@ async def test_growth_and_transport_ceiling_cover_replacement_values_and_large_v
 
 
 @pytest.mark.parametrize("text", ["thither", "界🙂é", '\\"\x00\n<|endoftext|>'])
+@pytest.mark.parametrize("outer_version", [5, 6])
 @pytest.mark.parametrize("wire_limit", [None, 24_000])
 async def test_v5_feedback_ceiling_survives_mutable_replacements_at_the_byte_boundary(
-    cases: tuple[PreparedCase, ...], text: str, wire_limit: int | None
+    cases: tuple[PreparedCase, ...], text: str, wire_limit: int | None, outer_version: Literal[5, 6]
 ) -> None:
     from weavria.core import ConversationView, SessionRequest
 
@@ -1048,6 +1144,10 @@ async def test_v5_feedback_ceiling_survives_mutable_replacements_at_the_byte_bou
         case.task, case.snapshot, phase="decision", max_instruction_bytes=1000
     )
     base = SessionRequest(
+        schema_version=outer_version,
+        bundles=(ContextBundle(bundle_id="memory:one", content={"text": text * 100}),)
+        if outer_version == 6
+        else (),
         conversation=ConversationView(session_id="s", through_sequence=1),
         current=ControlRequest(
             schema_version=5, task=case.task, instructions="host", task_model_view=view

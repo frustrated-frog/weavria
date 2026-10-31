@@ -35,6 +35,7 @@ from .formation import (
     MemoryReconciliation,
 )
 from .formation_storage import append_job, current_job
+from .groups import MemoryGroupRecall, pack_groups
 from .reducer import reduce_mutations
 from .retrieval import pack_recall, rank_versions
 
@@ -488,11 +489,37 @@ class SQLiteMemoryStore:
         deadline: datetime | None = None,
     ) -> MemoryRecall:
         """Filter exact grants and both time axes before ranking one consistent snapshot."""
+        result = await self._recall(access, query, grouped=False, deadline=deadline)
+        assert isinstance(result, MemoryRecall)
+        return result
+
+    async def recall_groups(
+        self,
+        access: MemoryAccess,
+        query: MemoryQuery,
+        *,
+        deadline: datetime | None = None,
+    ) -> MemoryGroupRecall:
+        """Recall complete exact families; limit counts groups, contested members stay visible."""
+        if not query.include_contested:
+            raise ValueError("complete group recall cannot exclude contested facts")
+        result = await self._recall(access, query, grouped=True, deadline=deadline)
+        assert isinstance(result, MemoryGroupRecall)
+        return result
+
+    async def _recall(
+        self,
+        access: MemoryAccess,
+        query: MemoryQuery,
+        *,
+        grouped: bool,
+        deadline: datetime | None,
+    ) -> MemoryRecall | MemoryGroupRecall:
         query = MemoryQuery.model_validate_json(MemoryQuery.model_validate(query).model_dump_json())
         _grant(access, query.scope)
         scope = _scope_key(query.scope)
 
-        def recall() -> MemoryRecall:
+        def recall() -> MemoryRecall | MemoryGroupRecall:
             with self._transaction(write=False, deadline=deadline) as conn:
                 current_head = self._head(scope)
                 head = current_head if query.at_head is None else query.at_head
@@ -545,7 +572,7 @@ class SQLiteMemoryStore:
                             {**version.model_dump(), "retired_at": None, "retired_head": None}
                         )
                     versions.append(version)
-                hits = rank_versions(versions, query.text)
+                hits = rank_versions(versions, "" if grouped else query.text)
                 sources = self._sources(
                     scope, {s for hit in hits for s in hit.version.assertion.source_ids}
                 )
@@ -553,6 +580,10 @@ class SQLiteMemoryStore:
                     {s for hit in hits for s in hit.version.assertion.source_ids}
                 ):
                     raise MemoryStorageError("memory projection has missing evidence sources")
+                if grouped:
+                    # 授权、时间过滤、来源加载与组闭包共享同一个读事务。
+                    # 不在分页或逐条 top-k 后拼“完整组”,否则无法证明例外没有遗漏。
+                    return pack_groups(versions, sources, query=query, head=head)
                 return pack_recall(
                     hits, sources, head=head, limit=query.limit, max_bytes=query.max_bytes
                 )

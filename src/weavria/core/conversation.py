@@ -3,10 +3,18 @@
 from datetime import datetime
 from typing import Literal, Self
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    SerializerFunctionWrapHandler,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 from ._schema import ContractModel, NonBlankString
 from .context import SessionContextCompiled
+from .context_supply import ContextBundle
 from .control import ControlEvent, ControlRequest, RunReport
 from .errors import ErrorCategory, TaskPreparationAttemptDiagnostic
 from .execution import ArtifactRef, ExecutionEvent
@@ -237,6 +245,7 @@ class ConversationView(BaseModel):
         "context-compiler/8",
         "context-compiler/9",
         "context-compiler/10",
+        "context-compiler/11",
     ] = "conversation/2"
 
     @model_validator(mode="after")
@@ -249,10 +258,11 @@ class ConversationView(BaseModel):
 
 
 class SessionRequest(BaseModel):
-    """v5 envelope with conversation v2 and independently versioned control requests."""
+    """v5 observations, with optional v6 atomic low-trust source bundles."""
 
     model_config = ContractModel.model_config
-    schema_version: Literal[5] = 5
+    schema_version: Literal[5, 6] = 5
+    bundles: tuple[ContextBundle, ...] = Field(default=(), max_length=100)
     conversation: ConversationView
     current: ControlRequest
 
@@ -260,6 +270,21 @@ class SessionRequest(BaseModel):
     @classmethod
     def validate_version_type(cls, value: object) -> object:
         return ContractModel.validate_version_type(value)
+
+    @model_serializer(mode="wrap")
+    def preserve_v5_wire(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        data = handler(self)
+        if self.schema_version == 5:
+            data.pop("bundles", None)
+        return data
+
+    @model_validator(mode="after")
+    def validate_bundles(self) -> Self:
+        if self.bundles and self.schema_version != 6:
+            raise ValueError("context bundles require session request v6")
+        if len({b.bundle_id for b in self.bundles}) != len(self.bundles):
+            raise ValueError("context bundle identities must be unique")
+        return self
 
 
 class SessionResult(ContractModel):

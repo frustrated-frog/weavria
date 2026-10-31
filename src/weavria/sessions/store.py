@@ -1314,6 +1314,29 @@ class SQLiteSessionStore:
             ):
                 raise SessionConflictError("compilation report disagrees with its request")
 
+        if (
+            compilation is not None
+            and compilation.supply is not None
+            and request.schema_version != 6
+        ):
+            raise SessionConflictError("source supply requires a bundle-capable request")
+        if request.schema_version == 6:
+            # 供给报告描述召回全集,choices 描述本次实际选择。落库前逐组复核
+            # 身份与完整内容摘要,避免模型收到未记录或被二次截断的记忆正文。
+            if compilation is None or compilation.supply is None:
+                raise SessionConflictError("bundle request requires its source supply report")
+            choices = {
+                c.source_id: c
+                for c in compilation.choices
+                if c.source_id.startswith("bundle:") and c.representation != "omitted"
+            }
+            if set(choices) != {f"bundle:{b.bundle_id}" for b in request.bundles} or any(
+                choices[f"bundle:{b.bundle_id}"].source_sha256
+                != hashlib.sha256(b.model_dump_json().encode()).hexdigest()
+                for b in request.bundles
+            ):
+                raise SessionConflictError("bundle content disagrees with compilation choices")
+
         def prepare() -> None:
             with self._transaction() as conn:
                 state = self._state(run_id)

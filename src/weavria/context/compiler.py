@@ -9,6 +9,7 @@ from weavria.core import (
     CONTROL_FEEDBACK_BYTES,
     ContextChoice,
     ContextCompilation,
+    ContextSupply,
     ControlFeedback,
     ControlRequest,
     ConversationTurn,
@@ -27,7 +28,7 @@ from weavria.core import (
     TurnFeedback,
 )
 
-from .allocation import AllocationCost, ContextAllocator, coverage
+from .allocation import AllocationCost, ContextAllocator, ContextUnit, Representation, coverage
 from .budget import (
     ContextCapacityError,
     ContextCompilerConfig,
@@ -44,6 +45,7 @@ from .compiler_sources import (
 )
 from .demand import ContextDemand, ContextFocus
 from .evidence import ControlEvidencePlan
+from .indexing import bounded_passages
 from .retrieval import history_query_digest
 from .selection import ContextBudgetError, ContextBuildError
 
@@ -167,6 +169,7 @@ class SessionContextCompiler:
         required_call_ids: tuple[str, ...] = (),
         focus: ContextFocus | None = None,
         retrieval: HistoryRetrievalReport | None = None,
+        supply: ContextSupply | None = None,
         recovery_ranges: tuple[RecoveryRange, ...] = (),
         next_step_reserve_bytes: int = 0,
         feedback_reserve_floor_bytes: int = 0,
@@ -176,6 +179,11 @@ class SessionContextCompiler:
         Cancellation propagates without publishing a partial plan. The caller
         owns deadline enforcement and persistence before model transport.
         """
+        if supply is not None:
+            supply = ContextSupply.model_validate_json(supply.model_dump_json())
+            if supply.report.task_revision != base.task.revision:
+                raise ContextBuildError("source supply belongs to another task revision")
+        bundles = supply.bundles if supply else ()
         if recovery_ranges and not base.recovery_enabled:
             raise ContextBuildError("recovery requires control request v4")
         required_call_ids = tuple(
@@ -193,7 +201,7 @@ class SessionContextCompiler:
             or not 0 <= feedback_reserve_floor_bytes <= max_request_bytes
         ):
             raise ValueError("feedback reserve floor exceeds the request budget")
-        if len(turns) + len(records) > self.config.max_units:
+        if len(turns) + len(records) + len(bundles) > self.config.max_units:
             forced = set(required_call_ids)
             if base.feedback:
                 forced.update(c.call_id for c in base.feedback.calls if c.status != "skipped")
@@ -209,7 +217,7 @@ class SessionContextCompiler:
                 "mandatory_units" if required_count > self.config.max_units else "candidate_units",
                 required_count
                 if required_count > self.config.max_units
-                else len(turns) + len(records),
+                else len(turns) + len(records) + len(bundles),
                 self.config.max_units,
             )
         if len(set(required_call_ids)) != len(required_call_ids):
@@ -240,6 +248,7 @@ class SessionContextCompiler:
             len(r.model_dump_json().encode()) + (r.artifact.size_bytes if r.artifact else 0)
             for r in records
         )
+        source_bytes += sum(len(b.model_dump_json().encode()) for b in bundles)
         if source_bytes > self.config.max_source_bytes:
             raise ContextCapacityError("source_bytes", source_bytes, self.config.max_source_bytes)
         sources = await self._index.load(run_id, records)
@@ -251,9 +260,29 @@ class SessionContextCompiler:
             raise ContextBuildError("context demands collide with the current task identity")
         if retrieval is not None and retrieval.query_sha256 != history_query_digest(demands):
             raise ContextBuildError("retrieval query differs from compiler demands")
+        if supply is not None and supply.report.demand_sha256 != history_query_digest(demands):
+            raise ContextBuildError("source supply query differs from compiler demands")
+        indexed_bundles = tuple(
+            [
+                await bounded_passages(
+                    bundle.content,
+                    max_passages=self.config.max_index_passages,
+                    max_bytes=self.config.max_index_bytes,
+                )
+                for bundle in bundles
+            ]
+        )
+        if sum(len(parts) for parts in indexed_bundles) > self.config.max_index_passages:
+            raise ContextCapacityError(
+                "bundle_passages",
+                sum(len(p) for p in indexed_bundles),
+                self.config.max_index_passages,
+            )
         indexed_history = await self._index.history_passages(turns)
-        passages = tuple(p for source in sources for p in source.passages) + tuple(
-            p for entry in indexed_history for p in entry
+        passages = (
+            tuple(p for source in sources for p in source.passages)
+            + tuple(p for entry in indexed_history for p in entry)
+            + tuple(p for parts in indexed_bundles for p in parts)
         )
         scorer = await CoverageScorer.create(
             demands, passages, max_work=self.config.max_scoring_work
@@ -271,6 +300,17 @@ class SessionContextCompiler:
             mandatory=mandatory,
             max_passages=self.config.max_passages,
             recovery_ranges=recovery_ranges,
+        )
+        # bundle 的唯一可选表示是整组 raw:片段索引用来评分,不生成模型可见摘录。
+        # 与历史/工具竞争同一预算时可以整体落选,不能只留下规则值而丢掉条件。
+        units += tuple(
+            ContextUnit(
+                f"bundle:{bundle.bundle_id}",
+                digest(bundle.model_dump_json()),
+                "bundle",
+                (Representation("raw", bundle.model_dump_json(), scorer.features(parts)),),
+            )
+            for bundle, parts in zip(bundles, indexed_bundles, strict=True)
         )
         padding = CONTROL_FEEDBACK_BYTES - len(
             base.control.model_dump_json().encode() if base.control else b"null"
@@ -295,7 +335,9 @@ class SessionContextCompiler:
         if view_receipt is not None and (sequence > 2**63 - 1 or total_turns > 2**63 - 1):
             raise ContextBuildError("model-view envelope counters exceed their encoding bound")
         policy_version = (
-            10
+            11
+            if supply is not None
+            else 10
             if view_receipt is not None
             else 8
             if sizer is not None
@@ -315,7 +357,9 @@ class SessionContextCompiler:
             session_id=session_id,
             through_sequence=sequence,
             omitted_turns=total_turns,
-            policy_version="context-compiler/10"
+            policy_version="context-compiler/11"
+            if policy_version == 11
+            else "context-compiler/10"
             if policy_version == 10
             else "context-compiler/8"
             if policy_version == 8
@@ -331,7 +375,9 @@ class SessionContextCompiler:
             if policy_version == 3
             else "context-compiler/2",
         )
-        template = SessionRequest.model_construct(conversation=empty, current=base)
+        template = SessionRequest.model_construct(
+            schema_version=6 if supply is not None else 5, conversation=empty, current=base
+        )
         wire = template.model_dump(mode="json")
         payloads = tuple(tuple(json.loads(v.payload_json) for v in unit.variants) for unit in units)
 
@@ -354,6 +400,17 @@ class SessionContextCompiler:
                     "omitted_turns": total_turns - len(history),
                 },
                 "current": {**wire["current"], "history": current},
+                **(
+                    {
+                        "bundles": [
+                            payloads[i][level]
+                            for i, level in sorted(selected.items())
+                            if units[i].channel == "bundle"
+                        ]
+                    }
+                    if supply is not None
+                    else {}
+                ),
             }
             return SessionRequest.model_validate_json(
                 json.dumps(value, ensure_ascii=False, separators=(",", ":"))
@@ -497,6 +554,7 @@ class SessionContextCompiler:
                 if not any(k.startswith(f"d:{d.demand_id}:") for k in covered)
             ),
             retrieval=retrieval,
+            supply=supply.report if supply else None,
             recovery_ranges=recovery_ranges,
             delivery_manifest=delivery_manifest,
             transport_request_bytes=transport_bytes(request),

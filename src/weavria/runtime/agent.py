@@ -17,6 +17,7 @@ from weavria.context import (
     BaseControlContextBuilder,
     ContextBudgetError,
     ContextCapacityError,
+    ContextSourceError,
     ContextTokenBudgetError,
     ControlContextBuilder,
     ControlEvidencePlan,
@@ -615,7 +616,14 @@ class _AgentKernel:
                             )
                             if self._feedback_budget < 1:
                                 raise ValueError("compiled feedback budget must be positive")
-                    except (ContextBudgetError, ContextTokenBudgetError, ContextCapacityError):
+                    except (
+                        ContextBudgetError,
+                        ContextTokenBudgetError,
+                        ContextCapacityError,
+                        ContextSourceError,
+                    ):
+                        # 召回也属于本次任务版本的准备阶段。若等待存储期间用户已修订
+                        # 任务,旧版本的依赖失败不应终止新任务;当前版本的失败则分类上报。
                         if task.revision != self.state.task.revision:
                             continue
                         raise
@@ -838,6 +846,22 @@ class _AgentKernel:
                 return await self._end(RunStatus.BUDGET_EXHAUSTED, "context_capacity")
             if isinstance(exc, ContextBudgetError):
                 return await self._end(RunStatus.BUDGET_EXHAUSTED, "context_bytes")
+            if isinstance(exc, ContextSourceError):
+                if exc.reason == "capacity":
+                    return await self._end(RunStatus.BUDGET_EXHAUSTED, "context_capacity")
+                # 来源拒绝不能伪装成“没有相关记忆”。保留错误分类和异常链,
+                # 对外只输出固定诊断,不泄露存储路径或原始记忆内容。
+                return await self._end(
+                    RunStatus.FAILED,
+                    "context_source_failure",
+                    error=RunError(
+                        category=ErrorCategory.POLICY_DENIED
+                        if exc.reason == "access_denied"
+                        else ErrorCategory.CONTEXT_SOURCE_FAILURE,
+                        message=str(exc),
+                        cause_type=type(exc.__cause__ or exc).__name__,
+                    ),
+                )
             if isinstance(exc, CompletionCheckError):
                 return await self._end(
                     RunStatus.FAILED,

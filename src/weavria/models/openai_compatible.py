@@ -582,7 +582,7 @@ class OpenAICompatibleTokenCounter:
 
     @property
     def version(self) -> str:
-        return f"openai-compatible-session/5[{self._tokenizer.version};frame={self._framing}]"
+        return f"openai-compatible-session/6[{self._tokenizer.version};frame={self._framing}]"
 
     @property
     def output_tokens(self) -> int:
@@ -629,7 +629,7 @@ class OpenAICompatibleTokenCounter:
         history/feedback/control suffix at one token per byte. The result is in
         the serialized SessionRequest domain and includes the optional HTTP cap.
         Legacy requests require fixed conversation/task/observation/instructions.
-        For v5 only conversation, task and model-view definition/layout stay fixed;
+        For inner v5 only conversation, bundles, task and model-view layout stay fixed;
         instructions and dynamic view fields are charged at their unknown-byte bound.
         """
         if type(input_tokens) is not int or input_tokens < 0:

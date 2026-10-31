@@ -35,6 +35,8 @@ class SessionTokenCounter(Protocol):
         invariant conversation, task and task observation as well as instructions
         exactly for legacy requests. For v5 only the task, selected conversation and
         stable definition may be fixed, if the actual encoder proves their prefix.
+        With outer SessionRequest v6, selected bundles are also fixed only for
+        that compilation; a new source read requires a new ceiling calculation.
         Model-view source/progress and instructions still permit bounded replacement.
         """
         ...
