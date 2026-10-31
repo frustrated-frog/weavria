@@ -42,19 +42,20 @@ def dataset() -> Dataset:
     )
 
 
-def specification(field: str) -> TaskSpecification:
+def specification(*fields: str) -> TaskSpecification:
     return TaskSpecification(
         route="execute",
         intent="Read archive",
-        goal=f"Read {field}",
-        information_needs=(
+        goal=f"Read {', '.join(fields)}",
+        information_needs=tuple(
             InformationNeed(
                 description=f"Archived {field}",
                 source="external",
                 freshness="stable",
                 required_fields=(f"/data/{field}",),
                 capability_names=("read_archive",),
-            ),
+            )
+            for field in fields
         ),
         capability_needs=(
             CapabilityNeed(name="read_archive", purpose="Read", necessity="required"),
@@ -209,6 +210,72 @@ async def test_failures_remain_in_trace_and_can_be_recovered(tmp_path: Path) -> 
     )
     assert row["task_success"] is True
     assert row["failed_tool_calls"] == 1 and row["tool_calls"] == 2
+
+
+@pytest.mark.parametrize("projected", [False, True])
+@pytest.mark.parametrize("failed_fields", [("owner",), ("owner", "deadline")])
+async def test_successful_sibling_does_not_turn_failed_attempt_into_early_finalization(
+    tmp_path: Path, projected: bool, failed_fields: tuple[str, ...]
+) -> None:
+    # 与真实失败轨迹保持相同边界:同一工具的一批调用中,一项成功、一项永久失败。
+    # 失败只否定 owner/primary 这次尝试;宿主没有枚举替代参数,更没有代模型选择 mirror。
+    case = next(case for case in dataset().cases if case.case_id == "primary_failure")
+    if len(failed_fields) > 1:
+        values = {**case.data, "deadline": "2031-06-18"}
+        case = Case(
+            case_id="multiple_failures",
+            request="Read title, owner and deadline, using another source after a failure",
+            data=values,
+            expected=values,
+            primary_failures=failed_fields,
+        )
+    first = ToolBatch(
+        calls=tuple(
+            ToolCallAction(
+                call_id=f"{field}-primary",
+                tool_name="read_archive",
+                arguments={"section": field, "source": "primary"},
+            )
+            for field in ("title", *failed_fields)
+        )
+    )
+    fallback = ToolBatch(
+        calls=tuple(
+            ToolCallAction(
+                call_id=f"{field}-mirror",
+                tool_name="read_archive",
+                arguments={"section": field, "source": "mirror"},
+            )
+            for field in failed_fields
+        )
+    )
+    model = FakeSessionProvider(
+        (
+            ModelTurn(decision=first),
+            ModelTurn(decision=fallback),
+            ModelTurn(decision=FinishAction(output=json.dumps(case.expected))),
+        )
+    )
+    row = await run_case(
+        root=tmp_path,
+        case=case,
+        specifications={1: specification("title", *failed_fields)},
+        projected=projected,
+        provider=model,
+        repetition=0,
+        config=OpenAICompatibleConfig(
+            model="test", max_output_tokens=2048, max_request_bytes=128000
+        ),
+    )
+    assert row["task_success"] is True
+    assert row["model_calls"] == 3 and row["tool_calls"] == 1 + 2 * len(failed_fields)
+    assert row["failed_tool_calls"] == len(failed_fields)
+    assert row["all_expected_fields_delivered"] is True
+    assert "FINALIZATION" not in model.requests[1].current.instructions
+    assert "FINALIZATION" in model.requests[2].current.instructions
+    assert row["phases"] == (
+        ["decision", "decision", "synthesis"] if projected else ["full", "full", "full"]
+    )
 
 
 async def test_probe_cancellation_joins_owned_model_task(tmp_path: Path) -> None:

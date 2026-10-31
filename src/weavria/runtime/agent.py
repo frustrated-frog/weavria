@@ -1033,11 +1033,18 @@ class _AgentKernel:
             return None
         if (
             existing is None
-            and not before.missing_need_ids
-            and assessed.mode != "complete"
             and not reserve_reached
             and not tool_budget
+            and (
+                not before.eligible
+                or not assessed.eligible
+                or assessed.mode != "complete"
+                or assessed.missing_need_ids
+            )
         ):
+            # 策略的账本预检与实际交付检查都通过,才可因 evidence_ready 提前封闭工具。
+            # “有一些可用证据”只支持资源边界上的有限回答,不能代替继续获取的判断;
+            # 这也防止自定义策略误把 eligible=True 的 limited 结果当成全量就绪。
             return await self._build_context(task)
         if existing is None:
             await self._accept(

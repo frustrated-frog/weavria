@@ -10,6 +10,12 @@ from .completion import CompletionContext
 
 @dataclass(frozen=True, slots=True)
 class FinalizationAssessment:
+    """Synthesis assessment; eligible means early readiness, not exhausted acquisition.
+
+    ``mode`` describes evidence actually delivered to the candidate request. A limited
+    view alone does not authorize Runtime to stop exploration before its stop boundary.
+    """
+
     eligible: bool
     mode: Literal["complete", "limited", "unavailable"]
     required_call_ids: tuple[str, ...] = ()

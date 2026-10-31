@@ -22,7 +22,7 @@ from .understanding import load_task_frame
 
 
 class NeedFinalizationPolicy:
-    version = "need-finalization/1"
+    version = "need-finalization/2"
 
     def __init__(self, evidence: EvidenceResolver | None = None) -> None:
         self._evidence = evidence or EvidenceResolver()
@@ -83,11 +83,10 @@ class NeedFinalizationPolicy:
             ledger.state_for(item.need_id).status is NeedStatus.CONTRADICTED for item in required
         ):
             return FinalizationAssessment(False, "unavailable")
-        eligible = all(
-            ledger.state_for(item.need_id).status is NeedStatus.SATISFIED
-            or ledger.state_for(item.need_id).acquisition_status in {"unavailable", "contract_gap"}
-            for item in required
-        )
+        # acquisition_status 描述已观察的尝试,不是整个 Need 的可达性证明。
+        # 同一个工具换参数、换来源仍可能补齐证据;只有必需证据全部满足,才允许
+        # 主动提前收尾。资源预留、工具预算和停滞后的有限收尾由 Runtime 单独决定。
+        eligible = ledger.mandatory_satisfied(required)
         bindings = tuple(
             item
             for item in ledger.bindings

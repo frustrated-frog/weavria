@@ -64,7 +64,7 @@ class CandidateAnswerVerifier(Protocol):
 class TaskCompletionEvaluator:
     """Evaluate declared obligations without trusting model claims of completion."""
 
-    version = "task-obligations/8"
+    version = "task-obligations/9"
 
     def __init__(
         self,
@@ -180,29 +180,39 @@ class TaskCompletionEvaluator:
                 outcome="unverifiable",
                 reason_code="conflicting_evidence",
             )
+        # 必需的独立动作不能被“证据源失败”或“有限收尾”豁免。先检查它,再处理
+        # 证据不完整的候选,避免降级分支绕过尚未执行的动作或应用的答案校验。
+        if any(
+            obligation.required
+            and obligation.kind == "capability_result"
+            and not obligation.need_ids
+            and any(
+                verdict.obligation_id == obligation.obligation_id
+                and verdict.result == "unsatisfied"
+                for verdict in verdicts
+            )
+            for obligation in frame.obligations
+        ):
+            return CompletionEvaluation(
+                disposition="repair",
+                verdicts=verdicts,
+                next_required_actions=("Obtain the required capability result",),
+                outcome="unverifiable",
+                reason_code="missing_capability_result",
+            )
         incomplete = tuple(
             item for item in required_states if item.status is not NeedStatus.SATISFIED
         )
         if incomplete:
-            if context.finalization is not None and context.finalization.mode == "limited":
-                if any(
-                    obligation.required
-                    and obligation.kind == "capability_result"
-                    and not obligation.need_ids
-                    and any(
-                        verdict.obligation_id == obligation.obligation_id
-                        and verdict.result == "unsatisfied"
-                        for verdict in verdicts
-                    )
-                    for obligation in frame.obligations
-                ):
-                    return CompletionEvaluation(
-                        disposition="repair",
-                        verdicts=verdicts,
-                        outcome="unverifiable",
-                        reason_code="missing_capability_result",
-                        next_required_actions=("The required action has not completed",),
-                    )
+            limited_finalization = (
+                context.finalization is not None and context.finalization.mode == "limited"
+            )
+            observed_paths_blocked = all(
+                item.acquisition_status in {"unavailable", "contract_gap"} for item in incomplete
+            )
+            # 模型可以主动提交无法核实的有限回答;这不等于宿主认定 Need 已经穷尽,
+            # 也不能反向触发提前收尾。继续调用工具时,仍由进度策略和资源边界管理。
+            if limited_finalization or observed_paths_blocked:
                 if (
                     self._answer is not None
                     and await self._answer.verify_answer(context, frame, ledger) == "reject"
@@ -220,29 +230,19 @@ class TaskCompletionEvaluator:
                     disposition="degraded_answer",
                     verdicts=verdicts,
                     outcome="unverifiable",
-                    reason_code="finalization_incomplete_evidence",
-                    next_required_actions=("Explain the remaining evidence limitations",),
-                )
-            retryable = any(item.can_retry for item in incomplete)
-            terminal_paths = all(
-                item.acquisition_status in {"unavailable", "contract_gap"} for item in incomplete
-            )
-            if terminal_paths:
-                contract_gap = any(item.acquisition_status == "contract_gap" for item in incomplete)
-                return CompletionEvaluation(
-                    disposition="cannot_proceed",
-                    verdicts=verdicts,
+                    reason_code=(
+                        "finalization_incomplete_evidence"
+                        if limited_finalization
+                        else "attempted_paths_contract_gap"
+                        if any(item.acquisition_status == "contract_gap" for item in incomplete)
+                        else "attempted_paths_unavailable"
+                    ),
                     next_required_actions=(
                         "Report the limits of the attempted evidence paths; do not infer "
                         "that the requested data does not exist",
                     ),
-                    outcome="unverifiable",
-                    reason_code=(
-                        "evidence_contract_mismatch"
-                        if contract_gap
-                        else "mandatory_evidence_unavailable"
-                    ),
                 )
+            retryable = any(item.can_retry for item in incomplete)
             return CompletionEvaluation(
                 disposition="repair",
                 verdicts=verdicts,
@@ -300,7 +300,7 @@ class TaskObligationCompletionPolicy:
 
     @property
     def version(self) -> str:
-        return f"task-obligation-completion/4[{self._evaluator.version}]"
+        return f"task-obligation-completion/5[{self._evaluator.version}]"
 
     async def verify(self, context: CompletionContext) -> CompletionDecision:
         evaluation = await self._evaluator.evaluate(context)

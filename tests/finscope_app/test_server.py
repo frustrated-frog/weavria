@@ -907,7 +907,7 @@ async def test_market_source_failure_finishes_unverifiable_without_completion_lo
     assert payload.status == "completed"
     assert payload.task_outcome == "unverifiable"
     assert payload.answer == "市场数据源暂时不可用, 本次无法判断市场阶段。"
-    assert payload.completion_reason == "mandatory_evidence_unavailable"
+    assert payload.completion_reason == "attempted_paths_unavailable"
     assert [tool.model_dump() for tool in payload.tools] == [
         {
             "call_id": "market-read-failed",

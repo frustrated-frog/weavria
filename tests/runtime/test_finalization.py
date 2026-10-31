@@ -12,6 +12,7 @@ from weavria.core import (
     ControlFeedback,
     ControlRequest,
     ErrorCategory,
+    EvidenceDeliveryManifest,
     FinalizationStarted,
     FinishAction,
     ModelResponse,
@@ -41,6 +42,8 @@ from weavria.runtime import (
     AgentLoop,
     CompletionContext,
     CompletionPolicy,
+    FinalizationAssessment,
+    FinalizationPolicy,
     LayeredCompletionPolicy,
     RunLimits,
     TurnPreparation,
@@ -72,6 +75,7 @@ async def setup(
     required_action: bool = False,
     context_builder: ControlContextBuilder | None = None,
     preparation: TurnPreparer | None = None,
+    finalization: FinalizationPolicy | None = None,
 ) -> tuple[AgentLoop, FakeControlProvider]:
     async def read(arguments: Input, context: ToolContext) -> Output:
         return Output(value=arguments.key)
@@ -150,7 +154,7 @@ async def setup(
             max_model_calls=max_calls, max_request_bytes=24_000, finalization_model_calls=reserve
         ),
         completion=completion or TaskObligationCompletionPolicy(),
-        finalization=NeedFinalizationPolicy(),
+        finalization=finalization or NeedFinalizationPolicy(),
         context_builder=context_builder,
         preparation=preparation,
     )
@@ -206,6 +210,54 @@ async def test_reserve_allows_limited_answer_without_claiming_task_verified() ->
     assert agent.state.assessment is not None
     assert agent.state.assessment.decision.kind == "unverifiable"
     assert agent.state.assessment.decision.reason == "finalization_incomplete_evidence"
+
+
+async def test_early_readiness_cannot_force_a_limited_delivery_view() -> None:
+    class Misleading(NeedFinalizationPolicy):
+        version = "misleading/1"
+
+        async def assess(
+            self,
+            context: CompletionContext,
+            *,
+            request: ControlRequest | None,
+            manifest: EvidenceDeliveryManifest | None,
+        ) -> FinalizationAssessment:
+            assessed = await super().assess(context, request=request, manifest=manifest)
+            if assessed.eligible:
+                # 故意模拟“仍有缺口却宣称提前就绪”的策略;宿主必须以确切交付为准。
+                return replace(
+                    assessed,
+                    mode="limited" if request is not None else assessed.mode,
+                    missing_need_ids=("not-delivered",),
+                )
+            return assessed
+
+    agent, provider = await setup((read(), finish()), finalization=Misleading())
+    result = await agent.execute()
+    assert result.status is RunStatus.COMPLETED
+    assert agent.state.finalization is None
+    assert "FINALIZATION" not in provider.requests[-1].instructions
+
+
+async def test_tool_budget_still_allows_limited_synthesis_of_successful_evidence() -> None:
+    agent, _ = await setup(
+        (read(), finish("Only value is known; the additional field is unavailable")),
+        fields=("/value", "/details/extra"),
+        limits=RunLimits(
+            max_model_calls=5,
+            max_tool_calls=1,
+            max_request_bytes=24_000,
+            finalization_model_calls=2,
+        ),
+    )
+    result = await agent.execute()
+    assert result.status is RunStatus.COMPLETED and result.task_outcome == "unverifiable"
+    assert agent.state.finalization is not None
+    assert agent.state.finalization.mode == "limited"
+    assert agent.state.finalization.reason == "tool_budget"
+    assert agent.state.finalization.evidence_call_ids == ("read-1",)
+    assert agent.state.finalization.missing_need_ids
 
 
 async def test_no_evidence_at_reserve_does_not_fabricate_an_answer() -> None:

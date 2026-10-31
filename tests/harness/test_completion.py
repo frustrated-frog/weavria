@@ -1,4 +1,5 @@
 from collections.abc import Awaitable, Callable
+from typing import Literal
 
 import pytest
 from pydantic import BaseModel
@@ -31,6 +32,7 @@ from weavria.harness import (
     InformationNeed,
     InformationRequirement,
     ModelTaskInterpreter,
+    NeedFinalizationPolicy,
     TaskCompletionEvaluator,
     TaskFrame,
     TaskObligationCompletionPolicy,
@@ -239,7 +241,10 @@ async def test_terminal_source_failure_allows_bounded_unverifiable_delivery() ->
     decision = await TaskObligationCompletionPolicy().verify(context)
 
     assert isinstance(decision, CompletionUnverifiable)
-    assert decision.reason == "mandatory_evidence_unavailable"
+    assert decision.reason == "attempted_paths_unavailable"
+    # 接受模型主动提交的有限回答,不意味着宿主可以把同一失败强制变成提前收尾。
+    readiness = await NeedFinalizationPolicy().assess(context, request=None, manifest=None)
+    assert readiness.eligible is False and readiness.missing_need_ids
 
 
 async def test_missing_or_partial_evidence_requests_repair() -> None:
@@ -296,14 +301,15 @@ async def test_successful_output_with_no_matching_fields_converges_as_unverifiab
         store,
         observation,
     )
-    policy = TaskObligationCompletionPolicy(
-        TaskCompletionEvaluator(evidence=EvidenceResolver((MismatchingExtractor(),)))
-    )
+    evidence = EvidenceResolver((MismatchingExtractor(),))
+    policy = TaskObligationCompletionPolicy(TaskCompletionEvaluator(evidence=evidence))
 
     decision = await policy.verify(context)
 
     assert isinstance(decision, CompletionUnverifiable)
-    assert decision.reason == "evidence_contract_mismatch"
+    assert decision.reason == "attempted_paths_contract_gap"
+    readiness = await NeedFinalizationPolicy(evidence).assess(context, request=None, manifest=None)
+    assert readiness.eligible is False and readiness.missing_need_ids
 
 
 def test_completion_guidance_is_bounded_by_encoded_bytes() -> None:
@@ -540,7 +546,61 @@ async def test_all_observed_declared_paths_unavailable_allow_limited_delivery() 
     decision = await TaskObligationCompletionPolicy().verify(context)
 
     assert isinstance(decision, CompletionUnverifiable)
-    assert decision.reason == "mandatory_evidence_unavailable"
+    assert decision.reason == "attempted_paths_unavailable"
+
+    evaluation = await TaskCompletionEvaluator().evaluate(context)
+    assert evaluation.disposition == "degraded_answer"
+    assert evaluation.outcome == "unverifiable"
+    assert any(verdict.result == "unsatisfied" for verdict in evaluation.verdicts)
+
+
+async def test_failed_paths_do_not_bypass_candidate_answer_verification() -> None:
+    context = await _scoped_context(targets=("alpha",), calls=("alpha",), failures={"alpha": False})
+
+    class Reject:
+        version = "reject/1"
+
+        async def verify_answer(
+            self, context: CompletionContext, frame: TaskFrame, ledger: object
+        ) -> Literal["reject"]:
+            return "reject"
+
+    decision = await TaskObligationCompletionPolicy(
+        TaskCompletionEvaluator(answer=Reject())
+    ).verify(context)
+
+    assert isinstance(decision, CompletionRepair)
+    assert decision.issue_codes == ("answer_verification_rejected",)
+
+
+async def test_failed_paths_do_not_excuse_an_unfinished_independent_action() -> None:
+    context = await _scoped_context(targets=("alpha",), calls=("alpha",), failures={"alpha": False})
+    assert context.task_observation is not None
+    frame = load_task_frame(context.task_observation.payload)
+    # 让同一能力同时承担独立的必需动作;读证据失败不能证明该动作已完成。
+    frame = frame.model_copy(
+        update={
+            "obligations": tuple(
+                item.model_copy(update={"need_ids": ()})
+                if item.kind == "capability_result"
+                else item
+                for item in frame.obligations
+            )
+        }
+    )
+    independent = CompletionContext(
+        "run",
+        context.task,
+        context.candidate,
+        context.records,
+        InMemoryArtifactStore(),
+        context.task_observation.model_copy(update={"payload": frame.model_dump(mode="json")}),
+    )
+
+    decision = await TaskObligationCompletionPolicy().verify(independent)
+
+    assert isinstance(decision, CompletionRepair)
+    assert decision.issue_codes == ("missing_capability_result",)
 
 
 async def test_contract_gap_does_not_close_an_untried_producer() -> None:
