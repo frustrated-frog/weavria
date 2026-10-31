@@ -18,7 +18,7 @@ from weavria.harness import (
 
 from .server import PageContext
 
-FROZEN_WEEKLY_SUMMARY_V2_SHA256 = "275e33ce5551dc14fd25d5cb5467dcb80918f1427fb7b3369ee1de04bebc3535"
+FROZEN_WEEKLY_SUMMARY_V3_SHA256 = "9ed3030f2841677eb8d0d65742484998267bebbea98fef548e621e93523f424f"
 WEEKLY_SUMMARY_REQUIRED_FIELDS = frozenset(
     {
         "/data/regime",
@@ -59,7 +59,7 @@ class MarketData(_EvaluationModel):
 
 
 class WeeklySummaryCase(_EvaluationModel):
-    schema_version: Literal[2]
+    schema_version: Literal[3]
     case_id: Literal["weekly-market-summary"]
     prompt: str = Field(min_length=1)
     page_context: PageContext
@@ -222,9 +222,9 @@ def unrelated_direct_specification() -> TaskSpecification:
 
 
 def load_weekly_summary_case(path: Path) -> WeeklySummaryCase:
-    """Load the exact v2 dataset and fail if its bytes drift silently."""
+    """Load the exact v3 dataset and fail if its bytes drift silently."""
     source = path.read_bytes()
-    if hashlib.sha256(source).hexdigest() != FROZEN_WEEKLY_SUMMARY_V2_SHA256:
+    if hashlib.sha256(source).hexdigest() != FROZEN_WEEKLY_SUMMARY_V3_SHA256:
         raise ValueError("frozen weekly-summary dataset digest changed")
     return WeeklySummaryCase.model_validate_json(source)
 
@@ -251,7 +251,8 @@ def expanded_market_data(case: WeeklySummaryCase) -> dict[str, JsonValue]:
 
 
 def grade_weekly_answer(case: WeeklySummaryCase, answer: str | None) -> WeeklyAnswerGrade:
-    """Apply the same explicit output contract to deterministic and live-model runs."""
+    """Check required content terms, without claiming independent factual verification."""
+    # v3 只约束回答内容。内部来源仍在交付探针和 Trace 中核对,不进入正文评分。
     text = answer or ""
     present = tuple(term for term in case.expected_output_terms if term in text)
     missing = tuple(term for term in case.expected_output_terms if term not in text)

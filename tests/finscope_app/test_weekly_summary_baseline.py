@@ -45,7 +45,7 @@ from weavria.harness import NeedStatus, load_need_ledger, load_task_frame
 from weavria.models import ModelCapabilities
 from weavria.sessions import SQLiteSessionStore
 
-FIXTURE = Path(__file__).parents[1] / "fixtures/finscope_weekly_summary_v2.json"
+FIXTURE = Path(__file__).parents[1] / "fixtures/finscope_weekly_summary_v3.json"
 
 
 async def _events(store: SQLiteSessionStore, session_id: str) -> tuple[SessionEvent, ...]:
@@ -172,7 +172,6 @@ class _EvidenceAwareScenarioModel:
                     "本周市场总结 (2026-10-19 至 2026-10-23): 市场阶段为 "
                     "RANGE_ROTATION; 10-23 上涨比例 81.2%, 成交额 1.97 万亿元, "
                     "半导体相对领先。数据质量: PARTIAL。"
-                    "[来源:market-pulse:2026-10-23]"
                 )
             )
         )
@@ -254,6 +253,7 @@ async def test_weekly_summary_closes_every_observable_layer(
     assert payload.status == "completed", payload.model_dump(mode="json")
     assert payload.task_outcome == "unverified"
     assert grade_weekly_answer(case, payload.answer).correct
+    assert payload.answer is not None and "[来源:" not in payload.answer
     assert len(market_calls) == 4
 
     run_facts = tuple(

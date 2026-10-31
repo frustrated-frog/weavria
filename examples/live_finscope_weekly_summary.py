@@ -14,7 +14,7 @@ import httpx
 
 from apps.finscope.config import FinScopeSettings
 from apps.finscope.evaluation import (
-    FROZEN_WEEKLY_SUMMARY_V2_SHA256,
+    FROZEN_WEEKLY_SUMMARY_V3_SHA256,
     WEEKLY_SUMMARY_REQUIRED_FIELDS,
     broad_weekly_summary_specification,
     expanded_market_data,
@@ -300,7 +300,7 @@ async def evaluate(
     finalization_model_calls: int = 0,
 ) -> dict[str, object]:
     repository = Path(__file__).parents[1]
-    fixture = repository / "tests" / "fixtures" / "finscope_weekly_summary_v2.json"
+    fixture = repository / "tests" / "fixtures" / "finscope_weekly_summary_v3.json"
     case = load_weekly_summary_case(fixture)
     market_data = expanded_market_data(case)
     base_url = _required("WEAVRIA_MODEL_BASE_URL")
@@ -441,9 +441,12 @@ async def evaluate(
     run_id = payload.run_id if payload is not None else None
     return {
         "schema_version": 1,
-        "dataset_version": "finscope-weekly-summary/2",
-        "evaluator_version": "finscope-weekly-live/6",
-        "dataset_sha256": FROZEN_WEEKLY_SUMMARY_V2_SHA256,
+        "dataset_version": "finscope-weekly-summary/3",
+        "evaluator_version": "finscope-weekly-live/7",
+        "dataset_sha256": FROZEN_WEEKLY_SUMMARY_V3_SHA256,
+        "answer_grade_scope": (
+            "required content terms; no inline source requirement or factual verifier"
+        ),
         "model": model_name,
         "configuration": {
             "temperature": 0.0,
