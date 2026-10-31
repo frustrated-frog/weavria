@@ -985,7 +985,7 @@ def test_review_versions_keep_v1_wire_and_reject_silent_upgrade() -> None:
     assert MemoryReview.model_validate_json(wire).model_dump_json() == wire
     with pytest.raises(ValidationError):
         MemoryReview.model_validate_json(
-            wire.replace('"schema_version":1', '"schema_version":3', 1)
+            wire.replace('"schema_version":1', '"schema_version":4', 1)
         )
     with pytest.raises(ValidationError):
         MemoryReview.model_validate({"schema_version": True})
@@ -1095,3 +1095,273 @@ async def test_joint_partition_rolls_back_all_segments_on_completion_failure(
             connection.execute("DROP TRIGGER abort_partition")
         assert (await engine.process(grant(first), second)).completed_head == 2
         assert len((await store.reconciliation(grant(first), first.scope)).versions) == 2
+
+
+def family_review(source: MemoryFormationInput, target: MemoryVersion) -> MemoryReview:
+    from weavria.memory import MemoryFamilyAlignment, MemoryFieldMatch
+
+    return MemoryReview(
+        schema_version=3,
+        judgments=judgment().judgments,
+        families=(
+            MemoryFamilyAlignment(
+                candidate_index=0,
+                target_id=target.assertion.memory_id,
+                target_revision=target.revision,
+                matches=tuple(
+                    MemoryFieldMatch(
+                        candidate_path=path,
+                        target_path=path,
+                        citations=(
+                            MemoryCitation(
+                                source_id=source.primary_source_id or "missing",
+                                quote=source.documents[-1].text,
+                            ),
+                        ),
+                    )
+                    for path in ("/subject", "/predicate")
+                ),
+            ),
+        ),
+    )
+
+
+@pytest.mark.parametrize("defect", ["none", "stale", "missing", "quote", "same_conditions"])
+async def test_family_admission_preserves_exception_and_survives_reopen(
+    tmp_path: Path, defect: str
+) -> None:
+    # 复现词汇漂移: 例外只匹配 README,一般规则词法零分仍须一起交付。
+    # 这里用脚本复核隔离执行不变量,并不证明模型能判断任意语义同族关系。
+    first = request()
+    second = request(2, "长期例外: README 使用英文。其他文档继续沿用原规则。")
+    access, path = grant(first), tmp_path / "family.db"
+    async with SQLiteMemoryStore(path) as store:
+        await MemoryFormationEngine(
+            store, Extractor(proposal(first)), Reviewer(judgment())
+        ).process(access, first)
+        anchor = (await store.reconciliation(access, first.scope)).versions[0]
+        extraction = proposal(
+            second,
+            predicate="文档语言",
+            value="英文",
+            qualifiers={} if defect == "same_conditions" else {"document": "README"},
+        )
+        review = family_review(second, anchor)
+        raw = review.model_dump(mode="json")
+        if defect == "stale":
+            raw["families"][0]["target_revision"] += 1
+        elif defect == "missing":
+            raw["families"][0]["target_id"] = "absent"
+        elif defect == "quote":
+            raw["families"][0]["matches"][0]["citations"][0]["quote"] = "invented"
+        review = MemoryReview.model_validate_json(json.dumps(raw))
+        engine = MemoryFormationEngine(store, Extractor(extraction), Reviewer(review))
+        job = await engine.process(access, second)
+        assert job.extraction is not None and job.plan is not None
+        assert job.extraction.candidates[0].predicate == "文档语言"
+        assert job.plan.review == review
+        assert await engine.process(access, second) == job
+        snapshot = await store.reconciliation(access, first.scope)
+        original = next(
+            v for v in snapshot.versions if v.assertion.memory_id == anchor.assertion.memory_id
+        )
+        assert original == anchor  # 同族不能产生覆盖、强化或争议副作用。
+        if defect != "none":
+            assert len(snapshot.versions) == 1
+            assert job.plan.admissions[0].status == "deferred"
+            assert job.plan.admissions[0].reason == (
+                "overlapping_new_fact" if defect == "same_conditions" else "unsafe_family_alignment"
+            )
+            return
+        assert len(snapshot.versions) == 2
+        added = next(v.assertion for v in snapshot.versions if v != anchor)
+        assert added.predicate == anchor.assertion.predicate
+        assert added.qualifiers == extraction.candidates[0].qualifiers
+        assert added.value == "英文" and added.valid_from == day(2)
+        assert added.source_ids == (second.primary_source_id,)
+        query = MemoryQuery(scope=first.scope, text="README", valid_at=day(3), limit=1)
+        recalled = await store.recall_groups(access, query)
+        assert len(recalled.groups) == 1 and len(recalled.groups[0].members) == 2
+        assert any(h.score == 0 for h in recalled.groups[0].members)
+        await store.rebuild(access, first.scope)
+        assert await store.recall_groups(access, query) == recalled
+    async with SQLiteMemoryStore(path) as reopened:
+        assert await reopened.recall_groups(access, query) == recalled
+        assert await reopened.formation(access, second.scope, second.identity()) == job
+
+
+async def test_family_anchor_change_requires_new_review_not_stale_key(tmp_path: Path) -> None:
+    first, second = request(), request(2, "README 文档采用英文。")
+    access = grant(first)
+    async with SQLiteMemoryStore(tmp_path / "race.db") as store:
+        await MemoryFormationEngine(
+            store, Extractor(proposal(first)), Reviewer(judgment())
+        ).process(access, first)
+        anchor = (await store.reconciliation(access, first.scope)).versions[0]
+
+        class RacingReviewer:
+            version = "family-race/1"
+            calls = 0
+
+            async def review(
+                self,
+                request: MemoryFormationInput,
+                extraction: MemoryExtraction,
+                snapshot: MemoryReconciliation,
+                *,
+                max_duration: float,
+            ) -> MemoryReview:
+                self.calls += 1
+                if self.calls == 1:
+                    # 复核时撤销锚点: 已落库的计划也不能越过 head CAS 写入。
+                    await store.commit(
+                        access,
+                        MemoryBatch(
+                            batch_id="retract-anchor",
+                            scope=first.scope,
+                            policy_version="test/1",
+                            mutations=(
+                                MemoryMutation(
+                                    operation="retract",
+                                    target_id=anchor.assertion.memory_id,
+                                    expected_revision=anchor.revision,
+                                    reason="withdrawn",
+                                    source_ids=anchor.assertion.source_ids,
+                                ),
+                            ),
+                        ),
+                    )
+                    return family_review(request, anchor)
+                assert not snapshot.versions
+                return judgment(relation="unresolved").model_copy(update={"schema_version": 3})
+
+        extractor = Extractor(proposal(second, predicate="语言", qualifiers={"document": "README"}))
+        reviewer = RacingReviewer()
+        job = await MemoryFormationEngine(store, extractor, reviewer).process(access, second)
+        assert extractor.calls == 1 and reviewer.calls == 2
+        assert job.plan is not None and job.plan.admissions[0].status == "deferred"
+        assert not (await store.reconciliation(access, first.scope)).versions
+
+
+def test_family_protocol_cannot_downgrade_or_authorize_mutation() -> None:
+    from weavria.memory import MemoryFamilyAlignment, MemoryFieldMatch
+
+    source = request()
+    cite = (
+        MemoryCitation(
+            source_id=source.primary_source_id or "missing", quote=source.documents[0].text
+        ),
+    )
+    family = MemoryFamilyAlignment(
+        candidate_index=0,
+        target_id="anchor",
+        target_revision=1,
+        matches=tuple(
+            MemoryFieldMatch(candidate_path=p, target_path=p, citations=cite)
+            for p in ("/subject", "/predicate")
+        ),
+    )
+    for version in (1, 2):
+        with pytest.raises(ValidationError):
+            MemoryReview(schema_version=version, judgments=judgment().judgments, families=(family,))
+        old = judgment().model_copy(update={"schema_version": version})
+        assert "families" not in old.model_dump()
+        assert MemoryReview.model_validate_json(old.model_dump_json()) == old
+    with pytest.raises(ValidationError):
+        MemoryReview(
+            schema_version=3,
+            judgments=judgment(relation="correction", target_id="anchor").judgments,
+            families=(family,),
+        )
+    with pytest.raises(ValidationError):
+        MemoryReview(schema_version=3, judgments=judgment().judgments, families=(family, family))
+    with pytest.raises(ValidationError, match="only maps subject and predicate"):
+        MemoryFamilyAlignment.model_validate(
+            {
+                **family.model_dump(),
+                "matches": (
+                    MemoryFieldMatch(candidate_path="/value", target_path="/value", citations=cite),
+                    family.matches[0],
+                ),
+            }
+        )
+
+
+async def test_family_reviewer_explicit_protocol_and_model_evidence(tmp_path: Path) -> None:
+    first, second = request(), request(2, "README 文档采用英文。")
+    async with SQLiteMemoryStore(tmp_path / "model-family.db") as store:
+        await MemoryFormationEngine(
+            store, Extractor(proposal(first)), Reviewer(judgment())
+        ).process(grant(first), first)
+        snapshot = await store.reconciliation(grant(first), first.scope)
+        review = family_review(second, snapshot.versions[0])
+        response = ModelResponse(
+            action=ToolCallAction(
+                call_id="review",
+                tool_name="review_memory",
+                arguments=review.model_dump(mode="json"),
+            )
+        )
+        model = FakeModelProvider((response, response))
+        extraction = proposal(second, predicate="语言", qualifiers={"document": "README"})
+        actual = await ModelMemoryReviewer(
+            model, configuration_id="test", family_alignment=True
+        ).review(second, extraction, snapshot, max_duration=1)
+        assert actual == review
+        assert '"families"' in model.requests[0].instructions
+        assert "No family link authorizes correction" in model.requests[0].instructions
+        assert second.documents[0].text in model.requests[0].task.goal
+        with pytest.raises(MemoryFormationError, match="different configured protocol"):
+            await ModelMemoryReviewer(model, configuration_id="test").review(
+                second, extraction, snapshot, max_duration=1
+            )
+
+
+@pytest.mark.parametrize("mode", ["distinct", "collision", "unsupported", "scope"])
+async def test_family_proposals_keep_batch_and_admission_boundaries(
+    tmp_path: Path, mode: str
+) -> None:
+    first, second = request(), request(2, "README 用英文, API 手册用中文, 其余保持一般规则。")
+    async with SQLiteMemoryStore(tmp_path / "family-boundaries.db") as store:
+        await MemoryFormationEngine(
+            store, Extractor(proposal(first)), Reviewer(judgment())
+        ).process(grant(first), first)
+        snapshot = await store.reconciliation(grant(first), first.scope)
+        anchor = snapshot.versions[0]
+        a = proposal(
+            second, predicate="语言", value="英文", qualifiers={"document": "README"}
+        ).candidates[0]
+        b = a.model_copy(
+            update={
+                "value": "中文",
+                "qualifiers": {"document": "README" if mode == "collision" else "API"},
+            }
+        )
+        if mode == "scope":
+            a = a.model_copy(update={"scope_kind": "user"})
+        review = family_review(second, anchor)
+        review = review.model_copy(
+            update={
+                "judgments": (
+                    review.judgments[0].model_copy(update={"supported": mode != "unsupported"}),
+                    review.judgments[0].model_copy(update={"candidate_index": 1}),
+                ),
+                "families": (
+                    review.families[0],
+                    review.families[0].model_copy(update={"candidate_index": 1}),
+                ),
+            }
+        )
+        plan = ConservativeMemoryAdmission().compile(
+            second, MemoryExtraction(candidates=(a, b)), snapshot, review
+        )
+        if mode == "collision":
+            assert not plan.batch.mutations
+            assert {d.reason for d in plan.admissions} == {"batch_target_collision"}
+        else:
+            assert len(plan.batch.mutations) == (2 if mode == "distinct" else 1)
+            if mode != "distinct":
+                assert plan.admissions[0].reason == (
+                    "unsupported" if mode == "unsupported" else "scope_mismatch"
+                )
+        assert all(m.operation == "add" for m in plan.batch.mutations)

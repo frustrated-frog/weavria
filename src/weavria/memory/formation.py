@@ -212,13 +212,32 @@ class MemoryAlignment(MemoryModel):
     matches: tuple[MemoryFieldMatch, ...] = Field(min_length=2, max_length=40)
 
 
+class MemoryFamilyAlignment(MemoryModel):
+    """同族归属只规范化主题与属性,不授权覆盖,也不改写适用条件。"""
+
+    candidate_index: int = Field(ge=0, lt=8)
+    target_id: Identifier
+    target_revision: int = Field(ge=1)
+    matches: tuple[MemoryFieldMatch, ...] = Field(min_length=2, max_length=2)
+
+    @model_validator(mode="after")
+    def validate_paths(self) -> Self:
+        if {(m.candidate_path, m.target_path) for m in self.matches} != {
+            ("/subject", "/subject"),
+            ("/predicate", "/predicate"),
+        }:
+            raise ValueError("family alignment only maps subject and predicate")
+        return self
+
+
 class MemoryReview(BaseModel):
-    """Versioned semantic review; v1 wire bytes remain unchanged."""
+    """Versioned semantic review; v1/v2 wire bytes remain unchanged."""
 
     model_config = MemoryModel.model_config
-    schema_version: Literal[1, 2] = 1
+    schema_version: Literal[1, 2, 3] = 1
     judgments: tuple[MemoryJudgment, ...] = Field(default=(), max_length=8)
     alignments: tuple[MemoryAlignment, ...] = Field(default=(), max_length=8)
+    families: tuple[MemoryFamilyAlignment, ...] = Field(default=(), max_length=8)
 
     @field_validator("schema_version", mode="before")
     @classmethod
@@ -229,6 +248,17 @@ class MemoryReview(BaseModel):
     def validate_alignments(self) -> Self:
         if self.schema_version == 1 and self.alignments:
             raise ValueError("field alignment requires review v2")
+        if self.schema_version < 3 and self.families:
+            raise ValueError("family alignment requires review v3")
+        family_indices = [a.candidate_index for a in self.families]
+        if len(family_indices) != len(set(family_indices)):
+            raise ValueError("one family anchor per candidate is required")
+        by_index = {j.candidate_index: j for j in self.judgments}
+        if any(
+            a.candidate_index not in by_index or by_index[a.candidate_index].relation != "new"
+            for a in self.families
+        ):
+            raise ValueError("family membership cannot authorize a target mutation")
         indices = [a.candidate_index for a in self.alignments]
         if len(indices) != len(set(indices)):
             raise ValueError("one alignment per candidate is required")
@@ -242,10 +272,12 @@ class MemoryReview(BaseModel):
         return self
 
     @model_serializer(mode="wrap")
-    def preserve_v1(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+    def preserve_legacy(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
         data = handler(self)
         if self.schema_version == 1:
             data.pop("alignments", None)
+        if self.schema_version < 3:
+            data.pop("families", None)
         return data
 
 
@@ -260,6 +292,7 @@ type MemoryAdmissionReason = Literal[
     "unknown_target",
     "different_conditions",
     "unsafe_relation",
+    "unsafe_family_alignment",
     "overlapping_new_fact",
     "batch_target_collision",
 ]

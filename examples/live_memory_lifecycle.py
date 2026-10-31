@@ -243,6 +243,7 @@ async def evaluate(
     dataset_path: Path,
     *,
     repeats: int = 2,
+    family_alignment: bool = False,
     on_record: Callable[[dict[str, object]], None] | None = None,
 ) -> dict[str, object]:
     if not 1 <= repeats <= 3:
@@ -315,7 +316,9 @@ async def evaluate(
                                         provider, configuration_id=configuration_id
                                     ),
                                     ModelMemoryReviewer(
-                                        provider, configuration_id=configuration_id
+                                        provider,
+                                        configuration_id=configuration_id,
+                                        family_alignment=family_alignment,
                                     ),
                                 )
                                 ingestor = SessionMemoryIngestor(session.store, formation)
@@ -422,6 +425,7 @@ async def evaluate(
         "configuration": asdict(config),
         "transport_options": options,
         "counter_version": counter.version,
+        "family_alignment": family_alignment,
         "repeats": repeats,
         "rows": rows,
     }
@@ -434,6 +438,7 @@ def main() -> None:
         "--dataset", type=Path, default=Path(__file__).parent / "data/memory_lifecycle/cases.json"
     )
     parser.add_argument("--repeats", type=int, default=2)
+    parser.add_argument("--family-alignment", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if not args.live:
@@ -453,7 +458,14 @@ def main() -> None:
             flush=True,
         )
 
-    report = asyncio.run(evaluate(args.dataset, repeats=args.repeats, on_record=progress))
+    report = asyncio.run(
+        evaluate(
+            args.dataset,
+            repeats=args.repeats,
+            family_alignment=args.family_alignment,
+            on_record=progress,
+        )
+    )
     args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
     print(f"结果已写入 {args.output}")
 

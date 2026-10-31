@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "dataset_version": "memory-family-transfer/1",
+  "cases": [
+    {
+      "id": "audience",
+      "inputs": [
+        "本项目的客户通知邮件从2026年1月1日零点起长期默认用中文撰写。",
+        "补充长期例外：本项目发给海外客户的通知邮件从2026年1月1日零点起用英文，其他客户通知邮件仍用中文。"
+      ],
+      "checks": [
+        {"after": 1, "day": 5, "question": "本项目默认用哪种语言写客户通知邮件？", "answer": "Chinese"},
+        {"after": 2, "day": 5, "question": "给海外客户的通知邮件应采用哪种语言？", "answer": "English"},
+        {"after": 2, "day": 5, "question": "给非海外客户的通知邮件应采用哪种语言？", "answer": "Chinese"}
+      ]
+    }
+  ]
+}

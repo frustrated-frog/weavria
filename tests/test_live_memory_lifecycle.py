@@ -23,12 +23,14 @@ def test_frozen_lifecycle_has_expiry_conflict_correction_and_retention() -> None
     assert not experiment.score('{"answer":"unknown","sources":[]}', check, None)["passed"]
 
 
+@pytest.mark.parametrize("family_alignment", [False, True])
 @pytest.mark.parametrize("failure", [False, True])
 async def test_actual_session_ingestion_reopen_consumption_and_failure_evidence(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     session_counter: OpenAICompatibleTokenCounter,
     failure: bool,
+    family_alignment: bool,
 ) -> None:
     path = tmp_path / "cases.json"
     path.write_text(
@@ -113,7 +115,7 @@ async def test_actual_session_ingestion_reopen_consumption_and_failure_evidence(
             else:
                 name = "review_memory"
                 output = {
-                    "schema_version": 2,
+                    "schema_version": 3 if family_alignment else 2,
                     "judgments": [
                         {
                             "candidate_index": 0,
@@ -171,7 +173,8 @@ async def test_actual_session_ingestion_reopen_consumption_and_failure_evidence(
     monkeypatch.setenv("WEAVRIA_MODEL_BASE_URL", "https://fixture.invalid")
     monkeypatch.setenv("WEAVRIA_MODEL_NAME", "fixture")
     monkeypatch.setenv("WEAVRIA_MODEL_API_KEY", "never-retain-key")
-    report = await experiment.evaluate(path, repeats=1)
+    report = await experiment.evaluate(path, repeats=1, family_alignment=family_alignment)
+    assert report["family_alignment"] is family_alignment
     encoded = json.dumps(report)
     assert "never-retain-key" not in encoded and "private-reasoning" not in encoded
     assert all(c.is_closed for c in clients)

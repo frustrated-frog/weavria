@@ -7,6 +7,8 @@ from pydantic import ValidationError
 from weavria.memory import (
     MemoryAlignment,
     MemoryCandidate,
+    MemoryFamilyAlignment,
+    MemoryFieldMatch,
     MemoryFormationInput,
     MemoryVersion,
 )
@@ -69,26 +71,8 @@ def align_candidate(
                 value not in candidate.text and value not in candidate.predicate
             ):
                 return None
-    documents = {d.source.source_id: d for d in request.documents}
-    cited_sources = {c.source_id for c in candidate.citations}
-    for match in alignment.matches:
-        if request.primary_source_id not in {c.source_id for c in match.citations}:
-            return None
-        for citation in match.citations:
-            document = documents.get(citation.source_id)
-            if (
-                document is None
-                or document.source.origin != "user"
-                or citation.source_id not in cited_sources
-            ):
-                return None
-            start = citation.start
-            if start is None:
-                start = document.text.find(citation.quote)
-                if start < 0 or document.text.find(citation.quote, start + 1) >= 0:
-                    return None
-            if document.text[start : start + len(citation.quote)] != citation.quote:
-                return None
+    if not grounded_matches(request, candidate, alignment.matches):
+        return None
     if any(not isinstance(value, str) for value in old.qualifiers.values()):
         return None
     value = old.value if ("/value", "/value") in pairs else candidate.value
@@ -106,3 +90,64 @@ def align_candidate(
         )
     except ValidationError:
         return None
+
+
+def grounded_matches(
+    request: MemoryFormationInput,
+    candidate: MemoryCandidate,
+    matches: tuple[MemoryFieldMatch, ...],
+) -> bool:
+    """引用来自焦点原文且逐字落地;只证明来源,不把模型语义判断升级为真理。"""
+    documents = {d.source.source_id: d for d in request.documents}
+    cited_sources = {c.source_id for c in candidate.citations}
+    for match in matches:
+        if request.primary_source_id not in {c.source_id for c in match.citations}:
+            return False
+        for citation in match.citations:
+            document = documents.get(citation.source_id)
+            if (
+                document is None
+                or document.source.origin != "user"
+                or citation.source_id not in cited_sources
+            ):
+                return False
+            start = citation.start
+            if start is None:
+                start = document.text.find(citation.quote)
+                if start < 0 or document.text.find(citation.quote, start + 1) >= 0:
+                    return False
+            if document.text[start : start + len(citation.quote)] != citation.quote:
+                return False
+    return True
+
+
+def align_family(
+    request: MemoryFormationInput,
+    candidate: MemoryCandidate,
+    target: MemoryVersion,
+    alignment: MemoryFamilyAlignment,
+) -> MemoryCandidate | None:
+    """借用已接受的族键,逐字保留候选条件、值、时间和来源。
+
+    与 align_candidate 的“同条件可修订”不同,这里允许例外加入同族。
+    只能引用同作用域的当前 semantic 版本;提交时还由 memory head CAS
+    防止复核期间被修订的锚点悄悄生效。此函数没有生成覆盖操作的权限。
+    """
+    old = target.assertion
+    if (
+        old.scope != request.scope
+        or old.kind != "semantic"
+        or target.status == "retracted"
+        or target.retired_head is not None
+        or alignment.target_id != old.memory_id
+        or alignment.target_revision != target.revision
+        or not grounded_matches(request, candidate, alignment.matches)
+    ):
+        return None
+    return MemoryCandidate.model_validate(
+        {
+            **candidate.model_dump(),
+            "subject": old.subject,
+            "predicate": old.predicate,
+        }
+    )

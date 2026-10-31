@@ -21,6 +21,8 @@ from .retrieval import rank_versions
 def group_identity(version: MemoryVersion) -> str:
     """Identify a fact family independently of value, conditions and revision."""
     a = version.assertion
+    # 形成准入可借用已接受锚点的规范键。召回只使用已落库的键,
+    # 不在读取时重新推断同义关系,避免相同快照随模型判断改变组成员。
     key = (a.scope.model_dump(mode="json"), a.kind, a.subject, a.predicate)
     return hashlib.sha256(json.dumps(key, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 

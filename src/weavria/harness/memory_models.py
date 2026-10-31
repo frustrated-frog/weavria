@@ -103,9 +103,14 @@ class ModelMemoryExtractor:
 class ModelMemoryReviewer:
     """A separate model call evaluates evidence and relationships; it is not a truth oracle."""
 
-    def __init__(self, provider: ModelProvider, *, configuration_id: str) -> None:
+    def __init__(
+        self, provider: ModelProvider, *, configuration_id: str, family_alignment: bool = False
+    ) -> None:
         self.provider = provider
-        self.version = f"model-memory-reviewer/2:{configuration_id}"
+        self._family_alignment = family_alignment
+        self.version = (
+            f"model-memory-reviewer/{'3' if family_alignment else '2.1'}:{configuration_id}"
+        )
 
     async def review(
         self,
@@ -134,7 +139,7 @@ class ModelMemoryReviewer:
             "differ. A conditional exception must not overwrite the general fact. If multiple "
             "targets would need joint revision, return unresolved. New evidence is not "
             "automatically more authoritative. Never choose a winner merely by recency. "
-            "Return schema_version=2. For every target relationship, provide an alignment "
+            "For every target relationship, provide an alignment "
             "binding candidate_index, target_id and target_revision from the snapshot. "
             "Each match has candidate_path, target_path and literal citations from the focal "
             "source (already cited by the candidate). Paths are /subject, /predicate, /value "
@@ -146,7 +151,25 @@ class ModelMemoryReviewer:
             "exception). If you cannot establish all correspondences, return unresolved. "
             "Several candidates may target one fact when they explicitly partition its whole "
             "valid interval: an unchanged prefix is equivalent, and a changed later segment "
-            "is change. The host validates the complete partition atomically.",
+            "is change. The host validates the complete partition atomically. "
+            + (
+                "Return schema_version=3. families is distinct from alignments: a NEW fact may "
+                "join an existing subject/property family despite different conditions or time. "
+                "For each such fact provide candidate_index, target_id, target_revision and "
+                "exactly two matches (/subject to /subject, /predicate to /predicate), with "
+                "literal focal citations as above. Choose an existing semantic assertion as "
+                "anchor; its value is not a winner. Compare meaning, not spelling or language. "
+                "Use families for conditional exceptions and disjoint validity intervals, even "
+                "when their subject/predicate spelling already matches. Keep all candidate "
+                "qualifiers, value and validity unchanged. Only map the same entity and property; "
+                "related topics alone do not establish a family. If a predicate embeds a condition "
+                "not explicitly retained in candidate qualifiers, return unresolved. Do not hide "
+                "a competing same-condition value as new: use conflict with a target alignment. "
+                "No family link authorizes correction or overwriting. If no family exists, omit "
+                "the link; if membership is ambiguous return unresolved."
+                if self._family_alignment
+                else "Return schema_version=2; omit families."
+            ),
             {
                 "input": request.model_dump(mode="json"),
                 "proposals": extraction.model_dump(mode="json"),
@@ -154,6 +177,6 @@ class ModelMemoryReviewer:
             },
             max_duration,
         )
-        if result.schema_version != 2:
-            raise MemoryFormationError("memory reviewer requires the v2 review protocol")
+        if result.schema_version != (3 if self._family_alignment else 2):
+            raise MemoryFormationError("memory reviewer returned a different configured protocol")
         return result

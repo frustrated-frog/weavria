@@ -24,7 +24,7 @@ from weavria.memory import (
     MemoryVersion,
 )
 
-from .memory_alignment import align_candidate
+from .memory_alignment import align_candidate, align_family
 from .memory_partition import partition_mutations
 
 
@@ -83,7 +83,7 @@ class ConservativeMemoryAdmission:
     conditions and interval mechanics; they cannot establish truth from language.
     """
 
-    version = "conservative-memory-admission/2"
+    version = "conservative-memory-admission/3"
 
     def compile(
         self,
@@ -105,6 +105,7 @@ class ConservativeMemoryAdmission:
         proposed: dict[int, MemoryMutation] = {}
         eligible: dict[int, MemoryCandidate] = {}
         alignments = {a.candidate_index: a for a in review.alignments}
+        families = {a.candidate_index: a for a in review.families}
         judgments = {j.candidate_index: j for j in review.judgments}
         groups: dict[str, list[int]] = defaultdict(list)
         for judgment in review.judgments:
@@ -125,8 +126,22 @@ class ConservativeMemoryAdmission:
                     candidate_index=i, status="deferred", reason="unresolved"
                 )
                 continue
+            if i in families:
+                family = families[i]
+                anchor = targets.get(family.target_id)
+                aligned_family = (
+                    align_family(request, candidate, anchor, family) if anchor is not None else None
+                )
+                if aligned_family is None:
+                    decisions[i] = MemoryAdmission(
+                        candidate_index=i, status="deferred", reason="unsafe_family_alignment"
+                    )
+                    continue
+                # 归组不授予覆盖权。后面的重叠检查仍会阻止同条件的新事实
+                # 绕过 equivalent/conflict/correction 路径;原候选保存在 extraction。
+                candidate = aligned_family
             target = targets.get(judgment.target_id or "")
-            if target is not None and review.schema_version == 2 and i not in alignments:
+            if target is not None and review.schema_version >= 2 and i not in alignments:
                 decisions[i] = MemoryAdmission(
                     candidate_index=i, status="deferred", reason="different_conditions"
                 )
