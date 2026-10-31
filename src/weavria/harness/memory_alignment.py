@@ -27,6 +27,7 @@ def align_candidate(
     alignment: MemoryAlignment,
     *,
     equivalent: bool,
+    allow_value_alignment: bool = False,
 ) -> MemoryCandidate | None:
     """Require revision binding, complete two-sided coverage and literal focal evidence.
 
@@ -41,10 +42,10 @@ def align_candidate(
     if len(pairs) != len(alignment.matches) or ("/subject", "/subject") not in pairs:
         return None
     allowed_special = {("/subject", "/subject")}
-    if equivalent:
+    if equivalent or allow_value_alignment:
         allowed_special.add(("/value", "/value"))
-        if candidate.value != old.value and ("/value", "/value") not in pairs:
-            return None
+    if equivalent and candidate.value != old.value and ("/value", "/value") not in pairs:
+        return None
     regular = pairs - allowed_special
     if {left for left, _ in regular} != candidate_paths or {
         right for _, right in regular
@@ -75,7 +76,9 @@ def align_candidate(
         return None
     if any(not isinstance(value, str) for value in old.qualifiers.values()):
         return None
-    value = old.value if ("/value", "/value") in pairs else candidate.value
+    # 字段对应不等于值相等。只有 equivalent 才复用旧值的规范表示;
+    # conflict/change/correction 的 /value 对应定位被比较的字段,必须保留新值。
+    value = old.value if equivalent and ("/value", "/value") in pairs else candidate.value
     if not isinstance(value, str):
         return None
     try:

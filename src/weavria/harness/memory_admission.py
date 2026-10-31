@@ -27,6 +27,7 @@ from weavria.memory import (
 
 from .memory_alignment import align_candidate, align_family
 from .memory_partition import partition_mutations
+from .memory_sets import compile_fact_sets
 
 
 class MemoryFormationError(MemoryError):
@@ -95,6 +96,11 @@ class ConservativeMemoryAdmission:
 
     version = "conservative-memory-admission/3"
 
+    def __init__(self, *, set_reconciliation: bool = False) -> None:
+        self._set_reconciliation = set_reconciliation
+        if set_reconciliation:
+            self.version = "fact-set-memory-admission/3"
+
     def compile(
         self,
         request: MemoryFormationInput,
@@ -107,6 +113,8 @@ class ConservativeMemoryAdmission:
             raise MemoryFormationError("reconciliation scope differs from source binding")
         extraction = ground_memory_candidates(request, extraction)
         review = MemoryReview.model_validate_json(review.model_dump_json())
+        if review.resolutions and not self._set_reconciliation:
+            raise MemoryFormationError("set resolutions require the fact-set admission policy")
         indices = [j.candidate_index for j in review.judgments]
         if sorted(indices) != list(range(len(extraction.candidates))):
             raise MemoryFormationError("review must cover each candidate exactly once")
@@ -124,6 +132,8 @@ class ConservativeMemoryAdmission:
             if judgment.target_id is not None:
                 groups[judgment.target_id].append(i)
             reason = self._rejection(request, candidate, judgment)
+            if extraction.modalities and extraction.modalities[i] in ("hypothetical", "quoted"):
+                reason = "non_factual_modality"
             if reason is not None:
                 decisions[i] = MemoryAdmission(candidate_index=i, status="rejected", reason=reason)
                 continue
@@ -164,6 +174,10 @@ class ConservativeMemoryAdmission:
                         target,
                         alignments[i],
                         equivalent=judgment.relation == "equivalent",
+                        # 对应描述字段角色,只有 equivalent 允许规范化成旧值。
+                        # 冲突与修订都保留候选值,再计算整个集合的时间变换。
+                        allow_value_alignment=self._set_reconciliation
+                        and judgment.relation in ("correction", "change", "conflict"),
                     )
                     if target is not None
                     else None
@@ -182,6 +196,13 @@ class ConservativeMemoryAdmission:
                     }
                 )
             eligible[i] = candidate
+
+        if self._set_reconciliation:
+            mutations, set_decisions = compile_fact_sets(
+                request, eligible, judgments, targets, review.resolutions
+            )
+            decisions.update(set_decisions)
+            return self._plan(request, extraction, snapshot, review, mutations, decisions)
 
         consumed: set[int] = set()
         joint: list[tuple[set[int], MemoryMutation]] = []
@@ -273,6 +294,17 @@ class ConservativeMemoryAdmission:
             *(retraction for members, retraction in joint if not members & collisions),
             *(proposed[i] for i in sorted(proposed)),
         )
+        return self._plan(request, extraction, snapshot, review, mutations, decisions)
+
+    def _plan(
+        self,
+        request: MemoryFormationInput,
+        extraction: MemoryExtraction,
+        snapshot: MemoryReconciliation,
+        review: MemoryReview,
+        mutations: tuple[MemoryMutation, ...],
+        decisions: dict[int, MemoryAdmission],
+    ) -> MemoryFormationPlan:
         used = {s for m in mutations for s in m.source_ids}
         used.update(s for m in mutations if m.assertion is not None for s in m.assertion.source_ids)
         identity = hashlib.sha256(

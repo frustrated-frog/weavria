@@ -20,6 +20,7 @@ from examples.live_memory_recall import IndividualReader
 from weavria.context import ContextCompilerConfig
 from weavria.core import FinishAction, ModelTurn, SessionContextCompiled, SessionRequest
 from weavria.harness import (
+    ConservativeMemoryAdmission,
     MemoryContextSource,
     MemoryFormationEngine,
     MemoryFormationError,
@@ -249,6 +250,9 @@ async def evaluate(
     repeats: int = 2,
     family_alignment: bool = False,
     generation_repairs: int | None = None,
+    fact_sets: bool = False,
+    thinking: Literal["enabled", "disabled"] = "enabled",
+    reasoning_effort: Literal["low", "high", "max"] = "high",
     on_record: Callable[[dict[str, object]], None] | None = None,
 ) -> dict[str, object]:
     if not 1 <= repeats <= 3:
@@ -256,12 +260,22 @@ async def evaluate(
     generation = (
         MemoryGenerationPolicy(generation_repairs) if generation_repairs is not None else None
     )
+    if fact_sets and (generation is None or not family_alignment):
+        raise ValueError("fact sets require family alignment and generation repairs configuration")
     raw = await asyncio.to_thread(dataset_path.read_bytes)
     dataset = Dataset.model_validate_json(raw)
     sources = await asyncio.to_thread(source_hashes)
     config = OpenAICompatibleConfig(model=os.environ["WEAVRIA_MODEL_NAME"], max_output_tokens=8192)
     timeout = float(os.environ.get("WEAVRIA_MODEL_TIMEOUT_SECONDS", "90"))
-    options: dict[str, object] = {"thinking": {"type": "enabled"}, "reasoning_effort": "high"}
+    # 默认保持既有冻结配置。显式关闭思考用于独立的成本/截断实验,
+    # 两个策略必须使用同一设置;不能把不同模型配置的成绩混成一次 A/B。
+    if thinking not in ("enabled", "disabled"):
+        raise ValueError("thinking must be enabled or disabled")
+    if reasoning_effort not in ("low", "high", "max"):
+        raise ValueError("reasoning_effort must be low, high or max")
+    options: dict[str, object] = {"thinking": {"type": thinking}}
+    if thinking == "enabled":
+        options["reasoning_effort"] = reasoning_effort
     configuration_id = hashlib.sha256(
         json.dumps(asdict(config) | options, sort_keys=True).encode()
     ).hexdigest()[:16]
@@ -324,12 +338,17 @@ async def evaluate(
                                         provider,
                                         configuration_id=configuration_id,
                                         generation=generation,
+                                        claim_modalities=fact_sets,
                                     ),
                                     ModelMemoryReviewer(
                                         provider,
                                         configuration_id=configuration_id,
                                         family_alignment=family_alignment,
                                         generation=generation,
+                                        set_reconciliation=fact_sets,
+                                    ),
+                                    admission=ConservativeMemoryAdmission(
+                                        set_reconciliation=fact_sets
                                     ),
                                 )
                                 ingestor = SessionMemoryIngestor(session.store, formation)
@@ -438,6 +457,7 @@ async def evaluate(
         "counter_version": counter.version,
         "family_alignment": family_alignment,
         "generation_repairs": generation_repairs,
+        "fact_sets": fact_sets,
         "repeats": repeats,
         "rows": rows,
     }
@@ -452,6 +472,9 @@ def main() -> None:
     parser.add_argument("--repeats", type=int, default=2)
     parser.add_argument("--family-alignment", action="store_true")
     parser.add_argument("--generation-repairs", type=int, choices=(0, 1, 2))
+    parser.add_argument("--fact-sets", action="store_true")
+    parser.add_argument("--thinking", choices=("enabled", "disabled"), default="enabled")
+    parser.add_argument("--reasoning-effort", choices=("low", "high", "max"), default="high")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if not args.live:
@@ -477,6 +500,9 @@ def main() -> None:
             repeats=args.repeats,
             family_alignment=args.family_alignment,
             generation_repairs=args.generation_repairs,
+            fact_sets=args.fact_sets,
+            thinking=args.thinking,
+            reasoning_effort=args.reasoning_effort,
             on_record=progress,
         )
     )

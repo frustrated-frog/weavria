@@ -44,8 +44,9 @@ def reduce_mutations(
 ) -> tuple[MemoryVersion, ...]:
     """Return new versions without mutating inputs; invalid preconditions reject the batch.
 
-    Supersede replaces an interval's tail; arbitrary interval surgery belongs to a
-    future protocol. A correction at its start retires the old claim altogether.
+    Supersede replaces an interval's tail. Harness fact-set reconciliation computes
+    general interval differences as atomic retract/add batches, including contested
+    residual fragments through v2 add. The reducer replays those admitted commands.
     """
     result: list[MemoryVersion] = []
     for mutation in batch.mutations:
@@ -58,7 +59,11 @@ def reduce_mutations(
             assert incoming is not None
             result.append(
                 MemoryVersion(
-                    assertion=incoming, revision=1, recorded_at=recorded_at, recorded_head=head
+                    assertion=incoming,
+                    revision=1,
+                    status=mutation.initial_status,
+                    recorded_at=recorded_at,
+                    recorded_head=head,
                 )
             )
             continue

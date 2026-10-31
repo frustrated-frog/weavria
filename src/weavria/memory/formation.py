@@ -92,8 +92,8 @@ class MemoryCitation(MemoryModel):
     start: int | None = Field(default=None, ge=0)
 
 
-class MemoryCandidate(MemoryModel):
-    """Untrusted semantic interpretation; no authority, scope ID or mutation privilege."""
+class MemoryProposition(MemoryModel):
+    """共享的语义命题字段;完整候选还必须绑定已接受的来源。"""
 
     # Mirror the existing cross-field validator in the model-visible schema. Persisted
     # v1 bytes do not change; this only closes a misleading generation contract.
@@ -141,7 +141,6 @@ class MemoryCandidate(MemoryModel):
     )
     valid_from: datetime | None = None
     valid_to: datetime | None = None
-    citations: tuple[MemoryCitation, ...] = Field(min_length=1, max_length=8)
 
     @model_validator(mode="after")
     def validate_time(self) -> Self:
@@ -161,11 +160,21 @@ class MemoryCandidate(MemoryModel):
         return self
 
 
+class MemoryCandidate(MemoryProposition):
+    """Untrusted semantic interpretation; no authority, scope ID or mutation privilege."""
+
+    citations: tuple[MemoryCitation, ...] = Field(min_length=1, max_length=8)
+
+
+type MemoryClaimModality = Literal["asserted", "reported", "hypothetical", "quoted"]
+
+
 class MemoryExtraction(BaseModel):
     model_config = MemoryModel.model_config
-    schema_version: Literal[1, 2] = 1
+    schema_version: Literal[1, 2, 3] = 1
     candidates: tuple[MemoryCandidate, ...] = Field(default=(), max_length=8)
     generation: MemoryGenerationReport | None = None
+    modalities: tuple[MemoryClaimModality, ...] = Field(default=(), max_length=8)
 
     @field_validator("schema_version", mode="before")
     @classmethod
@@ -174,7 +183,12 @@ class MemoryExtraction(BaseModel):
 
     @model_validator(mode="after")
     def validate_generation(self) -> Self:
-        validate_generation(self.generation, self.schema_version == 2, "extraction")
+        validate_generation(self.generation, self.schema_version >= 2, "extraction")
+        if self.schema_version == 3:
+            if len(self.modalities) != len(self.candidates):
+                raise ValueError("claim modality must cover every candidate")
+        elif self.modalities:
+            raise ValueError("claim modality requires extraction v3")
         return self
 
     @model_serializer(mode="wrap")
@@ -182,6 +196,8 @@ class MemoryExtraction(BaseModel):
         data = handler(self)
         if self.schema_version == 1:
             data.pop("generation", None)
+        if self.schema_version < 3:
+            data.pop("modalities", None)
         return data
 
 
@@ -262,15 +278,30 @@ class MemoryFamilyAlignment(MemoryModel):
         return self
 
 
+class MemoryResolution(MemoryModel):
+    """有来源的集合纠正:作用区间来自候选,不是模型生成的最终事实分片。"""
+
+    candidate_index: int = Field(ge=0, lt=8)
+    target_ids: tuple[Identifier, ...] = Field(min_length=1, max_length=128)
+    citations: tuple[MemoryCitation, ...] = Field(min_length=1, max_length=8)
+
+    @model_validator(mode="after")
+    def validate_targets(self) -> Self:
+        if len(set(self.target_ids)) != len(self.target_ids):
+            raise ValueError("resolution targets must be unique")
+        return self
+
+
 class MemoryReview(BaseModel):
     """Versioned semantic review; v1/v2 wire bytes remain unchanged."""
 
     model_config = MemoryModel.model_config
-    schema_version: Literal[1, 2, 3, 4] = 1
+    schema_version: Literal[1, 2, 3, 4, 5] = 1
     judgments: tuple[MemoryJudgment, ...] = Field(default=(), max_length=8)
     alignments: tuple[MemoryAlignment, ...] = Field(default=(), max_length=8)
     families: tuple[MemoryFamilyAlignment, ...] = Field(default=(), max_length=8)
     generation: MemoryGenerationReport | None = None
+    resolutions: tuple[MemoryResolution, ...] = Field(default=(), max_length=8)
 
     @field_validator("schema_version", mode="before")
     @classmethod
@@ -279,7 +310,20 @@ class MemoryReview(BaseModel):
 
     @model_validator(mode="after")
     def validate_alignments(self) -> Self:
-        validate_generation(self.generation, self.schema_version == 4, "review")
+        validate_generation(self.generation, self.schema_version >= 4, "review")
+        if self.resolutions and self.schema_version < 5:
+            raise ValueError("set resolution requires review v5")
+        resolution_indices = [r.candidate_index for r in self.resolutions]
+        if len(set(resolution_indices)) != len(resolution_indices):
+            raise ValueError("one resolution per candidate is required")
+        by_index = {j.candidate_index: j for j in self.judgments}
+        if any(
+            r.candidate_index not in by_index
+            or by_index[r.candidate_index].relation != "correction"
+            or by_index[r.candidate_index].target_id not in r.target_ids
+            for r in self.resolutions
+        ):
+            raise ValueError("resolution must bind its correction judgment and anchor")
         if self.schema_version == 1 and self.alignments:
             raise ValueError("field alignment requires review v2")
         if self.schema_version < 3 and self.families:
@@ -314,6 +358,8 @@ class MemoryReview(BaseModel):
             data.pop("families", None)
         if self.schema_version < 4:
             data.pop("generation", None)
+        if self.schema_version < 5:
+            data.pop("resolutions", None)
         return data
 
 
@@ -331,6 +377,10 @@ type MemoryAdmissionReason = Literal[
     "unsafe_family_alignment",
     "overlapping_new_fact",
     "batch_target_collision",
+    "non_factual_modality",
+    "incomplete_resolution",
+    "mixed_validity",
+    "competing_resolutions",
 ]
 
 

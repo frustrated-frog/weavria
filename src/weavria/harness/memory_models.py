@@ -14,8 +14,15 @@ from weavria.memory import (
 from weavria.models import ModelCallError, ModelProvider, call_model
 
 from .memory_admission import MemoryFormationError, ground_memory_candidates
+from .memory_evidence import index_memory_evidence
 from .memory_generation import MemoryGenerationPolicy, MemoryProposalError, generate_memory
-from .memory_review_wire import ExtractionWire, ReviewWire, legacy_review_schema
+from .memory_review_wire import (
+    ClaimExtractionWire,
+    ExtractionWire,
+    ReviewWire,
+    legacy_review_schema,
+)
+from .memory_set_wire import FactSetReviewWire
 
 
 async def _structured[T: BaseModel](
@@ -65,14 +72,21 @@ class ModelMemoryExtractor:
         *,
         configuration_id: str,
         generation: MemoryGenerationPolicy | None = None,
+        claim_modalities: bool = False,
     ) -> None:
+        if claim_modalities and generation is None:
+            raise ValueError("claim modalities require an explicit generation policy")
         self.provider = provider
         self._generation = generation
+        self._claim_modalities = claim_modalities
         self.version = (
             f"model-memory-extractor/3:{configuration_id};{generation.version}"
             if generation
             else f"model-memory-extractor/2.1:{configuration_id}"
         )
+        if claim_modalities:
+            assert generation is not None
+            self.version = f"model-memory-extractor/5:spans:{configuration_id};{generation.version}"
 
     async def extract(
         self,
@@ -84,7 +98,8 @@ class ModelMemoryExtractor:
             "Extract only durable facts, preferences, constraints or explicit corrections from "
             "the focal accepted user input. Use prior documents only to resolve references; "
             "every candidate must cite the focal source plus any needed earlier source. "
-            "Return zero candidates for casual talk, questions, one-off instructions, hypothetical "
+            "Return zero candidates for casual talk, questions, one-off instructions, "
+            "hypothetical "
             "examples or uncertain implications. Split independent claims. Do not invent details. "
             "Use author_subject only for a statement about the author, not for a statement "
             "about their project. For the bound project use input.scope.key as subject. "
@@ -110,6 +125,71 @@ class ModelMemoryExtractor:
             "Claims about changes and corrections must retain their wording in text and quotes."
         )
         payload: dict[str, object] = {"input": request.model_dump(mode="json")}
+        if self._claim_modalities:
+            assert self._generation is not None
+            evidence = index_memory_evidence(request)
+            payload = {"input": evidence.model_input}
+            # 将“材料确实报告了一个命题”和“该命题已经裁定为真”分开。
+            # 竞争说法各占一条 claim;不把整段争议摘要塞进 value 或 qualifiers。
+            instructions = (
+                "Extract atomic reusable facts, preferences, rules and corrections from the focal "
+                "accepted user input. Prior documents only resolve references. Each claim has one "
+                "subject, property, concise value, applicability conditions and validity interval. "
+                "Report actual competing rules separately even when nobody knows which is true. "
+                "Modality: asserted=direct statement/correction; reported=an actual existing "
+                "claim or record; hypothetical=possibility/suggestion; quoted=text only used in "
+                "a translation/example/task. A disputed existing claim is reported, not "
+                "hypothetical. "
+                "Do not turn denied or withdrawn statements into positive facts. For a correction "
+                "extract the corrected value and interval, retaining the full correction wording "
+                "in text and citations. Conflict, uncertainty, expiry and change are annotations "
+                "of these propositions, not additional standalone facts about rule status. "
+                "Retention=durable means useful across tasks, INCLUDING finite validity periods; "
+                "transient means a one-off task. Return zero claims when no reusable proposition "
+                "is expressed. Do not invent implications. Use input.scope.key as project subject; "
+                "author_subject only for author facts. Use concise stable property keys. "
+                "qualifiers express when/to what the rule applies: the governed document/audience, "
+                "not the document reporting a rule, the source identity, date or dispute status. "
+                "Preserve all real conditions and original-language condition values. A reaffirmed "
+                "general rule retains its original conditions; a new exception is a "
+                "separate claim. "
+                "scope_kind must match the statement's scope; never promote local facts "
+                "to user scope. "
+                "Each claim selects evidence indices from the supplied document spans. Include "
+                "at least one focal-document span plus necessary prior spans. The host restores "
+                "exact quotes and offsets: do not generate citations or count characters yourself. "
+                "Select enough spans to retain negation, attribution, "
+                "conditions and correction intent. "
+                "time_kind=unknown if unspecified, current only if explicitly effective now, dated "
+                "for explicit dates resolved to UTC using occurred_at/timezone. unknown/current "
+                "omit both valid_from/valid_to. dated supplies valid_from, valid_to only for an "
+                "explicit end; intervals are half-open. Never infer an expiry or start "
+                "from recency."
+            )
+
+            def ground_claims(wire: ClaimExtractionWire) -> MemoryExtraction:
+                try:
+                    return ground_memory_candidates(request, wire.proposals(evidence.citations))
+                except MemoryFormationError as exc:
+                    raise MemoryProposalError("invalid_evidence") from exc
+
+            claims, report = await generate_memory(
+                self.provider,
+                ClaimExtractionWire,
+                "propose_memory",
+                instructions,
+                payload,
+                max_duration,
+                stage="extraction",
+                policy=self._generation,
+                validate=ground_claims,
+            )
+            return MemoryExtraction(
+                schema_version=3,
+                candidates=ground_claims(claims).candidates,
+                modalities=tuple(c.modality for c in claims.claims),
+                generation=report,
+            )
         if self._generation is None:
             wire = await _structured(
                 self.provider, ExtractionWire, "propose_memory", instructions, payload, max_duration
@@ -150,15 +230,22 @@ class ModelMemoryReviewer:
         configuration_id: str,
         family_alignment: bool = False,
         generation: MemoryGenerationPolicy | None = None,
+        set_reconciliation: bool = False,
     ) -> None:
+        if set_reconciliation and (generation is None or not family_alignment):
+            raise ValueError("set reconciliation requires generation and family alignment")
         self.provider = provider
         self._family_alignment = family_alignment
         self._generation = generation
+        self._set_reconciliation = set_reconciliation
         self.version = (
             f"model-memory-reviewer/4:family={family_alignment}:{configuration_id};{generation.version}"
             if generation
             else f"model-memory-reviewer/{'3.1' if family_alignment else '2.2'}:{configuration_id}"
         )
+        if set_reconciliation:
+            assert generation is not None
+            self.version = f"model-memory-reviewer/6.1:sets:{configuration_id};{generation.version}"
 
     async def review(
         self,
@@ -224,6 +311,77 @@ class ModelMemoryReviewer:
             },
             "memory": snapshot.model_dump(mode="json"),
         }
+        if self._set_reconciliation:
+            assert self._generation is not None
+            payload["claim_modalities"] = extraction.modalities
+            payload["proposals"] = {
+                "candidates": [
+                    dict(index=i, **candidate.model_dump(mode="json"))
+                    for i, candidate in enumerate(extraction.candidates)
+                ]
+            }
+            payload["memory"] = {
+                "head": snapshot.head,
+                "versions": [
+                    dict(index=i, **v.model_dump(mode="json"))
+                    for i, v in enumerate(snapshot.versions)
+                ],
+            }
+            instructions = (
+                "Reconcile each candidate against the full evidence and memory snapshot. Return "
+                "one decision per candidate index. verdict checks factual support, scope, "
+                "conditions "
+                "and dates. An actual reported rule is supported as a proposition even "
+                "when disputed. "
+                "Hypothetical/quoted statements are irrelevant. Relations: new=no overlapping same-"
+                "condition fact; equivalent=same value; conflict=incompatible overlapping value; "
+                "change=explicit later change; correction=explicit earlier error; "
+                "unresolved=unclear; "
+                "irrelevant=not reusable. Recency alone never settles competing evidence. "
+                "anchor is the INDEX of a same-condition target for equivalent/conflict/change/"
+                "correction. For new, optionally anchor a same-entity/property family "
+                "with different "
+                "conditions/time. Omit anchor otherwise and leave mapping/resolves EMPTY: there is "
+                "no stored counterpart to map a standalone new fact onto. Only WITH an anchor, "
+                "mapping pairs candidate and target paths: /subject, /predicate, /value, "
+                "/qualifiers/<JSON-pointer-escaped-key>. Pair /subject with /subject. "
+                "For new-family map only subject and predicate. For other "
+                "target relations cover predicate and EVERY qualifier on BOTH sides; a condition "
+                "embedded in a predicate may map to an explicit qualifier. Never equate genuinely "
+                "different conditions. For equivalent values add /value to /value if "
+                "wording differs. "
+                "citations are indices in THIS candidate's citations supporting these "
+                "correspondences; "
+                "include focal evidence. Do not output quotes, target IDs or revisions. "
+                "When evidence explicitly settles the whole conflicting set in the candidate's "
+                "interval, use correction and resolves=[ALL affected memory INDICES], including "
+                "targets already agreeing with the corrected value. Exclude different conditions "
+                "and disjoint intervals. Without explicit settlement leave resolves empty. Partial "
+                "time corrections are allowed: the host retains unaffected intervals and computes "
+                "all fragments. Do not generate fragments or choose a winner for "
+                "unresolved conflict."
+            )
+            fact_wire, report = await generate_memory(
+                self.provider,
+                FactSetReviewWire,
+                "review_memory",
+                instructions,
+                payload,
+                max_duration,
+                stage="review",
+                policy=self._generation,
+                validate=lambda w: w.interpret(extraction, snapshot),
+            )
+            interpreted = fact_wire.interpret(extraction, snapshot)
+            result = interpreted.expand(extraction, families=True)
+            return MemoryReview.model_validate(
+                {
+                    **result.model_dump(),
+                    "schema_version": 5,
+                    "generation": report,
+                    "resolutions": interpreted.expand_resolutions(extraction),
+                }
+            )
         if self._generation is not None:
             # 模型只选择候选中已通过 grounding 的引用,不再反复抄写长原文。
             # wire schema_version=1 与持久 Review v4 是不同边界。

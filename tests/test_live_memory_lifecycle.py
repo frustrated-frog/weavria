@@ -3,7 +3,7 @@
 import asyncio
 import json
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import httpx
 import pytest
@@ -23,6 +23,7 @@ def test_frozen_lifecycle_has_expiry_conflict_correction_and_retention() -> None
     assert not experiment.score('{"answer":"unknown","sources":[]}', check, None)["passed"]
 
 
+@pytest.mark.parametrize("thinking", ["enabled", "disabled"])
 @pytest.mark.parametrize("generation", [False, True])
 @pytest.mark.parametrize("family_alignment", [False, True])
 @pytest.mark.parametrize("failure", [False, True])
@@ -33,7 +34,9 @@ async def test_actual_session_ingestion_reopen_consumption_and_failure_evidence(
     failure: bool,
     family_alignment: bool,
     generation: bool,
+    thinking: Literal["enabled", "disabled"],
 ) -> None:
+    fact_sets = thinking == "disabled" and generation and family_alignment
     path = tmp_path / "cases.json"
     path.write_text(
         json.dumps(
@@ -92,7 +95,7 @@ async def test_actual_session_ingestion_reopen_consumption_and_failure_evidence(
             }
         else:
             payload = json.loads(observations["task"]["goal"])
-            assert set(payload) <= {"input", "proposals", "memory"}
+            assert set(payload) <= {"input", "proposals", "memory", "claim_modalities"}
             source = payload["input"]
             if "proposals" not in payload:
                 name = "propose_memory"
@@ -102,7 +105,11 @@ async def test_actual_session_ingestion_reopen_consumption_and_failure_evidence(
                             "subject": "project",
                             "predicate": "documentation_language",
                             "value": "中文",
-                            "text": source["documents"][-1]["text"],
+                            "text": (
+                                "".join(s["text"] for s in source["documents"][-1]["spans"])
+                                if fact_sets
+                                else source["documents"][-1]["text"]
+                            ),
                             "scope_kind": "project",
                             "retention": "durable",
                             "time_kind": "dated",
@@ -129,6 +136,22 @@ async def test_actual_session_ingestion_reopen_consumption_and_failure_evidence(
                         }
                     ],
                 }
+            if fact_sets:
+                if name == "propose_memory":
+                    output = {
+                        "claims": [
+                            dict(
+                                {k: v for k, v in c.items() if k != "citations"},
+                                modality="asserted",
+                                evidence=[0],
+                            )
+                            for c in cast(list[dict[str, Any]], output["candidates"])
+                        ]
+                    }
+                else:
+                    output = {
+                        "decisions": [{"candidate": 0, "verdict": "supported", "relation": "new"}]
+                    }
             result = {
                 "action": {
                     "kind": "tool_call",
@@ -180,7 +203,18 @@ async def test_actual_session_ingestion_reopen_consumption_and_failure_evidence(
         repeats=1,
         family_alignment=family_alignment,
         generation_repairs=1 if generation else None,
+        thinking=thinking,
+        reasoning_effort="low" if family_alignment and generation else "high",
+        fact_sets=fact_sets,
     )
+    assert all(c["thinking"] == {"type": thinking} for c in calls)
+    assert all(("reasoning_effort" in c) == (thinking == "enabled") for c in calls)
+    if thinking == "enabled":
+        assert all(
+            c["reasoning_effort"] == ("low" if family_alignment and generation else "high")
+            for c in calls
+        )
+    assert report["fact_sets"] is fact_sets
     assert report["family_alignment"] is family_alignment
     encoded = json.dumps(report)
     assert "never-retain-key" not in encoded and "private-reasoning" not in encoded
@@ -209,6 +243,9 @@ async def test_actual_session_ingestion_reopen_consumption_and_failure_evidence(
             job = formed["jobs"][0]
             assert job["extraction"]["generation"]["stage"] == "extraction"
             assert job["plan"]["review"]["generation"]["stage"] == "review"
+            if fact_sets:
+                assert job["extraction"]["modalities"] == ["asserted"]
+                assert job["plan"]["review"]["schema_version"] == 5
         assert sum(r["score"]["passed"] for r in consumed) == 5
         assert all(r["formation_complete"] for r in consumed)
 

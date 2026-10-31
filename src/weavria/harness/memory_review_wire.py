@@ -7,11 +7,15 @@ from pydantic import Field, ValidationError
 from weavria.memory import (
     MemoryAlignment,
     MemoryCandidate,
+    MemoryCitation,
+    MemoryClaimModality,
     MemoryExtraction,
     MemoryFamilyAlignment,
     MemoryFieldMatch,
     MemoryJudgment,
     MemoryModel,
+    MemoryProposition,
+    MemoryResolution,
     MemoryReview,
 )
 
@@ -22,6 +26,35 @@ class ExtractionWire(MemoryModel):
     """模型不能自行生成宿主尝试收据。"""
 
     candidates: tuple[MemoryCandidate, ...] = Field(default=(), max_length=8)
+
+
+class ClaimWire(MemoryProposition):
+    modality: MemoryClaimModality
+    evidence: tuple[Annotated[int, Field(ge=0, lt=512)], ...] = Field(min_length=1, max_length=8)
+
+
+class ClaimExtractionWire(MemoryModel):
+    """先表达材料中的命题及言语模态,不要求提取器先选出它认为正确的事实。"""
+
+    claims: tuple[ClaimWire, ...] = Field(default=(), max_length=8)
+
+    def proposals(self, citations: tuple[MemoryCitation, ...]) -> MemoryExtraction:
+        if any(
+            len(set(c.evidence)) != len(c.evidence) or any(i >= len(citations) for i in c.evidence)
+            for c in self.claims
+        ):
+            raise MemoryProposalError("invalid_evidence")
+        return MemoryExtraction(
+            candidates=tuple(
+                MemoryCandidate.model_validate(
+                    {
+                        **c.model_dump(exclude={"modality", "evidence"}),
+                        "citations": tuple(citations[i] for i in c.evidence),
+                    }
+                )
+                for c in self.claims
+            )
+        )
 
 
 class CitationMatchWire(MemoryModel):
@@ -110,10 +143,60 @@ class ReviewWire(MemoryModel):
             raise MemoryProposalError("invalid_review") from exc
 
 
+class ResolutionWire(MemoryModel):
+    candidate_index: int = Field(ge=0, lt=8)
+    target_ids: tuple[str, ...] = Field(min_length=1, max_length=128)
+    citations: tuple[Annotated[int, Field(ge=0, lt=8)], ...] = Field(min_length=1, max_length=8)
+
+
+class SetReviewWire(ReviewWire):
+    resolutions: tuple[ResolutionWire, ...] = Field(default=(), max_length=8)
+
+    def expand_resolutions(self, extraction: MemoryExtraction) -> tuple[MemoryResolution, ...]:
+        """集合纠正指明语义意图与证据;区间分片由宿主计算。"""
+        base = self.expand(extraction, families=True)
+        judgments = {j.candidate_index: j for j in base.judgments}
+        if len({r.candidate_index for r in self.resolutions}) != len(self.resolutions):
+            raise MemoryProposalError("invalid_review")
+        result: list[MemoryResolution] = []
+        for resolution in self.resolutions:
+            judgment = judgments.get(resolution.candidate_index)
+            if (
+                judgment is None
+                or judgment.relation != "correction"
+                or judgment.target_id not in resolution.target_ids
+            ):
+                raise MemoryProposalError("invalid_review")
+            citations = extraction.candidates[resolution.candidate_index].citations
+            if len(set(resolution.citations)) != len(resolution.citations) or any(
+                i >= len(citations) for i in resolution.citations
+            ):
+                raise MemoryProposalError("invalid_review")
+            try:
+                result.append(
+                    MemoryResolution(
+                        candidate_index=resolution.candidate_index,
+                        target_ids=resolution.target_ids,
+                        citations=tuple(citations[i] for i in resolution.citations),
+                    )
+                )
+            except ValidationError as exc:
+                raise MemoryProposalError("invalid_review") from exc
+        if (
+            len(base.model_dump_json().encode())
+            + sum(len(r.model_dump_json().encode()) for r in result)
+            > 262144
+        ):
+            raise MemoryProposalError("oversized_output")
+        return tuple(result)
+
+
 def legacy_review_schema(*, families: bool) -> dict[str, object]:
     """旧完整引用模式也不向模型暴露宿主收据;持久化 Schema 不等于生成 Schema。"""
     schema = MemoryReview.model_json_schema()
     schema["properties"].pop("generation", None)
+    schema["properties"].pop("resolutions", None)
+    schema["$defs"].pop("MemoryResolution", None)
     schema["properties"]["schema_version"] = {"type": "integer", "const": 3 if families else 2}
     schema["$defs"].pop("MemoryGenerationReport", None)
     schema["$defs"].pop("MemoryGenerationAttempt", None)

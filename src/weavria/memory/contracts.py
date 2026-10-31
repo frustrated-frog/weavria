@@ -8,8 +8,10 @@ from pydantic import (
     ConfigDict,
     Field,
     JsonValue,
+    SerializerFunctionWrapHandler,
     StringConstraints,
     field_validator,
+    model_serializer,
     model_validator,
 )
 
@@ -126,18 +128,37 @@ class MemoryVersion(MemoryModel):
         return self
 
 
-class MemoryMutation(MemoryModel):
+class MemoryMutation(BaseModel):
     """An admitted host command, not an admission decision or model proposal."""
 
+    model_config = MemoryModel.model_config
+    schema_version: Literal[1, 2] = 1
     operation: Literal["add", "reinforce", "supersede", "contest", "retract"]
     assertion: MemoryAssertion | None = None
     target_id: Identifier | None = None
     expected_revision: int | None = Field(default=None, ge=1)
     source_ids: tuple[Identifier, ...] = Field(default=(), max_length=64)
     reason: Identifier
+    initial_status: Literal["active", "contested"] = "active"
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def validate_version(cls, value: object) -> object:
+        return MemoryModel.validate_version(value)
+
+    @model_serializer(mode="wrap")
+    def preserve_legacy(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        data = handler(self)
+        if self.schema_version == 1:
+            data.pop("initial_status", None)
+        return data
 
     @model_validator(mode="after")
     def validate_shape(self) -> Self:
+        if self.initial_status != "active" and (
+            self.schema_version != 2 or self.operation != "add"
+        ):
+            raise ValueError("initial contested status requires an explicit v2 add")
         needs_assertion = self.operation in ("add", "supersede", "contest")
         if (self.assertion is not None) != needs_assertion:
             raise ValueError("operation has incorrect assertion payload")

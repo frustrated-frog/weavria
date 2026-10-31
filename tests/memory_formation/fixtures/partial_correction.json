@@ -1,0 +1,535 @@
+{
+  "description": "领域无关合成情景的真实 deepseek-flash 语义结果；仅保留重现值字段复制错误所需的公开结构化输入，不含凭据、隐藏推理或原始供应商响应。",
+  "input": {
+    "schema_version": 1,
+    "scope": {
+      "schema_version": 1,
+      "tenant_id": "evaluation",
+      "kind": "project",
+      "key": "project"
+    },
+    "stream_id": "session:prior",
+    "position": 23,
+    "event_sha256": "435e21b06ceb807e1819496574c2c7ee6d168865b74a6e27d650823b689677b3",
+    "occurred_at": "2026-01-03T00:00:00Z",
+    "author_subject": "author",
+    "timezone": "UTC",
+    "primary_source_id": "session:prior:23",
+    "documents": [
+      {
+        "schema_version": 1,
+        "source": {
+          "schema_version": 1,
+          "source_id": "session:prior:1",
+          "scope": {
+            "schema_version": 1,
+            "tenant_id": "evaluation",
+            "kind": "project",
+            "key": "project"
+          },
+          "reference": "session:prior/event/1",
+          "content_sha256": "83f8c16dca4fbb420f50d976c6368b5e843a81a181963c2136967796bf509c83",
+          "origin": "user",
+          "observed_at": "2026-01-01T00:00:00Z"
+        },
+        "text": "本项目客户通知邮件从2026年1月1日零点起使用中文，长期有效。"
+      },
+      {
+        "schema_version": 1,
+        "source": {
+          "schema_version": 1,
+          "source_id": "session:prior:12",
+          "scope": {
+            "schema_version": 1,
+            "tenant_id": "evaluation",
+            "kind": "project",
+            "key": "project"
+          },
+          "reference": "session:prior/event/12",
+          "content_sha256": "dd26787230d3bd0e2ca3bf74574a895c18f786722a21d96ec4e7ae97f71b8e9b",
+          "origin": "user",
+          "observed_at": "2026-01-02T00:00:00Z"
+        },
+        "text": "另一个正式记录说本项目客户通知邮件从2026年1月1日零点起使用英文，同样长期有效。目前不能确定哪份记录正确，两条说法有未解决的冲突。"
+      },
+      {
+        "schema_version": 1,
+        "source": {
+          "schema_version": 1,
+          "source_id": "session:prior:23",
+          "scope": {
+            "schema_version": 1,
+            "tenant_id": "evaluation",
+            "kind": "project",
+            "key": "project"
+          },
+          "reference": "session:prior/event/23",
+          "content_sha256": "288af454d079549a354ddeeeec6083abfa163844b1cd27d769d00b9da05533fd",
+          "origin": "user",
+          "observed_at": "2026-01-03T00:00:00Z"
+        },
+        "text": "现仅核实2026年1月10日零点至1月20日零点这个区间：本项目客户通知邮件在这段时间一直应使用英文，中文记录对这个区间是错误的，该区间的争议已解决。这是纠正记录，不是宣布语言切换；1月10日以前和1月20日起的原争议仍未解决。"
+      }
+    ]
+  },
+  "extraction": {
+    "schema_version": 3,
+    "candidates": [
+      {
+        "schema_version": 1,
+        "subject": "project",
+        "predicate": "customer_notification_email_language",
+        "value": "中文",
+        "qualifiers": {},
+        "text": "本项目客户通知邮件从2026年1月1日零点起使用中文，长期有效。",
+        "scope_kind": "project",
+        "retention": "durable",
+        "time_kind": "dated",
+        "valid_from": "2026-01-01T00:00:00Z",
+        "valid_to": null,
+        "citations": [
+          {
+            "schema_version": 1,
+            "source_id": "session:prior:1",
+            "quote": "本项目客户通知邮件从2026年1月1日零点起使用中文，长期有效。",
+            "start": 0
+          },
+          {
+            "schema_version": 1,
+            "source_id": "session:prior:23",
+            "quote": "现仅核实2026年1月10日零点至1月20日零点这个区间：本项目客户通知邮件在这段时间一直应使用英文，中文记录对这个区间是错误的，该区间的争议已解决。这是纠正记录，不是宣布语言切换；1月10日以前和1月20日起的原争议仍未解决。",
+            "start": 0
+          }
+        ]
+      },
+      {
+        "schema_version": 1,
+        "subject": "project",
+        "predicate": "customer_notification_email_language",
+        "value": "英文",
+        "qualifiers": {},
+        "text": "另一个正式记录说本项目客户通知邮件从2026年1月1日零点起使用英文，同样长期有效。",
+        "scope_kind": "project",
+        "retention": "durable",
+        "time_kind": "dated",
+        "valid_from": "2026-01-01T00:00:00Z",
+        "valid_to": null,
+        "citations": [
+          {
+            "schema_version": 1,
+            "source_id": "session:prior:12",
+            "quote": "另一个正式记录说本项目客户通知邮件从2026年1月1日零点起使用英文，同样长期有效。目前不能确定哪份记录正确，两条说法有未解决的冲突。",
+            "start": 0
+          },
+          {
+            "schema_version": 1,
+            "source_id": "session:prior:23",
+            "quote": "现仅核实2026年1月10日零点至1月20日零点这个区间：本项目客户通知邮件在这段时间一直应使用英文，中文记录对这个区间是错误的，该区间的争议已解决。这是纠正记录，不是宣布语言切换；1月10日以前和1月20日起的原争议仍未解决。",
+            "start": 0
+          }
+        ]
+      },
+      {
+        "schema_version": 1,
+        "subject": "project",
+        "predicate": "customer_notification_email_language",
+        "value": "英文",
+        "qualifiers": {},
+        "text": "现仅核实2026年1月10日零点至1月20日零点这个区间：本项目客户通知邮件在这段时间一直应使用英文，中文记录对这个区间是错误的，该区间的争议已解决。这是纠正记录，不是宣布语言切换；1月10日以前和1月20日起的原争议仍未解决。",
+        "scope_kind": "project",
+        "retention": "durable",
+        "time_kind": "dated",
+        "valid_from": "2026-01-10T00:00:00Z",
+        "valid_to": "2026-01-20T00:00:00Z",
+        "citations": [
+          {
+            "schema_version": 1,
+            "source_id": "session:prior:1",
+            "quote": "本项目客户通知邮件从2026年1月1日零点起使用中文，长期有效。",
+            "start": 0
+          },
+          {
+            "schema_version": 1,
+            "source_id": "session:prior:23",
+            "quote": "现仅核实2026年1月10日零点至1月20日零点这个区间：本项目客户通知邮件在这段时间一直应使用英文，中文记录对这个区间是错误的，该区间的争议已解决。这是纠正记录，不是宣布语言切换；1月10日以前和1月20日起的原争议仍未解决。",
+            "start": 0
+          }
+        ]
+      }
+    ],
+    "generation": {
+      "schema_version": 1,
+      "stage": "extraction",
+      "policy_version": "memory-generation/1:repairs=1",
+      "attempts": [
+        {
+          "schema_version": 1,
+          "number": 1,
+          "reason": "accepted",
+          "request_sha256": "029eaeb3e2c5cbd3052556556cf5629ad6ea53aeb2e48b805af5f7637730f905",
+          "response_sha256": "d6264c6ecc1ae0b4dc8f81774de9320cfbcb639b288df40233683ca1c9592d7d",
+          "elapsed_ms": 10694.301957992138
+        }
+      ]
+    },
+    "modalities": [
+      "reported",
+      "reported",
+      "asserted"
+    ]
+  },
+  "snapshot": {
+    "schema_version": 1,
+    "scope": {
+      "schema_version": 1,
+      "tenant_id": "evaluation",
+      "kind": "project",
+      "key": "project"
+    },
+    "head": 22,
+    "versions": [
+      {
+        "schema_version": 1,
+        "assertion": {
+          "schema_version": 1,
+          "memory_id": "formed:8f5e6bac0573106860aff9afcf16c5e110a8e762a9a439f2f305842d849601da:set:7a7cd2d36b2eaf79bb438b526ad8dae872e55260e98643b37155ee9de1edfa11",
+          "scope": {
+            "schema_version": 1,
+            "tenant_id": "evaluation",
+            "kind": "project",
+            "key": "project"
+          },
+          "kind": "semantic",
+          "subject": "project",
+          "predicate": "customer_notification_email_language",
+          "value": "中文",
+          "qualifiers": {
+            "document": "客户通知邮件",
+            "audience": "客户"
+          },
+          "text": "本项目客户通知邮件从2026年1月1日零点起使用中文，长期有效。",
+          "source_ids": [
+            "session:prior:1"
+          ],
+          "authority": "user_statement",
+          "confidence": 0.5,
+          "epistemic_status": "stated",
+          "valid_from": "2026-01-01T00:00:00Z",
+          "valid_to": null
+        },
+        "revision": 1,
+        "status": "active",
+        "recorded_at": "2026-01-01T00:00:00Z",
+        "recorded_head": 1,
+        "retired_at": null,
+        "retired_head": null
+      }
+    ]
+  },
+  "review": {
+    "schema_version": 5,
+    "judgments": [
+      {
+        "schema_version": 1,
+        "candidate_index": 0,
+        "supported": true,
+        "scope_supported": true,
+        "conditions_preserved": true,
+        "time_supported": true,
+        "relation": "equivalent",
+        "target_id": "formed:8f5e6bac0573106860aff9afcf16c5e110a8e762a9a439f2f305842d849601da:set:7a7cd2d36b2eaf79bb438b526ad8dae872e55260e98643b37155ee9de1edfa11"
+      },
+      {
+        "schema_version": 1,
+        "candidate_index": 1,
+        "supported": true,
+        "scope_supported": true,
+        "conditions_preserved": true,
+        "time_supported": true,
+        "relation": "conflict",
+        "target_id": "formed:8f5e6bac0573106860aff9afcf16c5e110a8e762a9a439f2f305842d849601da:set:7a7cd2d36b2eaf79bb438b526ad8dae872e55260e98643b37155ee9de1edfa11"
+      },
+      {
+        "schema_version": 1,
+        "candidate_index": 2,
+        "supported": true,
+        "scope_supported": true,
+        "conditions_preserved": true,
+        "time_supported": true,
+        "relation": "correction",
+        "target_id": "formed:8f5e6bac0573106860aff9afcf16c5e110a8e762a9a439f2f305842d849601da:set:7a7cd2d36b2eaf79bb438b526ad8dae872e55260e98643b37155ee9de1edfa11"
+      }
+    ],
+    "alignments": [
+      {
+        "schema_version": 1,
+        "candidate_index": 0,
+        "target_id": "formed:8f5e6bac0573106860aff9afcf16c5e110a8e762a9a439f2f305842d849601da:set:7a7cd2d36b2eaf79bb438b526ad8dae872e55260e98643b37155ee9de1edfa11",
+        "target_revision": 1,
+        "matches": [
+          {
+            "schema_version": 1,
+            "candidate_path": "/subject",
+            "target_path": "/subject",
+            "citations": [
+              {
+                "schema_version": 1,
+                "source_id": "session:prior:1",
+                "quote": "本项目客户通知邮件从2026年1月1日零点起使用中文，长期有效。",
+                "start": 0
+              }
+            ]
+          },
+          {
+            "schema_version": 1,
+            "candidate_path": "/predicate",
+            "target_path": "/predicate",
+            "citations": [
+              {
+                "schema_version": 1,
+                "source_id": "session:prior:1",
+                "quote": "本项目客户通知邮件从2026年1月1日零点起使用中文，长期有效。",
+                "start": 0
+              }
+            ]
+          },
+          {
+            "schema_version": 1,
+            "candidate_path": "/predicate",
+            "target_path": "/qualifiers/document",
+            "citations": [
+              {
+                "schema_version": 1,
+                "source_id": "session:prior:1",
+                "quote": "本项目客户通知邮件从2026年1月1日零点起使用中文，长期有效。",
+                "start": 0
+              }
+            ]
+          },
+          {
+            "schema_version": 1,
+            "candidate_path": "/predicate",
+            "target_path": "/qualifiers/audience",
+            "citations": [
+              {
+                "schema_version": 1,
+                "source_id": "session:prior:1",
+                "quote": "本项目客户通知邮件从2026年1月1日零点起使用中文，长期有效。",
+                "start": 0
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "schema_version": 1,
+        "candidate_index": 1,
+        "target_id": "formed:8f5e6bac0573106860aff9afcf16c5e110a8e762a9a439f2f305842d849601da:set:7a7cd2d36b2eaf79bb438b526ad8dae872e55260e98643b37155ee9de1edfa11",
+        "target_revision": 1,
+        "matches": [
+          {
+            "schema_version": 1,
+            "candidate_path": "/subject",
+            "target_path": "/subject",
+            "citations": [
+              {
+                "schema_version": 1,
+                "source_id": "session:prior:12",
+                "quote": "另一个正式记录说本项目客户通知邮件从2026年1月1日零点起使用英文，同样长期有效。目前不能确定哪份记录正确，两条说法有未解决的冲突。",
+                "start": 0
+              },
+              {
+                "schema_version": 1,
+                "source_id": "session:prior:23",
+                "quote": "现仅核实2026年1月10日零点至1月20日零点这个区间：本项目客户通知邮件在这段时间一直应使用英文，中文记录对这个区间是错误的，该区间的争议已解决。这是纠正记录，不是宣布语言切换；1月10日以前和1月20日起的原争议仍未解决。",
+                "start": 0
+              }
+            ]
+          },
+          {
+            "schema_version": 1,
+            "candidate_path": "/predicate",
+            "target_path": "/predicate",
+            "citations": [
+              {
+                "schema_version": 1,
+                "source_id": "session:prior:12",
+                "quote": "另一个正式记录说本项目客户通知邮件从2026年1月1日零点起使用英文，同样长期有效。目前不能确定哪份记录正确，两条说法有未解决的冲突。",
+                "start": 0
+              },
+              {
+                "schema_version": 1,
+                "source_id": "session:prior:23",
+                "quote": "现仅核实2026年1月10日零点至1月20日零点这个区间：本项目客户通知邮件在这段时间一直应使用英文，中文记录对这个区间是错误的，该区间的争议已解决。这是纠正记录，不是宣布语言切换；1月10日以前和1月20日起的原争议仍未解决。",
+                "start": 0
+              }
+            ]
+          },
+          {
+            "schema_version": 1,
+            "candidate_path": "/predicate",
+            "target_path": "/qualifiers/document",
+            "citations": [
+              {
+                "schema_version": 1,
+                "source_id": "session:prior:12",
+                "quote": "另一个正式记录说本项目客户通知邮件从2026年1月1日零点起使用英文，同样长期有效。目前不能确定哪份记录正确，两条说法有未解决的冲突。",
+                "start": 0
+              },
+              {
+                "schema_version": 1,
+                "source_id": "session:prior:23",
+                "quote": "现仅核实2026年1月10日零点至1月20日零点这个区间：本项目客户通知邮件在这段时间一直应使用英文，中文记录对这个区间是错误的，该区间的争议已解决。这是纠正记录，不是宣布语言切换；1月10日以前和1月20日起的原争议仍未解决。",
+                "start": 0
+              }
+            ]
+          },
+          {
+            "schema_version": 1,
+            "candidate_path": "/predicate",
+            "target_path": "/qualifiers/audience",
+            "citations": [
+              {
+                "schema_version": 1,
+                "source_id": "session:prior:12",
+                "quote": "另一个正式记录说本项目客户通知邮件从2026年1月1日零点起使用英文，同样长期有效。目前不能确定哪份记录正确，两条说法有未解决的冲突。",
+                "start": 0
+              },
+              {
+                "schema_version": 1,
+                "source_id": "session:prior:23",
+                "quote": "现仅核实2026年1月10日零点至1月20日零点这个区间：本项目客户通知邮件在这段时间一直应使用英文，中文记录对这个区间是错误的，该区间的争议已解决。这是纠正记录，不是宣布语言切换；1月10日以前和1月20日起的原争议仍未解决。",
+                "start": 0
+              }
+            ]
+          },
+          {
+            "schema_version": 1,
+            "candidate_path": "/value",
+            "target_path": "/value",
+            "citations": [
+              {
+                "schema_version": 1,
+                "source_id": "session:prior:12",
+                "quote": "另一个正式记录说本项目客户通知邮件从2026年1月1日零点起使用英文，同样长期有效。目前不能确定哪份记录正确，两条说法有未解决的冲突。",
+                "start": 0
+              },
+              {
+                "schema_version": 1,
+                "source_id": "session:prior:23",
+                "quote": "现仅核实2026年1月10日零点至1月20日零点这个区间：本项目客户通知邮件在这段时间一直应使用英文，中文记录对这个区间是错误的，该区间的争议已解决。这是纠正记录，不是宣布语言切换；1月10日以前和1月20日起的原争议仍未解决。",
+                "start": 0
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "schema_version": 1,
+        "candidate_index": 2,
+        "target_id": "formed:8f5e6bac0573106860aff9afcf16c5e110a8e762a9a439f2f305842d849601da:set:7a7cd2d36b2eaf79bb438b526ad8dae872e55260e98643b37155ee9de1edfa11",
+        "target_revision": 1,
+        "matches": [
+          {
+            "schema_version": 1,
+            "candidate_path": "/subject",
+            "target_path": "/subject",
+            "citations": [
+              {
+                "schema_version": 1,
+                "source_id": "session:prior:23",
+                "quote": "现仅核实2026年1月10日零点至1月20日零点这个区间：本项目客户通知邮件在这段时间一直应使用英文，中文记录对这个区间是错误的，该区间的争议已解决。这是纠正记录，不是宣布语言切换；1月10日以前和1月20日起的原争议仍未解决。",
+                "start": 0
+              }
+            ]
+          },
+          {
+            "schema_version": 1,
+            "candidate_path": "/predicate",
+            "target_path": "/predicate",
+            "citations": [
+              {
+                "schema_version": 1,
+                "source_id": "session:prior:23",
+                "quote": "现仅核实2026年1月10日零点至1月20日零点这个区间：本项目客户通知邮件在这段时间一直应使用英文，中文记录对这个区间是错误的，该区间的争议已解决。这是纠正记录，不是宣布语言切换；1月10日以前和1月20日起的原争议仍未解决。",
+                "start": 0
+              }
+            ]
+          },
+          {
+            "schema_version": 1,
+            "candidate_path": "/predicate",
+            "target_path": "/qualifiers/document",
+            "citations": [
+              {
+                "schema_version": 1,
+                "source_id": "session:prior:23",
+                "quote": "现仅核实2026年1月10日零点至1月20日零点这个区间：本项目客户通知邮件在这段时间一直应使用英文，中文记录对这个区间是错误的，该区间的争议已解决。这是纠正记录，不是宣布语言切换；1月10日以前和1月20日起的原争议仍未解决。",
+                "start": 0
+              }
+            ]
+          },
+          {
+            "schema_version": 1,
+            "candidate_path": "/predicate",
+            "target_path": "/qualifiers/audience",
+            "citations": [
+              {
+                "schema_version": 1,
+                "source_id": "session:prior:23",
+                "quote": "现仅核实2026年1月10日零点至1月20日零点这个区间：本项目客户通知邮件在这段时间一直应使用英文，中文记录对这个区间是错误的，该区间的争议已解决。这是纠正记录，不是宣布语言切换；1月10日以前和1月20日起的原争议仍未解决。",
+                "start": 0
+              }
+            ]
+          },
+          {
+            "schema_version": 1,
+            "candidate_path": "/value",
+            "target_path": "/value",
+            "citations": [
+              {
+                "schema_version": 1,
+                "source_id": "session:prior:23",
+                "quote": "现仅核实2026年1月10日零点至1月20日零点这个区间：本项目客户通知邮件在这段时间一直应使用英文，中文记录对这个区间是错误的，该区间的争议已解决。这是纠正记录，不是宣布语言切换；1月10日以前和1月20日起的原争议仍未解决。",
+                "start": 0
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "families": [],
+    "generation": {
+      "schema_version": 1,
+      "stage": "review",
+      "policy_version": "memory-generation/1:repairs=1",
+      "attempts": [
+        {
+          "schema_version": 1,
+          "number": 1,
+          "reason": "accepted",
+          "request_sha256": "1a272813c682fe730d360b2248a17219c6f0189456a51927779debdd4c0c5e40",
+          "response_sha256": "56dc1e8d0663db7d0944442136fed936f8a2ecb9b1382a8abc514fc65b08330b",
+          "elapsed_ms": 35531.68808299233
+        }
+      ]
+    },
+    "resolutions": [
+      {
+        "schema_version": 1,
+        "candidate_index": 2,
+        "target_ids": [
+          "formed:8f5e6bac0573106860aff9afcf16c5e110a8e762a9a439f2f305842d849601da:set:7a7cd2d36b2eaf79bb438b526ad8dae872e55260e98643b37155ee9de1edfa11"
+        ],
+        "citations": [
+          {
+            "schema_version": 1,
+            "source_id": "session:prior:23",
+            "quote": "现仅核实2026年1月10日零点至1月20日零点这个区间：本项目客户通知邮件在这段时间一直应使用英文，中文记录对这个区间是错误的，该区间的争议已解决。这是纠正记录，不是宣布语言切换；1月10日以前和1月20日起的原争议仍未解决。",
+            "start": 0
+          }
+        ]
+      }
+    ]
+  }
+}
