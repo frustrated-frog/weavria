@@ -11,6 +11,7 @@ from .contracts import (
     MemoryError,
     MemoryEvent,
     MemoryHit,
+    MemoryModel,
     MemoryMutation,
     MemoryQuery,
     MemoryRecall,
@@ -37,6 +38,7 @@ from .formation import (
     MemoryReconciliation,
     MemoryReview,
 )
+from .generation import MemoryGenerationAttempt, MemoryGenerationReason, MemoryGenerationReport
 from .groups import MemoryGroup, MemoryGroupRecall
 from .store import SQLiteMemoryStore
 
@@ -62,10 +64,14 @@ __all__ = [
     "MemoryFormationInput",
     "MemoryFormationJob",
     "MemoryFormationPlan",
+    "MemoryGenerationAttempt",
+    "MemoryGenerationReason",
+    "MemoryGenerationReport",
     "MemoryGroup",
     "MemoryGroupRecall",
     "MemoryHit",
     "MemoryJudgment",
+    "MemoryModel",
     "MemoryMutation",
     "MemoryQuery",
     "MemoryRecall",

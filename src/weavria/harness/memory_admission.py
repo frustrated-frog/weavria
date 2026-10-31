@@ -17,6 +17,7 @@ from weavria.memory import (
     MemoryExtraction,
     MemoryFormationInput,
     MemoryFormationPlan,
+    MemoryGenerationReport,
     MemoryJudgment,
     MemoryMutation,
     MemoryReconciliation,
@@ -30,6 +31,10 @@ from .memory_partition import partition_mutations
 
 class MemoryFormationError(MemoryError):
     """Invalid source grounding or semantic output; the source remains unconsumed."""
+
+    def __init__(self, message: str, *, generation: MemoryGenerationReport | None = None) -> None:
+        super().__init__(message)
+        self.generation = generation
 
 
 def ground_memory_candidates(
@@ -57,7 +62,12 @@ def ground_memory_candidates(
                 raise MemoryFormationError("quote does not match its source range")
             citations.append(citation.model_copy(update={"start": start}))
         candidates.append(candidate.model_copy(update={"citations": tuple(citations)}))
-    return MemoryExtraction(candidates=tuple(candidates))
+    return MemoryExtraction.model_validate(
+        {
+            **extraction.model_dump(),
+            "candidates": tuple(candidates),
+        }
+    )
 
 
 def _key(assertion: MemoryAssertion) -> tuple[str, str, str]:

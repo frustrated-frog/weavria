@@ -22,6 +22,8 @@ from weavria.core import FinishAction, ModelTurn, SessionContextCompiled, Sessio
 from weavria.harness import (
     MemoryContextSource,
     MemoryFormationEngine,
+    MemoryFormationError,
+    MemoryGenerationPolicy,
     ModelMemoryExtractor,
     ModelMemoryReviewer,
     SessionMemoryBinding,
@@ -229,6 +231,8 @@ async def failure_audit(
         if cause is None:
             break
         item: dict[str, object] = {"type": type(cause).__name__}
+        if isinstance(cause, MemoryFormationError) and cause.generation is not None:
+            item["generation"] = cause.generation.model_dump(mode="json")
         if isinstance(cause, ModelCallError):
             item["category"] = cause.error.category.value
             item["output_diagnostic"] = (
@@ -244,10 +248,14 @@ async def evaluate(
     *,
     repeats: int = 2,
     family_alignment: bool = False,
+    generation_repairs: int | None = None,
     on_record: Callable[[dict[str, object]], None] | None = None,
 ) -> dict[str, object]:
     if not 1 <= repeats <= 3:
         raise ValueError("repeats must be in [1,3]")
+    generation = (
+        MemoryGenerationPolicy(generation_repairs) if generation_repairs is not None else None
+    )
     raw = await asyncio.to_thread(dataset_path.read_bytes)
     dataset = Dataset.model_validate_json(raw)
     sources = await asyncio.to_thread(source_hashes)
@@ -313,12 +321,15 @@ async def evaluate(
                                 formation = MemoryFormationEngine(
                                     memory,
                                     ModelMemoryExtractor(
-                                        provider, configuration_id=configuration_id
+                                        provider,
+                                        configuration_id=configuration_id,
+                                        generation=generation,
                                     ),
                                     ModelMemoryReviewer(
                                         provider,
                                         configuration_id=configuration_id,
                                         family_alignment=family_alignment,
+                                        generation=generation,
                                     ),
                                 )
                                 ingestor = SessionMemoryIngestor(session.store, formation)
@@ -426,6 +437,7 @@ async def evaluate(
         "transport_options": options,
         "counter_version": counter.version,
         "family_alignment": family_alignment,
+        "generation_repairs": generation_repairs,
         "repeats": repeats,
         "rows": rows,
     }
@@ -439,6 +451,7 @@ def main() -> None:
     )
     parser.add_argument("--repeats", type=int, default=2)
     parser.add_argument("--family-alignment", action="store_true")
+    parser.add_argument("--generation-repairs", type=int, choices=(0, 1, 2))
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if not args.live:
@@ -463,6 +476,7 @@ def main() -> None:
             args.dataset,
             repeats=args.repeats,
             family_alignment=args.family_alignment,
+            generation_repairs=args.generation_repairs,
             on_record=progress,
         )
     )

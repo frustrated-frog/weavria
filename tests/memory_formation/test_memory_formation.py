@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Literal
 
 import pytest
-from pydantic import ValidationError
+from pydantic import JsonValue, ValidationError
 
 from weavria.core import FinishAction, ModelResponse, ToolCallAction
 from weavria.harness import (
@@ -1365,3 +1365,255 @@ async def test_family_proposals_keep_batch_and_admission_boundaries(
                     "unsupported" if mode == "unsupported" else "scope_mismatch"
                 )
         assert all(m.operation == "add" for m in plan.batch.mutations)
+
+
+def proposal_response(
+    arguments: dict[str, JsonValue], name: str = "propose_memory"
+) -> ModelResponse:
+    return ModelResponse(
+        action=ToolCallAction(call_id="proposal", tool_name=name, arguments=arguments)
+    )
+
+
+@pytest.mark.parametrize("defect", ["action", "schema", "citation", "receipt"])
+async def test_generation_repairs_only_unaccepted_proposal_and_persists_receipt(
+    tmp_path: Path, defect: str
+) -> None:
+    from weavria.harness import MemoryGenerationPolicy
+
+    source = request()
+    good = proposal_response(proposal(source).model_dump(mode="json"))
+    if defect == "action":
+        bad = ModelResponse(action=FinishAction(output="untrusted-instruction"))
+    elif defect == "schema":
+        bad = proposal_response({"candidates": "untrusted-instruction"})
+    elif defect == "receipt":
+        bad = proposal_response(
+            {**proposal(source).model_dump(mode="json"), "generation": {"stage": "extraction"}}
+        )
+    else:
+        bad = proposal_response(
+            proposal(
+                source,
+                citations=(
+                    MemoryCitation(
+                        source_id=source.primary_source_id or "missing",
+                        quote="untrusted-instruction",
+                    ),
+                ),
+            ).model_dump(mode="json")
+        )
+    model = FakeModelProvider((bad, good))
+    extractor = ModelMemoryExtractor(
+        model, configuration_id="test", generation=MemoryGenerationPolicy()
+    )
+    path = tmp_path / "repair.db"
+    async with SQLiteMemoryStore(path) as store:
+        job = await MemoryFormationEngine(store, extractor, Reviewer(judgment())).process(
+            grant(source), source
+        )
+        assert job.extraction is not None and job.extraction.generation is not None
+        assert job.extraction.schema_version == 2
+        attempts = job.extraction.generation.attempts
+        assert [a.reason for a in attempts] == [
+            {
+                "action": "wrong_action",
+                "schema": "schema_mismatch",
+                "citation": "invalid_evidence",
+                "receipt": "schema_mismatch",
+            }[defect],
+            "accepted",
+        ]
+        assert attempts[0].request_sha256 != attempts[1].request_sha256
+        assert model.requests[0].task == model.requests[1].task
+        assert "untrusted-instruction" not in model.requests[1].instructions
+        assert "untrusted-instruction" not in job.model_dump_json()
+        assert len(await store.events(grant(source), source.scope)) == 1
+    async with SQLiteMemoryStore(path) as store:
+        saved = await store.formation(grant(source), source.scope, source.identity())
+        assert saved == job
+        assert (
+            await MemoryFormationEngine(store, extractor, Reviewer(judgment())).process(
+                grant(source), source
+            )
+            == job
+        )
+        assert len(model.requests) == 2
+
+
+async def test_compact_review_references_cannot_escape_candidate_or_skip_judgment(
+    tmp_path: Path,
+) -> None:
+    from weavria.harness import MemoryGenerationPolicy
+
+    first, second = request(), request(2, "README 长期使用英文。")
+    async with SQLiteMemoryStore(tmp_path / "compact.db") as store:
+        await MemoryFormationEngine(
+            store, Extractor(proposal(first)), Reviewer(judgment())
+        ).process(grant(first), first)
+        snapshot = await store.reconciliation(grant(first), first.scope)
+        extraction = ground_memory_candidates(
+            second,
+            proposal(second, qualifiers={"document": "README"}, predicate="语言", value="英文"),
+        )
+        expanded = family_review(second, snapshot.versions[0])
+        wire = expanded.model_dump(mode="json")
+        wire["schema_version"] = 1
+        for match in wire["families"][0]["matches"]:
+            match["citations"] = [0]
+        invalid = json.loads(json.dumps(wire))
+        invalid["families"][0]["matches"][0]["citations"] = [1]  # 单个候选只有一个引用。
+        model = FakeModelProvider(
+            (proposal_response(invalid, "review_memory"), proposal_response(wire, "review_memory"))
+        )
+        reviewer = ModelMemoryReviewer(
+            model,
+            configuration_id="test",
+            family_alignment=True,
+            generation=MemoryGenerationPolicy(),
+        )
+        reviewed = await reviewer.review(second, extraction, snapshot, max_duration=1)
+        assert reviewed.schema_version == 4 and reviewed.generation is not None
+        assert [a.reason for a in reviewed.generation.attempts] == ["invalid_review", "accepted"]
+        assert reviewed.families[0].matches[0].citations == extraction.candidates[0].citations
+        engine = MemoryFormationEngine(store, Extractor(extraction), Reviewer(reviewed))
+        job = await engine.process(grant(first), second)
+        assert job.plan is not None and job.plan.review == reviewed
+        await store.rebuild(grant(first), first.scope)
+        assert (await store.formation(grant(first), second.scope, second.identity())) == job
+        skipped: dict[str, JsonValue] = {"judgments": []}
+        failing = ModelMemoryReviewer(
+            FakeModelProvider((proposal_response(skipped, "review_memory"),)),
+            configuration_id="bad",
+            generation=MemoryGenerationPolicy(max_repairs=0),
+        )
+        with pytest.raises(MemoryFormationError) as caught:
+            await failing.review(second, extraction, snapshot, max_duration=1)
+        assert caught.value.generation is not None
+        assert caught.value.generation.attempts[0].reason == "invalid_review"
+
+
+@pytest.mark.parametrize("failure", ["protocol", "truncated", "dependency"])
+async def test_generation_provider_classification_and_attempt_ceiling(failure: str) -> None:
+    from weavria.core import ModelOutputDiagnostic, ModelRequest
+    from weavria.harness import MemoryGenerationPolicy
+    from weavria.models import ModelCapabilities, ModelOutputError
+
+    class BrokenProvider:
+        capabilities = ModelCapabilities(tool_calls=True)
+        calls = 0
+
+        async def generate(self, request: ModelRequest) -> ModelResponse:
+            self.calls += 1
+            if failure == "dependency":
+                raise OSError("private-key-must-not-be-repeated")
+            raise ModelOutputError(
+                "private-invalid-response",
+                diagnostic=ModelOutputDiagnostic(
+                    code="output_truncated" if failure == "truncated" else "schema_mismatch",
+                    repairable=failure != "truncated",
+                ),
+            )
+
+    model = BrokenProvider()
+    extractor = ModelMemoryExtractor(
+        model, configuration_id="test", generation=MemoryGenerationPolicy(max_repairs=2)
+    )
+    with pytest.raises(MemoryFormationError) as caught:
+        await extractor.extract(request(), max_duration=1)
+    assert model.calls == (3 if failure == "protocol" else 1)
+    receipt = caught.value.generation
+    assert receipt is not None and len(receipt.attempts) == model.calls
+    assert (
+        receipt.attempts[-1].reason
+        == {
+            "protocol": "invalid_output",
+            "truncated": "output_truncated",
+            "dependency": "dependency_failure",
+        }[failure]
+    )
+    assert "private" not in receipt.model_dump_json()
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_generation_total_deadline_and_cancellation_own_repair(cancel: bool) -> None:
+    from weavria.core import ModelRequest
+    from weavria.harness import MemoryGenerationPolicy
+    from weavria.models import ModelCapabilities
+
+    started, released = asyncio.Event(), asyncio.Event()
+
+    class WaitingProvider:
+        capabilities = ModelCapabilities(tool_calls=True)
+        calls = 0
+
+        async def generate(self, request: ModelRequest) -> ModelResponse:
+            self.calls += 1
+            if self.calls == 1:
+                return ModelResponse(action=FinishAction(output="not a proposal"))
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                released.set()
+            raise AssertionError
+
+    model = WaitingProvider()
+    task = asyncio.create_task(
+        ModelMemoryExtractor(
+            model, configuration_id="test", generation=MemoryGenerationPolicy(max_repairs=2)
+        ).extract(request(), max_duration=10 if cancel else 0.03)
+    )
+    await started.wait()
+    if cancel:
+        task.cancel()
+    with pytest.raises(asyncio.CancelledError if cancel else TimeoutError):
+        await task
+    assert released.is_set() and model.calls == 2
+
+
+@pytest.mark.parametrize("large", [False, True])
+def test_compact_reference_expansion_is_bounded_without_dropping_evidence(large: bool) -> None:
+    from weavria.harness.memory_generation import MemoryProposalError
+    from weavria.harness.memory_review_wire import ReviewWire
+
+    source = request(text="这是一段供复核的原始证据。" * 200)
+    extraction = proposal(source)
+    candidate = extraction.candidates[0]
+    # 18 个字段共享长引用。超大变体有 8 个引用,必须在展开时拒绝,
+    # 不能因 wire 只有整数就绕过宿主容量。此测试只验证表示与容量。
+    if large:
+        candidate = candidate.model_copy(update={"citations": candidate.citations * 8})
+        extraction = MemoryExtraction(candidates=(candidate,))
+    paths = ("/subject", "/predicate", *(f"/qualifiers/k{i}" for i in range(16)))
+    raw = {
+        "judgments": [
+            judgment(relation="correction", target_id="anchor").judgments[0].model_dump(mode="json")
+        ],
+        "alignments": [
+            {
+                "candidate_index": 0,
+                "target_id": "anchor",
+                "target_revision": 1,
+                "matches": [
+                    {
+                        "candidate_path": p,
+                        "target_path": p,
+                        "citations": list(range(8)) if large else [0],
+                    }
+                    for p in paths
+                ],
+            }
+        ],
+    }
+    wire = ReviewWire.model_validate_json(json.dumps(raw))
+    if large:
+        with pytest.raises(MemoryProposalError, match="oversized_output"):
+            wire.expand(extraction, families=False)
+    else:
+        expanded = wire.expand(extraction, families=False)
+        assert (
+            len(wire.model_dump_json().encode()) < 65536 < len(expanded.model_dump_json().encode())
+        )
+        assert len(expanded.model_dump_json().encode()) <= 262144
+        assert all(m.citations == candidate.citations for m in expanded.alignments[0].matches)

@@ -23,6 +23,7 @@ def test_frozen_lifecycle_has_expiry_conflict_correction_and_retention() -> None
     assert not experiment.score('{"answer":"unknown","sources":[]}', check, None)["passed"]
 
 
+@pytest.mark.parametrize("generation", [False, True])
 @pytest.mark.parametrize("family_alignment", [False, True])
 @pytest.mark.parametrize("failure", [False, True])
 async def test_actual_session_ingestion_reopen_consumption_and_failure_evidence(
@@ -31,6 +32,7 @@ async def test_actual_session_ingestion_reopen_consumption_and_failure_evidence(
     session_counter: OpenAICompatibleTokenCounter,
     failure: bool,
     family_alignment: bool,
+    generation: bool,
 ) -> None:
     path = tmp_path / "cases.json"
     path.write_text(
@@ -115,7 +117,7 @@ async def test_actual_session_ingestion_reopen_consumption_and_failure_evidence(
             else:
                 name = "review_memory"
                 output = {
-                    "schema_version": 3 if family_alignment else 2,
+                    "schema_version": 1 if generation else (3 if family_alignment else 2),
                     "judgments": [
                         {
                             "candidate_index": 0,
@@ -173,7 +175,12 @@ async def test_actual_session_ingestion_reopen_consumption_and_failure_evidence(
     monkeypatch.setenv("WEAVRIA_MODEL_BASE_URL", "https://fixture.invalid")
     monkeypatch.setenv("WEAVRIA_MODEL_NAME", "fixture")
     monkeypatch.setenv("WEAVRIA_MODEL_API_KEY", "never-retain-key")
-    report = await experiment.evaluate(path, repeats=1, family_alignment=family_alignment)
+    report = await experiment.evaluate(
+        path,
+        repeats=1,
+        family_alignment=family_alignment,
+        generation_repairs=1 if generation else None,
+    )
     assert report["family_alignment"] is family_alignment
     encoded = json.dumps(report)
     assert "never-retain-key" not in encoded and "private-reasoning" not in encoded
@@ -186,6 +193,10 @@ async def test_actual_session_ingestion_reopen_consumption_and_failure_evidence(
     assert formed["blocked"] == failure
     if failure:
         assert formed["error"] == "MemoryFormationError"
+        if generation:
+            receipt = formed["failure_audit"]["causes"][0]["generation"]
+            assert len(receipt["attempts"]) == 2
+            assert {a["reason"] for a in receipt["attempts"]} == {"schema_mismatch"}
         assert formed["failure_audit"]["pending_job"]["completed_head"] is None
         assert formed["failure_audit"]["pending_job"]["extraction"] is None
         assert all(not r["pipeline_passed"] for r in consumed)
@@ -194,6 +205,10 @@ async def test_actual_session_ingestion_reopen_consumption_and_failure_evidence(
     else:
         # 两次形成调用 + 六次消费;完成作业的显式重放不额外调模型。
         assert len(calls) == 8 and len(formed["jobs"]) == 1
+        if generation:
+            job = formed["jobs"][0]
+            assert job["extraction"]["generation"]["stage"] == "extraction"
+            assert job["plan"]["review"]["generation"]["stage"] == "review"
         assert sum(r["score"]["passed"] for r in consumed) == 5
         assert all(r["formation_complete"] for r in consumed)
 

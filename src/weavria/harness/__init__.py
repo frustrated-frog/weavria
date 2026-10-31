@@ -74,6 +74,7 @@ from .memory_admission import (
 )
 from .memory_context import MemoryContextSource, MemoryGroupReader
 from .memory_formation import MemoryExtractor, MemoryFormationEngine, MemoryReviewer
+from .memory_generation import MemoryGenerationPolicy
 from .memory_models import ModelMemoryExtractor, ModelMemoryReviewer
 from .memory_session import AcceptedMemoryEvents, SessionMemoryBinding, SessionMemoryIngestor
 from .progress import NeedProgressEvaluator
@@ -195,6 +196,7 @@ __all__ = [
     "MemoryExtractor",
     "MemoryFormationEngine",
     "MemoryFormationError",
+    "MemoryGenerationPolicy",
     "MemoryGroupReader",
     "MemoryReviewer",
     "ModelMemoryExtractor",

@@ -24,6 +24,18 @@ from .contracts import (
     MemorySource,
     MemoryVersion,
 )
+from .generation import MemoryGenerationReport
+
+
+def validate_generation(
+    report: MemoryGenerationReport | None,
+    required: bool,
+    stage: Literal["extraction", "review"],
+) -> None:
+    if required != (report is not None):
+        raise ValueError("generation receipt requires its explicit schema version")
+    if report is not None and (report.stage != stage or report.attempts[-1].reason != "accepted"):
+        raise ValueError("accepted proposal must bind successful stage generation")
 
 
 class MemoryDocument(MemoryModel):
@@ -149,8 +161,28 @@ class MemoryCandidate(MemoryModel):
         return self
 
 
-class MemoryExtraction(MemoryModel):
+class MemoryExtraction(BaseModel):
+    model_config = MemoryModel.model_config
+    schema_version: Literal[1, 2] = 1
     candidates: tuple[MemoryCandidate, ...] = Field(default=(), max_length=8)
+    generation: MemoryGenerationReport | None = None
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def validate_version(cls, value: object) -> object:
+        return MemoryModel.validate_version(value)
+
+    @model_validator(mode="after")
+    def validate_generation(self) -> Self:
+        validate_generation(self.generation, self.schema_version == 2, "extraction")
+        return self
+
+    @model_serializer(mode="wrap")
+    def preserve_legacy(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        data = handler(self)
+        if self.schema_version == 1:
+            data.pop("generation", None)
+        return data
 
 
 class MemoryReconciliation(MemoryModel):
@@ -234,10 +266,11 @@ class MemoryReview(BaseModel):
     """Versioned semantic review; v1/v2 wire bytes remain unchanged."""
 
     model_config = MemoryModel.model_config
-    schema_version: Literal[1, 2, 3] = 1
+    schema_version: Literal[1, 2, 3, 4] = 1
     judgments: tuple[MemoryJudgment, ...] = Field(default=(), max_length=8)
     alignments: tuple[MemoryAlignment, ...] = Field(default=(), max_length=8)
     families: tuple[MemoryFamilyAlignment, ...] = Field(default=(), max_length=8)
+    generation: MemoryGenerationReport | None = None
 
     @field_validator("schema_version", mode="before")
     @classmethod
@@ -246,6 +279,7 @@ class MemoryReview(BaseModel):
 
     @model_validator(mode="after")
     def validate_alignments(self) -> Self:
+        validate_generation(self.generation, self.schema_version == 4, "review")
         if self.schema_version == 1 and self.alignments:
             raise ValueError("field alignment requires review v2")
         if self.schema_version < 3 and self.families:
@@ -278,6 +312,8 @@ class MemoryReview(BaseModel):
             data.pop("alignments", None)
         if self.schema_version < 3:
             data.pop("families", None)
+        if self.schema_version < 4:
+            data.pop("generation", None)
         return data
 
 
