@@ -21,6 +21,7 @@ from examples.m1_corpus import SnapshotCorpus
 from weavria.context import ContextCompilerConfig
 from weavria.core import (
     ModelTurn,
+    RunEnded,
     RunStatus,
     SessionContextCompiled,
     SessionEvent,
@@ -115,7 +116,7 @@ class Budgets(Frozen):
 
 class Dataset(Frozen):
     schema_version: Literal[1]
-    dataset_version: Literal["m1-harness/1"]
+    dataset_version: Literal["m1-harness/1", "m1-harness/2"]
     source_commit: str = Field(pattern=r"^[a-f0-9]{40}$")
     corpora: dict[Domain, dict[str, str]]
     model: ModelSettings
@@ -489,6 +490,15 @@ async def run_trial(
                     "artifact_read": readback,
                     "source_reads": corpus.reads,
                     "source_failures": corpus.failures,
+                    "terminations": [
+                        {
+                            "run_id": e.data.event.run_id,
+                            "reason": e.data.event.data.reason,
+                        }
+                        for e in events
+                        if isinstance(e.data, SessionRunEvent)
+                        and isinstance(e.data.event.data, RunEnded)
+                    ],
                 }
             )
     except Exception as exc:

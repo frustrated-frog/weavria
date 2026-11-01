@@ -620,6 +620,61 @@ async def test_model_interpreter_normalizes_derived_required_capability_completi
     ) == ("read_document",)
 
 
+@pytest.mark.parametrize("criterion_count", [1, 8])
+async def test_model_interpreter_normalizes_clarification_proposal_completion(
+    criterion_count: int,
+) -> None:
+    # 模型遵循提示,省略宿主承诺派生的能力完成边。嵌套行动提案也应补全,
+    # 但不能为补全而删除模型声明的条件或突破最多八项的契约。
+    declared = _ask_or_act_specification(
+        primary_route="execute", primary_capability="read_document"
+    )
+    assert declared.action_proposal is not None
+    omitted = declared.model_copy(
+        update={
+            "action_proposal": declared.action_proposal.model_copy(
+                update={"completion_criteria": (_criterion(),) * criterion_count}
+            )
+        }
+    )
+    provider = FakeModelProvider((_declaration(omitted), _declaration(omitted)))
+    request = TaskUnderstandingInput(
+        task=TaskInput(goal="Determine the requested document before reading it"),
+        capabilities=(
+            CapabilityView(
+                name="read_document",
+                version="1",
+                description="Read a named document",
+                input_schema={"type": "object"},
+                behavior="read_only",
+                risk="low",
+                approval_required=False,
+            ),
+        ),
+    )
+    interpreter = ModelTaskInterpreter(provider)
+    if criterion_count == 8:
+        with pytest.raises(TaskUnderstandingError):
+            await interpreter.interpret(request, max_duration=1)
+        assert len(provider.requests) == 2
+        return
+
+    specification = await interpreter.interpret(request, max_duration=1)
+    assert len(provider.requests) == 1
+    assert specification.route == "clarify"
+    assert specification.capability_needs == ()
+    assert specification.completion_criteria == declared.completion_criteria
+    assert specification.uncertainty == declared.uncertainty
+    assert specification.action_proposal is not None
+    assert tuple(
+        item.capability
+        for item in specification.action_proposal.completion_criteria
+        if item.kind == "capability_result"
+    ) == ("read_document",)
+    assert omitted.action_proposal is not None
+    assert omitted.action_proposal.completion_criteria == (_criterion(),)
+
+
 async def test_model_interpreter_persists_content_free_root_invariant_code() -> None:
     execute = _execute()
     invalid = execute.model_copy(

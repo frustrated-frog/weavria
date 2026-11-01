@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "dataset_version": "m1-harness/1",
+  "dataset_version": "m1-harness/2",
   "source_commit": "f026796054a10132561faa4f2e7225a6e23390d4",
   "corpora": {
     "documents": {
@@ -11,7 +11,13 @@
       "docs/decisions/0075-统一执行链与记忆生命周期.md": "75bb22676fc8a41024ef2fe81dab6f77619469908e88ba22cdf359bd6093c6c2",
       "docs/decisions/0077-统一执行链的组合契约与请求期限.md": "7569c3691b9000269fc41791aaaa6660a144db3e49eb71d833f2b5a3e13121ee",
       "docs/decisions/0078-工作记录驱动的上下文与能力选择.md": "0a3e1f55ee85ea6805aef2d5d8bd17ea88af81c2679b8b1c15a0791fd1db5505",
-      "docs/decisions/0079-推荐配置与完整链路装配.md": "55ee3c49b20a896ad28dcb1ea123cd46071c3879cd4830e28c6dce81e0dc71bf"
+      "docs/decisions/0079-推荐配置与完整链路装配.md": "55ee3c49b20a896ad28dcb1ea123cd46071c3879cd4830e28c6dce81e0dc71bf",
+      "docs/上下文编译与信息恢复.md": "dfbfa48dd36f2fd27f042aeb91d31d5e45959e33c2ed0f61b3ddf3c1ecf33b20",
+      "docs/上下文编译修复与资源边界.md": "117c102862f608d4249b0aa0b7a0186bf52dff777af46e4c5cb9ac188acd4dfe",
+      "docs/主动上下文恢复与预算闭环.md": "e65badc5d87b04f32d371cdcad1192dd7a72f94876c29a57e686a4f143763f70",
+      "docs/完整记忆召回与上下文接入.md": "b5441e93b4aed2d3b4a54274f25c0856180b608c8ef6508eab1b3030db56083b",
+      "docs/持久历史发现与多区间上下文.md": "b87d3a54b41f00890e1400418327533352bc833b956d952934f0b336fdeeaf30",
+      "docs/记忆形成与修订决策.md": "f560a060d85138ae3e5b6d42242a80bb1cfc91b36f73aa2f69df77b7d67ff2b7"
     },
     "repository": {
       "src/weavria/harness/assembly.py": "412ba4c58b80dcc37600ca7537610e1e3b9c0a4b4d526d769f524c494880e935",
@@ -21,14 +27,16 @@
       "src/weavria/harness/memory_formation.py": "9c72c4a5c0d29233a74ef0fad14e84f92bf436f06da56865c4e32846a18dab71",
       "src/weavria/context/budget.py": "29ea60b550e705c77e94e78774abd9c2a7078915fefe899846881a9a140b0d20",
       "src/weavria/runtime/agent.py": "16a93a5b103ab37d63d1ea5826b17962ea58a60d89a134f6d381a2b47356f3d5",
-      "src/weavria/runtime/intervention.py": "3849deb2befc53f7e71792f8ebe078d47f076cd0dc19c291333c4defc2c49779"
+      "src/weavria/runtime/intervention.py": "3849deb2befc53f7e71792f8ebe078d47f076cd0dc19c291333c4defc2c49779",
+      "src/weavria/harness/understanding.py": "aa3eaa4d05f91c128b7a5a385577893932b4d57d15ed950e3272ab535cdd5ae5",
+      "src/weavria/context/compiler.py": "248b293113385b4129f769e2dd652e1a2854bef93cf94177988743db814ebfd3"
     }
   },
   "model": {
     "name": "deepseek-flash",
     "temperature": 0.0,
     "output_tokens": 4096,
-    "window_tokens": 16384,
+    "window_tokens": 32768,
     "safety_tokens": 1024,
     "max_request_bytes": 96000,
     "json_mode": true,

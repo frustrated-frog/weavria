@@ -922,7 +922,7 @@ class TaskUnderstandingInputAdmission(Protocol):
 class ModelTaskInterpreter:
     """Compile validated declarations with one shared, deadline-bound correction path."""
 
-    version = "model-task-understanding/11"
+    version = "model-task-understanding/12"
 
     def __init__(
         self,
@@ -1584,7 +1584,23 @@ def _validate_engine_specification(
 def _normalize_derived_completion_criteria(
     arguments: dict[str, JsonValue],
 ) -> dict[str, JsonValue]:
-    """Fill only completion edges mechanically implied by required selected capabilities."""
+    """补全宿主承诺派生的能力完成边,同时覆盖澄清中的完整行动提案。"""
+    normalized: dict[str, JsonValue] = _normalize_action_completion_criteria(arguments)
+    proposal = normalized.get("action_proposal")
+    if normalized.get("route") == "clarify" and isinstance(proposal, dict):
+        # 顶层 clarify 不暴露能力;候选行动独立承载执行义务。只处理契约定义
+        # 的这一层,不递归解释任意模型 JSON,也不改变 Ask/Act 策略的选择。
+        normalized = {
+            **normalized,
+            "action_proposal": _normalize_action_completion_criteria(proposal),
+        }
+    return normalized
+
+
+def _normalize_action_completion_criteria(
+    arguments: dict[str, JsonValue],
+) -> dict[str, JsonValue]:
+    """只补选定 required 能力必然蕴含的结果条件,其余语义仍由校验器负责。"""
     if arguments.get("route") != "execute":
         return arguments
     raw_needs = arguments.get("capability_needs")
