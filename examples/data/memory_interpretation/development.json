@@ -1,0 +1,4 @@
+{"schema_version":1,"split":"development","cases":[
+{"id":"onboarding","input":"本项目面向新加入团队的同事的培训材料，长期使用格式K7。","probes":[{"question":"面向新加入团队的同事的培训材料用什么格式？","answer":"K7"},{"question":"面向已经任职多年的同事的培训材料用什么格式？没有依据则unknown。","answer":"unknown"}]},
+{"id":"negation","input":"本项目启用匿名访问的页面长期采用缓存策略A4；未启用匿名访问的页面长期采用缓存策略B9。","probes":[{"question":"未启用匿名访问的页面采用什么缓存策略？","answer":"B9"},{"question":"启用匿名访问的页面采用什么缓存策略？","answer":"A4"}]}
+]}

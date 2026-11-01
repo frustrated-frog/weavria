@@ -50,7 +50,13 @@ from .formation import (
     MemoryFormationInput,
     MemoryFormationJob,
     MemoryFormationPlan,
+    MemoryInterpretation,
+    MemoryInterpretationQuality,
+    MemoryInterpretationRound,
+    MemoryInterpretationSearch,
     MemoryJudgment,
+    MemoryMeaningAssessment,
+    MemoryMeaningUnit,
     MemoryProposition,
     MemoryReconciliation,
     MemoryResolution,
@@ -58,9 +64,11 @@ from .formation import (
 )
 from .generation import MemoryGenerationAttempt, MemoryGenerationReason, MemoryGenerationReport
 from .groups import MemoryGroup, MemoryGroupRecall
+from .interpretation_selection import InterpretationOption, select_interpretation
 from .store import SQLiteMemoryStore
 
 __all__ = [
+    "InterpretationOption",
     "MemoryAccess",
     "MemoryAccessError",
     "MemoryAdmission",
@@ -94,7 +102,13 @@ __all__ = [
     "MemoryGroup",
     "MemoryGroupRecall",
     "MemoryHit",
+    "MemoryInterpretation",
+    "MemoryInterpretationQuality",
+    "MemoryInterpretationRound",
+    "MemoryInterpretationSearch",
     "MemoryJudgment",
+    "MemoryMeaningAssessment",
+    "MemoryMeaningUnit",
     "MemoryModel",
     "MemoryMutation",
     "MemoryProposition",
@@ -115,4 +129,5 @@ __all__ = [
     "compare_memory_conditions",
     "fact_key",
     "rewrite_fact_set",
+    "select_interpretation",
 ]

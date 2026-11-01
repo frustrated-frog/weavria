@@ -1,0 +1,6 @@
+{"schema_version":1,"split":"validation","cases":[
+{"id":"origin","input":"本项目由供应商提交的设计草稿保存在目录D3；给供应商阅读的最终设计保存在目录F8。这两项是长期规定。","probes":[{"question":"给供应商阅读的最终设计保存在哪个目录？","answer":"F8"},{"question":"由供应商提交的设计草稿保存在哪个目录？","answer":"D3"}]},
+{"id":"maintenance","input":"本项目的机械设备检修记录，在设备停机期间由小组G2负责；设备运行期间的同类记录由小组H5负责。","probes":[{"question":"设备运行期间的检修记录由哪个小组负责？","answer":"H5"},{"question":"设备停机期间的检修记录由哪个小组负责？","answer":"G2"}]},
+{"id":"support","input":"项目支持手册规定：用户没有提交日志时发送指引C6；用户已经提交日志但缺少复现步骤时发送指引E1。","probes":[{"question":"用户已经提交日志但没有复现步骤，应发送哪个指引？","answer":"E1"},{"question":"用户的日志和复现步骤都完整，应发送哪个指引？没有依据则unknown。","answer":"unknown"}]},
+{"id":"accessibility","input":"本项目中，面向使用屏幕阅读器的参与者的操作指南采用版本V2；面向只能使用键盘操作的参与者的操作指南采用版本V5。","probes":[{"question":"面向使用屏幕阅读器的参与者的指南采用哪个版本？","answer":"V2"},{"question":"面向只能使用键盘操作的参与者的指南采用哪个版本？","answer":"V5"}]}
+]}

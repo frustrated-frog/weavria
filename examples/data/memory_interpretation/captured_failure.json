@@ -1,0 +1,89 @@
+{
+  "schema_version": 1,
+  "split": "development",
+  "source_report_sha256": "0fdd0f479daa60d732a50009076c8a7e8975359da0dc9afd1e81bce88cd315ec",
+  "cases": [
+    {
+      "id": "captured_split_relation",
+      "input": "本项目面向新加入团队的同事的培训材料，长期使用PDF格式。",
+      "initial": {
+        "schema_version": 3,
+        "candidates": [
+          {
+            "schema_version": 1,
+            "subject": "project",
+            "predicate": "training_material_audience",
+            "value": "新加入团队的同事",
+            "qualifiers": {},
+            "text": "本项目面向新加入团队的同事的培训材料，长期使用PDF格式。",
+            "scope_kind": "project",
+            "retention": "durable",
+            "time_kind": "unknown",
+            "valid_from": null,
+            "valid_to": null,
+            "citations": [
+              {
+                "schema_version": 1,
+                "source_id": "input:1",
+                "quote": "本项目面向新加入团队的同事的培训材料，长期使用PDF格式。",
+                "start": 0
+              }
+            ]
+          },
+          {
+            "schema_version": 1,
+            "subject": "project",
+            "predicate": "training_material_format",
+            "value": "PDF",
+            "qualifiers": {
+              "使用期限": "长期"
+            },
+            "text": "本项目面向新加入团队的同事的培训材料，长期使用PDF格式。",
+            "scope_kind": "project",
+            "retention": "durable",
+            "time_kind": "unknown",
+            "valid_from": null,
+            "valid_to": null,
+            "citations": [
+              {
+                "schema_version": 1,
+                "source_id": "input:1",
+                "quote": "本项目面向新加入团队的同事的培训材料，长期使用PDF格式。",
+                "start": 0
+              }
+            ]
+          }
+        ],
+        "generation": {
+          "schema_version": 1,
+          "stage": "extraction",
+          "policy_version": "memory-generation/1:repairs=1",
+          "attempts": [
+            {
+              "schema_version": 1,
+              "number": 1,
+              "reason": "accepted",
+              "request_sha256": "bc4ca1445562b53c500a8706bcc17e7ab50a6e0010865af97257edfde7b9a9cb",
+              "response_sha256": "e97d9cb77279daabe0ac72800b5d3c88cdff9c41a3eff7621b5ebb8f4b1ec32a",
+              "elapsed_ms": 4496.482541988371
+            }
+          ]
+        },
+        "modalities": [
+          "asserted",
+          "asserted"
+        ]
+      },
+      "probes": [
+        {
+          "question": "给新加入团队的同事的培训材料使用哪种格式?只返回格式标识。",
+          "answer": "PDF"
+        },
+        {
+          "question": "给团队之外访客的培训材料使用哪种格式?没有依据则unknown。",
+          "answer": "unknown"
+        }
+      ]
+    }
+  ]
+}

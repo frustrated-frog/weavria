@@ -26,6 +26,7 @@ from .contracts import (
     MemoryVersion,
 )
 from .generation import MemoryGenerationReport
+from .interpretation_selection import InterpretationOption, select_interpretation
 
 
 def validate_generation(
@@ -170,11 +171,131 @@ class MemoryCandidate(MemoryProposition):
 type MemoryClaimModality = Literal["asserted", "reported", "hypothetical", "quoted"]
 
 
+class MemoryInterpretation(MemoryModel):
+    """一种完整命题组织方案;保留候选之间的条件附着关系。"""
+
+    candidates: tuple[MemoryCandidate, ...] = Field(default=(), max_length=8)
+    modalities: tuple[MemoryClaimModality, ...] = Field(default=(), max_length=8)
+
+    @model_validator(mode="after")
+    def validate_modalities(self) -> Self:
+        if len(self.candidates) != len(self.modalities):
+            raise ValueError("interpretation modality must cover each candidate")
+        return self
+
+    def fingerprint(self) -> str:
+        # 候选重排不构成新的解释,避免相同内容消耗搜索预算。
+        frames = sorted(
+            json.dumps(
+                {"candidate": c.model_dump(mode="json"), "modality": m},
+                sort_keys=True,
+                ensure_ascii=False,
+            )
+            for c, m in zip(self.candidates, self.modalities, strict=True)
+        )
+        return hashlib.sha256(json.dumps(frames, ensure_ascii=False).encode()).hexdigest()
+
+
+class MemoryMeaningUnit(MemoryModel):
+    meaning: str = Field(min_length=1, max_length=1024)
+    citations: tuple[MemoryCitation, ...] = Field(min_length=1, max_length=8)
+
+
+class MemoryMeaningAssessment(MemoryModel):
+    """同一含义的等级与缺陷一起传递,避免模型生成两条无法对应的平行数组。"""
+
+    # 0=扭曲,1=遗漏,2=部分保留,3=完整且忠实。不是校准后的概率。
+    grade: int = Field(ge=0, le=3)
+    defect: Literal[
+        "none",
+        "role_attachment",
+        "missing_condition",
+        "split_relation",
+        "merged_facts",
+        "wrong_value",
+        "wrong_time",
+        "wrong_scope",
+        "missing_fact",
+        "other",
+    ]
+
+
+class MemoryInterpretationQuality(MemoryModel):
+    assessments: tuple[MemoryMeaningAssessment, ...] = Field(
+        max_length=8, description="Exactly one assessment per fixed meaning unit, in its order."
+    )
+    unsupported: int = Field(ge=0, le=8)
+
+    @property
+    def grades(self) -> tuple[int, ...]:
+        return tuple(a.grade for a in self.assessments)
+
+    def option(self, interpretation: MemoryInterpretation) -> InterpretationOption:
+        return InterpretationOption(
+            self.grades,
+            self.unsupported,
+            len(interpretation.candidates),
+            interpretation.fingerprint(),
+        )
+
+
+class MemoryInterpretationRound(MemoryModel):
+    alternatives: tuple[MemoryInterpretation, ...] = Field(min_length=1, max_length=2)
+    qualities: tuple[MemoryInterpretationQuality, ...] = Field(min_length=2, max_length=3)
+    selected: int = Field(ge=0, le=2)
+    proposal_generation: MemoryGenerationReport
+    comparison_generation: MemoryGenerationReport
+
+
+class MemoryInterpretationSearch(MemoryModel):
+    policy_version: Identifier
+    initial: MemoryInterpretation
+    initial_generation: MemoryGenerationReport | None = None
+    units: tuple[MemoryMeaningUnit, ...] = Field(max_length=8)
+    initial_quality: MemoryInterpretationQuality | None = None
+    analysis_generation: MemoryGenerationReport
+    repeated_generation: MemoryGenerationReport | None = None
+    rounds: tuple[MemoryInterpretationRound, ...] = Field(default=(), max_length=2)
+
+    @model_validator(mode="after")
+    def validate_search(self) -> Self:
+        expected_initial = self.rounds[0].qualities[0] if self.rounds else None
+        if self.initial_quality != expected_initial:
+            raise ValueError("initial quality must come from the first competitive comparison")
+        current = self.initial
+        reports = [self.analysis_generation]
+        if self.repeated_generation is not None:
+            reports.append(self.repeated_generation)
+        for step in self.rounds:
+            choices = (current, *step.alternatives)
+            if len(step.qualities) != len(choices) or any(
+                len(q.grades) != len(self.units) for q in step.qualities
+            ):
+                raise ValueError("comparison must cover all interpretations and fixed units")
+            expected = select_interpretation(
+                tuple(q.option(c) for q, c in zip(step.qualities, choices, strict=True))
+            )
+            if step.selected != expected:
+                raise ValueError("search selection differs from host policy")
+            current = choices[step.selected]
+            reports.extend((step.proposal_generation, step.comparison_generation))
+        for report in reports:
+            validate_generation(report, True, "extraction")
+        return self
+
+    def chosen(self) -> MemoryInterpretation:
+        current = self.initial
+        for step in self.rounds:
+            current = (current, *step.alternatives)[step.selected]
+        return current
+
+
 class MemoryExtraction(BaseModel):
     model_config = MemoryModel.model_config
-    schema_version: Literal[1, 2, 3] = 1
+    schema_version: Literal[1, 2, 3, 4] = 1
     candidates: tuple[MemoryCandidate, ...] = Field(default=(), max_length=8)
     generation: MemoryGenerationReport | None = None
+    search: MemoryInterpretationSearch | None = None
     modalities: tuple[MemoryClaimModality, ...] = Field(default=(), max_length=8)
 
     @field_validator("schema_version", mode="before")
@@ -185,11 +306,17 @@ class MemoryExtraction(BaseModel):
     @model_validator(mode="after")
     def validate_generation(self) -> Self:
         validate_generation(self.generation, self.schema_version >= 2, "extraction")
-        if self.schema_version == 3:
+        if self.schema_version >= 3:
             if len(self.modalities) != len(self.candidates):
                 raise ValueError("claim modality must cover every candidate")
         elif self.modalities:
             raise ValueError("claim modality requires extraction v3")
+        if (self.search is not None) != (self.schema_version == 4):
+            raise ValueError("interpretation search requires extraction v4")
+        if self.search is not None:
+            selected = self.search.chosen()
+            if selected.candidates != self.candidates or selected.modalities != self.modalities:
+                raise ValueError("extraction must equal selected interpretation")
         return self
 
     @model_serializer(mode="wrap")
@@ -199,6 +326,8 @@ class MemoryExtraction(BaseModel):
             data.pop("generation", None)
         if self.schema_version < 3:
             data.pop("modalities", None)
+        if self.schema_version < 4:
+            data.pop("search", None)
         return data
 
 
