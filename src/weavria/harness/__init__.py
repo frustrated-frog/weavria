@@ -30,6 +30,7 @@ from .completion import (
     TaskCompletionEvaluator,
     TaskObligationCompletionPolicy,
 )
+from .configuration import HarnessConfig
 from .coverage import (
     CapabilityEvidenceProfile,
     CoverageAdjustment,
@@ -191,6 +192,7 @@ __all__ = [
     "EvidenceSurface",
     "EvidenceTargetBinding",
     "EvidenceTargetRule",
+    "HarnessConfig",
     "HarnessMemory",
     "HarnessResult",
     "InformationNeed",

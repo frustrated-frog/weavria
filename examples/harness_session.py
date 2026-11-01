@@ -9,20 +9,8 @@ from pathlib import Path
 
 from examples.live_memory_formation import Transport
 from examples.persistent_session import source_tool
-from weavria.context import (
-    ContextCompilerConfig,
-    HistoryRetrievalConfig,
-    ModelRequestContextCompiler,
-    ModelRequestContextConfig,
-)
-from weavria.core import RecoveryLimits
-from weavria.harness import (
-    AgentHarness,
-    HarnessMemory,
-    ModelTaskInterpreter,
-    TaskModelViewProjector,
-    TaskUnderstandingEngine,
-)
+from weavria.context import ContextCompilerConfig
+from weavria.harness import AgentHarness, HarnessConfig, HarnessMemory
 from weavria.memory import MemoryAccess, MemoryScope
 from weavria.models import (
     OpenAICompatibleConfig,
@@ -59,57 +47,42 @@ async def main() -> None:
         )
         counter = OpenAICompatibleTokenCounter(config, encoding="cl100k_base")
         provider = OpenAICompatibleProvider(config, transport=transport)
-        understanding = (
-            TaskUnderstandingEngine(
-                ModelTaskInterpreter(
-                    provider,
-                    context_compiler=(
-                        ModelRequestContextCompiler(
-                            counter=counter,
-                            config=ModelRequestContextConfig(
-                                window_tokens=64000,
-                                output_tokens=4096,
-                                max_request_bytes=128000,
-                            ),
-                        )
-                    ),
-                ),
-                max_duration=60,
-            )
-            if args.understand or args.working_records
-            else None
-        )
         # 本地单用户示例的宿主授权。真实服务必须从认证结果构造,不能取模型参数。
         scope = MemoryScope(tenant_id="local", kind="project", key="workspace")
         memory = (
-            HarnessMemory.from_model(
+            HarnessMemory(
                 args.state / "memory.db",
                 MemoryAccess(
                     principal_id="local-user", readable_scopes=(scope,), writable_scopes=(scope,)
                 ),
                 scope,
                 "local-user",
-                model=provider,
-                configuration_id="harness-cli-v1",
                 max_duration=60,
             )
             if args.memory
             else None
         )
-        async with AgentHarness(
+        # 应用只声明启用哪些能力;理解、模型工作视图、检索和记忆形成由框架组装。
+        # 保留 CLI 的显式选择语义,避免旧命令升级后意外增加模型调用。
+        harness_config = HarnessConfig(
+            configuration_id="harness-cli-v2",
+            context=ContextCompilerConfig(window_tokens=64000, output_tokens=4096),
+            task_understanding=args.understand or args.working_records,
+            working_records=args.working_records,
+            memory_write="basic" if args.memory else "off",
+            preparation_max_duration=60,
+            limits=RunLimits(max_duration=120, max_request_bytes=128000),
+        )
+        async with AgentHarness.from_config(
             args.state / "session.db",
+            config=harness_config,
             model=OpenAICompatibleSessionProvider(config, transport=transport),
             tools=ToolRegistry((source_tool(args.documents),) if args.documents else ()),
             instructions="Answer the user's request. Use available tools when needed.",
-            context=ContextCompilerConfig(window_tokens=64000, output_tokens=4096),
             token_counter=counter,
-            understanding=understanding,
-            working_records=args.working_records,
+            reasoning_model=provider,
+            reasoning_counter=counter,
             memory=memory,
-            history_retrieval=HistoryRetrievalConfig(),
-            context_recovery=RecoveryLimits(),
-            task_model_projector=TaskModelViewProjector() if understanding else None,
-            limits=RunLimits(max_duration=120, max_request_bytes=128000),
         ) as agent:
             try:
                 await agent.sessions.store.head(args.session)

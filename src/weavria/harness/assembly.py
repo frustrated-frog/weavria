@@ -6,7 +6,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Self
 
-from weavria.context import ContextCompilerConfig, HistoryRetrievalConfig, SessionTokenCounter
+from weavria.context import (
+    ContextCompilerConfig,
+    HistoryRetrievalConfig,
+    ModelRequestContextCompiler,
+    ModelRequestContextConfig,
+    ModelRequestTokenCounter,
+    SessionTokenCounter,
+)
 from weavria.core import ApplicationObservation, RecoveryLimits, SessionResult, TaskUpdate
 from weavria.memory import MemoryAccess, MemoryError, MemoryScope, SQLiteMemoryStore
 from weavria.models import ModelCallError, ModelProvider, SessionModelProvider
@@ -20,6 +27,7 @@ from weavria.runtime import (
 from weavria.sessions import SessionBusyError, SessionEngine
 from weavria.tools import ToolPolicy, ToolRegistry
 
+from .configuration import HarnessConfig
 from .memory_admission import ConservativeMemoryAdmission, MemoryFormationError
 from .memory_context import MemoryContextSource
 from .memory_features import MemoryReviewFeatureProvider, MemoryReviewFeatures
@@ -29,7 +37,7 @@ from .memory_models import ModelMemoryExtractor, ModelMemoryReviewer
 from .memory_session import SessionMemoryBinding, SessionMemoryIngestor
 from .session import TaskAwareSessionPreparer
 from .task_view import TaskModelViewProjector
-from .understanding import TaskUnderstandingEngine
+from .understanding import ModelTaskInterpreter, TaskUnderstandingEngine
 from .work import work_tool
 from .working_set import AdaptiveCapabilityPolicy, CapabilityWorkingSetPolicy
 
@@ -153,6 +161,11 @@ class MemoryUpdateReport:
     cursor: int = 0
     processed_events: int = 0
     error_type: str | None = None
+    # 本次调用确认处理的候选,并非库中事实总数或新写入条数。重试可能为零。
+    extracted_candidates: int = 0
+    admitted_candidates: int = 0
+    rejected_candidates: int = 0
+    deferred_candidates: int = 0
 
 
 @dataclass(frozen=True)
@@ -169,6 +182,100 @@ class AgentHarness:
     同一会话的串行区间覆盖记忆形成,避免下一输入与上一次形成并发。
     不同会话可并发;同作用域冲突交给 MemoryFormationEngine 的版本重审处理。
     """
+
+    @classmethod
+    def from_config(
+        cls,
+        path: Path,
+        *,
+        config: HarnessConfig,
+        model: SessionModelProvider,
+        tools: ToolRegistry,
+        token_counter: SessionTokenCounter,
+        reasoning_model: ModelProvider | None = None,
+        reasoning_counter: ModelRequestTokenCounter | None = None,
+        memory: HarnessMemory | None = None,
+        memory_model: ModelProvider | None = None,
+        instructions: str = "",
+        completion: CompletionPolicy | None = None,
+        policy: ToolPolicy | None = None,
+        scheduling: ToolScheduling | None = None,
+    ) -> Self:
+        """按同一配置装配已有组件;应用无需构造理解器、记忆形成或恢复链路。
+
+        reasoning_model 供任务理解使用,也是未单独指定 memory_model 时的形成
+        模型。模型连接和匹配的计量器由宿主提供,框架不猜测供应商或认证信息。
+        高级组件替换仍使用底层构造函数,本入口不混合两套配置来源。
+        """
+        understanding = None
+        if config.task_understanding:
+            if reasoning_model is None or reasoning_counter is None:
+                raise ValueError("task understanding requires reasoning model and counter")
+            if not reasoning_model.capabilities.tool_calls:
+                raise ValueError("task understanding requires structured tool-call capability")
+            # 显式采用调用方提供的窗口作为两种模型角色的共同允许窗口。
+            # 准备角色输出上限用自己的计量器,不会复制执行模型的输出额度。
+            preparation_context = ModelRequestContextConfig(
+                window_tokens=config.context.window_tokens,
+                output_tokens=reasoning_counter.output_tokens,
+                safety_tokens=config.context.safety_tokens,
+                max_request_bytes=config.limits.max_request_bytes,
+                max_history_bytes=min(8000, config.limits.max_request_bytes),
+            )
+            understanding = TaskUnderstandingEngine(
+                ModelTaskInterpreter(
+                    reasoning_model,
+                    context_compiler=ModelRequestContextCompiler(
+                        counter=reasoning_counter,
+                        config=preparation_context,
+                    ),
+                ),
+                max_duration=config.preparation_max_duration,
+            )
+        if memory is not None and (memory.extractor is not None or memory.admission is not None):
+            raise ValueError(
+                "from_config memory must supply storage and scope, not formation components"
+            )
+        if config.memory_write != "off":
+            formation_model = memory_model if memory_model is not None else reasoning_model
+            if memory is None or formation_model is None:
+                raise ValueError("memory write requires storage, scope and a formation model")
+            if not formation_model.capabilities.tool_calls:
+                raise ValueError("memory formation requires structured tool-call capability")
+            memory = HarnessMemory.from_model(
+                memory.path,
+                memory.access,
+                memory.scope,
+                memory.author_subject,
+                model=formation_model,
+                configuration_id=config.configuration_id,
+                profile=config.memory_write,
+                timezone=memory.timezone,
+                max_duration=memory.max_duration,
+                max_events=memory.max_events,
+                max_recall_bytes=memory.max_recall_bytes,
+            )
+        return cls(
+            path,
+            model=model,
+            tools=tools,
+            context=config.context,
+            token_counter=token_counter,
+            instructions=instructions,
+            limits=config.limits,
+            max_request_duration=config.max_request_duration,
+            memory_catchup_fraction=config.memory_catchup_fraction,
+            understanding=understanding,
+            working_records=config.working_records,
+            memory=memory,
+            history_retrieval=HistoryRetrievalConfig() if config.history_retrieval else None,
+            context_recovery=RecoveryLimits() if config.context_recovery else None,
+            task_model_projector=TaskModelViewProjector() if config.task_understanding else None,
+            completion=completion,
+            policy=policy,
+            scheduling=scheduling,
+            configuration_id=config.configuration_id,
+        )
 
     def __init__(
         self,
@@ -192,6 +299,7 @@ class AgentHarness:
         task_model_projector: TaskModelProjector | None = None,
         policy: ToolPolicy | None = None,
         scheduling: ToolScheduling | None = None,
+        configuration_id: str | None = None,
     ) -> None:
         if working_records and understanding is None:
             raise ValueError("working records require task understanding")
@@ -260,7 +368,8 @@ class AgentHarness:
             policy=policy,
             scheduling=scheduling,
             configuration_metadata={
-                "harness_version": "unified-harness/4",
+                "harness_version": "unified-harness/5",
+                "configuration_id": configuration_id,
                 "working_records": working_records,
                 "harness_max_request_duration": duration,
                 "memory_catchup_fraction": memory_catchup_fraction,
@@ -401,6 +510,23 @@ class AgentHarness:
         if ingestor is None:
             return MemoryUpdateReport("read_only")
         cursor = processed = target = 0
+        extracted = admitted = rejected = deferred = 0
+
+        def report(
+            status: Literal["completed", "deferred", "failed"], error_type: str | None = None
+        ) -> MemoryUpdateReport:
+            return MemoryUpdateReport(
+                status,
+                target,
+                cursor,
+                processed,
+                error_type,
+                extracted,
+                admitted,
+                rejected,
+                deferred,
+            )
+
         loop = asyncio.get_running_loop()
         end = loop.time() + config.max_duration
         if deadline is not None:
@@ -428,18 +554,19 @@ class AgentHarness:
                         break
                     cursor = job.input.position
                     processed += 1
-                return MemoryUpdateReport(
-                    "completed" if cursor >= target else "deferred",
-                    target,
-                    cursor,
-                    processed,
-                )
+                    if job.extraction is not None:
+                        extracted += len(job.extraction.candidates)
+                    if job.plan is not None:
+                        admitted += sum(a.status == "admitted" for a in job.plan.admissions)
+                        rejected += sum(a.status == "rejected" for a in job.plan.admissions)
+                        deferred += sum(a.status == "deferred" for a in job.plan.admissions)
+                return report("completed" if cursor >= target else "deferred")
         except TimeoutError:
             # 事务可能已经提交但调用者未观察到;报告 cursor 是确认的下界。
             # 下一次以数据库游标为准,不能盲目重新提取。取消不进入此分支。
-            return MemoryUpdateReport("deferred", target, cursor, processed, "TimeoutError")
+            return report("deferred", "TimeoutError")
         except (MemoryError, MemoryFormationError, ModelCallError) as exc:
-            return MemoryUpdateReport("failed", target, cursor, processed, type(exc).__name__)
+            return report("failed", type(exc).__name__)
 
     async def close(self) -> None:
         if asyncio.current_task() in self._active.values():
