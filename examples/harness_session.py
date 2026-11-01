@@ -2,12 +2,16 @@
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 from dataclasses import asdict
 from pathlib import Path
 
+from pydantic import TypeAdapter
+
 from examples.live_memory_formation import Transport
+from examples.m1_corpus import SnapshotCorpus
 from examples.persistent_session import source_tool
 from weavria.context import ContextCompilerConfig
 from weavria.harness import AgentHarness, HarnessConfig, HarnessMemory
@@ -22,17 +26,41 @@ from weavria.runtime import RunLimits
 from weavria.tools import ToolRegistry
 
 
+def snapshot_tools(archive: Path, scene: str) -> ToolRegistry:
+    """自由提问示例只加载原文归档,不读取验收问题或评分器。"""
+    stored = TypeAdapter(dict[str, str]).validate_json(archive.read_bytes())
+    prefix = "docs/" if scene == "documents" else "src/weavria/"
+    sources = {
+        path: hashlib.sha256(text.encode()).hexdigest()
+        for path, text in stored.items()
+        if path.startswith(prefix)
+    }
+    if not sources:
+        raise ValueError("snapshot contains no files for the selected scene")
+    return SnapshotCorpus.load(archive, sources).registry(documents=scene == "documents")
+
+
 async def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--session", required=True)
     parser.add_argument("--message", required=True)
     parser.add_argument("--input-id", help="重试原请求时使用相同标识")
+    parser.add_argument("--clarification-id", help="回答上一次输出中的待澄清标识")
     parser.add_argument("--state", type=Path, default=Path(".weavria/harness"))
     parser.add_argument("--documents", type=Path, help="只读 JSON 文档所在目录")
+    parser.add_argument("--snapshot", type=Path, help="只读原文 JSON 归档,不包含评分")
+    parser.add_argument("--scene", choices=("documents", "repository"))
     parser.add_argument("--memory", action="store_true")
     parser.add_argument("--understand", action="store_true")
     parser.add_argument("--working-records", action="store_true", help="启用有界工作记录与任务理解")
     args = parser.parse_args()
+    if bool(args.snapshot) != bool(args.scene) or (args.snapshot and args.documents):
+        parser.error("--snapshot 与 --scene 必须一起提供,且不能同时使用 --documents")
+    tools = (
+        snapshot_tools(args.snapshot, args.scene)
+        if args.snapshot
+        else ToolRegistry((source_tool(args.documents),) if args.documents else ())
+    )
     base = os.environ.get("WEAVRIA_MODEL_BASE_URL")
     name = os.environ.get("WEAVRIA_MODEL_NAME")
     if not base or not name:
@@ -77,7 +105,7 @@ async def main() -> None:
             args.state / "session.db",
             config=harness_config,
             model=OpenAICompatibleSessionProvider(config, transport=transport),
-            tools=ToolRegistry((source_tool(args.documents),) if args.documents else ()),
+            tools=tools,
             instructions="Answer the user's request. Use available tools when needed.",
             token_counter=counter,
             reasoning_model=provider,
@@ -88,7 +116,13 @@ async def main() -> None:
                 await agent.sessions.store.head(args.session)
             except KeyError:
                 await agent.create(args.session)
-            result = await agent.send(args.session, args.message, input_id=args.input_id)
+            result = await agent.send(
+                args.session,
+                args.message,
+                input_id=args.input_id,
+                clarification_id=args.clarification_id,
+            )
+            pending = await agent.sessions.store.pending_clarifications(args.session)
             print(
                 json.dumps(
                     {
@@ -98,6 +132,14 @@ async def main() -> None:
                         "output": result.session.report.output,
                         "prior_memory": asdict(result.prior_memory),
                         "memory": asdict(result.memory),
+                        "pending_clarifications": [
+                            {
+                                "work_id": item.work_id,
+                                "clarification_id": item.pending_clarification.clarification_id,
+                            }
+                            for item in pending
+                            if item.pending_clarification is not None
+                        ],
                     },
                     ensure_ascii=False,
                     indent=2,
