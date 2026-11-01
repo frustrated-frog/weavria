@@ -1,0 +1,254 @@
+{
+  "schema_version": 1,
+  "dataset_version": "m1-harness/1",
+  "source_commit": "f026796054a10132561faa4f2e7225a6e23390d4",
+  "corpora": {
+    "documents": {
+      "docs/长期研发宪章.md": "bb06e2ee1b12b796893a8df04a2cf3a8fcf41d12c47772511cb37b9436d6dcd3",
+      "docs/统一执行链的调用过程与使用.md": "51ca9db36530743c22a922fc5e2e8c79ba58e6d3aa721dc1ac05dcb8cefd0d33",
+      "docs/工作记录的执行过程与使用.md": "ce01c837a422e21476a3442c1061049e55c43b85c78e303831a234616f139c8a",
+      "docs/动态工具工作集的选择机制与实验.md": "a65780ba0195e81c2126c3b7836bcae7acd7d3333e6a9db288a47effe508335e",
+      "docs/decisions/0075-统一执行链与记忆生命周期.md": "75bb22676fc8a41024ef2fe81dab6f77619469908e88ba22cdf359bd6093c6c2",
+      "docs/decisions/0077-统一执行链的组合契约与请求期限.md": "7569c3691b9000269fc41791aaaa6660a144db3e49eb71d833f2b5a3e13121ee",
+      "docs/decisions/0078-工作记录驱动的上下文与能力选择.md": "0a3e1f55ee85ea6805aef2d5d8bd17ea88af81c2679b8b1c15a0791fd1db5505",
+      "docs/decisions/0079-推荐配置与完整链路装配.md": "55ee3c49b20a896ad28dcb1ea123cd46071c3879cd4830e28c6dce81e0dc71bf"
+    },
+    "repository": {
+      "src/weavria/harness/assembly.py": "412ba4c58b80dcc37600ca7537610e1e3b9c0a4b4d526d769f524c494880e935",
+      "src/weavria/harness/configuration.py": "aadc1af879067155f95301e9cd37c172a42165f6ce071d5cead6ed366087d01b",
+      "src/weavria/harness/work.py": "1203f168a0d98d482df83fd53a0c52d5bcca7f841c7234cfd857697511b30353",
+      "src/weavria/harness/memory_session.py": "20b0e502a938811ce4cae7bf87d5cad4db491f2b4cf63ec5ae40fb9499a1e870",
+      "src/weavria/harness/memory_formation.py": "9c72c4a5c0d29233a74ef0fad14e84f92bf436f06da56865c4e32846a18dab71",
+      "src/weavria/context/budget.py": "29ea60b550e705c77e94e78774abd9c2a7078915fefe899846881a9a140b0d20",
+      "src/weavria/runtime/agent.py": "16a93a5b103ab37d63d1ea5826b17962ea58a60d89a134f6d381a2b47356f3d5",
+      "src/weavria/runtime/intervention.py": "3849deb2befc53f7e71792f8ebe078d47f076cd0dc19c291333c4defc2c49779"
+    }
+  },
+  "model": {
+    "name": "deepseek-flash",
+    "temperature": 0.0,
+    "output_tokens": 4096,
+    "window_tokens": 16384,
+    "safety_tokens": 1024,
+    "max_request_bytes": 96000,
+    "json_mode": true,
+    "reasoning_effort": "none"
+  },
+  "budgets": {
+    "request_seconds": 240,
+    "run_seconds": 180,
+    "model_seconds": 60,
+    "preparation_seconds": 60,
+    "memory_seconds": 45,
+    "max_model_calls": 16,
+    "max_tool_calls": 20,
+    "finalization_model_calls": 2,
+    "trial_seconds": 1200
+  },
+  "repetitions": 3,
+  "minimum_successes": 30,
+  "cases": [
+    {
+      "case_id": "documents_multistep",
+      "domain": "documents",
+      "scenario": "multistep",
+      "request": "根据统一执行链使用说明和 ADR 0077，说明推荐 Python 接入入口、Run 已成功但记忆形成失败时的状态，以及单独续接形成的方法。返回 entry、memory_status、retry_method、answer_preserved 和 sources。最终只输出一个 JSON 对象，sources 是实际引用的文件路径数组，不要代码围栏。",
+      "expected": {
+        "entry": "AgentHarness.from_config",
+        "memory_status": "failed",
+        "retry_method": "flush_memory",
+        "answer_preserved": true
+      },
+      "required_sources": [
+        "docs/统一执行链的调用过程与使用.md",
+        "docs/decisions/0077-统一执行链的组合契约与请求期限.md"
+      ]
+    },
+    {
+      "case_id": "documents_long_context",
+      "domain": "documents",
+      "scenario": "long_context",
+      "request": "研究完整 research_bundle.txt 资料包，核对推荐配置默认的 memory_write，以及工作记录最多几条笔记、每条 summary 最多多少字符、整个工作状态最多多少 UTF-8 字节。过程中保留简短工作记录，按需回取原文。返回 memory_write、max_notes、summary_characters、state_bytes 和 sources。最终只输出一个 JSON 对象，sources 是实际引用的文件路径数组，不要代码围栏。",
+      "expected": {
+        "memory_write": "off",
+        "max_notes": 6,
+        "summary_characters": 240,
+        "state_bytes": 8192
+      },
+      "required_sources": [
+        "docs/decisions/0078-工作记录驱动的上下文与能力选择.md",
+        "docs/decisions/0079-推荐配置与完整链路装配.md"
+      ]
+    },
+    {
+      "case_id": "documents_clarification",
+      "domain": "documents",
+      "scenario": "clarification",
+      "request": "我要根据文档接入记忆，但还没有告诉你是只读现有记忆还是从对话形成新记忆；请先确认我的选择，再建议配置。最终需要 memory_write、mode、needs_formation_model 和 sources。最终只输出一个 JSON 对象，sources 是实际引用的文件路径数组，不要代码围栏。",
+      "expected": {
+        "memory_write": "off",
+        "mode": "read_only",
+        "needs_formation_model": false
+      },
+      "required_sources": [
+        "docs/统一执行链的调用过程与使用.md"
+      ],
+      "clarification": "只读已有记忆，不从新对话形成；请根据使用说明给出配置。"
+    },
+    {
+      "case_id": "documents_steering",
+      "domain": "documents",
+      "scenario": "steering",
+      "request": "根据文档分析记忆形成的时间预算及失败行为，读取原始资料后回答。最终只输出一个 JSON 对象，sources 是实际引用的文件路径数组，不要代码围栏。",
+      "expected": {
+        "tool": "propose_work",
+        "max_notes": 6,
+        "state_bytes": 8192
+      },
+      "required_sources": [
+        "docs/decisions/0078-工作记录驱动的上下文与能力选择.md"
+      ],
+      "steering": "改变任务：现在只查工作记录机制。请指出写工作记录的工具名、笔记数量上限和整个工作状态的字节上限。返回 tool、max_notes、state_bytes 和 sources。最终只输出一个 JSON 对象，sources 是实际引用的文件路径数组，不要代码围栏。"
+    },
+    {
+      "case_id": "documents_memory",
+      "domain": "documents",
+      "scenario": "memory",
+      "request": "本项目当前文档语言约定是什么？只返回 JSON 对象，字段 language。",
+      "expected": {
+        "language": "English"
+      },
+      "required_sources": [],
+      "memory_seed": "本项目文档的长期默认语言是中文。请记住这个项目约定，后续会话都适用。",
+      "memory_correction": "修订本项目的长期文档语言约定：从现在起默认使用英文，替代之前的中文约定。请记住这一更新，后续会话都适用。",
+      "first_expected": {
+        "language": "中文"
+      },
+      "aliases": {
+        "language": [
+          "英文",
+          "英语",
+          "english"
+        ]
+      },
+      "first_aliases": {
+        "language": [
+          "Chinese",
+          "chinese",
+          "汉语"
+        ]
+      }
+    },
+    {
+      "case_id": "documents_failure",
+      "domain": "documents",
+      "scenario": "failure",
+      "request": "请从主档案读取 ADR 0077，解释前置记忆追赶占父请求期限的默认比例，以及记忆超时是否会改写已完成的执行结果。资料有独立镜像，主档案不可用时继续完成。返回 catchup_fraction、overwrites_completed_run 和 sources。最终只输出一个 JSON 对象，sources 是实际引用的文件路径数组，不要代码围栏。",
+      "expected": {
+        "catchup_fraction": 0.1,
+        "overwrites_completed_run": false
+      },
+      "required_sources": [
+        "docs/decisions/0077-统一执行链的组合契约与请求期限.md"
+      ]
+    },
+    {
+      "case_id": "repository_multistep",
+      "domain": "repository",
+      "scenario": "multistep",
+      "request": "只读分析 harness/assembly.py 与 harness/memory_session.py：AgentHarness.send 返回哪三个顶层字段？SessionMemoryIngestor 是否把 Tool Output 自动作为长期记忆来源？返回 result_fields（字段名数组）、learns_tool_outputs（布尔值）和 sources。最终只输出一个 JSON 对象，sources 是实际引用的文件路径数组，不要代码围栏。",
+      "expected": {
+        "result_fields": [
+          "session",
+          "memory",
+          "prior_memory"
+        ],
+        "learns_tool_outputs": false
+      },
+      "required_sources": [
+        "src/weavria/harness/assembly.py",
+        "src/weavria/harness/memory_session.py"
+      ],
+      "unordered_fields": [
+        "result_fields"
+      ]
+    },
+    {
+      "case_id": "repository_long_context",
+      "domain": "repository",
+      "scenario": "long_context",
+      "request": "分析完整 runtime/agent.py，说明 RunLimits.max_intervention_reconsiderations 默认值，以及完成阶段 _evidence_access_proof 对首次 read_artifact 的 start 和已有分页结果的下一次 start 有何要求。过程中保留简短工作记录，按需回取原文。返回 reconsiderations、first_start、continuation_start（源码表达式）、tool 和 sources。最终只输出一个 JSON 对象，sources 是实际引用的文件路径数组，不要代码围栏。",
+      "expected": {
+        "reconsiderations": 2,
+        "first_start": 0,
+        "continuation_start": "page.end",
+        "tool": "read_artifact"
+      },
+      "required_sources": [
+        "src/weavria/runtime/agent.py"
+      ]
+    },
+    {
+      "case_id": "repository_clarification",
+      "domain": "repository",
+      "scenario": "clarification",
+      "request": "我要在 AgentHarness 和 AgentHarness.from_config 之间选接入方式，但还没有说明是否要替换内部策略。先问我这一点，再阅读源码给出选择。最终返回 entry、supports_custom_understanding 和 sources。最终只输出一个 JSON 对象，sources 是实际引用的文件路径数组，不要代码围栏。",
+      "expected": {
+        "entry": "AgentHarness",
+        "supports_custom_understanding": true
+      },
+      "required_sources": [
+        "src/weavria/harness/assembly.py"
+      ],
+      "clarification": "我要注入自己的 TaskUnderstandingEngine 和 working_set 策略，选择支持这些自定义组件的入口。"
+    },
+    {
+      "case_id": "repository_steering",
+      "domain": "repository",
+      "scenario": "steering",
+      "request": "先分析 AgentHarness.send 的父请求期限和记忆阶段分配，读取源码后再总结。最终只输出一个 JSON 对象，sources 是实际引用的文件路径数组，不要代码围栏。",
+      "expected": {
+        "cancel_active": true,
+        "await_children": true,
+        "close_order": [
+          "sessions",
+          "memory"
+        ]
+      },
+      "required_sources": [
+        "src/weavria/harness/assembly.py"
+      ],
+      "steering": "任务变更：现在只分析 AgentHarness.close/_close_owned 的关闭顺序。是否取消活跃请求、是否等子任务清理、两个存储按什么顺序关闭？返回 cancel_active、await_children、close_order（sessions/memory 的顺序数组）和 sources。最终只输出一个 JSON 对象，sources 是实际引用的文件路径数组，不要代码围栏。"
+    },
+    {
+      "case_id": "repository_memory",
+      "domain": "repository",
+      "scenario": "memory",
+      "request": "本项目当前代码审查报告的排序约定是什么？只返回 JSON 对象，字段 ordering。",
+      "expected": {
+        "ordering": "文件路径升序"
+      },
+      "required_sources": [],
+      "memory_seed": "本项目代码审查报告的长期排序约定是严重程度降序。请记住这个项目约定，后续会话都适用。",
+      "memory_correction": "修订本项目代码审查报告的长期排序约定：从现在起采用文件路径升序，替代严重程度降序。请记住这一更新，后续会话都适用。",
+      "first_expected": {
+        "ordering": "严重程度降序"
+      }
+    },
+    {
+      "case_id": "repository_failure",
+      "domain": "repository",
+      "scenario": "failure",
+      "request": "请从主档案只读分析 harness/configuration.py 和 harness/assembly.py；主档案不可用时使用独立镜像。工作记录是否依赖任务理解，默认 memory_write 是什么，开启记忆写入但缺少存储时是否拒绝启动？返回 requires_understanding、default_memory_write、rejects_missing_storage 和 sources。最终只输出一个 JSON 对象，sources 是实际引用的文件路径数组，不要代码围栏。",
+      "expected": {
+        "requires_understanding": true,
+        "default_memory_write": "off",
+        "rejects_missing_storage": true
+      },
+      "required_sources": [
+        "src/weavria/harness/assembly.py",
+        "src/weavria/harness/configuration.py"
+      ]
+    }
+  ]
+}
