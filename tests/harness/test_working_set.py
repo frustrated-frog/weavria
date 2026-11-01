@@ -298,7 +298,8 @@ async def test_session_failure_switches_tool_then_retires_satisfied_tools(
 
     async def backup(arguments: Input, context: ToolContext) -> Output:
         calls.append("b_source")
-        return Output(value="accepted")
+        # 大结果必须卸载,完成信息需求不意味着模型已经看完原文。
+        return Output(value="accepted " * 10000)
 
     registry = ToolRegistry(
         tuple(
@@ -342,7 +343,45 @@ async def test_session_failure_switches_tool_then_retires_satisfied_tools(
                 ),
             )
 
-    model = FakeSessionProvider(
+    from weavria.core import SessionRequest, ToolSucceededObservation
+
+    class ReadbackModel(FakeSessionProvider):
+        async def generate_session(self, request: SessionRequest) -> ModelTurn:
+            exchanges = [e for e in request.current.history if isinstance(e, ToolExchange)]
+            if any(e.action.call_id == "b" for e in exchanges) and not any(
+                e.action.call_id == "readback" for e in exchanges
+            ):
+                names = request.current.instructions
+                assert "a_source" not in names and "b_source" not in names
+                assert "read_artifact" in names
+                source = next(e for e in exchanges if e.action.call_id == "b")
+                assert isinstance(source.observation, ToolSucceededObservation)
+                output = source.observation.output
+                assert isinstance(output, dict)
+                assert output["representation"] != "full"
+                return ModelTurn(
+                    decision=ToolBatch(
+                        calls=(
+                            ToolCallAction(
+                                call_id="readback",
+                                tool_name="read_artifact",
+                                arguments={
+                                    "artifact_id": output["artifact_id"],
+                                    "pointer": "/value",
+                                    "start": 0,
+                                    "length": 100,
+                                },
+                            ),
+                        )
+                    )
+                )
+            if any(e.action.call_id == "readback" for e in exchanges):
+                recovered = next(e for e in exchanges if e.action.call_id == "readback")
+                assert isinstance(recovered.observation, ToolSucceededObservation)
+                assert "accepted" in str(recovered.observation.output)
+            return await super().generate_session(request)
+
+    model = ReadbackModel(
         (
             ModelTurn(
                 decision=ToolBatch(

@@ -91,7 +91,7 @@ class TaskAwareSessionPreparer:
     @property
     def version(self) -> str:
         return (
-            "task-aware-session/9["
+            "task-aware-session/10["
             f"{self._understanding.version};{self._evidence.version};"
             f"{self._capabilities.version};{self._clarification.version};"
             f"{self._working_set.version if self._working_set else 'monotonic-view/1'}]"
@@ -318,6 +318,7 @@ class TaskAwareSessionPreparer:
                     tools=context.tools,
                     base_semantic=context.base_semantic,
                     cause="steering",
+                    context_supply=context.context_supply,
                 )
             )
         previous = load_need_ledger(context.base_semantic.need_ledger)

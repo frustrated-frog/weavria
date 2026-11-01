@@ -74,6 +74,7 @@ from .memory_admission import (
     ground_memory_candidates,
 )
 from .memory_context import MemoryContextSource, MemoryGroupReader
+from .memory_features import MemoryReviewFeatureProvider, MemoryReviewFeatures
 from .memory_formation import MemoryExtractor, MemoryFormationEngine, MemoryReviewer
 from .memory_generation import MemoryGenerationPolicy
 from .memory_interpretation import ModelMemoryRepairingExtractor
@@ -207,6 +208,8 @@ __all__ = [
     "MemoryFormationError",
     "MemoryGenerationPolicy",
     "MemoryGroupReader",
+    "MemoryReviewFeatureProvider",
+    "MemoryReviewFeatures",
     "MemoryReviewer",
     "MemoryUpdateReport",
     "ModelMemoryExtractor",

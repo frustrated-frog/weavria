@@ -31,6 +31,7 @@ from .memory_alignment import (
     analyze_conditions,
     equivalent_conditions,
 )
+from .memory_features import MemoryReviewFeatures
 from .memory_partition import partition_mutations
 from .memory_sets import compile_fact_sets
 
@@ -100,6 +101,10 @@ class ConservativeMemoryAdmission:
     """
 
     version = "conservative-memory-admission/3"
+
+    @property
+    def features(self) -> MemoryReviewFeatures:
+        return MemoryReviewFeatures(self._set_reconciliation, self._semantic_conditions)
 
     def __init__(
         self, *, set_reconciliation: bool = False, semantic_conditions: bool = False

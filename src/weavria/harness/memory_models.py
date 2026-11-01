@@ -16,6 +16,7 @@ from weavria.models import ModelCallError, ModelProvider, call_model
 from .memory_admission import MemoryFormationError, ground_memory_candidates
 from .memory_condition_wire import ConditionSetReviewWire
 from .memory_evidence import index_memory_evidence
+from .memory_features import MemoryReviewFeatures
 from .memory_generation import MemoryGenerationPolicy, MemoryProposalError, generate_memory
 from .memory_review_wire import (
     ClaimExtractionWire,
@@ -223,6 +224,10 @@ class ModelMemoryExtractor:
 
 class ModelMemoryReviewer:
     """A separate model call evaluates evidence and relationships; it is not a truth oracle."""
+
+    @property
+    def features(self) -> MemoryReviewFeatures:
+        return MemoryReviewFeatures(self._set_reconciliation, self._semantic_conditions)
 
     def __init__(
         self,

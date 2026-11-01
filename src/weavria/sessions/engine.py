@@ -35,6 +35,7 @@ from weavria.core import (
     ApplicationObservation,
     ContextBundle,
     ContextCompilation,
+    ContextSupply,
     ControlEvent,
     ControlFeedback,
     ControlRequest,
@@ -125,6 +126,23 @@ class _RunArtifacts:
         if run_id != self._run_id:
             raise ValueError("use the scoped session source tool for prior-run evidence")
         return await self._store.get(run_id, artifact_id)
+
+
+async def _preparation_supply(
+    source: ContextSource | None, *, session_id: str, run_id: str, task: TaskInput
+) -> ContextSupply | None:
+    """新输入、澄清和修订共享同一查询;只返回当前任务的背景,不缓存旧版本。"""
+    if source is None:
+        return None
+    supply = await source.retrieve(
+        session_id=session_id,
+        run_id=run_id,
+        task=task,
+        demands=(ContextDemand("current_task", " ".join((task.goal, *task.constraints))),),
+    )
+    if supply.report.task_revision != task.revision:
+        raise ValueError("preparation background belongs to another task revision")
+    return supply
 
 
 class _SessionAdapter:
@@ -657,6 +675,15 @@ class _SessionAdapter:
         ):
             return
         history = await self._store.history(self._session_id, before_ordinal=self._ordinal)
+        # 工具反馈只归约事实;只有目标版本变化才重新读取理解背景。
+        # Runtime 在 await 返回后再次核对 task revision,旧供给不会进入新版本请求。
+        supply = (
+            await _preparation_supply(
+                self._context_source, session_id=self._session_id, run_id=self._run_id, task=task
+            )
+            if task.revision != self._semantic.version.task_revision
+            else None
+        )
         prepared = await self._task_preparer.refresh(
             SessionSemanticContext(
                 session_id=self._session_id,
@@ -665,6 +692,7 @@ class _SessionAdapter:
                 history=history,
                 tools=self._capability_ceiling,
                 base_semantic=self._semantic,
+                context_supply=supply,
                 records=records,
                 read_artifact=lambda artifact_id: self._store.get(self._run_id, artifact_id),
                 trigger=(
@@ -708,9 +736,15 @@ class _SessionAdapter:
             for descriptor in self._tools.descriptors
             if descriptor.name not in {item.name for item in self._capability_ceiling.descriptors}
         )
+        # 获取新资料的工具可以退休;已有成果仍需要分页/原文读取,二者条件独立。
         self._visible_tool_names = (
             *snapshot.visible_tool_names,
-            *(support_names if snapshot.visible_tool_names else ()),
+            *(
+                support_names
+                if snapshot.visible_tool_names
+                or any(record.artifact is not None for record in records)
+                else ()
+            ),
         )
         self._capability_epoch = snapshot.version.capability_epoch
         self._task_observation = snapshot.observation
@@ -937,10 +971,24 @@ class SessionEngine:
         input_id: str | None = None,
         application_context: tuple[ApplicationObservation, ...] = (),
         clarification_id: str | None = None,
+        max_duration: float | None = None,
     ) -> SessionResult:
-        """Persist input before work; retrying an input ID returns its original terminal report."""
+        """Persist input before work; duplicates return the original report.
+
+        max_duration may shorten, never extend, the configured request deadline.
+        """
         if self._closing:
             raise RuntimeError("session engine is closing")
+        # 外层 Harness 可以缩短本次期限,不能扩大构造时的 Session 上限。
+        duration = self._max_request_duration
+        if max_duration is not None:
+            if (
+                isinstance(max_duration, bool)
+                or not math.isfinite(max_duration)
+                or max_duration <= 0
+            ):
+                raise ValueError("request duration must be positive and finite")
+            duration = min(duration, max_duration)
         owner = asyncio.current_task()
         if owner is None:
             raise RuntimeError("send requires an owned asyncio task")
@@ -950,7 +998,7 @@ class SessionEngine:
         claimed_run: str | None = None
         interruption_reason = "owner_exit"
         try:
-            root_budget = RootBudget.start(self._clock.monotonic(), self._max_request_duration)
+            root_budget = RootBudget.start(self._clock.monotonic(), duration)
             run_id = self._ids()
             identity = input_id if input_id is not None else self._ids()
             config = json.dumps(
@@ -1007,7 +1055,7 @@ class SessionEngine:
                     "session_tools_version": "2",
                     "session_lifecycle_version": "2",
                     "limits": asdict(self._limits),
-                    "max_request_duration": self._max_request_duration,
+                    "max_request_duration": duration,
                     "history_budget_bytes": self._history_budget,
                     "history_mode": self._history_mode.value,
                     "instructions": self._instructions,
@@ -1099,19 +1147,8 @@ class SessionEngine:
                 async with asyncio.timeout(root_budget.remaining(self._clock.monotonic())):
                     # 理解目标之前读取已有记忆。该快照只供本次理解使用;后续每轮
                     # 决策仍按新需求召回,不能把首次读取冻结成整个 Run 的事实。
-                    supply = (
-                        await self._context_source.retrieve(
-                            session_id=session_id,
-                            run_id=run_id,
-                            task=task,
-                            demands=(
-                                ContextDemand(
-                                    "current_task", " ".join((task.goal, *task.constraints))
-                                ),
-                            ),
-                        )
-                        if self._context_source is not None
-                        else None
+                    supply = await _preparation_supply(
+                        self._context_source, session_id=session_id, run_id=run_id, task=task
                     )
                     prepared = await self._task_preparation.prepare(
                         SessionTaskContext(

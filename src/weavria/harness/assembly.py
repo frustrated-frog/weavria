@@ -9,14 +9,23 @@ from typing import Literal, Self
 from weavria.context import ContextCompilerConfig, HistoryRetrievalConfig, SessionTokenCounter
 from weavria.core import ApplicationObservation, RecoveryLimits, SessionResult, TaskUpdate
 from weavria.memory import MemoryAccess, MemoryError, MemoryScope, SQLiteMemoryStore
-from weavria.models import ModelCallError, SessionModelProvider
-from weavria.runtime import RunLimits, TaskModelProjector, ToolScheduling, settle_mutation
+from weavria.models import ModelCallError, ModelProvider, SessionModelProvider
+from weavria.runtime import (
+    CompletionPolicy,
+    RunLimits,
+    TaskModelProjector,
+    ToolScheduling,
+    settle_mutation,
+)
 from weavria.sessions import SessionBusyError, SessionEngine
 from weavria.tools import ToolPolicy, ToolRegistry
 
-from .memory_admission import MemoryFormationError
+from .memory_admission import ConservativeMemoryAdmission, MemoryFormationError
 from .memory_context import MemoryContextSource
+from .memory_features import MemoryReviewFeatureProvider, MemoryReviewFeatures
 from .memory_formation import MemoryExtractor, MemoryFormationEngine, MemoryReviewer
+from .memory_generation import MemoryGenerationPolicy
+from .memory_models import ModelMemoryExtractor, ModelMemoryReviewer
 from .memory_session import SessionMemoryBinding, SessionMemoryIngestor
 from .session import TaskAwareSessionPreparer
 from .understanding import TaskUnderstandingEngine
@@ -41,10 +50,74 @@ class HarnessMemory:
     max_duration: float = 30
     max_events: int = 512
     max_recall_bytes: int = 8192
+    admission: ConservativeMemoryAdmission | None = None
+
+    @classmethod
+    def from_model(
+        cls,
+        path: Path,
+        access: MemoryAccess,
+        scope: MemoryScope,
+        author_subject: str,
+        *,
+        model: ModelProvider,
+        configuration_id: str,
+        profile: Literal["basic", "fact_sets", "conditions"] = "basic",
+        generation: MemoryGenerationPolicy | None = None,
+        timezone: str = "UTC",
+        max_duration: float = 30,
+        max_events: int = 512,
+        max_recall_bytes: int = 8192,
+    ) -> Self:
+        """一份配置成套构造提取、审阅、准入;增强语义与修复调用均显式选择。"""
+        if profile not in {"basic", "fact_sets", "conditions"}:
+            raise ValueError("unknown memory formation profile")
+        enhanced = profile != "basic"
+        # 事实集协议需要结构化生成,但默认不额外支付修复调用。
+        policy = generation or (MemoryGenerationPolicy(max_repairs=0) if enhanced else None)
+        return cls(
+            path,
+            access,
+            scope,
+            author_subject,
+            extractor=ModelMemoryExtractor(
+                model,
+                configuration_id=configuration_id,
+                generation=policy,
+                claim_modalities=enhanced,
+            ),
+            reviewer=ModelMemoryReviewer(
+                model,
+                configuration_id=configuration_id,
+                generation=policy,
+                family_alignment=enhanced,
+                set_reconciliation=enhanced,
+                semantic_conditions=profile == "conditions",
+            ),
+            admission=ConservativeMemoryAdmission(
+                set_reconciliation=enhanced, semantic_conditions=profile == "conditions"
+            ),
+            timezone=timezone,
+            max_duration=max_duration,
+            max_events=max_events,
+            max_recall_bytes=max_recall_bytes,
+        )
 
     def __post_init__(self) -> None:
         if (self.extractor is None) != (self.reviewer is None):
             raise ValueError("memory formation requires both extractor and reviewer")
+        if self.admission is not None and self.reviewer is None:
+            raise ValueError("memory admission requires formation components")
+        required = (
+            self.reviewer.features
+            if isinstance(self.reviewer, MemoryReviewFeatureProvider)
+            else MemoryReviewFeatures()
+        )
+        admission = self.admission or ConservativeMemoryAdmission()
+        if not admission.features.supports(required):
+            raise ValueError("memory reviewer features are not supported by admission")
+        if self.reviewer is not None:
+            object.__setattr__(self, "admission", admission)
         if self.scope not in self.access.readable_scopes:
             raise ValueError("Harness memory requires explicit read access")
         if self.extractor is not None and self.scope not in self.access.writable_scopes:
@@ -105,6 +178,9 @@ class AgentHarness:
         token_counter: SessionTokenCounter,
         instructions: str = "",
         limits: RunLimits | None = None,
+        max_request_duration: float | None = None,
+        memory_catchup_fraction: float = 0.1,
+        completion: CompletionPolicy | None = None,
         understanding: TaskUnderstandingEngine | None = None,
         working_set: CapabilityWorkingSetPolicy | None = None,
         memory: HarnessMemory | None = None,
@@ -116,6 +192,21 @@ class AgentHarness:
     ) -> None:
         if working_set is not None and understanding is None:
             raise ValueError("capability working set requires task understanding")
+        duration = (
+            (limits or RunLimits()).max_duration
+            if max_request_duration is None
+            else max_request_duration
+        )
+        if isinstance(duration, bool) or not math.isfinite(duration) or duration <= 0:
+            raise ValueError("Harness request duration must be positive and finite")
+        if (
+            isinstance(memory_catchup_fraction, bool)
+            or not math.isfinite(memory_catchup_fraction)
+            or not 0 <= memory_catchup_fraction < 1
+        ):
+            raise ValueError("memory catchup fraction must be in [0, 1)")
+        self._max_request_duration = duration
+        self._memory_catchup_fraction = memory_catchup_fraction
         self._memory = memory
         self._memory_store = SQLiteMemoryStore(memory.path) if memory else None
         source = (
@@ -134,6 +225,8 @@ class AgentHarness:
             tools=tools,
             instructions=instructions,
             limits=limits,
+            max_request_duration=duration,
+            completion=completion,
             context_compiler=context,
             token_counter=token_counter,
             task_preparation=TaskAwareSessionPreparer(
@@ -148,7 +241,12 @@ class AgentHarness:
             policy=policy,
             scheduling=scheduling,
             configuration_metadata={
-                "harness_version": "unified-harness/2",
+                "harness_version": "unified-harness/3",
+                "harness_max_request_duration": duration,
+                "memory_catchup_fraction": memory_catchup_fraction,
+                "memory_admission_version": memory.admission.version
+                if memory and memory.admission
+                else None,
                 "memory_update_max_duration": memory.max_duration if memory else None,
                 "memory_update_max_events": memory.max_events if memory else None,
                 "memory_formation_version": (
@@ -165,6 +263,7 @@ class AgentHarness:
                     self._memory_store,
                     memory.extractor,
                     memory.reviewer,
+                    admission=memory.admission,
                 ),
             )
             if memory and self._memory_store and memory.extractor and memory.reviewer
@@ -215,20 +314,37 @@ class AgentHarness:
         application_context: tuple[ApplicationObservation, ...] = (),
         clarification_id: str | None = None,
     ) -> HarnessResult:
-        """运行并有界形成记忆;重复 input_id 不重跑模型,可续接上次未完成的形成。"""
+        """共享父期限执行与形成;重复 input_id 不重跑模型,可续接形成。
+
+        Session 阶段被父期限取消可抛 TimeoutError;已提交结果后的形成超时
+        返回 deferred。外部取消始终传播,事务清理完成后才归还请求所有权。
+        """
         self._claim(session_id)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._max_request_duration
         try:
-            # 先补齐此前取消/超预算留下的事件,让本次理解尽可能看到既有经验。
-            # 失败不会伪装成已追平: 前后两个报告分别交给调用者。
-            prior_memory = await self._update_memory(session_id)
-            result = await self.sessions.send(
+            # 前置追赶最多占父预算的一小部分,不能先耗尽回答时间。
+            prior_memory = await self._update_memory(
                 session_id,
-                text,
-                input_id=input_id,
-                application_context=application_context,
-                clarification_id=clarification_id,
+                deadline=min(
+                    deadline,
+                    loop.time() + self._max_request_duration * self._memory_catchup_fraction,
+                ),
             )
-            return HarnessResult(result, await self._update_memory(session_id), prior_memory)
+            # Session 收到剩余期限,其内部探索/收尾继续共享既有 RootBudget。
+            # 外层还约束接受输入等存储 I/O;取消时仍等待事务确定,不承诺硬实时。
+            async with asyncio.timeout_at(deadline):
+                result = await self.sessions.send(
+                    session_id,
+                    text,
+                    input_id=input_id,
+                    application_context=application_context,
+                    clarification_id=clarification_id,
+                    max_duration=max(0.000001, deadline - loop.time()),
+                )
+            return HarnessResult(
+                result, await self._update_memory(session_id, deadline=deadline), prior_memory
+            )
         finally:
             self._active.pop(session_id, None)
 
@@ -256,7 +372,9 @@ class AgentHarness:
         finally:
             self._active.pop(session_id, None)
 
-    async def _update_memory(self, session_id: str) -> MemoryUpdateReport:
+    async def _update_memory(
+        self, session_id: str, *, deadline: float | None = None
+    ) -> MemoryUpdateReport:
         config, store, ingestor = self._memory, self._memory_store, self._ingestor
         if config is None or store is None:
             return MemoryUpdateReport("disabled")
@@ -265,8 +383,12 @@ class AgentHarness:
         cursor = processed = target = 0
         loop = asyncio.get_running_loop()
         end = loop.time() + config.max_duration
+        if deadline is not None:
+            end = min(end, deadline)
+        if end <= loop.time():
+            return MemoryUpdateReport("deferred", error_type="RequestBudgetExhausted")
         try:
-            async with asyncio.timeout(config.max_duration):
+            async with asyncio.timeout_at(end):
                 # 固定本轮消费上界;不能因并发的新事件而无界追赶。
                 target, _ = await self.sessions.store.head(session_id)
                 cursor = await store.cursor(config.access, config.scope, f"session:{session_id}")

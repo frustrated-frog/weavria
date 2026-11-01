@@ -19,8 +19,6 @@ from weavria.core import RecoveryLimits
 from weavria.harness import (
     AgentHarness,
     HarnessMemory,
-    ModelMemoryExtractor,
-    ModelMemoryReviewer,
     ModelTaskInterpreter,
     TaskModelViewProjector,
     TaskUnderstandingEngine,
@@ -83,15 +81,15 @@ async def main() -> None:
         # 本地单用户示例的宿主授权。真实服务必须从认证结果构造,不能取模型参数。
         scope = MemoryScope(tenant_id="local", kind="project", key="workspace")
         memory = (
-            HarnessMemory(
+            HarnessMemory.from_model(
                 args.state / "memory.db",
                 MemoryAccess(
                     principal_id="local-user", readable_scopes=(scope,), writable_scopes=(scope,)
                 ),
                 scope,
                 "local-user",
-                ModelMemoryExtractor(provider, configuration_id="harness-cli-v1"),
-                ModelMemoryReviewer(provider, configuration_id="harness-cli-v1"),
+                model=provider,
+                configuration_id="harness-cli-v1",
                 max_duration=60,
             )
             if args.memory

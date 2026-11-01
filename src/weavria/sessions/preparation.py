@@ -121,6 +121,7 @@ class SessionSemanticContext:
     records: tuple[ToolRecord, ...]
     read_artifact: Callable[[str], Awaitable[ArtifactSnapshot]]
     trigger: Literal["tool_feedback", "steering"]
+    context_supply: ContextSupply | None = None
 
 
 @dataclass(frozen=True, slots=True)
