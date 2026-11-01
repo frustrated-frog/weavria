@@ -150,6 +150,7 @@ def _validate_semantic_transition(
             or accepted.observation != current.observation
             or accepted.visible_tool_names != current.visible_tool_names
             or accepted.need_ledger != current.need_ledger
+            or accepted.working_state != current.working_state
             or (
                 after.task_revision,
                 after.frame_revision,

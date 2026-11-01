@@ -97,6 +97,7 @@ class SessionTaskPreparation:
     transition: SemanticTransition
     work_status: WorkStatus = "active"
     clarification_plan: ClarificationDeliveryPlan | None = None
+    working_state: dict[str, JsonValue] | None = None
 
     def __post_init__(self) -> None:
         if self.work_status == "waiting_input":

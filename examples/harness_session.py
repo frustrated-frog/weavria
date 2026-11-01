@@ -43,6 +43,7 @@ async def main() -> None:
     parser.add_argument("--documents", type=Path, help="只读 JSON 文档所在目录")
     parser.add_argument("--memory", action="store_true")
     parser.add_argument("--understand", action="store_true")
+    parser.add_argument("--working-records", action="store_true", help="启用有界工作记录与任务理解")
     args = parser.parse_args()
     base = os.environ.get("WEAVRIA_MODEL_BASE_URL")
     name = os.environ.get("WEAVRIA_MODEL_NAME")
@@ -75,7 +76,7 @@ async def main() -> None:
                 ),
                 max_duration=60,
             )
-            if args.understand
+            if args.understand or args.working_records
             else None
         )
         # 本地单用户示例的宿主授权。真实服务必须从认证结果构造,不能取模型参数。
@@ -103,6 +104,7 @@ async def main() -> None:
             context=ContextCompilerConfig(window_tokens=64000, output_tokens=4096),
             token_counter=counter,
             understanding=understanding,
+            working_records=args.working_records,
             memory=memory,
             history_retrieval=HistoryRetrievalConfig(),
             context_recovery=RecoveryLimits(),

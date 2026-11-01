@@ -10,6 +10,7 @@ from .capabilities import CapabilityQuery, CapabilityResolver
 from .context import need_priority_weights
 from .requirements import NeedLedger, NeedStatus
 from .understanding import TaskFrame
+from .work import WorkingState, work_need_weights
 
 
 @dataclass(frozen=True)
@@ -36,6 +37,7 @@ class CapabilityWorkingSetPolicy(Protocol):
         previous: tuple[str, ...],
         records: tuple[ToolRecord, ...],
         discover: bool,
+        working_state: WorkingState | None = None,
     ) -> CapabilityWorkingSet: ...
 
 
@@ -47,6 +49,7 @@ class AdaptiveCapabilityPolicy:
     每轮从接受的 Frame/Ledger/Records 重算,不隐藏运行状态或永久封禁工具。
     """
 
+    working_records_version = 1
     max_tools: int = 8
     max_descriptor_bytes: int = 16000
 
@@ -61,7 +64,7 @@ class AdaptiveCapabilityPolicy:
 
     @property
     def version(self) -> str:
-        return f"adaptive-capabilities/1:tools={self.max_tools}:bytes={self.max_descriptor_bytes}"
+        return f"adaptive-capabilities/2:tools={self.max_tools}:bytes={self.max_descriptor_bytes}"
 
     def select(
         self,
@@ -73,13 +76,22 @@ class AdaptiveCapabilityPolicy:
         previous: tuple[str, ...],
         records: tuple[ToolRecord, ...],
         discover: bool,
+        working_state: WorkingState | None = None,
     ) -> CapabilityWorkingSet:
         if frame.work_id != ledger.work_id or frame.revision != ledger.frame_revision:
             raise ValueError("working set requires the current task frame and ledger")
+        if (
+            working_state is not None
+            and working_state.task_revision != frame.request_anchor.task_revision
+        ):
+            raise ValueError("working preference belongs to another task revision")
         descriptors = {d.name: d for d in tools.descriptors}
         declared = {n.name for n in frame.specification.capability_needs}
         candidates = set(previous) | declared
         priorities = need_priority_weights(frame.requirements, ledger)
+        for need_id, boost in work_need_weights(working_state).items():
+            if need_id in priorities:
+                priorities[need_id] = min(8.0, priorities[need_id] * boost)
         # 一次索引全部执行记录,避免每个需求-候选组合重扫长任务历史。
         positions = {r.exchange.action.call_id: i for i, r in enumerate(records)}
         last_success: dict[tuple[str, str], int] = {}

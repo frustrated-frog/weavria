@@ -5,6 +5,7 @@ from weavria.core import SemanticSnapshot
 
 from .requirements import InformationRequirement, NeedLedger, NeedStatus, load_need_ledger
 from .understanding import load_task_frame
+from .work import load_work, work_need_weights
 
 
 def project_context_focus(snapshot: SemanticSnapshot) -> ContextFocus:
@@ -21,6 +22,12 @@ def project_context_focus(snapshot: SemanticSnapshot) -> ContextFocus:
     ):
         raise ValueError("context focus requires the current accepted semantic snapshot")
     weights = need_priority_weights(frame.requirements, ledger)
+    working = load_work(snapshot.working_state) if snapshot.working_state is not None else None
+    if working is not None and working.task_revision != snapshot.version.task_revision:
+        raise ValueError("working context belongs to another task revision")
+    for need_id, boost in work_need_weights(working).items():
+        if need_id in weights:
+            weights[need_id] = min(8.0, weights[need_id] * boost)
     demands: list[ContextDemand] = []
     for requirement in frame.requirements:
         state = ledger.state_for(requirement.need_id)
@@ -45,6 +52,17 @@ def project_context_focus(snapshot: SemanticSnapshot) -> ContextFocus:
                 weight=weight,
                 anchors=anchors,
             )
+        )
+    if working is not None and working.next_query:
+        # 只优先取回被当前工作记录引用的资料,摘要本身不会替代原始材料。
+        anchors = tuple(
+            EvidenceAnchor(
+                s.artifact.run_id, s.artifact.call_id, s.artifact.sha256, s.reference.pointer
+            )
+            for s in working.sources
+        )
+        demands.append(
+            ContextDemand("working:next", working.next_query, weight=2.0, anchors=anchors)
         )
     return ContextFocus(snapshot.version.task_revision, tuple(demands))
 

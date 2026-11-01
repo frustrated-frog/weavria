@@ -80,7 +80,7 @@ from weavria.runtime import (
     TurnPreparation,
     settle_mutation,
 )
-from weavria.tools import ToolPolicy, ToolRegistry, artifact_read_tool
+from weavria.tools import RegisteredTool, ToolPolicy, ToolRegistry, artifact_read_tool
 
 from .evidence import session_history_tool, session_source_tool
 from .preparation import (
@@ -174,6 +174,7 @@ class _SessionAdapter:
         context_recovery: RecoveryLimits | None = None,
         task_model_projector: TaskModelProjector | None = None,
         context_source: ContextSource | None = None,
+        support_tools: tuple[RegisteredTool, ...] = (),
     ) -> None:
         self._provider, self._budget = provider, budget
         self._store, self._run_id = store, run_id
@@ -231,6 +232,7 @@ class _SessionAdapter:
             else 0
         )
         self._context_source = context_source
+        self._support_tools = support_tools
         self._bundles: tuple[ContextBundle, ...] = ()
 
     @property
@@ -705,6 +707,8 @@ class _SessionAdapter:
         if prepared.preparation_version != self._task_preparer.version:
             raise ValueError("semantic refresh version does not match its provider")
         snapshot = SemanticSnapshot(
+            schema_version=2 if prepared.working_state is not None else 1,
+            working_state=prepared.working_state,
             session_id=self._session_id,
             work_id=prepared.work_id,
             input_id=self._semantic.input_id,
@@ -737,14 +741,16 @@ class _SessionAdapter:
             if descriptor.name not in {item.name for item in self._capability_ceiling.descriptors}
         )
         # 获取新资料的工具可以退休;已有成果仍需要分页/原文读取,二者条件独立。
+        # 启用持久工作能力时,从初始决策就保留同组读取工具。否则第一次写入
+        # 工作 Artifact 会在业务集合不变时偷偷扩展视图,违反同 epoch 同视图。
+        include_support = (
+            prepared.clarification_plan is None
+            if self._support_tools
+            else bool(snapshot.visible_tool_names) or any(r.artifact is not None for r in records)
+        )
         self._visible_tool_names = (
             *snapshot.visible_tool_names,
-            *(
-                support_names
-                if snapshot.visible_tool_names
-                or any(record.artifact is not None for record in records)
-                else ()
-            ),
+            *(support_names if include_support else ()),
         )
         self._capability_epoch = snapshot.version.capability_epoch
         self._task_observation = snapshot.observation
@@ -827,6 +833,7 @@ class SessionEngine:
         configuration_metadata: dict[str, JsonValue] | None = None,
         task_model_projector: TaskModelProjector | None = None,
         context_source: ContextSource | None = None,
+        support_tools: tuple[RegisteredTool, ...] = (),
     ) -> None:
         if (context_compiler is None) != (token_counter is None):
             raise ValueError("context compiler and token counter must be configured together")
@@ -867,6 +874,7 @@ class SessionEngine:
         if context_source is not None and context_compiler is None:
             raise ValueError("context sources require the context compiler")
         self._context_source = context_source
+        self._support_tools = support_tools
         self._compiler_config, self._token_counter = context_compiler, token_counter
         if history_retrieval is not None and context_compiler is None:
             raise ValueError("history retrieval requires the context compiler")
@@ -888,6 +896,8 @@ class SessionEngine:
             clock=clock,
             semantic_reducer=semantic_reducer,
         )
+        # 支持能力不进入任务理解的业务目录,但与业务工具共享同一执行/授权链路。
+        ToolRegistry((*[tools.get(d.name) for d in tools.descriptors], *support_tools))
         self._model, self._tools = model, tools
         excerpt_instruction = (
             "Excerpts are exact: v1 offset 0, v2 uses start. "
@@ -1052,7 +1062,10 @@ class SessionEngine:
                     + "."
                     + type(self._model).__qualname__,
                     "model_capabilities": asdict(self._model.capabilities),
-                    "session_tools_version": "2",
+                    "session_tools_version": "3" if self._support_tools else "2",
+                    "support_tools": [
+                        t.descriptor.model_dump(mode="json") for t in self._support_tools
+                    ],
                     "session_lifecycle_version": "2",
                     "limits": asdict(self._limits),
                     "max_request_duration": duration,
@@ -1184,6 +1197,8 @@ class SessionEngine:
                     1 if semantic_base is None else semantic_base.version.semantic_sequence + 1
                 )
                 semantic = SemanticSnapshot(
+                    schema_version=2 if prepared.working_state is not None else 1,
+                    working_state=prepared.working_state,
                     session_id=session_id,
                     work_id=prepared.work_id,
                     input_id=claim.input_id,
@@ -1212,18 +1227,27 @@ class SessionEngine:
                 session_history_tool(self.store, session_id),
             )
             registered = tuple(self._tools.get(d.name) for d in self._tools.descriptors)
-            include_support_tools = self._task_preparation is None or bool(selected.descriptors)
+            include_support_tools = (
+                clarification_plan is None
+                if self._support_tools
+                else self._task_preparation is None or bool(selected.descriptors)
+            )
             support = (
                 (artifact_read_tool(), *extra)
                 if not any(d.name == "read_artifact" for d in self._tools.descriptors)
                 else extra
             )
-            registry = ToolRegistry((*registered, *support))
+            registry = ToolRegistry((*registered, *support, *self._support_tools))
             visible_tool_names = tuple(d.name for d in selected.descriptors)
             if include_support_tools:
                 visible_tool_names = (
                     *visible_tool_names,
                     *(tool.descriptor.name for tool in support),
+                )
+            if clarification_plan is None:
+                visible_tool_names = (
+                    *visible_tool_names,
+                    *(t.descriptor.name for t in self._support_tools),
                 )
             run_instructions = self._instructions
             if planned_clarification_text is not None:
@@ -1268,6 +1292,7 @@ class SessionEngine:
                 self._recovery_limits,
                 self._task_model_projector,
                 self._context_source,
+                self._support_tools,
             )
             remaining = min(
                 self._limits.max_duration,

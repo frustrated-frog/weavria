@@ -108,3 +108,5 @@ uv run python examples/live_progress_control.py --repeats 3
 ```
 
 实验设计、隔离不变量和证据边界见 [ADR 0023](docs/decisions/0023-进度策略隔离与真实模型对照.md)。
+
+工作状态：统一 Harness 可显式启用[有界工作记录](docs/工作记录的执行过程与使用.md)，由当前工作意图影响上下文与工具选择。该机制尚未通过真实长任务评测证明收益。

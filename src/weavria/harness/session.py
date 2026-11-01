@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+from dataclasses import replace
 from typing import NoReturn
 
 from weavria.context import ContextFocus
@@ -45,6 +46,7 @@ from .understanding import (
     reduce_frame_patch,
     task_frame_observation,
 )
+from .work import WorkingState, load_work, reduce_work, revise_work
 from .working_set import CapabilityWorkingSetPolicy
 
 
@@ -63,7 +65,9 @@ class TaskAwareSessionPreparer:
         capabilities: CapabilityResolver | None = None,
         clarification: ClarificationPolicy | None = None,
         working_set: CapabilityWorkingSetPolicy | None = None,
+        working_records: bool = False,
     ) -> None:
+        self._working_records = working_records
         self._working_set = working_set
         self._understanding = understanding
         self._evidence = evidence or EvidenceResolver()
@@ -91,7 +95,7 @@ class TaskAwareSessionPreparer:
     @property
     def version(self) -> str:
         return (
-            "task-aware-session/10["
+            f"task-aware-session/11[work={self._working_records};"
             f"{self._understanding.version};{self._evidence.version};"
             f"{self._capabilities.version};{self._clarification.version};"
             f"{self._working_set.version if self._working_set else 'monotonic-view/1'}]"
@@ -236,6 +240,17 @@ class TaskAwareSessionPreparer:
                 need_state_sha256=ledger.progress_sha256(),
             )
             observation = task_frame_observation(frame)
+        working = (
+            WorkingState(task_revision=context.task.revision) if self._working_records else None
+        )
+        if (
+            working is not None
+            and context.cause == "steering"
+            and context.base_semantic is not None
+            and context.base_semantic.working_state is not None
+            and base is not None
+        ):
+            working = revise_work(load_work(context.base_semantic.working_state), base, frame)
         visible_names = preparation.record.selected_capabilities
         if self._working_set is not None:
             visible_names = self._working_set.select(
@@ -246,9 +261,18 @@ class TaskAwareSessionPreparer:
                 previous=visible_names,
                 records=(),
                 discover=False,
+                **({"working_state": working} if self._working_records else {}),
             ).names
         if context.base_semantic is not None and (
-            visible_names != context.base_semantic.visible_tool_names
+            (
+                visible_names != context.base_semantic.visible_tool_names
+                or (
+                    self._working_records
+                    and base is not None
+                    and (base.specification.route == "clarify")
+                    != (frame.specification.route == "clarify")
+                )
+            )
             and frame.capability_epoch <= context.base_semantic.version.capability_epoch
         ):
             # Steering 即使没有改变声明的工具,也可能改变需求权重和实际工作集。
@@ -303,13 +327,14 @@ class TaskAwareSessionPreparer:
             ),
             work_status="active",
             clarification_plan=delivery_plan,
+            working_state=working.model_dump(mode="json") if working else None,
         )
 
     async def refresh(self, context: SessionSemanticContext) -> SessionTaskPreparation:
         """Reproject evidence or reinterpret a steering revision at a decision boundary."""
         base = load_task_frame(context.base_semantic.observation.payload)
         if context.task.revision != context.base_semantic.version.task_revision:
-            return await self.prepare(
+            prepared = await self.prepare(
                 SessionTaskContext(
                     session_id=context.session_id,
                     input_id=context.input_id,
@@ -321,6 +346,13 @@ class TaskAwareSessionPreparer:
                     context_supply=context.context_supply,
                 )
             )
+            if prepared.working_state is not None:
+                # steering 前已开始的动作不再更新新目标的工作记录;实际工具事实仍保留。
+                working = load_work(prepared.working_state).model_copy(
+                    update={"processed_records": len(context.records)}
+                )
+                prepared = replace(prepared, working_state=working.model_dump(mode="json"))
+            return prepared
         previous = load_need_ledger(context.base_semantic.need_ledger)
         ledger = await self._evidence.resolve(
             work_id=base.work_id,
@@ -356,6 +388,16 @@ class TaskAwareSessionPreparer:
             for name in context.base_semantic.visible_tool_names
             if any(descriptor.name == name for descriptor in context.tools.descriptors)
         )
+        working = None
+        if self._working_records:
+            if context.base_semantic.working_state is None:
+                raise ValueError("working-record preparation requires an initialized work state")
+            working = await reduce_work(
+                load_work(context.base_semantic.working_state),
+                base,
+                context.records,
+                context.read_artifact,
+            )
         if self._working_set is not None:
             visible = self._working_set.select(
                 frame=base,
@@ -365,6 +407,7 @@ class TaskAwareSessionPreparer:
                 previous=existing,
                 records=context.records,
                 discover=True,
+                **({"working_state": working} if self._working_records else {}),
             ).names
         else:
             discovered, _ = self._capabilities.resolve(
@@ -401,6 +444,7 @@ class TaskAwareSessionPreparer:
             capability_epoch=capability_epoch,
             evidence_revision=ledger.evidence_revision,
             need_ledger=ledger.model_dump(mode="json"),
+            working_state=working.model_dump(mode="json") if working else None,
             transition=_transition(
                 kind="evidence_refresh",
                 work_id=frame.work_id,

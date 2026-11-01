@@ -17,6 +17,7 @@ from weavria.core import (
 
 from .requirements import EvidenceProbe, NeedStatus, load_need_ledger
 from .understanding import load_task_frame
+from .work import MAX_WORK_BYTES, load_work
 
 _GAPS = ("$freshness", "$schema", "$proof", "$scope", "$producer", "$result", "$target")
 _MAX_NUMBER = 2**63 - 1
@@ -25,7 +26,8 @@ _MAX_NUMBER = 2**63 - 1
 class TaskModelViewProjector:
     """Project accepted state without authorizing actions or manufacturing evidence."""
 
-    version = "task-model-view/1"
+    version = "task-model-view/2"
+    working_records_version = 1
 
     def project(
         self,
@@ -200,6 +202,12 @@ class TaskModelViewProjector:
                 "Additional gaps and latest failure are summaries; consult tool feedback."
             ),
         }
+        work = load_work(snapshot.working_state) if snapshot.working_state is not None else None
+        progress_payload: dict[str, JsonValue] = {"needs": progress}
+        if work is not None:
+            if work.task_revision != task.revision:
+                raise ValueError("working projection belongs to another task revision")
+            progress_payload["working_state"] = work.model_dump(mode="json")
         return TaskModelView(
             projector_version=self.version,
             phase=phase,
@@ -215,9 +223,10 @@ class TaskModelViewProjector:
             ),
             definition=definition,
             definition_sha256=task_view_digest(definition),
-            progress={"needs": progress},
+            progress=progress_payload,
             max_progress_bytes=len(
                 json.dumps({"needs": maximum}, ensure_ascii=False, separators=(",", ":")).encode()
-            ),
+            )
+            + (MAX_WORK_BYTES + 32 if work is not None else 0),
             max_instruction_bytes=max_instruction_bytes,
         )

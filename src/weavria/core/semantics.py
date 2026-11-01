@@ -5,7 +5,15 @@ import json
 from datetime import datetime
 from typing import Literal, Self
 
-from pydantic import Field, JsonValue, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    JsonValue,
+    SerializerFunctionWrapHandler,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 from ._schema import ContractModel, NonBlankString
 from .model_io import TaskObservation
@@ -100,8 +108,25 @@ class PendingClarification(ContractModel):
         return self
 
 
-class SemanticSnapshot(ContractModel):
+class SemanticSnapshot(BaseModel):
     """Rebuildable semantic head committed from a low-trust proposal."""
+
+    model_config = ContractModel.model_config
+    schema_version: Literal[1, 2] = 1
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def validate_version_type(cls, value: object) -> object:
+        return ContractModel.validate_version_type(value)
+
+    working_state: dict[str, JsonValue] | None = None
+
+    @model_serializer(mode="wrap")
+    def preserve_v1(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        data = handler(self)
+        if self.schema_version == 1:
+            data.pop("working_state", None)
+        return data
 
     session_id: NonBlankString
     work_id: NonBlankString
@@ -116,6 +141,8 @@ class SemanticSnapshot(ContractModel):
 
     @model_validator(mode="after")
     def validate_snapshot(self) -> Self:
+        if self.schema_version == 1 and self.working_state is not None:
+            raise ValueError("working state requires semantic snapshot v2")
         if self.observation.input_id != self.input_id:
             raise ValueError("semantic observation belongs to another input")
         if self.observation.task_revision != self.version.task_revision:

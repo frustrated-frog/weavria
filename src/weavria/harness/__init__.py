@@ -136,6 +136,7 @@ from .understanding import (
     load_task_frame_patch,
     reduce_frame_patch,
 )
+from .work import WorkingState, WorkNote, WorkReference, WorkUpdate
 from .working_set import AdaptiveCapabilityPolicy, CapabilityWorkingSet, CapabilityWorkingSetPolicy
 
 __all__ = [
@@ -258,6 +259,10 @@ __all__ = [
     "TaskUnderstandingInput",
     "TaskUnderstandingInputAdmission",
     "TaskUnderstandingRecord",
+    "WorkNote",
+    "WorkReference",
+    "WorkUpdate",
+    "WorkingState",
     "action_proposal_sha256",
     "apply_frame_patch",
     "canonicalize_task_frame",

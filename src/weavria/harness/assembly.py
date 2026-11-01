@@ -28,7 +28,9 @@ from .memory_generation import MemoryGenerationPolicy
 from .memory_models import ModelMemoryExtractor, ModelMemoryReviewer
 from .memory_session import SessionMemoryBinding, SessionMemoryIngestor
 from .session import TaskAwareSessionPreparer
+from .task_view import TaskModelViewProjector
 from .understanding import TaskUnderstandingEngine
+from .work import work_tool
 from .working_set import AdaptiveCapabilityPolicy, CapabilityWorkingSetPolicy
 
 
@@ -182,6 +184,7 @@ class AgentHarness:
         memory_catchup_fraction: float = 0.1,
         completion: CompletionPolicy | None = None,
         understanding: TaskUnderstandingEngine | None = None,
+        working_records: bool = False,
         working_set: CapabilityWorkingSetPolicy | None = None,
         memory: HarnessMemory | None = None,
         history_retrieval: HistoryRetrievalConfig | None = None,
@@ -190,6 +193,19 @@ class AgentHarness:
         policy: ToolPolicy | None = None,
         scheduling: ToolScheduling | None = None,
     ) -> None:
+        if working_records and understanding is None:
+            raise ValueError("working records require task understanding")
+        if working_records:
+            for component in (working_set, task_model_projector):
+                if (
+                    component is not None
+                    and getattr(component, "working_records_version", None) != 1
+                ):
+                    raise ValueError(
+                        "custom work selection/projection must support working records v1"
+                    )
+        if working_records and task_model_projector is None:
+            task_model_projector = TaskModelViewProjector()
         if working_set is not None and understanding is None:
             raise ValueError("capability working set requires task understanding")
         duration = (
@@ -230,18 +246,22 @@ class AgentHarness:
             context_compiler=context,
             token_counter=token_counter,
             task_preparation=TaskAwareSessionPreparer(
-                understanding, working_set=working_set or AdaptiveCapabilityPolicy()
+                understanding,
+                working_set=working_set or AdaptiveCapabilityPolicy(),
+                working_records=working_records,
             )
             if understanding
             else None,
             context_source=source,
+            support_tools=(work_tool(),) if working_records else (),
             history_retrieval=history_retrieval,
             context_recovery=context_recovery,
             task_model_projector=task_model_projector,
             policy=policy,
             scheduling=scheduling,
             configuration_metadata={
-                "harness_version": "unified-harness/3",
+                "harness_version": "unified-harness/4",
+                "working_records": working_records,
                 "harness_max_request_duration": duration,
                 "memory_catchup_fraction": memory_catchup_fraction,
                 "memory_admission_version": memory.admission.version
