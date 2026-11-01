@@ -20,6 +20,7 @@ from .memory_formation import MemoryExtractor, MemoryFormationEngine, MemoryRevi
 from .memory_session import SessionMemoryBinding, SessionMemoryIngestor
 from .session import TaskAwareSessionPreparer
 from .understanding import TaskUnderstandingEngine
+from .working_set import AdaptiveCapabilityPolicy, CapabilityWorkingSetPolicy
 
 
 @dataclass(frozen=True)
@@ -105,6 +106,7 @@ class AgentHarness:
         instructions: str = "",
         limits: RunLimits | None = None,
         understanding: TaskUnderstandingEngine | None = None,
+        working_set: CapabilityWorkingSetPolicy | None = None,
         memory: HarnessMemory | None = None,
         history_retrieval: HistoryRetrievalConfig | None = None,
         context_recovery: RecoveryLimits | None = None,
@@ -112,6 +114,8 @@ class AgentHarness:
         policy: ToolPolicy | None = None,
         scheduling: ToolScheduling | None = None,
     ) -> None:
+        if working_set is not None and understanding is None:
+            raise ValueError("capability working set requires task understanding")
         self._memory = memory
         self._memory_store = SQLiteMemoryStore(memory.path) if memory else None
         source = (
@@ -132,7 +136,11 @@ class AgentHarness:
             limits=limits,
             context_compiler=context,
             token_counter=token_counter,
-            task_preparation=TaskAwareSessionPreparer(understanding) if understanding else None,
+            task_preparation=TaskAwareSessionPreparer(
+                understanding, working_set=working_set or AdaptiveCapabilityPolicy()
+            )
+            if understanding
+            else None,
             context_source=source,
             history_retrieval=history_retrieval,
             context_recovery=context_recovery,
@@ -140,7 +148,7 @@ class AgentHarness:
             policy=policy,
             scheduling=scheduling,
             configuration_metadata={
-                "harness_version": "unified-harness/1",
+                "harness_version": "unified-harness/2",
                 "memory_update_max_duration": memory.max_duration if memory else None,
                 "memory_update_max_events": memory.max_events if memory else None,
                 "memory_formation_version": (

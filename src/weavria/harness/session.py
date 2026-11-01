@@ -45,6 +45,7 @@ from .understanding import (
     reduce_frame_patch,
     task_frame_observation,
 )
+from .working_set import CapabilityWorkingSetPolicy
 
 
 async def _no_artifact(artifact_id: str) -> NoReturn:
@@ -61,7 +62,9 @@ class TaskAwareSessionPreparer:
         evidence: EvidenceResolver | None = None,
         capabilities: CapabilityResolver | None = None,
         clarification: ClarificationPolicy | None = None,
+        working_set: CapabilityWorkingSetPolicy | None = None,
     ) -> None:
+        self._working_set = working_set
         self._understanding = understanding
         self._evidence = evidence or EvidenceResolver()
         self._capabilities = capabilities or CapabilityResolver()
@@ -88,9 +91,10 @@ class TaskAwareSessionPreparer:
     @property
     def version(self) -> str:
         return (
-            "task-aware-session/8["
+            "task-aware-session/9["
             f"{self._understanding.version};{self._evidence.version};"
-            f"{self._capabilities.version};{self._clarification.version}]"
+            f"{self._capabilities.version};{self._clarification.version};"
+            f"{self._working_set.version if self._working_set else 'monotonic-view/1'}]"
         )
 
     @property
@@ -115,8 +119,8 @@ class TaskAwareSessionPreparer:
             feedback=context.feedback,
             remaining_model_calls=context.remaining_model_calls,
             remaining_tool_calls=context.remaining_tool_calls,
-            capability_expanded=(
-                context.after.version.capability_epoch > context.before.version.capability_epoch
+            capability_expanded=bool(
+                set(context.after.visible_tool_names) - set(context.before.visible_tool_names)
             ),
         )
 
@@ -232,6 +236,31 @@ class TaskAwareSessionPreparer:
                 need_state_sha256=ledger.progress_sha256(),
             )
             observation = task_frame_observation(frame)
+        visible_names = preparation.record.selected_capabilities
+        if self._working_set is not None:
+            visible_names = self._working_set.select(
+                frame=frame,
+                ledger=ledger,
+                tools=context.tools,
+                resolver=self._capabilities,
+                previous=visible_names,
+                records=(),
+                discover=False,
+            ).names
+        if context.base_semantic is not None and (
+            visible_names != context.base_semantic.visible_tool_names
+            and frame.capability_epoch <= context.base_semantic.version.capability_epoch
+        ):
+            # Steering 即使没有改变声明的工具,也可能改变需求权重和实际工作集。
+            # 这种视图变更必须有新 epoch,不能复用理解器按声明集合计算的旧编号。
+            frame = _project_frame(
+                frame,
+                frame_revision=frame.revision,
+                capability_epoch=context.base_semantic.version.capability_epoch + 1,
+                evidence_revision=ledger.evidence_revision,
+                need_state_sha256=ledger.progress_sha256(),
+            )
+            observation = task_frame_observation(frame)
         if base is not None:
             assert preparation.patch is not None
             transition_patch_model = create_frame_patch(base, frame, preparation.patch.cause)
@@ -257,7 +286,7 @@ class TaskAwareSessionPreparer:
             )
         return SessionTaskPreparation(
             preparation_version=self.version,
-            visible_tool_names=preparation.record.selected_capabilities,
+            visible_tool_names=visible_names,
             observation=observation,
             work_id=frame.work_id,
             capability_epoch=frame.capability_epoch,
@@ -321,24 +350,35 @@ class TaskAwareSessionPreparer:
             )
             else "partial_need"
         )
-        discovered, _ = self._capabilities.resolve(
-            CapabilityQuery(
-                goal=" ".join(
-                    (base.specification.goal, *(item.description for item in unresolved))
-                ),
-                requirements=unresolved,
-                allow_side_effects=False,
-            ),
-            context.tools,
-            epoch=base.capability_epoch + 1,
-            trigger=trigger,
-        )
         existing = tuple(
             name
             for name in context.base_semantic.visible_tool_names
             if any(descriptor.name == name for descriptor in context.tools.descriptors)
         )
-        visible = tuple(dict.fromkeys((*existing, *discovered.allowed_tool_names)))
+        if self._working_set is not None:
+            visible = self._working_set.select(
+                frame=base,
+                ledger=ledger,
+                tools=context.tools,
+                resolver=self._capabilities,
+                previous=existing,
+                records=context.records,
+                discover=True,
+            ).names
+        else:
+            discovered, _ = self._capabilities.resolve(
+                CapabilityQuery(
+                    goal=" ".join(
+                        (base.specification.goal, *(item.description for item in unresolved))
+                    ),
+                    requirements=unresolved,
+                    allow_side_effects=False,
+                ),
+                context.tools,
+                epoch=base.capability_epoch + 1,
+                trigger=trigger,
+            )
+            visible = tuple(dict.fromkeys((*existing, *discovered.allowed_tool_names)))
         capability_changed = visible != existing
         ledger_changed = ledger.evidence_revision != previous.evidence_revision
         frame_revision = base.revision + int(capability_changed or ledger_changed)

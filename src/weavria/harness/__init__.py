@@ -135,9 +135,11 @@ from .understanding import (
     load_task_frame_patch,
     reduce_frame_patch,
 )
+from .working_set import AdaptiveCapabilityPolicy, CapabilityWorkingSet, CapabilityWorkingSetPolicy
 
 __all__ = [
     "AcceptedMemoryEvents",
+    "AdaptiveCapabilityPolicy",
     "AgentHarness",
     "BM25CapabilityRetriever",
     "BeliefUpdater",
@@ -155,6 +157,8 @@ __all__ = [
     "CapabilityResolver",
     "CapabilityRetriever",
     "CapabilityView",
+    "CapabilityWorkingSet",
+    "CapabilityWorkingSetPolicy",
     "CatalogSnapshot",
     "ClarificationAnswerOption",
     "ClarificationBeliefUpdate",
