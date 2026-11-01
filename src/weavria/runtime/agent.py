@@ -136,6 +136,7 @@ from .controller import (
     ProgressAssessor,
     TurnPreparation,
     TurnPreparer,
+    TurnSettler,
     prepare_task,
     resolve_turn,
 )
@@ -812,7 +813,7 @@ class _AgentKernel:
                         )
                         if self._journal_version >= 3:
                             assert isinstance(response, ModelTurn)
-                            progress_assessment = await self._prepare_progress_assessment(
+                            progress_assessment = await self._prepare_turn_settlement(
                                 task.revision, deadline
                             )
                             await self._resolve(
@@ -1964,18 +1965,18 @@ class _AgentKernel:
             raise _CompletionRepairStalled(assessment.decision.issue_codes)
         return assessment
 
-    async def _prepare_progress_assessment(
+    async def _prepare_turn_settlement(
         self, revision: int, deadline: float
     ) -> ProgressAssessment | None:
         if not self._limits.finalization_model_calls:
-            return await self._assess_progress(revision)
+            return await self._settle_and_assess_progress(revision)
         exploration_seconds = self._remaining(deadline) - self._finalization_reserve
         if exploration_seconds <= 0:
             return None
         scope = asyncio.timeout(exploration_seconds)
         try:
             async with scope:
-                return await self._assess_progress(revision)
+                return await self._settle_and_assess_progress(revision)
         except TimeoutError:
             if not scope.expired():
                 raise
@@ -1983,7 +1984,13 @@ class _AgentKernel:
             # time reserved for delivering them or publish a partial assessment.
             return None
 
-    async def _assess_progress(self, revision: int) -> ProgressAssessment | None:
+    async def _settle_and_assess_progress(self, revision: int) -> ProgressAssessment | None:
+        # 状态归约是执行阶段,而不是可选评估器的副作用。两者共享探索期限,
+        # 取消后保留已接受的工具事实,下一次 prepare_turn 可补齐未完成的归约。
+        if revision != self.state.task.revision:
+            return None
+        if isinstance(self._preparation, TurnSettler):
+            await self._preparation.settle_turn(self.state.task)
         if self._progress_assessor is None or revision != self.state.task.revision:
             return None
         feedback = self.state.feedback

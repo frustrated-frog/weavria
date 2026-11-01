@@ -1,6 +1,7 @@
 """Domain-independent Agent Harness capabilities above the Runtime."""
 
 from .agent import TaskAwareAgent, TaskAwareExecution
+from .assembly import AgentHarness, HarnessMemory, HarnessResult, MemoryUpdateReport
 from .capabilities import (
     BM25CapabilityRetriever,
     CapabilityCandidate,
@@ -137,6 +138,7 @@ from .understanding import (
 
 __all__ = [
     "AcceptedMemoryEvents",
+    "AgentHarness",
     "BM25CapabilityRetriever",
     "BeliefUpdater",
     "BlockingAmbiguityPolicy",
@@ -183,6 +185,8 @@ __all__ = [
     "EvidenceSurface",
     "EvidenceTargetBinding",
     "EvidenceTargetRule",
+    "HarnessMemory",
+    "HarnessResult",
     "InformationNeed",
     "InformationRequirement",
     "IntentActionValue",
@@ -200,6 +204,7 @@ __all__ = [
     "MemoryGenerationPolicy",
     "MemoryGroupReader",
     "MemoryReviewer",
+    "MemoryUpdateReport",
     "ModelMemoryExtractor",
     "ModelMemoryRepairingExtractor",
     "ModelMemoryReviewer",

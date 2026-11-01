@@ -8,6 +8,7 @@ from .controller import (
     ProgressAssessor,
     TurnPreparation,
     TurnPreparer,
+    TurnSettler,
     prepare_task,
     resolve_turn,
 )
@@ -87,6 +88,7 @@ __all__ = [
     "ToolScheduling",
     "TurnPreparation",
     "TurnPreparer",
+    "TurnSettler",
     "action_value_state_sha256",
     "evaluate_action_intervention",
     "observe_action_value",

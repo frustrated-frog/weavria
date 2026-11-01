@@ -1546,3 +1546,52 @@ async def test_semantic_transaction_settles_before_cancellation_is_published(
         repeated = await reopened.send("s", "Read alpha", input_id="input-1")
         assert await reopened.store.semantic_head("s", commits[-1].work_id) == head
         assert repeated.report.execution == terminal_run
+
+
+async def test_tool_settlement_updates_work_without_optional_progress_assessor(
+    tmp_path: Path,
+) -> None:
+    """工具事实必须在 execution resolution 前归约,不能等下一轮准备才碰巧刷新。"""
+    from weavria.core import SessionControlDecided
+    from weavria.sessions import SessionTaskContext
+
+    delegate = TaskAwareSessionPreparer(
+        TaskUnderstandingEngine(
+            ModelTaskInterpreter(FakeModelProvider((_declaration(_execute()),)))
+        )
+    )
+
+    class NoAssessment:
+        version = delegate.version
+        semantic_reducer = delegate.semantic_reducer
+
+        async def prepare(self, context: SessionTaskContext) -> SessionTaskPreparation:
+            return await delegate.prepare(context)
+
+        async def refresh(self, context: SessionSemanticContext) -> SessionTaskPreparation:
+            return await delegate.refresh(context)
+
+    async with SessionEngine(
+        tmp_path / "without-assessor.db",
+        model=_ExecuteSessionModel(),
+        tools=_registry(),
+        task_preparation=NoAssessment(),
+    ) as engine:
+        await engine.create("s")
+        result = await engine.send("s", "Read alpha")
+        events = await engine.store.events("s")
+    assert result.report.status is RunStatus.COMPLETED
+    commits = [e for e in events if isinstance(e.data, SessionSemanticCommitted)]
+    resolutions = [e for e in events if isinstance(e.data, SessionControlDecided)]
+    assert len(commits) >= 3
+    # 初始解释、工具反馈归约、终态投影依次发生。取 execution 的 resolution。
+    execution = next(
+        e
+        for e in resolutions
+        if isinstance(e.data, SessionControlDecided) and e.data.resolution.stage == "execution"
+    )
+    assert commits[1].sequence < execution.sequence
+    assert not any(
+        isinstance(e.data, SessionRunEvent) and isinstance(e.data.event.data, ProgressAssessed)
+        for e in events
+    )

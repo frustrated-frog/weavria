@@ -88,7 +88,7 @@ class TaskAwareSessionPreparer:
     @property
     def version(self) -> str:
         return (
-            "task-aware-session/7["
+            "task-aware-session/8["
             f"{self._understanding.version};{self._evidence.version};"
             f"{self._capabilities.version};{self._clarification.version}]"
         )
@@ -177,6 +177,7 @@ class TaskAwareSessionPreparer:
             base_frame=base,
             cause=context.cause,
             application_context=context.application_context,
+            context_supply=context.context_supply,
             prior_clarification_question=(
                 context.base_semantic.pending_clarification.question_text
                 if context.base_semantic is not None

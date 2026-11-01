@@ -186,6 +186,7 @@ class _SessionAdapter:
         self._history_sequence = 0
         self._history_count = 0
         self._prepared_task_revision: int | None = None
+        self._progress_before: SemanticSnapshot | None = None
         self._retrieval_config = history_retrieval
         self._recovery_limits = context_recovery
         self._task_model_projector = task_model_projector
@@ -608,6 +609,11 @@ class _SessionAdapter:
             report.feedback_budget_bytes,
         )
 
+    async def settle_turn(self, task: TaskInput) -> None:
+        """将工具事实归约到工作状态;不要求配置进展评估器。"""
+        self._progress_before = self._semantic
+        await self._refresh_semantics(task)
+
     async def assess_progress(
         self,
         *,
@@ -623,9 +629,10 @@ class _SessionAdapter:
         if assessor_method is None:
             return None
         assessor = cast(SessionProgressAssessor, self._task_preparer)
-        before = self._semantic
-        await self._refresh_semantics(task)
+        before = self._progress_before
         after = self._semantic
+        if before is None:
+            return None
         if task.revision != after.version.task_revision:
             return None
         return await assessor.assess_progress(
@@ -998,6 +1005,7 @@ class SessionEngine:
                     + type(self._model).__qualname__,
                     "model_capabilities": asdict(self._model.capabilities),
                     "session_tools_version": "2",
+                    "session_lifecycle_version": "2",
                     "limits": asdict(self._limits),
                     "max_request_duration": self._max_request_duration,
                     "history_budget_bytes": self._history_budget,
@@ -1089,6 +1097,22 @@ class SessionEngine:
                         revision=semantic_base.version.task_revision + 1,
                     )
                 async with asyncio.timeout(root_budget.remaining(self._clock.monotonic())):
+                    # 理解目标之前读取已有记忆。该快照只供本次理解使用;后续每轮
+                    # 决策仍按新需求召回,不能把首次读取冻结成整个 Run 的事实。
+                    supply = (
+                        await self._context_source.retrieve(
+                            session_id=session_id,
+                            run_id=run_id,
+                            task=task,
+                            demands=(
+                                ContextDemand(
+                                    "current_task", " ".join((task.goal, *task.constraints))
+                                ),
+                            ),
+                        )
+                        if self._context_source is not None
+                        else None
+                    )
                     prepared = await self._task_preparation.prepare(
                         SessionTaskContext(
                             session_id=session_id,
@@ -1103,6 +1127,7 @@ class SessionEngine:
                                 else "new_user_input"
                             ),
                             application_context=application_context,
+                            context_supply=supply,
                         )
                     )
                 if prepared.preparation_version != self._task_preparation.version:

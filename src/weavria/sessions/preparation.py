@@ -9,6 +9,7 @@ from pydantic import JsonValue
 from weavria.artifacts import ArtifactSnapshot
 from weavria.core import (
     ApplicationObservation,
+    ContextSupply,
     ConversationTurn,
     ProgressAssessment,
     RunError,
@@ -79,6 +80,7 @@ class SessionTaskContext:
     base_semantic: SemanticSnapshot | None = None
     cause: Literal["new_user_input", "clarification_answer", "steering"] = "new_user_input"
     application_context: tuple[ApplicationObservation, ...] = ()
+    context_supply: ContextSupply | None = None
 
 
 @dataclass(frozen=True, slots=True)

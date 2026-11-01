@@ -54,6 +54,13 @@ class FinalizationPreparer(Protocol):
     def prepare_finalization(self, task: TaskInput) -> TurnPreparation | None: ...
 
 
+@runtime_checkable
+class TurnSettler(Protocol):
+    """Fold accepted tool facts before optional progress assessment and the next decision."""
+
+    async def settle_turn(self, task: TaskInput) -> None: ...
+
+
 class ProgressAssessor(Protocol):
     """Assess accepted feedback after settlement; it cannot accept completion."""
 
