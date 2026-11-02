@@ -166,6 +166,14 @@ class RunState:
     def recovery_ranges(self) -> tuple[RecoveryRange, ...]:
         return tuple(RecoveryRange.model_validate_json(p) for p in self.recovery_ranges_json)
 
+    def recovery_selection(self, result: RecoveryResolved) -> tuple[RecoveryRange, ...]:
+        """连续恢复共享有界阅读工作集;失败不丢失已交付片段,任务修订仍使其失效。"""
+        if result.notice.status == "stale":
+            return ()
+        if self.recovery_limits is not None and self.recovery_limits.retention == "chain":
+            return (*self.recovery_ranges, *result.ranges)
+        return result.ranges
+
     @property
     def recovery_seen(self) -> tuple[RecoveryRange, ...]:
         return tuple(RecoveryRange.model_validate_json(p) for p in self.recovery_seen_json)
@@ -528,8 +536,13 @@ def _reduce_turn(
             state.phase is Phase.MODEL and state.model_revision == state.task.revision,
             "turn is out of phase or belongs to an obsolete task",
         )
-        next_state = replace(next_state, recovery_ranges_json=(), model_output_failures=0)
         decision = data.turn.decision
+        keep = state.recovery_limits is not None and state.recovery_limits.retention == "chain"
+        next_state = replace(
+            next_state,
+            recovery_ranges_json=state.recovery_ranges_json if keep else (),
+            model_output_failures=0,
+        )
         if isinstance(decision, RecoverContext):
             _require(
                 state.journal_version == 4 and state.recovery_limits is not None,
@@ -719,6 +732,7 @@ def _reduce_turn(
         active_call_ids=(),
         settled_call_ids=(),
         skipped_call_ids=(),
+        recovery_ranges_json=(),
         feedback_call_ids=ordered,
         feedback_json=feedback.model_dump_json(),
         progress_assessment_json=None,
@@ -1301,7 +1315,7 @@ def _reduce_recovery(state: RunState, next_state: RunState, data: RecoveryResolv
         phase=Phase.READY,
         turn_json=None,
         control_json=None if stale else notice.model_dump_json(),
-        recovery_ranges_json=ranges,
+        recovery_ranges_json=tuple(p.model_dump_json() for p in state.recovery_selection(data)),
         recovery_seen_json=(*state.recovery_seen_json, *ranges),
         recovery_bytes=state.recovery_bytes + notice.recovered_bytes,
         recovery_attempts=(*state.recovery_attempts, key)

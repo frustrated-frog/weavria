@@ -52,6 +52,16 @@ def terms(text: str) -> tuple[str, ...]:
 
 
 @dataclass(frozen=True, slots=True)
+class PassageContext:
+    start: int
+    end: int
+    value: str
+
+    def view(self) -> dict[str, JsonValue]:
+        return {"start": self.start, "end": self.end, "value": self.value}
+
+
+@dataclass(frozen=True, slots=True)
 class Passage:
     """Exact scalar or character range at an escaped JSON Pointer."""
 
@@ -60,6 +70,7 @@ class Passage:
     end: int
     value_json: str = field(repr=False)
     tokens: tuple[str, ...] = field(repr=False)
+    context: tuple[PassageContext, ...] = ()
 
     def view(self) -> dict[str, JsonValue]:
         return {
@@ -67,6 +78,7 @@ class Passage:
             "start": self.start,
             "end": self.end,
             "value": TypeAdapter[JsonValue](JsonValue).validate_json(self.value_json),
+            **({"context": [item.view() for item in self.context]} if self.context else {}),
         }
 
 

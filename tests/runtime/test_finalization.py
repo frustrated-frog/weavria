@@ -711,3 +711,105 @@ async def test_external_cancel_during_reserved_turn_preparation_does_not_finaliz
     assert closed.is_set() and len(provider.requests) == 1
     assert agent.state.result is not None and agent.state.result.status is RunStatus.CANCELLED
     assert not any(isinstance(event.data, FinalizationStarted) for event in agent.events)
+
+
+async def test_partial_text_delivery_allows_only_limited_synthesis() -> None:
+    """整字段尚未送达不能阻断有限收尾,也不能冒充全部问题已有答案。"""
+    import hashlib
+
+    from weavria.core import EvidenceDelivery, EvidenceDeliveryManifest, EvidenceDeliveryRange
+
+    store = InMemoryArtifactStore()
+    long_read = ModelTurn(
+        decision=ToolBatch(
+            calls=(
+                ToolCallAction(
+                    call_id="read-1", tool_name="read", arguments={"key": "long source material"}
+                ),
+            )
+        )
+    )
+    agent, provider = await setup((long_read, finish()), store=store)
+    await agent.execute()
+    record = agent.state.records[0]
+    assert record.artifact is not None
+    context = CompletionContext(
+        "run",
+        agent.state.task,
+        FinishAction(output="candidate"),
+        agent.state.records,
+        store,
+        provider.requests[0].task_observation,
+    )
+    request = ControlRequest(instructions="Finish", task=agent.state.task)
+    manifest = EvidenceDeliveryManifest(
+        task_revision=agent.state.task.revision,
+        control_request_sha256=hashlib.sha256(request.model_dump_json().encode()).hexdigest(),
+        transport_request_sha256="0" * 64,
+        deliveries=(
+            EvidenceDelivery(
+                run_id="run",
+                call_id=record.exchange.action.call_id,
+                artifact_id=record.artifact.artifact_id,
+                artifact_sha256=record.artifact.sha256,
+                artifact_size_bytes=record.artifact.size_bytes,
+                representation="excerpt",
+                ranges=(EvidenceDeliveryRange(pointer="/value", kind="text", start=0, end=3),),
+            ),
+        ),
+    )
+    assessed = await NeedFinalizationPolicy().assess(context, request=request, manifest=manifest)
+    assert assessed.mode == "limited"
+    assert assessed.missing_need_ids
+    assert not assessed.eligible  # 结构读取不升级为语义证明。
+    wrong = manifest.model_copy(update={"control_request_sha256": "f" * 64})
+    assert (
+        await NeedFinalizationPolicy().assess(context, request=request, manifest=wrong)
+    ).mode == "unavailable"
+    # 原来源仅剩回执,完整回取页仍应提供同一来源的局部交付证据。
+    from weavria.tools import ReadOnlyPolicy, ToolExecutor, artifact_read_tool
+
+    executor = ToolExecutor("run", ToolRegistry((artifact_read_tool(),)), store, ReadOnlyPolicy())
+    page_record = await executor.execute(
+        ToolCallAction(
+            call_id="page",
+            tool_name="read_artifact",
+            arguments={
+                "artifact_id": record.artifact.artifact_id,
+                "pointer": "/value",
+                "length": 5,
+            },
+        ),
+        max_duration=1,
+        accepted_artifacts=(record.artifact,),
+    )
+    assert page_record.artifact is not None
+    page_ref = page_record.artifact
+    page_manifest = manifest.model_copy(
+        update={
+            "deliveries": (
+                EvidenceDelivery(
+                    run_id="run",
+                    call_id="page",
+                    artifact_id=page_ref.artifact_id,
+                    artifact_sha256=page_ref.sha256,
+                    artifact_size_bytes=page_ref.size_bytes,
+                    representation="raw",
+                ),
+            )
+        }
+    )
+    page_context = CompletionContext(
+        "run",
+        agent.state.task,
+        FinishAction(output="candidate"),
+        (*agent.state.records, page_record),
+        store,
+        provider.requests[0].task_observation,
+    )
+    page_assessed = await NeedFinalizationPolicy().assess(
+        page_context, request=request, manifest=page_manifest
+    )
+    assert page_assessed.mode == "limited" and page_assessed.missing_need_ids
+    page_context.close()
+    context.close()

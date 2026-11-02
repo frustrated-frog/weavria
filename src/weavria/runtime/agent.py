@@ -26,7 +26,6 @@ from weavria.context import (
     EvidencePlan,
     RecoveryContextBuilder,
     TurnEvidencePlan,
-    delivery_ranges,
     first_delivery_gap,
     reserve_feedback,
     validate_recovery_view,
@@ -140,6 +139,7 @@ from .controller import (
     prepare_task,
     resolve_turn,
 )
+from .delivery import artifact_page_source_ranges
 from .finalization import FinalizationAssessment, FinalizationPolicy
 from .intervention import (
     ACTION_VALUE_LEDGER_VERSION,
@@ -327,20 +327,17 @@ def _instructions_for(instructions: str, tools: ToolRegistry, journal_version: i
         )
     if journal_version >= 3:
         assembled += (
-            "\nNo dispatch on rejection. Obey recommended_max_calls for feedback_budget; "
-            "else change actions. Finish is checked: correct gaps. Later task.constraints "
-            "override earlier conflicts; reuse relevant work."
+            "\nRejected calls were not dispatched. For feedback_budget retry page_call_index "
+            "alone with page_parameter <= page_maximum (0: impossible), else obey "
+            "recommended_max_calls. Correct completion gaps; later task.constraints prevail."
         )
     if journal_version == 4:
         assembled += (
-            ' To recover omitted current-run evidence, return {"schema_version":2,"decision":'
-            '{"kind":"recover_context","query":"missing evidence"}} as a separate decision. '
-            "Alternatively replace query with call_id, source_sha256, pointer, start and length "
-            "(at most 4000 characters). Search needs no known source ID. Recovery reads accepted "
-            "current-run results within round/byte limits and returns exact original passages. "
-            "Recovered passages are retained until your next accepted response; control reports "
-            "no_match, redundant, invalid_source, budget or limit when no content was recovered. "
-            "Do not repeat an identical unsuccessful request against unchanged sources."
+            ' Recovery: {"schema_version":2,"decision":{"kind":"recover_context",'
+            '"query":"missing evidence"}}. Or replace query with call_id, source_sha256, '
+            "pointer, start, length (<=4000 characters). It reads accepted originals within "
+            "round/byte limits. Stop on limit; do not repeat unsuccessful queries. "
+            "Continuous recovery can retain prior excerpts; normal actions release the lease."
         )
     return assembled
 
@@ -356,33 +353,6 @@ def _recommended_feedback_batch_width(
         return 1
     proportional = proposed_calls * budget_bytes // max(1, required_bytes)
     return max(1, min(proposed_calls - 1, proportional))
-
-
-def _artifact_page_source_ranges(page: ArtifactReadOutput) -> tuple[EvidenceDeliveryRange, ...]:
-    """Project a fully delivered Artifact page onto the ranges it revealed in its source."""
-    if page.value_kind == "string":
-        if page.end > page.start:
-            return (
-                EvidenceDeliveryRange(
-                    pointer=page.pointer,
-                    kind="text",
-                    start=page.start,
-                    end=page.end,
-                ),
-            )
-        return (
-            (EvidenceDeliveryRange(pointer=page.pointer, kind="value"),)
-            if page.total == 0 and page.start == 0
-            else ()
-        )
-    if page.value_kind not in {"array", "object"}:
-        return (EvidenceDeliveryRange(pointer=page.pointer, kind="value"),)
-    return tuple(
-        source_range
-        for item in page.items
-        if item.included
-        for source_range in delivery_ranges(item.value, pointer=item.pointer)
-    )
 
 
 class _AgentKernel:
@@ -1141,7 +1111,9 @@ class _AgentKernel:
                     max_request_bytes=self._request_budget,
                     required_call_ids=required_call_ids,
                     recovery_ranges=(
-                        recovery.ranges if recovery is not None else self.state.recovery_ranges
+                        self.state.recovery_selection(recovery)
+                        if recovery is not None
+                        else self.state.recovery_ranges
                     )
                     if self._journal_version == 4
                     else (),
@@ -1172,7 +1144,9 @@ class _AgentKernel:
                     records=self.state.records,
                     max_request_bytes=self._request_budget,
                     required_call_ids=required_call_ids,
-                    ranges=recovery.ranges if recovery is not None else self.state.recovery_ranges,
+                    ranges=self.state.recovery_selection(recovery)
+                    if recovery is not None
+                    else self.state.recovery_ranges,
                     feedback_reserve_floor_bytes=(
                         self._feedback_reserve_floor
                         if self._feedback_reserve_revision == task.revision and not finalizing
@@ -1292,9 +1266,10 @@ class _AgentKernel:
                     or preflight.compilation_json is None
                 ):
                     raise ValueError("recovery preflight requires a compilation receipt")
-                validate_recovery_view(preflight.request, result.ranges)
+                working_set = state.recovery_selection(result)
+                validate_recovery_view(preflight.request, working_set)
                 report = ContextCompilation.model_validate_json(preflight.compilation_json)
-                if report.schema_version < 4 or report.recovery_ranges != result.ranges:
+                if report.schema_version < 4 or report.recovery_ranges != working_set:
                     raise ValueError("recovery preflight changed the planned ranges")
                 requested = preflight.request_bytes + preflight.control_padding_bytes
                 if requested > preflight.budget_bytes:
@@ -1657,9 +1632,58 @@ class _AgentKernel:
                 or page.source_sha256 != source_artifact_sha256
             ):
                 continue
-            ranges.extend(_artifact_page_source_ranges(page))
+            ranges.extend(artifact_page_source_ranges(page))
         identities = {(item.pointer, item.kind, item.start, item.end): item for item in ranges}
         return tuple(identities.values())
+
+    def _page_advice(self, batch: ToolBatch) -> tuple[int, str, int] | None:
+        """只计算建议,不改写已提出的 Action。每个候选重新校验并计量完整反馈包络。"""
+        for index, call in enumerate(batch.calls):
+            if call.tool_name not in {d.name for d in self._tool_ceiling.descriptors}:
+                continue
+            tool = self._tool_ceiling.get(call.tool_name)
+            if tool.descriptor.feedback_page_parameter is None:
+                continue
+            parameter = tool.descriptor.feedback_page_parameter
+            properties = tool.descriptor.input_schema.get("properties")
+            if not isinstance(properties, dict):
+                continue
+            field = properties.get(parameter)
+            if not isinstance(field, dict):
+                continue
+            minimum, maximum = field.get("minimum"), field.get("maximum")
+            if type(minimum) is not int or type(maximum) is not int:
+                continue
+            low, high, feasible = minimum, maximum, 0
+            while low <= high:
+                middle = (low + high) // 2
+                candidate = call.model_copy(
+                    update={"arguments": {**call.arguments, parameter: middle}}
+                )
+                identity = self._tool_ceiling.action_identity(candidate)
+                if identity.normalization != "validated":
+                    return None
+                envelope = self._tool_ceiling.feedback_envelope(
+                    candidate, identity=identity, bounds=self._bounds
+                )
+                reservation = reserve_feedback(
+                    instructions=self._instructions,
+                    task=self.state.task,
+                    task_observation=self._task_observation,
+                    records=self.state.records,
+                    batch=ToolBatch(calls=(candidate,)),
+                    bounds=self._bounds,
+                    budget_bytes=self._feedback_budget,
+                    evidence_access=self._evidence_access,
+                    feedback_envelopes=(envelope,),
+                    base_request=self._feedback_template,
+                )
+                if reservation.fits:
+                    feasible, low = middle, middle + 1
+                else:
+                    high = middle - 1
+            return index, parameter, feasible
+        return None
 
     async def _admit_batch(
         self,
@@ -1755,6 +1779,7 @@ class _AgentKernel:
             if progress.blocked:
                 reason = "no_progress"
         if reason is not None:
+            page_advice = self._page_advice(batch) if reason == "feedback_budget" else None
             async with self._commit_lock:
                 if revision != self.state.task.revision:
                     return False, ()
@@ -1829,6 +1854,10 @@ class _AgentKernel:
                 await self._accept_locked(
                     BatchRejected(
                         notice=AdmissionNotice(
+                            schema_version=2 if page_advice else 1,
+                            page_call_index=page_advice[0] if page_advice else None,
+                            page_parameter=page_advice[1] if page_advice else None,
+                            page_maximum=page_advice[2] if page_advice else None,
                             reason=reason,
                             proposal_sha256=hashlib.sha256(
                                 batch.model_dump_json().encode()
@@ -2098,6 +2127,9 @@ class _AgentKernel:
             accepted_artifacts=accepted,
             expected_identity=expected_identity,
             feedback_envelope=feedback_envelope,
+            task_view=self._feedback_template.task_model_view
+            if self._feedback_template is not None
+            else None,
         )
         self._check_cancel(owner, cancellations)
         await self._accept(ToolRecorded(record=record))

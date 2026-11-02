@@ -5,12 +5,13 @@ import hashlib
 from weavria.context import first_delivery_gap
 from weavria.core import (
     ControlRequest,
+    EvidenceDelivery,
     EvidenceDeliveryManifest,
     ToolExchange,
     ToolSucceededObservation,
 )
-from weavria.runtime import CompletionContext, FinalizationAssessment
-from weavria.tools import resolve_pointer
+from weavria.runtime import CompletionContext, FinalizationAssessment, artifact_page_source_ranges
+from weavria.tools import ArtifactReadOutput, resolve_pointer
 
 from .requirements import (
     EvidenceBinding,
@@ -22,7 +23,7 @@ from .understanding import load_task_frame
 
 
 class NeedFinalizationPolicy:
-    version = "need-finalization/3"
+    version = "need-finalization/4"
 
     def __init__(self, evidence: EvidenceResolver | None = None) -> None:
         self._evidence = evidence or EvidenceResolver()
@@ -120,10 +121,61 @@ class NeedFinalizationPolicy:
             != hashlib.sha256(request.model_dump_json().encode()).hexdigest()
         ):
             return FinalizationAssessment(False, "unavailable")
+        # 回取页可能完整可见而原 Artifact 只剩引用。将完整页的原文区间映射回
+        # 同一个来源,避免把“读过分页”误判成没有资料。摘要与引用回执不参与。
+        for record in context.records:
+            ref = record.artifact
+            page_delivery = deliveries.get(record.exchange.action.call_id)
+            if (
+                ref is None
+                or record.exchange.action.tool_name != "read_artifact"
+                or page_delivery is None
+                or not page_delivery.complete
+                or page_delivery.artifact_sha256 != ref.sha256
+            ):
+                continue
+            page_snapshot = await context.read_artifact(ref.artifact_id)
+            if page_snapshot.reference != ref:
+                continue
+            try:
+                page = ArtifactReadOutput.model_validate_json(page_snapshot.content_json)
+            except ValueError:
+                continue
+            source = next(
+                (
+                    r.artifact
+                    for r in context.records
+                    if r.artifact is not None
+                    and r.artifact.artifact_id == page.source_artifact
+                    and r.artifact.sha256 == page.source_sha256
+                ),
+                None,
+            )
+            if source is None:
+                continue
+            prior = deliveries.get(source.call_id)
+            if prior is not None and prior.complete:
+                continue
+            ranges = tuple(
+                dict.fromkeys(
+                    (*(prior.ranges if prior else ()), *artifact_page_source_ranges(page))
+                )
+            )
+            if ranges:
+                deliveries[source.call_id] = EvidenceDelivery(
+                    run_id=source.run_id,
+                    call_id=source.call_id,
+                    artifact_id=source.artifact_id,
+                    artifact_sha256=source.sha256,
+                    artifact_size_bytes=source.size_bytes,
+                    representation="excerpt",
+                    ranges=ranges,
+                )
         views = {
             item.action.call_id: item for item in request.history if isinstance(item, ToolExchange)
         }
         delivered_bindings: list[EvidenceBinding] = []
+        usable = False
         for binding in bindings:
             complete = True
             for address in binding.addresses:
@@ -143,7 +195,16 @@ class NeedFinalizationPolicy:
                 if delivery is not None:
                     if delivery.artifact_sha256 != address.artifact_sha256:
                         complete = False
-                    elif delivery.representation != "raw":
+                    elif delivery.representation == "raw":
+                        usable = True
+                    else:
+                        # 局部原文允许有限回答,但不能据此声称整字段已交付或穷举完成。
+                        usable = usable or any(
+                            not address.json_pointer
+                            or part.pointer == address.json_pointer
+                            or part.pointer.startswith(address.json_pointer + "/")
+                            for part in delivery.ranges
+                        )
                         try:
                             target = resolve_pointer(snapshot.value, address.json_pointer)
                             complete = (
@@ -173,6 +234,7 @@ class NeedFinalizationPolicy:
                         and output.get("data") == snapshot.value
                     )
             if complete:
+                usable = True
                 delivered_bindings.append(binding)
         covered = {need.need_id for need in required if need.covered_by(tuple(delivered_bindings))}
         missing = tuple(
@@ -181,5 +243,5 @@ class NeedFinalizationPolicy:
             if item.need_id not in covered
             or not ledger.state_for(item.need_id).acquisition_complete
         )
-        mode = "complete" if not missing else "limited" if delivered_bindings else "unavailable"
+        mode = "complete" if not missing else "limited" if usable else "unavailable"
         return FinalizationAssessment(eligible, mode, call_ids, missing)

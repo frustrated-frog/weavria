@@ -32,7 +32,15 @@ def range_passage(source: "IndexedSource", part: RecoveryRange) -> Passage:
     except ArtifactAccessError as exc:
         raise ContextBuildError(str(exc)) from exc
     raw = encoded_value(value)
-    return Passage(part.pointer, part.start, part.end, raw.decode(), terms(str(value)))
+    context = next(
+        (
+            p.context
+            for p in source.passages
+            if p.pointer == part.pointer and p.start <= part.start < p.end
+        ),
+        (),
+    )
+    return Passage(part.pointer, part.start, part.end, raw.decode(), terms(str(value)), context)
 
 
 def novel_passages(
@@ -65,6 +73,7 @@ def novel_passages(
             end,
             encoded_value(value[start - passage.start : end - passage.start]).decode(),
             terms(value[start - passage.start : end - passage.start]),
+            passage.context,
         )
         for start, end in intervals
     )

@@ -226,10 +226,10 @@ def test_complete_feedback_delivery_is_an_explicit_versioned_tool_contract() -> 
 
     assert adaptive.schema_version == 2 and adaptive.feedback_delivery == "adaptive"
     assert "feedback_delivery" not in adaptive.model_dump_json()
-    assert complete.schema_version == 4 and complete.feedback_delivery == "complete"
-    assert complete.feedback_bound_version == "artifact-read-output/1"
+    assert complete.schema_version == 5 and complete.feedback_delivery == "complete"
+    assert complete.feedback_bound_version == "artifact-read-output/2"
     assert '"feedback_delivery":"complete"' in complete.model_dump_json()
-    assert '"feedback_bound_version":"artifact-read-output/1"' in complete.model_dump_json()
+    assert '"feedback_bound_version":"artifact-read-output/2"' in complete.model_dump_json()
 
 
 def test_action_identity_uses_validated_defaults_and_tool_normalization() -> None:
@@ -517,14 +517,13 @@ async def test_structured_artifact_read_returns_a_resumable_page_instead_of_fail
     assert all(item.pointer.startswith("/data/entries/") for item in first_value.items)
     assert all(item.included for item in first_value.items)
 
+    assert first_value.next_read is not None
+    assert first_value.next_read.artifact_id == source.reference.artifact_id
+    assert first_value.next_read.pointer == "/data/entries"
+    assert first_value.next_read.start == first_value.end
     second = await executor.execute(
         action(
-            {
-                "artifact_id": source.reference.artifact_id,
-                "pointer": "/data/entries",
-                "start": first_value.end,
-                "length": 3000,
-            },
+            first_value.next_read.model_dump(mode="json"),
             "read_artifact",
             "page-2",
         ),
@@ -622,7 +621,7 @@ async def test_complete_feedback_estimate_covers_the_exact_delivered_exchange() 
     )
 
     assert envelope.delivery == "complete"
-    assert envelope.estimator_version == "artifact-read-output/1"
+    assert envelope.estimator_version == "artifact-read-output/2"
     assert record.artifact is not None
     snapshot = await store.get("run", record.artifact.artifact_id)
     delivered = complete_exchange(proposed, record.artifact, snapshot.value)

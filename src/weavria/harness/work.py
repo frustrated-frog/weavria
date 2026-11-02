@@ -1,5 +1,6 @@
 """有界工作记录: 模型提出可错的进展摘要,接受事实仍由 NeedLedger 管理。"""
 
+import hashlib
 import json
 from collections.abc import Awaitable, Callable
 from typing import Annotated, Literal, Self
@@ -101,15 +102,85 @@ class WorkingState(WorkContract):
         return self
 
 
-class _WorkTool(TypedTool[WorkUpdate, WorkProposal]):
-    def validate_arguments(self, arguments: dict[str, JsonValue]) -> WorkUpdate:
+class WorkDraftNote(WorkContract):
+    """模型负责内容与关联;省略编号时由内容摘要确定稳定编号。"""
+
+    note_id: Identity | None = None
+    kind: Literal["plan", "hypothesis", "result", "rejected", "issue"]
+    summary: Text
+    need_ids: tuple[Identity, ...] = Field(default=(), max_length=4)
+    sources: tuple[WorkReference, ...] = Field(default=(), max_length=2)
+
+
+class WorkDraft(WorkContract):
+    """简化的输入协议;接受后仍持久化带明确版本的 WorkUpdate。"""
+
+    task_revision: int | None = Field(default=None, ge=1)
+    base_revision: int | None = Field(default=None, ge=0)
+    notes: tuple[WorkDraftNote, ...] = Field(default=(), max_length=6)
+    next_need_ids: tuple[Identity, ...] = Field(default=(), max_length=4)
+    next_query: str = Field(default="", max_length=240)
+
+
+def _bind_draft(draft: WorkDraft, context: ToolContext) -> WorkUpdate:
+    view = context.task_view
+    raw = view.progress.get("working_state") if view else None
+    state = load_work(raw) if isinstance(raw, dict) else None
+    task_revision = (
+        draft.task_revision
+        if draft.task_revision is not None
+        else state.task_revision
+        if state
+        else None
+    )
+    base_revision = (
+        draft.base_revision
+        if draft.base_revision is not None
+        else state.revision
+        if state
+        else None
+    )
+    if task_revision is None or base_revision is None:
+        raise ToolFault(
+            ErrorCategory.INVALID_TOOL_ARGUMENTS,
+            "Work revision requires a bound task view or explicit revisions",
+        )
+    notes = tuple(
+        WorkNote(
+            note_id=n.note_id
+            or "note-"
+            + hashlib.sha256(n.model_dump_json(exclude={"note_id"}).encode()).hexdigest()[:16],
+            kind=n.kind,
+            summary=n.summary,
+            need_ids=n.need_ids,
+            sources=n.sources,
+        )
+        for n in draft.notes
+    )
+    return WorkUpdate(
+        task_revision=task_revision,
+        base_revision=base_revision,
+        notes=notes,
+        next_need_ids=draft.next_need_ids,
+        next_query=draft.next_query,
+    )
+
+
+class _WorkTool(TypedTool[WorkDraft, WorkProposal]):
+    def validate_arguments(self, arguments: dict[str, JsonValue]) -> WorkDraft:
         # 模型工具参数来自 JSON;通过 JSON 校验允许数组表示不可变 tuple,
         # 同时保留数字/字符串等字段的严格类型,不关闭整个 Schema 的 strict。
-        return WorkUpdate.model_validate_json(json.dumps(arguments))
+        return WorkDraft.model_validate_json(json.dumps(arguments))
 
 
-def work_tool() -> TypedTool[WorkUpdate, WorkProposal]:
-    async def propose(update: WorkUpdate, context: ToolContext) -> WorkProposal:
+def work_tool() -> TypedTool[WorkDraft, WorkProposal]:
+    async def propose(draft: WorkDraft, context: ToolContext) -> WorkProposal:
+        try:
+            update = _bind_draft(draft, context)
+        except ValueError as exc:
+            raise ToolFault(
+                ErrorCategory.INVALID_TOOL_ARGUMENTS, "Invalid bounded work update"
+            ) from exc
         sources: list[WorkSource] = []
         for note in update.notes:
             for ref in note.sources:
@@ -132,18 +203,19 @@ def work_tool() -> TypedTool[WorkUpdate, WorkProposal]:
 
     return _WorkTool(
         name=WORK_TOOL,
-        version="2",
-        input_type=WorkUpdate,
+        version="3",
+        input_type=WorkDraft,
         output_type=WorkProposal,
         description=(
             "Keep bounded multi-step notes: results with accepted artifact IDs/pointers, "
-            "open issues, plans, hypotheses or rejected attempts. Use current task_revision, "
-            "working_state.revision as base_revision (initially 0), and current need IDs. "
+            "open issues, plans, hypotheses or rejected attempts. Supply notes with kind, summary, "
+            "need_ids and sources (artifact_id/pointer). Revisions and note_id may be omitted; "
+            "the host binds them to the task view that produced this call. "
             "Replace the whole set; retain useful notes. Sourced results lower acquired needs' "
             "exploration priority; issues and next_need_ids raise it. "
             "Check working_state.last_notice "
             "after this proposal. Notes are fallible summaries, never proof or private reasoning. "
-            "Skip unchanged notes and simple answers."
+            "Skip unchanged notes. Honor requested working notes even for a short final answer."
         ),
         execute=propose,
     )

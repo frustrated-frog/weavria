@@ -17,7 +17,11 @@ from .compiler import (
     SessionContextCompiler,
 )
 from .conversation import ConversationPlan, project_turn, select_conversation
-from .delivery import delivery_range_is_covered, delivery_ranges, first_delivery_gap
+from .delivery import (
+    delivery_range_is_covered,
+    delivery_ranges,
+    first_delivery_gap,
+)
 from .demand import ContextDemand, ContextFocus, EvidenceAnchor
 from .evidence import (
     ControlEvidencePlan,

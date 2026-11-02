@@ -276,7 +276,9 @@ class AgentHarness:
             working_records=config.working_records,
             memory=memory,
             history_retrieval=HistoryRetrievalConfig() if config.history_retrieval else None,
-            context_recovery=RecoveryLimits() if config.context_recovery else None,
+            context_recovery=RecoveryLimits(schema_version=2, retention="chain")
+            if config.context_recovery
+            else None,
             task_model_projector=TaskModelViewProjector() if config.task_understanding else None,
             completion=completion,
             policy=policy,
@@ -376,7 +378,7 @@ class AgentHarness:
             policy=policy,
             scheduling=scheduling,
             configuration_metadata={
-                "harness_version": "unified-harness/7",
+                "harness_version": "unified-harness/8",
                 "configuration_id": configuration_id,
                 "working_records": working_records,
                 "harness_max_request_duration": duration,

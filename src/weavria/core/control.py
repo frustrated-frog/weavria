@@ -83,7 +83,28 @@ class FeedbackEnvelopeBound(ContractModel):
     max_exchange_bytes: int = Field(gt=0)
 
 
-class AdmissionNotice(ContractModel):
+class AdmissionNotice(BaseModel):
+    model_config = ContractModel.model_config
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def version_type(cls, value: object) -> object:
+        return ContractModel.validate_version_type(value)
+
+    schema_version: Literal[1, 2] = 1
+    # 建议只针对原提案中指定的一次调用单独重提,0 表示最低页也无法容纳。
+    page_call_index: int | None = Field(default=None, ge=0, le=31)
+    page_parameter: str | None = Field(default=None, min_length=1, max_length=64)
+    page_maximum: int | None = Field(default=None, ge=0)
+
+    @model_serializer(mode="wrap")
+    def preserve_v1_wire(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        data = handler(self)
+        if self.schema_version == 1:
+            for key in ("page_call_index", "page_parameter", "page_maximum"):
+                data.pop(key, None)
+        return data
+
     kind: Literal["admission_rejected"] = "admission_rejected"
     reason: Literal["feedback_budget", "tool_budget", "capability_view", "no_progress"]
     proposal_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
@@ -100,6 +121,16 @@ class AdmissionNotice(ContractModel):
 
     @model_validator(mode="after")
     def bound_notice(self) -> Self:
+        advice = (self.page_call_index, self.page_parameter, self.page_maximum)
+        if any(x is not None for x in advice):
+            if (
+                self.schema_version != 2
+                or self.reason != "feedback_budget"
+                or any(x is None for x in advice)
+            ):
+                raise ValueError("page advice requires a complete v2 feedback-budget notice")
+            if self.page_call_index is not None and self.page_call_index >= self.proposed_calls:
+                raise ValueError("page advice must reference a proposed call")
         progress = self.reason == "no_progress"
         if progress != (
             self.progress_fingerprint_sha256 is not None

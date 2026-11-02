@@ -335,7 +335,7 @@ class SessionContextCompiler:
         if view_receipt is not None and (sequence > 2**63 - 1 or total_turns > 2**63 - 1):
             raise ContextBuildError("model-view envelope counters exceed their encoding bound")
         policy_version = (
-            11
+            12
             if supply is not None
             else 10
             if view_receipt is not None
@@ -357,8 +357,8 @@ class SessionContextCompiler:
             session_id=session_id,
             through_sequence=sequence,
             omitted_turns=total_turns,
-            policy_version="context-compiler/11"
-            if policy_version == 11
+            policy_version="context-compiler/12"
+            if policy_version == 12
             else "context-compiler/10"
             if policy_version == 10
             else "context-compiler/8"

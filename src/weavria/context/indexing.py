@@ -7,7 +7,8 @@ from collections.abc import Iterator
 from pydantic import JsonValue
 
 from .budget import ContextCapacityError
-from .evidence import Passage, terms
+from .evidence import Passage, PassageContext, terms
+from .structure import text_windows
 
 
 async def bounded_passages(
@@ -19,16 +20,26 @@ async def bounded_passages(
     used = 0
     visited = 0
 
-    async def add(pointer: str, start: int, end: int, leaf: JsonValue) -> None:
+    async def add(
+        pointer: str,
+        start: int,
+        end: int,
+        leaf: JsonValue,
+        context: tuple[PassageContext, ...] = (),
+    ) -> None:
         nonlocal used
         if len(result) >= max_passages:
             raise ContextCapacityError("index_passages", len(result) + 1, max_passages)
         encoded = json.dumps(leaf, ensure_ascii=False, allow_nan=False)
-        used += len(pointer.encode()) + len(encoded.encode())
+        used += (
+            len(pointer.encode())
+            + len(encoded.encode())
+            + sum(len(json.dumps(c.view(), ensure_ascii=False).encode()) for c in context)
+        )
         if used > max_bytes:
             raise ContextCapacityError("index_bytes", used, max_bytes)
         text = leaf if isinstance(leaf, str) else encoded
-        result.append(Passage(pointer, start, end, encoded, terms(f"{pointer} {text}")))
+        result.append(Passage(pointer, start, end, encoded, terms(f"{pointer} {text}"), context))
         if len(result) % 64 == 0:
             await asyncio.sleep(0)
 
@@ -63,17 +74,8 @@ async def bounded_passages(
 
             pending.append(elements(current, pointer))
         elif isinstance(current, str) and current:
-            start = 0
-            while start < len(current):
-                end, size = start, 0
-                while end < len(current):
-                    width = len(current[end].encode())
-                    if size + width > 320:
-                        break
-                    size += width
-                    end += 1
-                await add(pointer, start, end, current[start:end])
-                start = end
+            for start, end, context in text_windows(current):
+                await add(pointer, start, end, current[start:end], context)
         else:
             await add(pointer, 0, 0, current)
     return tuple(result)

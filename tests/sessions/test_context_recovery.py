@@ -559,3 +559,80 @@ async def test_same_query_can_retry_after_the_accepted_corpus_changes(
             for e in events
             if isinstance(e.data, SessionContextCompiled)
         )
+
+
+@pytest.mark.parametrize("retention", ["latest", "chain"])
+async def test_continuous_recovery_retains_prior_ranges_until_tool_settlement(
+    tmp_path: Path, session_counter: OpenAICompatibleTokenCounter, retention: str
+) -> None:
+    """多次读取必须能在同一次模型输入中合并;v1 日志仍重放原有单轮语义。"""
+    from typing import Literal, cast
+
+    requests: list[SessionRequest] = []
+    source: dict[str, str] = {}
+
+    class Model:
+        capabilities = ModelCapabilities(True, True)
+
+        async def generate_session(self, request: SessionRequest) -> ModelTurn:
+            requests.append(request)
+            step = len(requests)
+            if step == 1:
+                return call("archive", "archive")
+            if step == 2:
+                exchange = next(e for e in request.current.history if isinstance(e, ToolExchange))
+                assert isinstance(exchange.observation, ToolSucceededObservation)
+                output = exchange.observation.output
+                assert isinstance(output, dict)
+                source.update(call_id="archive", source_sha256=str(output["sha256"]))
+            if step in (2, 3):
+                return ModelTurn(
+                    schema_version=2,
+                    decision=RecoverContext(
+                        call_id=source["call_id"],
+                        source_sha256=source["source_sha256"],
+                        pointer="/text",
+                        start=2700 if step == 2 else 0,
+                        length=30,
+                    ),
+                )
+            if step == 4:
+                # 第三次已超出两轮额度。chain 保留已取得资料,不会在 limit 清空工作集。
+                return recover("unused query")
+            if step == 5:
+                assert isinstance(request.current.control, RecoveryNotice)
+                assert request.current.control.status == "limit"
+                return call("work", "work")
+            return finish()
+
+    limits = RecoveryLimits(
+        schema_version=2 if retention == "chain" else 1,
+        retention=cast(Literal["latest", "chain"], retention),
+        max_rounds=2,
+    )
+    async with SessionEngine(
+        tmp_path / "continuous.db",
+        model=Model(),
+        tools=registry(),
+        context_compiler=config(),
+        token_counter=session_counter,
+        context_recovery=limits,
+    ) as engine:
+        await engine.create("s")
+        result = await engine.send("s", "read source in stages")
+        assert result.report.execution.status is RunStatus.COMPLETED
+        events = await engine.store.events("s", limit=256)
+        reports = [e.data.compilation for e in events if isinstance(e.data, SessionContextCompiled)]
+        assert [len(c.recovery_ranges) for c in reports] == (
+            [0, 0, 1, 2, 2, 0] if retention == "chain" else [0, 0, 1, 1, 0, 0]
+        )
+        state = None
+        counts: list[int] = []
+        for e in events:
+            if isinstance(e.data, SessionRunEvent):
+                state = reduce_event(state, e.data.event)
+                if isinstance(e.data.event.data, RecoveryResolved):
+                    counts.append(len(state.recovery_ranges))
+        assert counts == ([1, 2, 2] if retention == "chain" else [1, 1, 0])
+        assert state is not None and not state.recovery_ranges
+        assert state.recovery_bytes == sum(r.value_bytes for r in state.recovery_seen)

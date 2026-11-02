@@ -12,6 +12,7 @@ from .controller import (
     prepare_task,
     resolve_turn,
 )
+from .delivery import artifact_page_source_ranges
 from .finalization import FinalizationAssessment, FinalizationPolicy
 from .intervention import (
     ACTION_VALUE_LEDGER_VERSION,
@@ -90,6 +91,7 @@ __all__ = [
     "TurnPreparer",
     "TurnSettler",
     "action_value_state_sha256",
+    "artifact_page_source_ranges",
     "evaluate_action_intervention",
     "observe_action_value",
     "prepare_task",

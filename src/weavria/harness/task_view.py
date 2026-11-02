@@ -26,7 +26,7 @@ _MAX_NUMBER = 2**63 - 1
 class TaskModelViewProjector:
     """Project accepted state without authorizing actions or manufacturing evidence."""
 
-    version = "task-model-view/3"
+    version = "task-model-view/4"
     working_records_version = 1
 
     def project(
@@ -202,11 +202,10 @@ class TaskModelViewProjector:
                 item.model_dump(mode="json") for item in frame.application_context
             ],
             "interpretation": (
-                "acquired=source fields available, analysis pending; satisfied=semantic "
-                "coverage, not answer verification. Excerpts omit text: use read_artifact or "
-                "source tools to check missing context. Keep multi-step findings/open issues "
-                "via propose_work when available; finding_recorded is model inference. "
-                "Answer the original request when ready. Gaps/failures are summaries."
+                "acquired=material available, analysis pending; satisfied=semantic coverage, "
+                "not answer verification. Recover omitted text by query or read_artifact. "
+                "Preserve useful findings/issues with propose_work; revisions/IDs are automatic. "
+                "Notes are model inference. Follow the original user request."
             ),
         }
         progress_payload: dict[str, JsonValue] = {"needs": progress}

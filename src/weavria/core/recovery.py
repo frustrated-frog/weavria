@@ -3,13 +3,42 @@
 import hashlib
 from typing import Literal, Self
 
-from pydantic import Field, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    SerializerFunctionWrapHandler,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 from ._schema import ContractModel, NonBlankString
 
 
-class RecoveryLimits(ContractModel):
+class RecoveryLimits(BaseModel):
     """Run-wide control-round and original-value payload quotas."""
+
+    model_config = ContractModel.model_config
+    schema_version: Literal[1, 2] = 1
+    retention: Literal["latest", "chain"] = "latest"
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def version_type(cls, value: object) -> object:
+        return ContractModel.validate_version_type(value)
+
+    @model_serializer(mode="wrap")
+    def preserve_v1_wire(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        data = handler(self)
+        if self.schema_version == 1:
+            data.pop("retention", None)
+        return data
+
+    @model_validator(mode="after")
+    def versioned_retention(self) -> Self:
+        if self.schema_version == 1 and self.retention != "latest":
+            raise ValueError("chain retention requires recovery limits v2")
+        return self
 
     max_rounds: int = Field(default=4, ge=1, le=32)
     max_ranges: int = Field(default=4, ge=1, le=8)

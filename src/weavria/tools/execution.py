@@ -31,6 +31,7 @@ from weavria.core import (
     FeedbackEnvelopeBound,
     JsonPointer,
     RunError,
+    TaskModelView,
     ToolAuthorization,
     ToolCallAction,
     ToolExchange,
@@ -55,7 +56,7 @@ class ToolDescriptor(BaseModel):
         validate_default=True,
         revalidate_instances="always",
     )
-    schema_version: Literal[2, 3, 4] = 2
+    schema_version: Literal[2, 3, 4, 5] = 2
     name: str = Field(min_length=1, pattern=r"^[a-zA-Z][a-zA-Z0-9_]*$")
     version: str = Field(min_length=1)
     description: str = Field(min_length=1)
@@ -73,6 +74,9 @@ class ToolDescriptor(BaseModel):
     feedback_delivery: FeedbackDelivery = "adaptive"
     feedback_bound_version: str | None = Field(default=None, min_length=1)
 
+    # 声明一个单调的页容量参数: 缩小它不能增加反馈上界,也不能改变读取位置。
+    feedback_page_parameter: str | None = Field(default=None, min_length=1, max_length=64)
+
     @field_validator("schema_version", "max_attempts", mode="before")
     @classmethod
     def validate_literal_integer(cls, value: object) -> object:
@@ -83,6 +87,8 @@ class ToolDescriptor(BaseModel):
     @model_serializer(mode="wrap")
     def preserve_legacy_wire(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
         data = handler(self)
+        if self.schema_version < 5:
+            data.pop("feedback_page_parameter", None)
         if self.schema_version == 2:
             data.pop("feedback_delivery", None)
         if self.schema_version < 4:
@@ -95,12 +101,28 @@ class ToolDescriptor(BaseModel):
             raise ValueError("complete feedback delivery requires descriptor schema version 3")
         if self.schema_version < 4 and self.feedback_bound_version is not None:
             raise ValueError("feedback bound metadata requires descriptor schema version 4")
-        if self.schema_version == 4 and (
+        if self.schema_version >= 4 and (
             self.feedback_delivery != "complete" or self.feedback_bound_version is None
         ):
             raise ValueError("descriptor schema version 4 requires a complete feedback bound")
         if self.feedback_delivery == "adaptive" and self.feedback_bound_version is not None:
             raise ValueError("adaptive feedback cannot declare a complete-data bound")
+        if self.feedback_page_parameter is not None:
+            properties = self.input_schema.get("properties")
+            field = (
+                properties.get(self.feedback_page_parameter)
+                if isinstance(properties, dict)
+                else None
+            )
+            if self.schema_version != 5 or self.feedback_delivery != "complete":
+                raise ValueError("page advice requires a versioned complete feedback bound")
+            if (
+                not isinstance(field, dict)
+                or field.get("type") != "integer"
+                or not isinstance(field.get("minimum"), int)
+                or not isinstance(field.get("maximum"), int)
+            ):
+                raise ValueError("page parameter requires finite integer bounds")
         return self
 
 
@@ -144,7 +166,9 @@ class ToolContext:
         accepted_artifacts: tuple[ArtifactRef, ...] | None = None,
         *,
         call_id: str | None = None,
+        task_view: TaskModelView | None = None,
     ) -> None:
+        self._task_view_json = task_view.model_dump_json() if task_view else None
         self._call_id = call_id
         self._run_id = run_id
         self._store = store
@@ -154,6 +178,15 @@ class ToolContext:
             None
             if accepted_artifacts is None
             else {ref.artifact_id: ref for ref in accepted_artifacts}
+        )
+
+    @property
+    def task_view(self) -> TaskModelView | None:
+        """本次提案产生时的模型可见任务快照;不是最新状态或授权依据。"""
+        return (
+            TaskModelView.model_validate_json(self._task_view_json)
+            if self._task_view_json
+            else None
         )
 
     @property
@@ -228,6 +261,7 @@ class TypedTool[Input: BaseModel, Output: BaseModel]:
         feedback_delivery: FeedbackDelivery = "adaptive",
         feedback_bound_version: str | None = None,
         feedback_data_bound: Callable[[Input, FeedbackBounds], int] | None = None,
+        feedback_page_parameter: str | None = None,
     ) -> None:
         if isinstance(timeout_seconds, bool) or not math.isfinite(timeout_seconds):
             raise ValueError("tool timeout must be finite")
@@ -240,7 +274,11 @@ class TypedTool[Input: BaseModel, Output: BaseModel]:
             raise ValueError("adaptive feedback cannot declare a complete-data bound")
         adapter = TypeAdapter[dict[str, JsonValue]](dict[str, JsonValue])
         descriptor = ToolDescriptor(
-            schema_version=4 if feedback_delivery != "adaptive" else 2,
+            schema_version=5
+            if feedback_page_parameter
+            else 4
+            if feedback_delivery != "adaptive"
+            else 2,
             name=name,
             version=version,
             description=description,
@@ -256,6 +294,7 @@ class TypedTool[Input: BaseModel, Output: BaseModel]:
             context_paths=context_paths,
             feedback_delivery=feedback_delivery,
             feedback_bound_version=feedback_bound_version,
+            feedback_page_parameter=feedback_page_parameter,
         )
         self._descriptor_json = descriptor.model_dump_json()
         self._input_type = input_type
@@ -421,7 +460,7 @@ class ToolRegistry:
         if tool is not None and identity.normalization == "validated":
             descriptor = tool.descriptor
             if descriptor.feedback_delivery == "complete":
-                if descriptor.schema_version != 4 or descriptor.feedback_bound_version is None:
+                if descriptor.schema_version < 4 or descriptor.feedback_bound_version is None:
                     raise ToolExecutionError(
                         "complete feedback tool does not provide a versioned bound"
                     )
@@ -483,6 +522,7 @@ class ToolExecutor:
         accepted_artifacts: tuple[ArtifactRef, ...] | None = None,
         expected_identity: ToolActionIdentity | None = None,
         feedback_envelope: FeedbackEnvelopeBound | None = None,
+        task_view: TaskModelView | None = None,
     ) -> ToolRecord:
         """Return a classified exchange; external cancellation always propagates."""
         if isinstance(max_duration, bool) or not math.isfinite(max_duration) or max_duration <= 0:
@@ -496,7 +536,13 @@ class ToolExecutor:
             _validate_feedback_envelope(action, expected_identity, feedback_envelope)
         owner = asyncio.current_task()
         cancellations = owner.cancelling() if owner is not None else 0
-        context = ToolContext(self._run_id, self._store, accepted_artifacts, call_id=action.call_id)
+        context = ToolContext(
+            self._run_id,
+            self._store,
+            accepted_artifacts,
+            call_id=action.call_id,
+            task_view=task_view,
+        )
         authorization: ToolAuthorization | None = None
         retryable = False
         loop = asyncio.get_running_loop()

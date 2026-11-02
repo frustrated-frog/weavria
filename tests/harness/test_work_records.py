@@ -93,9 +93,11 @@ class Interpreter:
 
 
 @pytest.mark.parametrize("need_count", [1, 4])
+@pytest.mark.parametrize("automatic_versions", [False, True])
 async def test_work_update_keeps_material_readable_and_projects_sources(
     tmp_path: Path,
     need_count: int,
+    automatic_versions: bool,
 ) -> None:
     class Questions(Interpreter):
         async def interpret(
@@ -174,18 +176,28 @@ async def test_work_update_keeps_material_readable_and_projects_sources(
                     next_need_ids=(need_id,),
                     next_query="source content tail",
                 )
+                arguments = update.model_dump(mode="json")
+                if automatic_versions:
+                    arguments.pop("task_revision")
+                    arguments.pop("base_revision")
+                    arguments["notes"][0].pop("note_id")
                 return ModelTurn(
                     decision=ToolBatch(
                         calls=(
                             ToolCallAction(
                                 call_id="work",
                                 tool_name="propose_work",
-                                arguments=update.model_dump(mode="json"),
+                                arguments=arguments,
                             ),
                         )
                     )
                 )
-            assert state.last_notice == "accepted" and state.notes[0].note_id == "result"
+            assert state.last_notice == "accepted"
+            assert (
+                state.notes[0].note_id.startswith("note-")
+                if automatic_versions
+                else state.notes[0].note_id == "result"
+            )
             assert state.sources[0].artifact.call_id == "read"
             rows = view.progress["needs"]
             assert isinstance(rows, list) and isinstance(rows[0], dict)

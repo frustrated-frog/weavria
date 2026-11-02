@@ -50,12 +50,24 @@ class ArtifactReadOutput(BaseModel):
     page_bytes: int = Field(ge=0)
     value: JsonValue = None
     items: tuple[ArtifactPageItem, ...] = ()
+    next_read: ArtifactReadInput | None = None
 
 
 _PAGE = TypeAdapter(tuple[ArtifactPageItem, ...])
 
 
 async def _read(arguments: ArtifactReadInput, context: ToolContext) -> ArtifactReadOutput:
+    page = await _read_page(arguments, context)
+    # 下一页仍指向原始 Artifact,不会误把响应包络 /data/value 当成原文路径。
+    # start 是字符/子项游标,与本次 payload 的字节数无关。
+    if page.has_more:
+        return page.model_copy(
+            update={"next_read": arguments.model_copy(update={"start": page.end})}
+        )
+    return page
+
+
+async def _read_page(arguments: ArtifactReadInput, context: ToolContext) -> ArtifactReadOutput:
     snapshot = await context.read_artifact(arguments.artifact_id)
     try:
         value = resolve_pointer(snapshot.value, arguments.pointer)
@@ -221,6 +233,7 @@ def _feedback_data_bound(arguments: ArtifactReadInput, bounds: FeedbackBounds) -
         total=numeric_ceiling,
         has_more=False,
         page_bytes=arguments.length,
+        next_read=arguments.model_copy(update={"start": numeric_ceiling}),
     )
     base = len(template.model_dump_json().encode())
     value_bound = base + max(0, arguments.length - len(b"null"))
@@ -253,16 +266,17 @@ def artifact_read_tool() -> TypedTool[ArtifactReadInput, ArtifactReadOutput]:
     """Register exact scalar/text reads and resumable immediate-child pages."""
     return TypedTool(
         name="read_artifact",
-        version="4",
+        version="6",
         description=(
-            "Read a JSON Pointer under a serialized-payload byte budget; start/end remain "
-            "Unicode character offsets for strings and child cursors for arrays/objects."
+            "Read original Artifact JSON Pointer: length is bytes, start/end are character "
+            "or child cursors. Wrapper /data is not stored. Copy next_read to continue the source."
         ),
         input_type=ArtifactReadInput,
         output_type=ArtifactReadOutput,
         execute=_read,
         context_paths=("",),
         feedback_delivery="complete",
-        feedback_bound_version="artifact-read-output/1",
+        feedback_bound_version="artifact-read-output/2",
         feedback_data_bound=_feedback_data_bound,
+        feedback_page_parameter="length",
     )

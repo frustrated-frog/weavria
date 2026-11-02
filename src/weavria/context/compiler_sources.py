@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import math
+import re
 from collections import Counter, OrderedDict
 from dataclasses import dataclass
 from typing import Literal
@@ -94,7 +95,12 @@ class SourceIndex:
 
     @staticmethod
     def _passage_bytes(passages: tuple[Passage, ...]) -> int:
-        return sum(len(p.pointer.encode()) + len(p.value_json.encode()) for p in passages)
+        return sum(
+            len(p.pointer.encode())
+            + len(p.value_json.encode())
+            + sum(len(json.dumps(c.view(), ensure_ascii=False).encode()) for c in p.context)
+            for p in passages
+        )
 
     def _reserve_index(self, passages: tuple[Passage, ...]) -> None:
         self._active_passages += len(passages)
@@ -180,6 +186,27 @@ class CoverageScorer:
 
     def __init__(self, demands: tuple[ContextDemand, ...], passages: tuple[Passage, ...]) -> None:
         self.demands = demands
+        # 保留标识符整体,避免 max/start 等通用词盖过用户明确指定的符号。
+        # 同时索引限定名与末段,兼容 Class.method 与源码中的 def method。
+        self._identifiers = tuple(
+            (
+                d.demand_id,
+                d.weight,
+                tuple(
+                    sorted(
+                        {
+                            part.casefold()
+                            for name in re.findall(
+                                r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*", d.query
+                            )
+                            if "_" in name or "." in name
+                            for part in (name, name.rsplit(".", 1)[-1])
+                        }
+                    )
+                ),
+            )
+            for d in demands
+        )
         self._features: dict[Passage, tuple[tuple[str, float], ...]] = {}
         frequencies: Counter[str] = Counter()
         for passage in passages:
@@ -239,6 +266,18 @@ class CoverageScorer:
                     for key, value in self._term_features.get(term, ()):
                         features[key] = value
                         relevance += value
+                for context in passage.context:
+                    for term in set(terms(context.value)):
+                        for key, value in self._term_features.get(term, ()):
+                            features[key] = max(features.get(key, 0.0), value * 0.15)
+                body = passage.value_json.casefold()
+                scope = "\n".join(c.value for c in passage.context).casefold()
+                for identity, weight, identifiers in self._identifiers:
+                    for name in identifiers:
+                        if name in body or name in scope:
+                            features[f"d:{identity}:identifier:{name}"] = weight * (
+                                2.0 if name in body else 0.5
+                            )
                 if relevance:
                     features[f"p:{digest(passage.value_json)}"] = 0.05 * relevance
                 cached = tuple(sorted(features.items()))
@@ -265,7 +304,7 @@ class CoverageScorer:
                                 (anchor.run_id, anchor.call_id, anchor.sha256, anchor.pointer)
                             )
                         )
-                        result[f"d:{demand.demand_id}:a:{key}"] = demand.weight
+                        result[f"d:{demand.demand_id}:a:{key}"] = demand.weight * 0.1
         return tuple(sorted(result.items()))
 
     async def rank(self, source: IndexedSource, limit: int) -> tuple[Passage, ...]:
@@ -365,6 +404,24 @@ async def source_units(
                 ]
             if not (record.feedback_delivery == "complete" and call_id in mandatory):
                 ranked = await scorer.rank(source, max_passages)
+                if ranked:
+                    compact = tuple(dict.fromkeys((*protected, *empty_roots, ranked[0])))
+                    variants.append(
+                        Representation(
+                            "excerpt",
+                            _exchange_view(
+                                record.exchange,
+                                {
+                                    **common,
+                                    "representation": "excerpts",
+                                    "passages": [p.view() for p in compact],
+                                },
+                            ),
+                            scorer.features(compact, source=source),
+                            _delivery(reference, "excerpt", compact),
+                        )
+                    )
+                ranked = tuple(_neighbor_window(source, p) for p in ranked)
                 for size in sorted(
                     {1, min(2, len(ranked)), min(4, len(ranked)), len(ranked)} - {0}
                 ):
@@ -419,6 +476,45 @@ async def source_units(
     return tuple(result)
 
 
+def _neighbor_window(source: IndexedSource, passage: Passage) -> Passage:
+    """把候选中心扩展到同作用域邻文。短预算仍可选择上面的紧凑表示。"""
+    if passage.end <= passage.start:
+        return passage
+    index = source.passages.index(passage)
+    chosen = [passage]
+    size = len(passage.value_json.encode())
+    for distance in (1, 2):
+        for candidate in (index - distance, index + distance):
+            if not 0 <= candidate < len(source.passages):
+                continue
+            other = source.passages[candidate]
+            if (
+                other.pointer != passage.pointer
+                or other.context != passage.context
+                or other.end <= other.start
+            ):
+                continue
+            if size + len(other.value_json.encode()) > 1200:
+                continue
+            # 只有与现有窗口连续的邻块才可拼接,不伪造跨缺口原文。
+            if other.end != min(p.start for p in chosen) and other.start != max(
+                p.end for p in chosen
+            ):
+                continue
+            chosen.append(other)
+            size += len(other.value_json.encode())
+    chosen.sort(key=lambda p: p.start)
+    value = "".join(str(json.loads(p.value_json)) for p in chosen)
+    return Passage(
+        passage.pointer,
+        chosen[0].start,
+        chosen[-1].end,
+        json.dumps(value, ensure_ascii=False),
+        terms(f"{passage.pointer} {value}"),
+        passage.context,
+    )
+
+
 def _delivery(
     reference: ArtifactRef,
     representation: Literal["raw", "excerpt"],
@@ -440,6 +536,14 @@ def _delivery(
                 end=passage.end,
             ),
         )
+    for passage in passages:
+        for context in passage.context:
+            if context.end > context.start:
+                ranges[(passage.pointer, "text", context.start, context.end)] = (
+                    EvidenceDeliveryRange(
+                        pointer=passage.pointer, kind="text", start=context.start, end=context.end
+                    )
+                )
     return EvidenceDelivery(
         run_id=artifact.run_id,
         call_id=artifact.call_id,

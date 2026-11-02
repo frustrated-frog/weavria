@@ -121,7 +121,7 @@ async def test_complete_or_omitted_and_persisted_before_transport(
                     reports[-1].request_sha256
                     == hashlib.sha256(request.model_dump_json().encode()).hexdigest()
                 )
-                assert reports[-1].schema_version == 11
+                assert reports[-1].schema_version == 12
                 assert (reports[-1].transport_request_bytes is not None) == http_accounting
                 report_data = reports[-1].model_dump()
                 assert ContextCompilation.model_validate(report_data) == reports[-1]
@@ -168,7 +168,7 @@ async def test_complete_or_omitted_and_persisted_before_transport(
             for e in await engine.store.events("next-session", limit=100)
             if isinstance(e.data, SessionContextCompiled)
         ]
-        assert len(reports) == 1 and reports[0].schema_version == 11
+        assert len(reports) == 1 and reports[0].schema_version == 12
 
 
 async def test_source_cancellation_joins_before_owner_finishes(

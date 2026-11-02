@@ -612,7 +612,7 @@ async def test_finalization_receives_synthesis_view_and_preserves_full_needs(
     assert reports[-1].task_model_view.growth_reserve_bytes == 0
     assert reports[-1].control_reserve_bytes > 0
     if with_memory:
-        assert all(r.schema_version == 11 and r.supply is not None for r in reports)
+        assert all(r.schema_version == 12 and r.supply is not None for r in reports)
         assert all(r.task_model_view and r.task_model_view.schema_version == 2 for r in reports)
         for request in model.requests:
             assert request.schema_version == 6 and len(request.bundles) == 1
