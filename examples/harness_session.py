@@ -51,6 +51,11 @@ async def main() -> None:
     parser.add_argument("--snapshot", type=Path, help="只读原文 JSON 归档,不包含评分")
     parser.add_argument("--scene", choices=("documents", "repository"))
     parser.add_argument("--memory", action="store_true")
+    parser.add_argument(
+        "--include-unknown-time",
+        action="store_true",
+        help="允许召回生效起点未知的记忆,保留未知标记",
+    )
     parser.add_argument("--understand", action="store_true")
     parser.add_argument("--working-records", action="store_true", help="启用有界工作记录与任务理解")
     args = parser.parse_args()
@@ -86,6 +91,7 @@ async def main() -> None:
                 scope,
                 "local-user",
                 max_duration=60,
+                include_unknown_time=args.include_unknown_time,
             )
             if args.memory
             else None

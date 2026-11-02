@@ -81,3 +81,53 @@ async def test_snapshot_fault_mirror_and_unknown_path() -> None:
         assert corpus.failures == 1 and corpus.reads == [("read_document_mirror", "docs/source.md")]
     finally:
         context.close()
+
+
+async def test_external_update_owns_a_separate_task_and_is_cleaned_up() -> None:
+    import asyncio
+
+    from examples.m1_harness import ObservedModel
+    from weavria.core import (
+        ControlRequest,
+        ConversationView,
+        FinishAction,
+        ModelTurn,
+        SessionRequest,
+        TaskInput,
+    )
+    from weavria.models import FakeSessionProvider
+
+    request = SessionRequest(
+        conversation=ConversationView(session_id="s", through_sequence=0),
+        current=ControlRequest(instructions="", task=TaskInput(goal="question")),
+    )
+    delegate = FakeSessionProvider((ModelTurn(decision=FinishAction(output="answer")),))
+    observer = ObservedModel(delegate)
+    owner = asyncio.current_task()
+
+    async def inject(request: SessionRequest) -> None:
+        # 直接重入原 send 任务就是首轮复测的脚本缺陷。
+        assert asyncio.current_task() is not owner
+
+    observer.on_request = inject
+    await observer.generate_session(request)
+    assert len(delegate.requests) == 1
+    entered, cleaned = asyncio.Event(), asyncio.Event()
+
+    async def blocked(request: SessionRequest) -> None:
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cleaned.set()
+
+    observer.on_request = blocked
+    task = asyncio.create_task(observer.generate_session(request))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=1)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert cleaned.is_set()
+    assert len(delegate.requests) == 1

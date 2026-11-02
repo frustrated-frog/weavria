@@ -4,6 +4,7 @@ import asyncio
 import json
 from dataclasses import replace
 from pathlib import Path
+from typing import Literal
 
 import pytest
 from pydantic import BaseModel, JsonValue
@@ -79,6 +80,7 @@ class ReasoningModel:
 
     def __init__(self) -> None:
         self.requests: list[ModelRequest] = []
+        self.time_kind: Literal["current", "unknown"] = "current"
         self.fail_formation = False
         self.reject_candidate = False
         self.block_formation = False
@@ -143,7 +145,7 @@ class ReasoningModel:
                         text=doc.text,
                         scope_kind="project",
                         retention="durable",
-                        time_kind="current",
+                        time_kind=self.time_kind,
                         citations=(MemoryCitation(source_id=doc.source.source_id, quote=doc.text),),
                     ),
                 )
@@ -489,3 +491,41 @@ def test_configuration_rejects_missing_dependencies_before_opening_storage(
             token_counter=session_counter,
         )
     assert not (tmp_path / "session.db").exists()
+
+
+@pytest.mark.parametrize("include_unknown", [False, True])
+async def test_configured_unknown_time_memory_survives_reopen_and_respects_host_choice(
+    tmp_path: Path,
+    access: MemoryAccess,
+    scope: MemoryScope,
+    session_counter: OpenAICompatibleTokenCounter,
+    include_unknown: bool,
+) -> None:
+    reasoning = ReasoningModel()
+    reasoning.time_kind = "unknown"
+    memory = HarnessMemory(
+        tmp_path / "memory.db", access, scope, "author", include_unknown_time=include_unknown
+    )
+    # 走真实模型适配器的抽取/审阅与存储,只替换模型响应;不预写正确记忆。
+    for session, text in (("seed", PREFERENCE), ("recall", "What is documentation language?")):
+        model = FakeSessionProvider((ModelTurn(decision=FinishAction(output="answer")),))
+        async with AgentHarness.from_config(
+            tmp_path / "sessions.db",
+            config=configuration(),
+            model=model,
+            tools=ToolRegistry(()),
+            token_counter=session_counter,
+            reasoning_model=reasoning,
+            reasoning_counter=session_counter,
+            memory=memory,
+        ) as agent:
+            await agent.create(session)
+            result = await agent.send(session, text, input_id="input")
+            assert result.session.report.status is RunStatus.COMPLETED
+            if session == "seed":
+                assert result.memory.admitted_candidates == 1
+            else:
+                assert bool(model.requests[0].bundles) is include_unknown
+                if include_unknown:
+                    payload = model.requests[0].bundles[0].model_dump_json()
+                    assert '"valid_from":null' in payload and "中文" in payload

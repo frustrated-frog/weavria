@@ -61,6 +61,8 @@ class HarnessMemory:
     max_events: int = 512
     max_recall_bytes: int = 8192
     admission: ConservativeMemoryAdmission | None = None
+    # 显式选择当前已知但生效起点未知的事实;不改变其时间字段或权威等级。
+    include_unknown_time: bool = False
 
     @classmethod
     def from_model(
@@ -78,6 +80,7 @@ class HarnessMemory:
         max_duration: float = 30,
         max_events: int = 512,
         max_recall_bytes: int = 8192,
+        include_unknown_time: bool = False,
     ) -> Self:
         """一份配置成套构造提取、审阅、准入;增强语义与修复调用均显式选择。"""
         if profile not in {"basic", "fact_sets", "conditions"}:
@@ -111,9 +114,12 @@ class HarnessMemory:
             max_duration=max_duration,
             max_events=max_events,
             max_recall_bytes=max_recall_bytes,
+            include_unknown_time=include_unknown_time,
         )
 
     def __post_init__(self) -> None:
+        if type(self.include_unknown_time) is not bool:
+            raise ValueError("include_unknown_time must be a boolean")
         if (self.extractor is None) != (self.reviewer is None):
             raise ValueError("memory formation requires both extractor and reviewer")
         if self.admission is not None and self.reviewer is None:
@@ -254,6 +260,7 @@ class AgentHarness:
                 max_duration=memory.max_duration,
                 max_events=memory.max_events,
                 max_recall_bytes=memory.max_recall_bytes,
+                include_unknown_time=memory.include_unknown_time,
             )
         return cls(
             path,
@@ -339,6 +346,7 @@ class AgentHarness:
                 access=memory.access,
                 scope=memory.scope,
                 max_bytes=memory.max_recall_bytes,
+                include_unknown_time=memory.include_unknown_time,
             )
             if memory is not None and self._memory_store is not None
             else None
@@ -368,7 +376,7 @@ class AgentHarness:
             policy=policy,
             scheduling=scheduling,
             configuration_metadata={
-                "harness_version": "unified-harness/5",
+                "harness_version": "unified-harness/6",
                 "configuration_id": configuration_id,
                 "working_records": working_records,
                 "harness_max_request_duration": duration,
@@ -378,6 +386,7 @@ class AgentHarness:
                 else None,
                 "memory_update_max_duration": memory.max_duration if memory else None,
                 "memory_update_max_events": memory.max_events if memory else None,
+                "memory_include_unknown_time": memory.include_unknown_time if memory else False,
                 "memory_formation_version": (
                     f"{memory.extractor.version};{memory.reviewer.version}"
                     if memory and memory.extractor and memory.reviewer

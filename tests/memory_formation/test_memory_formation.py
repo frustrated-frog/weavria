@@ -1617,3 +1617,61 @@ def test_compact_reference_expansion_is_bounded_without_dropping_evidence(large:
         )
         assert len(expanded.model_dump_json().encode()) <= 262144
         assert all(m.citations == candidate.citations for m in expanded.alignments[0].matches)
+
+
+@pytest.mark.parametrize("future", [False, True])
+async def test_explicit_change_replaces_unknown_start_without_inventing_history(
+    tmp_path: Path, future: bool
+) -> None:
+    first = request(text="本项目默认中文。")
+    second = request(2, "本项目从现在起改用英文,替代中文。")
+    access = grant(first)
+    path = tmp_path / "memory.db"
+    async with SQLiteMemoryStore(path, now=lambda: day(2)) as store:
+        original = await MemoryFormationEngine(
+            store, Extractor(proposal(first, time_kind="unknown")), Reviewer(judgment())
+        ).process(access, first)
+        assert original.plan is not None
+        old = original.plan.batch.mutations[0].assertion
+        assert old is not None and old.valid_from is None
+        # 未来变更不能现在就退役 unknown 旧值;已发生的明确变更复用内核 supersede。
+        candidate = proposal(
+            second,
+            value="English",
+            **({"time_kind": "dated", "valid_from": day(3)} if future else {}),
+        )
+        engine = MemoryFormationEngine(
+            store,
+            Extractor(candidate),
+            Reviewer(judgment(relation="change", target_id=old.memory_id)),
+        )
+        changed = await engine.process(access, second)
+        assert changed.plan is not None
+        if future:
+            assert changed.plan.admissions[0].status == "deferred"
+            return
+        assert changed.plan.admissions[0].status == "admitted"
+        assert changed.plan.batch.mutations[0].operation == "supersede"
+        current_query = MemoryQuery(scope=first.scope, valid_at=day(2), include_unknown_time=True)
+        current = await store.recall(access, current_query)
+        assert [hit.version.assertion.value for hit in current.hits] == ["English"]
+        assert current.hits[0].version.assertion.valid_from == day(2)
+        prior = await store.recall(
+            access, current_query.model_copy(update={"at_head": original.completed_head})
+        )
+        assert prior.hits[0].version.assertion.value == "中文"
+        assert prior.hits[0].version.assertion.valid_from is None
+        # 未知起点不能被伪造为一个已知历史区间;旧知识仍能通过 head 查询。
+        assert not (
+            await store.recall(access, MemoryQuery(scope=first.scope, valid_at=day(1)))
+        ).hits
+        history = await store.history(access, first.scope, old.memory_id)
+        assert len(history) == 2 and history[-1].status == "retracted"
+        assert all(v.assertion.valid_from is None and v.assertion.valid_to is None for v in history)
+        assert (await engine.process(access, second)).completed_head == changed.completed_head
+        events = await store.events(access, first.scope)
+        await store.rebuild(access, first.scope)
+        assert await store.events(access, first.scope) == events
+        assert await store.recall(access, current_query) == current
+    async with SQLiteMemoryStore(path) as store:
+        assert await store.recall(access, current_query) == current

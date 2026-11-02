@@ -100,7 +100,7 @@ class ConservativeMemoryAdmission:
     conditions and interval mechanics; they cannot establish truth from language.
     """
 
-    version = "conservative-memory-admission/3"
+    version = "conservative-memory-admission/4"
 
     @property
     def features(self) -> MemoryReviewFeatures:
@@ -114,9 +114,9 @@ class ConservativeMemoryAdmission:
         self._semantic_conditions = semantic_conditions
         self._set_reconciliation = set_reconciliation
         if set_reconciliation:
-            self.version = "fact-set-memory-admission/3"
+            self.version = "fact-set-memory-admission/5"
         if semantic_conditions:
-            self.version = "fact-set-memory-admission/4:conditions"
+            self.version = "fact-set-memory-admission/5:conditions"
 
     def compile(
         self,
@@ -454,8 +454,10 @@ class ConservativeMemoryAdmission:
             if judgment.relation == "change":
                 if (
                     start is None
-                    or old.valid_from is None
-                    or start <= old.valid_from
+                    or (old.valid_from is not None and start <= old.valid_from)
+                    # 内核可明确替代 unknown 旧值,保留其旧知识版本而不编造
+                    # 有效区间。未来变更不能提前撤销当前未知时间的约定。
+                    or (old.valid_from is None and start > request.occurred_at)
                     or end != old.valid_to
                 ):
                     return None, "unsafe_relation"

@@ -33,7 +33,13 @@ from weavria.core import (
     ToolSucceededObservation,
 )
 from weavria.evaluation import RecordingHTTPTransport, summarize_samples
-from weavria.harness import AgentHarness, HarnessConfig, HarnessMemory, HarnessResult
+from weavria.harness import (
+    AgentHarness,
+    HarnessConfig,
+    HarnessMemory,
+    HarnessResult,
+    TaskUnderstandingError,
+)
 from weavria.memory import MemoryAccess, MemoryScope
 from weavria.models import (
     ModelCapabilities,
@@ -216,7 +222,15 @@ class ObservedModel:
     async def generate_session(self, request: SessionRequest) -> ModelTurn:
         self.requests.append(request.model_copy(deep=True))
         if self.on_request is not None:
-            await self.on_request(request)
+            callback = self.on_request
+
+            async def inject() -> None:
+                await callback(request)
+
+            # 用户输入拥有独立任务;若借用 send 的任务重入 steer,宿主会拒绝。
+            # TaskGroup 绑定父生命周期,取消时等待注入任务清理,不遗留后台更新。
+            async with asyncio.TaskGroup() as group:
+                await group.create_task(inject())
         return await self.delegate.generate_session(request)
 
 
@@ -316,6 +330,7 @@ async def run_trial(
         scope,
         "m1-user",
         max_duration=data.budgets.memory_seconds,
+        include_unknown_time=True,
     )
     started = time.perf_counter()
     report: dict[str, object] = {
@@ -504,6 +519,13 @@ async def run_trial(
     except Exception as exc:
         # 错误类型足够定位;异常正文可能包含 HTTP 参数,不进入交付报告。
         report["error_type"] = type(exc).__name__
+        if isinstance(exc, TaskUnderstandingError):
+            report["preparation_failure"] = {
+                "category": exc.error.category.value,
+                "message": exc.error.message,
+                "cause_type": exc.error.cause_type,
+                "attempts": [a.model_dump(mode="json") for a in exc.attempts],
+            }
     finally:
         for transport in transports.values():
             await transport.close()
@@ -602,6 +624,8 @@ async def main() -> None:
             "selection": args.case,
             "model": data.model.model_dump(),
             "budgets": data.budgets.model_dump(),
+            "runner_version": "m1-runner/2",
+            "memory_include_unknown_time": True,
             "implementation": implementation_identity(),
         }
     )
