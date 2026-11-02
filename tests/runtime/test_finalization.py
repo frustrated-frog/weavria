@@ -4,7 +4,7 @@ from dataclasses import replace
 import pytest
 from pydantic import BaseModel, Field
 
-from weavria.artifacts import InMemoryArtifactStore
+from weavria.artifacts import ArtifactSnapshot, InMemoryArtifactStore
 from weavria.context import ControlContextBuilder, ControlEvidencePlan, EvidenceContextBuilder
 from weavria.core import (
     CompletionChecked,
@@ -30,9 +30,13 @@ from weavria.core import (
 from weavria.harness import (
     CapabilityNeed,
     CompletionCriterion,
+    EvidenceEvaluation,
+    EvidenceResolver,
     InformationNeed,
+    InformationRequirement,
     ModelTaskInterpreter,
     NeedFinalizationPolicy,
+    StructuralEvidenceExtractor,
     TaskObligationCompletionPolicy,
     TaskSpecification,
     TaskUnderstandingEngine,
@@ -60,6 +64,20 @@ class Input(BaseModel):
 class Output(BaseModel):
     value: str
     details: dict[str, str] = Field(default_factory=dict)
+
+
+class RecordEvidence(StructuralEvidenceExtractor):
+    """在测试领域明确 /value 是指定 key 的答案,以验证语义就绪后的 synthesis。"""
+
+    key = "test-record-value"
+
+    async def evaluate(
+        self, requirement: InformationRequirement, record: ToolRecord, snapshot: ArtifactSnapshot
+    ) -> EvidenceEvaluation:
+        result = await super().evaluate(requirement, record, snapshot)
+        assert isinstance(snapshot.value, dict)
+        assert snapshot.value["value"] == record.exchange.action.arguments["key"]
+        return result.model_copy(update={"proof_strength": "semantic"})
 
 
 async def setup(
@@ -154,7 +172,7 @@ async def setup(
             max_model_calls=max_calls, max_request_bytes=24_000, finalization_model_calls=reserve
         ),
         completion=completion or TaskObligationCompletionPolicy(),
-        finalization=finalization or NeedFinalizationPolicy(),
+        finalization=finalization or NeedFinalizationPolicy(EvidenceResolver((RecordEvidence(),))),
         context_builder=context_builder,
         preparation=preparation,
     )

@@ -182,7 +182,7 @@ async def test_real_session_path_uses_oracle_only_for_grading(
     assert row["task_outcome"] == "unverified"
     assert "EMBER-742" not in model.requests[0].model_dump_json()
     assert "EMBER-742" in model.requests[1].model_dump_json()
-    assert row["phases"] == (["decision", "synthesis"] if projected else ["full", "full"])
+    assert row["phases"] == (["decision", "decision"] if projected else ["full", "full"])
 
 
 async def test_failures_remain_in_trace_and_can_be_recovered(tmp_path: Path) -> None:
@@ -369,9 +369,10 @@ async def test_successful_sibling_does_not_turn_failed_attempt_into_early_finali
     assert row["failed_tool_calls"] == len(failed_fields)
     assert row["all_expected_fields_delivered"] is True
     assert "FINALIZATION" not in model.requests[1].current.instructions
-    assert "FINALIZATION" in model.requests[2].current.instructions
+    # 补齐原始字段也不强制提前收尾;模型在 decision 中主动综合回答。
+    assert "FINALIZATION" not in model.requests[2].current.instructions
     assert row["phases"] == (
-        ["decision", "decision", "synthesis"] if projected else ["full", "full", "full"]
+        ["decision", "decision", "decision"] if projected else ["full", "full", "full"]
     )
 
 

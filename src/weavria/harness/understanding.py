@@ -922,7 +922,7 @@ class TaskUnderstandingInputAdmission(Protocol):
 class ModelTaskInterpreter:
     """Compile validated declarations with one shared, deadline-bound correction path."""
 
-    version = "model-task-understanding/12"
+    version = "model-task-understanding/13"
 
     def __init__(
         self,
@@ -1247,7 +1247,11 @@ def _task_specification_request(
         "selected capability and no blocking ambiguities. Record only ambiguities that "
         "prevent safe progress, not harmless context limitations or optional detail. "
         "Decompose independently omissible requested facts into separate information needs "
-        "instead of hiding several requirements in one broad description. Omit mechanically "
+        "instead of hiding several requirements in one broad description. Preserve the actual "
+        "question in each need description, including requested entities, relationships and "
+        "qualifiers. Reading a document or obtaining a whole source file is an acquisition "
+        "step, not a replacement for those questions. Several distinct questions may use "
+        "the same /text field; that field supplies material, not their answers. Omit mechanically "
         "derived capability-result criteria: the host adds completion edges for required "
         "selected capabilities before validation. For external "
         "information, use completion_mode=positive_value_required only when a positive fact "

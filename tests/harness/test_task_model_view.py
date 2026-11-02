@@ -14,6 +14,7 @@ import pytest
 from pydantic import BaseModel, ValidationError
 
 from labs.task_model_view_design import PreparedCase, prepared_cases
+from weavria.artifacts import ArtifactSnapshot
 from weavria.context import ContextCompilerConfig, ContextSource, HistoryRetrievalConfig
 from weavria.core import (
     CompletionAccept,
@@ -40,18 +41,23 @@ from weavria.core import (
     ToolBatch,
     ToolCallAction,
     ToolExchange,
+    ToolRecord,
     ToolSucceededObservation,
     task_view_digest,
 )
 from weavria.harness import (
     CapabilityNeed,
     CompletionCriterion,
+    EvidenceEvaluation,
     EvidenceProbe,
+    EvidenceResolver,
     InformationNeed,
+    InformationRequirement,
     MemoryContextSource,
     NeedFailure,
     NeedFinalizationPolicy,
     NeedStatus,
+    StructuralEvidenceExtractor,
     TaskAwareSessionPreparer,
     TaskModelViewProjector,
     TaskSpecification,
@@ -408,6 +414,28 @@ def _counter() -> OpenAICompatibleTokenCounter:
     )
 
 
+class _ArchivedValueEvidence(StructuralEvidenceExtractor):
+    """测试领域的值语义: /value 就是指定 key 的归档值,不是待分析的整份原文。
+
+    本文件的提前 synthesis 用例需要这种明确语义。通用结构提取器只取得资料,
+    其不提前收尾的行为由 completion/work_records 组合测试单独验证。
+    """
+
+    key = "test-archived-value"
+
+    async def evaluate(
+        self,
+        requirement: InformationRequirement,
+        record: ToolRecord,
+        snapshot: ArtifactSnapshot,
+    ) -> EvidenceEvaluation:
+        result = await super().evaluate(requirement, record, snapshot)
+        value = snapshot.value
+        assert isinstance(value, dict) and isinstance(value.get("value"), str)
+        assert str(value["value"]).startswith(f"record:{record.exchange.action.arguments['key']}")
+        return result.model_copy(update={"proof_strength": "semantic"})
+
+
 def _engine(
     path: Path,
     model: FakeSessionProvider,
@@ -426,7 +454,10 @@ def _engine(
         path,
         model=model,
         tools=tools or _tools(),
-        task_preparation=TaskAwareSessionPreparer(TaskUnderstandingEngine(_Interpreter())),
+        task_preparation=TaskAwareSessionPreparer(
+            TaskUnderstandingEngine(_Interpreter()),
+            evidence=EvidenceResolver((_ArchivedValueEvidence(),)),
+        ),
         context_compiler=context_config
         or ContextCompilerConfig(window_tokens=64_000, output_tokens=256),
         token_counter=_counter(),

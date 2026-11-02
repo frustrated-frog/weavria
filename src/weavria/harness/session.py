@@ -95,7 +95,7 @@ class TaskAwareSessionPreparer:
     @property
     def version(self) -> str:
         return (
-            f"task-aware-session/11[work={self._working_records};"
+            f"task-aware-session/12[work={self._working_records};"
             f"{self._understanding.version};{self._evidence.version};"
             f"{self._capabilities.version};{self._clarification.version};"
             f"{self._working_set.version if self._working_set else 'monotonic-view/1'}]"
@@ -370,6 +370,7 @@ class TaskAwareSessionPreparer:
             in {
                 NeedStatus.PENDING,
                 NeedStatus.PARTIAL,
+                NeedStatus.ACQUIRED,
                 NeedStatus.STALE,
                 NeedStatus.CONTRADICTED,
                 NeedStatus.UNAVAILABLE,
@@ -412,9 +413,9 @@ class TaskAwareSessionPreparer:
         else:
             discovered, _ = self._capabilities.resolve(
                 CapabilityQuery(
-                    goal=" ".join(
-                        (base.specification.goal, *(item.description for item in unresolved))
-                    ),
+                    # Retriever 已逐条索引 requirements;重复拼接既放大词频,又可能
+                    # 让合法的多个需求超过 goal 自身的长度契约。
+                    goal=base.specification.goal,
                     requirements=unresolved,
                     allow_side_effects=False,
                 ),

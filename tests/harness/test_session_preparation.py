@@ -608,7 +608,7 @@ async def test_execute_frame_exposes_only_selected_business_capability(
     assert result.report.status is RunStatus.COMPLETED
     assert semantic is not None and semantic.work_status == "succeeded"
     ledger = NeedLedger.model_validate_json(json.dumps(semantic.need_ledger))
-    assert ledger.state_for(frame.requirements[0].need_id).status is NeedStatus.SATISFIED
+    assert ledger.state_for(frame.requirements[0].need_id).status is NeedStatus.ACQUIRED
     assert any(event.data.kind == "semantic_committed" for event in events)
     progress_events = [
         event.data.event.data
@@ -617,10 +617,10 @@ async def test_execute_frame_exposes_only_selected_business_capability(
         and isinstance(event.data.event.data, ProgressAssessed)
     ]
     assert len(progress_events) == 1
-    assert progress_events[0].assessment.obligations.open_after == 0
-    assert progress_events[0].assessment.continuation.recommended_action == "verify"
+    assert progress_events[0].assessment.obligations.open_after == 2
+    assert progress_events[0].assessment.continuation.recommended_action == "continue"
     assert isinstance(model.requests[1].current.control, ProgressNotice)
-    assert model.requests[1].current.control.recommended_action == "verify"
+    assert model.requests[1].current.control.recommended_action == "continue"
     first = model.requests[0].current
     assert first.task.goal == "Read alpha."
     assert "read_value" in first.instructions
@@ -722,7 +722,7 @@ async def test_nonretryable_primary_failure_allows_untried_backup(tmp_path: Path
         for item in run_data
         if isinstance(item, ActionInterventionChecked)
     )
-    assert assessed[-1].continuation.recommended_action == "verify"
+    assert assessed[-1].continuation.recommended_action == "continue"
     assert result.report.status is RunStatus.COMPLETED
     assert result.report.task_outcome == "unverified"
 
@@ -1261,7 +1261,8 @@ async def test_joint_compiler_uses_accepted_ledger_progress_without_changing_tas
     assert result.report.status is RunStatus.COMPLETED
     snapshots = [e.data.snapshot for e in events if isinstance(e.data, SessionSemanticCommitted)]
     before, after = preparer.context_focus(snapshots[0]), preparer.context_focus(snapshots[-1])
-    assert before.demands[0].weight > after.demands[0].weight
+    # 读到材料后应增加分析上下文的权重,不能因字段存在而降为已解决。
+    assert before.demands[0].weight < after.demands[0].weight
     assert not before.demands[0].anchors and after.demands[0].anchors
     reports = [e.data.compilation for e in events if isinstance(e.data, SessionContextCompiled)]
     assert len(reports) == 2

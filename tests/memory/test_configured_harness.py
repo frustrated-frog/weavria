@@ -259,8 +259,8 @@ async def test_configured_chain_forms_recalls_executes_updates_and_recovers(
                 assert isinstance(exchanges[-1].observation, ToolFailedObservation)
                 return call("b_source", {"key": "document"})
             if self.step == 3:
-                # 需求完成会退休业务工具,但成果读取和工作更新仍必须可用。
-                assert '"name":"b_source"' not in request.current.instructions
+                # 已取得原文仍需分析,业务工具、成果读取和工作更新都继续可用。
+                assert '"name":"b_source"' in request.current.instructions
                 assert "read_artifact" in request.current.instructions
                 assert "propose_work" in request.current.instructions
                 source = next(e for e in exchanges if e.action.call_id == "b_source")

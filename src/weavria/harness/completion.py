@@ -64,7 +64,7 @@ class CandidateAnswerVerifier(Protocol):
 class TaskCompletionEvaluator:
     """Evaluate declared obligations without trusting model claims of completion."""
 
-    version = "task-obligations/9"
+    version = "task-obligations/10"
 
     def __init__(
         self,
@@ -200,9 +200,10 @@ class TaskCompletionEvaluator:
                 outcome="unverifiable",
                 reason_code="missing_capability_result",
             )
-        incomplete = tuple(
-            item for item in required_states if item.status is not NeedStatus.SATISFIED
-        )
+        # Finish 是模型主动交付,不等于宿主认定问题已有语义答案。资料齐备时允许
+        # 综合作答,但下方 verdict 保持 unknown,默认 outcome 仍是 unverified;
+        # 缺资料/冲突/独立动作和应用校验继续约束交付。
+        incomplete = tuple(item for item in required_states if not item.acquisition_complete)
         if incomplete:
             limited_finalization = (
                 context.finalization is not None and context.finalization.mode == "limited"
@@ -288,7 +289,12 @@ class TaskCompletionEvaluator:
             disposition="accept",
             verdicts=verdicts,
             outcome=answer_outcome,
-            reason_code="mandatory_obligations_satisfied",
+            reason_code=(
+                "source_material_acquired_answer_unverified"
+                if answer_outcome == "unverified"
+                and any(item.status is NeedStatus.ACQUIRED for item in required_states)
+                else "mandatory_obligations_satisfied"
+            ),
         )
 
 
@@ -300,7 +306,7 @@ class TaskObligationCompletionPolicy:
 
     @property
     def version(self) -> str:
-        return f"task-obligation-completion/5[{self._evaluator.version}]"
+        return f"task-obligation-completion/6[{self._evaluator.version}]"
 
     async def verify(self, context: CompletionContext) -> CompletionDecision:
         evaluation = await self._evaluator.evaluate(context)
@@ -355,19 +361,26 @@ def _verdicts(
             continue
         states = tuple(ledger.state_for(need_id) for need_id in obligation.need_ids)
         satisfied = all(item.status is NeedStatus.SATISFIED for item in states)
+        acquired = all(item.acquisition_complete for item in states)
         verdicts.append(
             ObligationVerdict(
                 obligation_id=obligation.obligation_id,
-                result="satisfied" if satisfied else "unsatisfied",
+                result="satisfied" if satisfied else "unknown" if acquired else "unsatisfied",
                 evidence_binding_ids=tuple(
                     dict.fromkeys(
                         binding for state in states for binding in state.evidence_binding_ids
                     )
                 ),
                 missing_need_ids=tuple(
-                    state.need_id for state in states if state.status is not NeedStatus.SATISFIED
+                    state.need_id for state in states if not state.acquisition_complete
                 ),
-                reason_code=("need_satisfied" if satisfied else "need_not_satisfied"),
+                reason_code=(
+                    "need_satisfied"
+                    if satisfied
+                    else "material_acquired_analysis_unverified"
+                    if acquired
+                    else "need_not_satisfied"
+                ),
             )
         )
     return tuple(verdicts)

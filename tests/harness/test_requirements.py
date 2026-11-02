@@ -192,7 +192,7 @@ class _SemanticExtractor:
         )
 
 
-async def test_resolver_binds_accepted_artifact_and_satisfies_structural_need() -> None:
+async def test_resolver_acquires_structural_material_without_claiming_need_satisfied() -> None:
     store, record = await _success_record()
     resolver = EvidenceResolver()
 
@@ -206,13 +206,78 @@ async def test_resolver_binds_accepted_artifact_and_satisfies_structural_need() 
     )
 
     state = ledger.state_for("need-a")
-    assert state.status is NeedStatus.SATISFIED
-    assert ledger.mandatory_satisfied((_requirement(),))
+    assert state.status is NeedStatus.ACQUIRED
+    assert state.acquisition_complete
+    assert not ledger.mandatory_satisfied((_requirement(),))
     assert len(ledger.bindings) == 1
     address = ledger.bindings[0].addresses[0]
     assert address.producer_call_id == "call-1"
     assert record.artifact is not None
     assert address.artifact_sha256 == record.artifact.sha256
+
+
+async def test_one_semantic_fragment_does_not_upgrade_the_remaining_structural_material() -> None:
+    class Mixed(_ProgressiveExtractor):
+        async def evaluate(
+            self,
+            requirement: InformationRequirement,
+            record: ToolRecord,
+            snapshot: ArtifactSnapshot,
+        ) -> EvidenceEvaluation:
+            result = await super().evaluate(requirement, record, snapshot)
+            return result.model_copy(
+                update={
+                    "proof_strength": (
+                        "semantic" if record.exchange.action.call_id == "call-1" else "structural"
+                    )
+                }
+            )
+
+    store, records = await _success_records()
+    requirement = _requirement(required_fields=("/value", "/source_time"))
+    ledger = await EvidenceResolver((Mixed(complete_second=False, shared_scope=True),)).resolve(
+        work_id="work-a",
+        task_revision=1,
+        frame_revision=1,
+        requirements=(requirement,),
+        records=records,
+        read_artifact=lambda aid: store.get("run-1", aid),
+    )
+    assert ledger.states[0].status is NeedStatus.ACQUIRED
+    assert not ledger.mandatory_satisfied((requirement,))
+
+
+async def test_v4_judgment_keeps_its_digest_until_fresh_evidence_projection() -> None:
+    store, record = await _success_record()
+    resolver = EvidenceResolver()
+    current = await resolver.resolve(
+        work_id="work-a",
+        task_revision=1,
+        frame_revision=1,
+        requirements=(_requirement(),),
+        records=(record,),
+        read_artifact=lambda aid: store.get("run-1", aid),
+    )
+    # 模拟旧版本对结构字段的 satisfied 判断;读取历史不能偷偷改写既有 Frame 摘要。
+    old_state = current.states[0].model_copy(
+        update={"schema_version": 1, "status": NeedStatus.SATISFIED}
+    )
+    old = current.model_copy(update={"schema_version": 4, "states": (old_state,)})
+    loaded = load_need_ledger(old.model_dump_json())
+    assert loaded.progress_sha256() == old.progress_sha256()
+    assert loaded.states[0].status is NeedStatus.SATISFIED
+    projected = await resolver.resolve(
+        work_id="work-a",
+        task_revision=1,
+        frame_revision=1,
+        requirements=(_requirement(),),
+        records=(record,),
+        previous=loaded,
+        read_artifact=lambda aid: store.get("run-1", aid),
+    )
+    assert projected.states[0].status is NeedStatus.ACQUIRED
+    assert projected.evidence_revision == loaded.evidence_revision + 1
+    assert projected.progress_sha256() != loaded.progress_sha256()
 
 
 async def test_profile_match_checks_normalized_parameters_and_semantic_proof() -> None:
@@ -574,7 +639,7 @@ def test_v1_need_ledger_is_explicitly_upcast_without_inventing_probes() -> None:
 
     ledger = load_need_ledger(legacy)
 
-    assert ledger.schema_version == 4
+    assert ledger.schema_version == 5
     assert ledger.probes == ()
     legacy_progress: list[dict[str, object]] = [
         {
@@ -594,7 +659,7 @@ def test_v1_need_ledger_is_explicitly_upcast_without_inventing_probes() -> None:
     )
 
 
-async def test_resolver_keeps_satisfied_prior_evidence_when_a_later_attempt_fails() -> None:
+async def test_resolver_keeps_acquired_prior_material_when_a_later_attempt_fails() -> None:
     store, record = await _success_record()
     resolver = EvidenceResolver()
     first = await resolver.resolve(
@@ -631,7 +696,7 @@ async def test_resolver_keeps_satisfied_prior_evidence_when_a_later_attempt_fail
     )
 
     state = merged.state_for("need-a")
-    assert state.status is NeedStatus.SATISFIED
+    assert state.status is NeedStatus.ACQUIRED
     assert state.evidence_binding_ids == first.state_for("need-a").evidence_binding_ids
     assert state.failures == ()
 

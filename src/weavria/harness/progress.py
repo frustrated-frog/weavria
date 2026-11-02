@@ -22,7 +22,7 @@ from .understanding import TaskFrame
 class NeedProgressEvaluator:
     """Compare accepted Need projections without pretending unknown sources are independent."""
 
-    version = "need-progress-assessment/2"
+    version = "need-progress-assessment/3"
 
     def assess(
         self,

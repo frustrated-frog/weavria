@@ -45,13 +45,14 @@ class _SemanticContract(BaseModel):
 
 class _SemanticLedgerContract(BaseModel):
     model_config = _SemanticContract.model_config
-    schema_version: Literal[4] = 4
+    schema_version: Literal[5] = 5
 
 
 class NeedStatus(StrEnum):
     PENDING = "pending"
     ACQUIRING = "acquiring"
     PARTIAL = "partial"
+    ACQUIRED = "acquired"
     SATISFIED = "satisfied"
     STALE = "stale"
     CONTRADICTED = "contradicted"
@@ -227,7 +228,9 @@ class NeedFailure(_SemanticContract):
     attempt_identity_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
 
 
-class NeedState(_SemanticContract):
+class NeedState(BaseModel):
+    model_config = _SemanticContract.model_config
+    schema_version: Literal[1, 2] = 2
     need_id: _Identifier
     status: NeedStatus
     evidence_binding_ids: tuple[_Identifier, ...] = ()
@@ -239,13 +242,15 @@ class NeedState(_SemanticContract):
 
     @model_validator(mode="after")
     def validate_state(self) -> Self:
-        if self.status is NeedStatus.SATISFIED and (
+        if self.status is NeedStatus.ACQUIRED and self.schema_version != 2:
+            raise ValueError("acquired status requires NeedState v2")
+        if self.status in {NeedStatus.SATISFIED, NeedStatus.ACQUIRED} and (
             not self.evidence_binding_ids
             or self.missing_fields
             or self.failures
             or self.acquisition_status != "open"
         ):
-            raise ValueError("satisfied need requires evidence and no unresolved gaps")
+            raise ValueError("covered need requires evidence and no unresolved acquisition gaps")
         if self.can_retry and not self.failures:
             raise ValueError("retryability requires an observed failure")
         if self.acquisition_status == "retryable" and not self.can_retry:
@@ -253,6 +258,11 @@ class NeedState(_SemanticContract):
         if self.acquisition_status in {"unavailable", "contract_gap"} and self.can_retry:
             raise ValueError("terminal acquisition cannot retain a retryable query")
         return self
+
+    @property
+    def acquisition_complete(self) -> bool:
+        """资料覆盖条件已满足,不代表模型已经提取了答案或完成了分析。"""
+        return self.status in {NeedStatus.ACQUIRED, NeedStatus.SATISFIED}
 
 
 class NeedLedger(_SemanticLedgerContract):
@@ -459,6 +469,12 @@ def load_need_ledger(value: str | Mapping[str, object]) -> NeedLedger:
         # Historical judgments and their progress digest stay intact. Missing attempt
         # attribution is unknown; only a fresh projection can establish V4 availability.
         payload["schema_version"] = 4
+    if payload.get("schema_version") == 4:
+        # 保留旧判断和 progress digest,避免读取历史快照时暗改 Frame 的绑定。
+        # 下一次 resolve 才按新规则重新判断,并推进 evidence_revision。
+        payload["schema_version"] = 5
+        for state in payload.get("states", []):
+            state.setdefault("schema_version", 1)
     return NeedLedger.model_validate_json(
         json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     )
@@ -564,7 +580,7 @@ class EvidenceResolver:
     @property
     def version(self) -> str:
         strategies = ",".join(f"{item.key}@{item.version}" for item in self._extractors)
-        return f"evidence-resolver/5[{strategies}]"
+        return f"evidence-resolver/6[{strategies}]"
 
     async def resolve(
         self,
@@ -1128,7 +1144,19 @@ def _reduce_need(
     if contradictory:
         status = NeedStatus.CONTRADICTED
     elif coverage_complete:
-        status = NeedStatus.SATISFIED
+        # 字段存在只能证明资料已取得。例如 /text 可同时包含多个问题的原文,
+        # 不能让一次读取把它们全部标成已解决。只有语义证据本身覆盖完整需求时
+        # 才能给出 satisfied;不能用一条语义 binding 给其余结构覆盖整体升级。
+        semantic = [
+            binding
+            for binding in eligible
+            if binding.proof_strength in {"semantic", "scoped_semantic"}
+        ]
+        status = (
+            NeedStatus.SATISFIED
+            if _scope_coverage(requirement, semantic)[0]
+            else NeedStatus.ACQUIRED
+        )
         failures = []
         missing = ()
         acquisition_status, can_retry = "open", False

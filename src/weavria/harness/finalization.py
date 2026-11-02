@@ -22,7 +22,7 @@ from .understanding import load_task_frame
 
 
 class NeedFinalizationPolicy:
-    version = "need-finalization/2"
+    version = "need-finalization/3"
 
     def __init__(self, evidence: EvidenceResolver | None = None) -> None:
         self._evidence = evidence or EvidenceResolver()
@@ -107,7 +107,7 @@ class NeedFinalizationPolicy:
                 tuple(
                     item.need_id
                     for item in required
-                    if ledger.state_for(item.need_id).status is not NeedStatus.SATISFIED
+                    if not ledger.state_for(item.need_id).acquisition_complete
                 ),
             )
         deliveries = (
@@ -179,7 +179,7 @@ class NeedFinalizationPolicy:
             item.need_id
             for item in required
             if item.need_id not in covered
-            or ledger.state_for(item.need_id).status is not NeedStatus.SATISFIED
+            or not ledger.state_for(item.need_id).acquisition_complete
         )
         mode = "complete" if not missing else "limited" if delivered_bindings else "unavailable"
         return FinalizationAssessment(eligible, mode, call_ids, missing)

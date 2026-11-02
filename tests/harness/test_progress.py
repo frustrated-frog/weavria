@@ -255,10 +255,11 @@ async def test_progress_separates_coverage_obligation_and_independent_source_gai
     )
 
     assert second_assessment.coverage.delta == 1
-    assert len(second_assessment.obligations.newly_satisfied_ids) == 2
+    assert second_assessment.obligations.newly_satisfied_ids == ()
+    assert second_assessment.obligations.open_after == 2
     assert second_assessment.information_gain.new_source_sha256s == ()
     assert second_assessment.information_gain.repeated_source_bindings == 1
-    assert second_assessment.continuation.recommended_action == "verify"
+    assert second_assessment.continuation.recommended_action == "continue"
 
 
 async def test_empty_query_scope_does_not_masquerade_as_positive_source_gain() -> None:

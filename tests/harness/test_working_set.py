@@ -281,7 +281,7 @@ def test_dependency_frontier_priorities_are_shared_and_cycle_is_rejected() -> No
 
 
 @pytest.mark.parametrize("unified", [False, True])
-async def test_session_failure_switches_tool_then_retires_satisfied_tools(
+async def test_session_failure_switches_tool_then_keeps_acquired_material_readable(
     tmp_path: Path,
     session_counter: OpenAICompatibleTokenCounter,
     unified: bool,
@@ -352,7 +352,7 @@ async def test_session_failure_switches_tool_then_retires_satisfied_tools(
                 e.action.call_id == "readback" for e in exchanges
             ):
                 names = request.current.instructions
-                assert "a_source" not in names and "b_source" not in names
+                assert "a_source" not in names and "b_source" in names
                 assert "read_artifact" in names
                 source = next(e for e in exchanges if e.action.call_id == "b")
                 assert isinstance(source.observation, ToolSucceededObservation)
@@ -434,8 +434,12 @@ async def test_session_failure_switches_tool_then_retires_satisfied_tools(
     assert report.status is RunStatus.COMPLETED
     assert calls == ["a_source", "b_source"]
     snapshots = [e.data.snapshot for e in events if isinstance(e.data, SessionSemanticCommitted)]
-    assert [s.visible_tool_names for s in snapshots[:3]] == [("a_source",), ("b_source",), ()]
-    assert [s.version.capability_epoch for s in snapshots[:3]] == [1, 2, 3]
+    assert [s.visible_tool_names for s in snapshots[:3]] == [
+        ("a_source",),
+        ("b_source",),
+        ("b_source",),
+    ]
+    assert [s.version.capability_epoch for s in snapshots[:3]] == [1, 2, 2]
 
 
 async def test_steering_changes_view_epoch_with_unchanged_declared_tools() -> None:

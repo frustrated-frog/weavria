@@ -64,7 +64,7 @@ class AdaptiveCapabilityPolicy:
 
     @property
     def version(self) -> str:
-        return f"adaptive-capabilities/2:tools={self.max_tools}:bytes={self.max_descriptor_bytes}"
+        return f"adaptive-capabilities/3:tools={self.max_tools}:bytes={self.max_descriptor_bytes}"
 
     def select(
         self,
@@ -89,7 +89,7 @@ class AdaptiveCapabilityPolicy:
         declared = {n.name for n in frame.specification.capability_needs}
         candidates = set(previous) | declared
         priorities = need_priority_weights(frame.requirements, ledger)
-        for need_id, boost in work_need_weights(working_state).items():
+        for need_id, boost in work_need_weights(working_state, ledger).items():
             if need_id in priorities:
                 priorities[need_id] = min(8.0, priorities[need_id] * boost)
         # 一次索引全部执行记录,避免每个需求-候选组合重扫长任务历史。

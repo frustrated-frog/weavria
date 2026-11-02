@@ -17,7 +17,7 @@ from weavria.core import (
 
 from .requirements import EvidenceProbe, NeedStatus, load_need_ledger
 from .understanding import load_task_frame
-from .work import MAX_WORK_BYTES, load_work
+from .work import MAX_WORK_BYTES, load_work, work_analysis_status
 
 _GAPS = ("$freshness", "$schema", "$proof", "$scope", "$producer", "$result", "$target")
 _MAX_NUMBER = 2**63 - 1
@@ -26,7 +26,7 @@ _MAX_NUMBER = 2**63 - 1
 class TaskModelViewProjector:
     """Project accepted state without authorizing actions or manufacturing evidence."""
 
-    version = "task-model-view/2"
+    version = "task-model-view/3"
     working_records_version = 1
 
     def project(
@@ -64,6 +64,8 @@ class TaskModelViewProjector:
         definitions: list[JsonValue] = []
         progress: list[JsonValue] = []
         maximum: list[JsonValue] = []
+        work = load_work(snapshot.working_state) if snapshot.working_state is not None else None
+        analysis = work_analysis_status(ledger, work)
         # 长任务的证据条目会累积。先按身份/需求建索引, 避免每个需求都重新扫描
         # 全部 bindings 和 probes; 投影大小有界, 构建成本也不应随需求数成倍重复。
         bindings_by_id = {item.binding_id: item for item in ledger.bindings}
@@ -119,6 +121,7 @@ class TaskModelViewProjector:
             row: dict[str, JsonValue] = {
                 "id": need.need_id,
                 "status": state.status.value,
+                "analysis": analysis.get(need.need_id),
                 "missing_fields": [
                     field for field in dict.fromkeys(state.missing_fields) if field in known_gaps
                 ],
@@ -144,6 +147,7 @@ class TaskModelViewProjector:
                 {
                     "id": need.need_id,
                     "status": max(NeedStatus, key=lambda item: len(item.value)).value,
+                    "analysis": "finding_recorded",
                     "missing_fields": list(known_gaps),
                     "additional_gap_count": _MAX_NUMBER,
                     "acquisition": "contract_gap",
@@ -198,11 +202,13 @@ class TaskModelViewProjector:
                 item.model_dump(mode="json") for item in frame.application_context
             ],
             "interpretation": (
-                "Statuses summarize acquisition, not verification or delivery. "
-                "Additional gaps and latest failure are summaries; consult tool feedback."
+                "acquired=source fields available, analysis pending; satisfied=semantic "
+                "coverage, not answer verification. Excerpts omit text: use read_artifact or "
+                "source tools to check missing context. Keep multi-step findings/open issues "
+                "via propose_work when available; finding_recorded is model inference. "
+                "Answer the original request when ready. Gaps/failures are summaries."
             ),
         }
-        work = load_work(snapshot.working_state) if snapshot.working_state is not None else None
         progress_payload: dict[str, JsonValue] = {"needs": progress}
         if work is not None:
             if work.task_revision != task.revision:

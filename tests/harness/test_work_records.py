@@ -12,6 +12,7 @@ from weavria.core import (
     RunStatus,
     SemanticSnapshot,
     SessionRequest,
+    SessionRunEvent,
     SessionSemanticCommitted,
     ToolBatch,
     ToolCallAction,
@@ -34,7 +35,7 @@ from weavria.harness import (
 )
 from weavria.harness.context import project_context_focus
 from weavria.harness.work import load_work
-from weavria.models import FakeSessionProvider, OpenAICompatibleTokenCounter
+from weavria.models import FakeSessionProvider, OpenAICompatibleConfig, OpenAICompatibleTokenCounter
 from weavria.runtime import RunLimits
 from weavria.tools import ToolContext, ToolRegistry, TypedTool
 
@@ -91,12 +92,39 @@ class Interpreter:
         )
 
 
-async def test_work_update_survives_tool_retirement_and_projects_sources(
+@pytest.mark.parametrize("need_count", [1, 4])
+async def test_work_update_keeps_material_readable_and_projects_sources(
     tmp_path: Path,
-    session_counter: OpenAICompatibleTokenCounter,
+    need_count: int,
 ) -> None:
+    class Questions(Interpreter):
+        async def interpret(
+            self, request: TaskUnderstandingInput, *, max_duration: float
+        ) -> TaskSpecification:
+            base = await super().interpret(request, max_duration=max_duration)
+            return base.model_copy(
+                update={
+                    "information_needs": tuple(
+                        InformationNeed(
+                            description=(
+                                f"Which documented setting applies to option {i} "
+                                "and under which conditions?"
+                            ),
+                            source="external",
+                            required_fields=("/value",),
+                            capability_names=("read_document",),
+                        )
+                        for i in range(need_count)
+                    )
+                }
+            )
+
     class Model(FakeSessionProvider):
         async def generate_session(self, request: SessionRequest) -> ModelTurn:
+            assert (
+                request.current.control is None
+                or request.current.control.kind != "admission_rejected"
+            )
             view = request.current.task_model_view
             assert view is not None
             raw = view.progress["working_state"]
@@ -116,7 +144,11 @@ async def test_work_update_survives_tool_retirement_and_projects_sources(
                 )
             if state.revision == 0:
                 assert "propose_work" in request.current.instructions
-                assert "read_document" not in request.current.instructions
+                assert "read_document" in request.current.instructions
+                rows = view.progress["needs"]
+                assert isinstance(rows, list) and isinstance(rows[0], dict)
+                assert rows[0]["status"] == "acquired"
+                assert rows[0]["analysis"] == "analysis_pending"
                 exchange = next(e for e in request.current.history if isinstance(e, ToolExchange))
                 assert isinstance(exchange.observation, ToolSucceededObservation)
                 output = exchange.observation.output
@@ -155,21 +187,60 @@ async def test_work_update_survives_tool_retirement_and_projects_sources(
                 )
             assert state.last_notice == "accepted" and state.notes[0].note_id == "result"
             assert state.sources[0].artifact.call_id == "read"
+            rows = view.progress["needs"]
+            assert isinstance(rows, list) and isinstance(rows[0], dict)
+            assert rows[0]["status"] == "acquired"
+            assert rows[0]["analysis"] == "finding_recorded"
+            if not (
+                request.current.feedback is not None
+                and any(
+                    c.call_id == "readback" and c.status == "succeeded"
+                    for c in request.current.feedback.calls
+                )
+            ):
+                return ModelTurn(
+                    decision=ToolBatch(
+                        calls=(
+                            ToolCallAction(
+                                call_id="readback",
+                                tool_name="read_artifact",
+                                arguments={
+                                    "artifact_id": state.sources[0].artifact.artifact_id,
+                                    "pointer": "/value",
+                                    "start": 4000,
+                                    "length": 4000,
+                                },
+                            ),
+                        )
+                    )
+                )
             return ModelTurn(decision=FinishAction(output="source content"))
 
     async with AgentHarness(
         tmp_path / "session.db",
         model=Model(()),
         tools=registry(),
-        context=ContextCompilerConfig(window_tokens=128000, output_tokens=256),
-        token_counter=session_counter,
-        understanding=TaskUnderstandingEngine(Interpreter()),
+        # 与 M1 相同的窗口/输出/传输预算;多需求、工作视图增长和原文回取须一起容纳。
+        context=ContextCompilerConfig(window_tokens=32768, output_tokens=4096, safety_tokens=1024),
+        # 容量验证必须使用与真实任务一致的编码器;通用 session_counter fixture
+        # 使用接近逐字节的合成词表,适合执行不变量,不代表 M1 的 Token 容量。
+        token_counter=OpenAICompatibleTokenCounter(
+            OpenAICompatibleConfig(model="test", max_output_tokens=4096, max_request_bytes=96000),
+            encoding="cl100k_base",
+        ),
+        understanding=TaskUnderstandingEngine(Questions()),
         working_records=True,
-        limits=RunLimits(max_request_bytes=128000),
+        limits=RunLimits(max_request_bytes=96000),
     ) as agent:
         await agent.create("s")
         result = await agent.send("s", "Read the manual")
         events = await agent.sessions.store.events("s")
+    rejected = [
+        e.data.event.data
+        for e in events
+        if isinstance(e.data, SessionRunEvent) and e.data.event.data.kind == "batch_rejected"
+    ]
+    assert rejected == []
     assert result.session.report.status is RunStatus.COMPLETED, result.session.report
     heads = [e.data.snapshot for e in events if isinstance(e.data, SessionSemanticCommitted)]
     head = next(h for h in reversed(heads) if h.working_state is not None)

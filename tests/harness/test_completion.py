@@ -149,6 +149,14 @@ async def test_obligation_policy_accepts_grounded_evidence_without_claiming_answ
 
     assert isinstance(decision, CompletionAccept)
     assert decision.outcome == "unverified"
+    evaluation = await TaskCompletionEvaluator().evaluate(context)
+    assert evaluation.reason_code == "source_material_acquired_answer_unverified"
+    assert any(
+        v.reason_code == "material_acquired_analysis_unverified" for v in evaluation.verdicts
+    )
+    # 模型可以主动综合作答,但宿主不能因为原文字段存在而强制提前 synthesis。
+    finalization = await NeedFinalizationPolicy().assess(context, request=None, manifest=None)
+    assert not finalization.eligible
 
 
 async def test_model_knowledge_need_is_not_misclassified_as_missing_tool_evidence() -> None:

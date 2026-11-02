@@ -18,6 +18,7 @@ from weavria.artifacts import ArtifactSnapshot
 from weavria.core import ArtifactRef, ErrorCategory, ToolRecord, ToolSucceededObservation
 from weavria.tools import ToolContext, ToolFault, TypedTool, resolve_pointer
 
+from .requirements import NeedLedger, NeedStatus
 from .understanding import TaskFrame
 
 WORK_TOOL = "propose_work"
@@ -131,18 +132,18 @@ def work_tool() -> TypedTool[WorkUpdate, WorkProposal]:
 
     return _WorkTool(
         name=WORK_TOOL,
-        version="1",
+        version="2",
         input_type=WorkUpdate,
         output_type=WorkProposal,
         description=(
-            "Propose a bounded replacement working record: short plans, hypotheses, results, "
-            "rejected attempts and next information needs. Use current task_revision and "
-            "working_state.revision as base_revision (initially 0). Record concise progress, "
-            "not private reasoning. Needs must use current IDs. "
-            "Cite accepted artifact IDs/pointers. "
-            "A tool receipt is only a proposal; consult working_state.last_notice next turn. "
-            "Notes cannot mark needs satisfied or change the user's goal. No update is needed "
-            "for a simple answer. Do not repeat an unchanged update."
+            "Keep bounded multi-step notes: results with accepted artifact IDs/pointers, "
+            "open issues, plans, hypotheses or rejected attempts. Use current task_revision, "
+            "working_state.revision as base_revision (initially 0), and current need IDs. "
+            "Replace the whole set; retain useful notes. Sourced results lower acquired needs' "
+            "exploration priority; issues and next_need_ids raise it. "
+            "Check working_state.last_notice "
+            "after this proposal. Notes are fallible summaries, never proof or private reasoning. "
+            "Skip unchanged notes and simple answers."
         ),
         execute=propose,
     )
@@ -216,9 +217,79 @@ async def reduce_work(
     return state.model_copy(update={"processed_records": len(records)})
 
 
-def work_need_weights(state: WorkingState | None) -> dict[str, float]:
-    """意图只提供有界软偏好,不能移除其它需求或改变满足状态。"""
-    return dict.fromkeys(state.next_need_ids, 2.0) if state else {}
+AnalysisStatus = Literal["analysis_pending", "finding_recorded", "open_question"]
+
+
+def work_analysis_status(
+    ledger: NeedLedger, state: WorkingState | None
+) -> dict[str, AnalysisStatus]:
+    """把已取得资料与当前工作结论关联,不把模型笔记升级为语义证据。
+
+    只有引用当前需求资料的 result 才降低其继续探索优先级。issue/rejected
+    优先于 result,显式 next_need_ids 又可以要求重新检查已有结论。状态从当前
+    有界笔记重算,删除结论或用户修订使它失效后,需求自然重新获得探索权重。
+    """
+    result: dict[str, AnalysisStatus] = {
+        need.need_id: "analysis_pending"
+        for need in ledger.states
+        if need.status is NeedStatus.ACQUIRED
+    }
+    if state is None:
+        return result
+    if state.task_revision != ledger.task_revision:
+        raise ValueError("working analysis belongs to another task revision")
+    bindings = {binding.binding_id: binding for binding in ledger.bindings}
+    sources = {(s.reference.artifact_id, s.reference.pointer): s.artifact for s in state.sources}
+    for need in ledger.states:
+        if need.need_id not in result:
+            continue
+        addresses = [
+            address
+            for identity in need.evidence_binding_ids
+            if (binding := bindings.get(identity)) is not None
+            and binding.relation in {"supports", "partially_supports"}
+            and binding.freshness != "stale"
+            for address in binding.addresses
+        ]
+        notes = [note for note in state.notes if need.need_id in note.need_ids]
+        if any(note.kind in {"issue", "rejected"} for note in notes):
+            result[need.need_id] = "open_question"
+        elif any(
+            note.kind == "result"
+            and any(
+                (artifact := sources.get((ref.artifact_id, ref.pointer))) is not None
+                and any(
+                    address.artifact_id == artifact.artifact_id
+                    and address.artifact_sha256 == artifact.sha256
+                    and (
+                        ref.pointer == address.json_pointer
+                        or ref.pointer.startswith(address.json_pointer + "/")
+                        or address.json_pointer.startswith(ref.pointer + "/")
+                    )
+                    for address in addresses
+                )
+                for ref in note.sources
+            )
+            for note in notes
+        ):
+            result[need.need_id] = "finding_recorded"
+    return result
+
+
+def work_need_weights(
+    state: WorkingState | None, ledger: NeedLedger | None = None
+) -> dict[str, float]:
+    """资料与笔记共同分配探索资源;任何权重都不改变账本或强制动作顺序。"""
+    weights: dict[str, float] = {}
+    if ledger is not None:
+        for need_id, analysis in work_analysis_status(ledger, state).items():
+            if analysis == "finding_recorded":
+                weights[need_id] = 0.25
+            elif analysis == "open_question":
+                weights[need_id] = 2.0
+    if state is not None:
+        weights.update(dict.fromkeys(state.next_need_ids, 2.0))
+    return weights
 
 
 def load_work(value: dict[str, JsonValue]) -> WorkingState:

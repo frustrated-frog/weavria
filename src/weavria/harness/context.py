@@ -25,7 +25,7 @@ def project_context_focus(snapshot: SemanticSnapshot) -> ContextFocus:
     working = load_work(snapshot.working_state) if snapshot.working_state is not None else None
     if working is not None and working.task_revision != snapshot.version.task_revision:
         raise ValueError("working context belongs to another task revision")
-    for need_id, boost in work_need_weights(working).items():
+    for need_id, boost in work_need_weights(working, ledger).items():
         if need_id in weights:
             weights[need_id] = min(8.0, weights[need_id] * boost)
     demands: list[ContextDemand] = []
@@ -47,7 +47,17 @@ def project_context_focus(snapshot: SemanticSnapshot) -> ContextFocus:
             ContextDemand(
                 demand_id=f"need:{requirement.need_id}",
                 query=" ".join(
-                    (requirement.description, *requirement.required_fields, *state.missing_fields)
+                    (
+                        requirement.description,
+                        *requirement.required_fields,
+                        *state.missing_fields,
+                        *(
+                            note.summary
+                            for note in (working.notes if working else ())
+                            if requirement.need_id in note.need_ids
+                            and note.kind in {"issue", "rejected"}
+                        ),
+                    )
                 ),
                 weight=weight,
                 anchors=anchors,
@@ -111,7 +121,7 @@ def need_priority_weights(
             3.0
             if state.status in (NeedStatus.CONTRADICTED, NeedStatus.STALE)
             else 2.0
-            if state.status is NeedStatus.PARTIAL
+            if state.status in {NeedStatus.PARTIAL, NeedStatus.ACQUIRED}
             else 0.5
             if state.status is NeedStatus.SATISFIED
             else 1.0

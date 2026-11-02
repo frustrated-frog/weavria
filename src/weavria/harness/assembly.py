@@ -376,7 +376,7 @@ class AgentHarness:
             policy=policy,
             scheduling=scheduling,
             configuration_metadata={
-                "harness_version": "unified-harness/6",
+                "harness_version": "unified-harness/7",
                 "configuration_id": configuration_id,
                 "working_records": working_records,
                 "harness_max_request_duration": duration,
