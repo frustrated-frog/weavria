@@ -53,6 +53,7 @@ from weavria.core import (
     SessionTaskPreparationFailed,
     SessionTaskUpdated,
     SourceUse,
+    TaskInput,
     TaskModelViewReceipt,
     TaskPreparationAttemptDiagnostic,
     TaskRevised,
@@ -80,6 +81,7 @@ from .history_index import (
 from .history_search import search_history
 from .history_validation import validate_history_request
 from .preparation import SemanticTransitionReducer
+from .task_continuation import TaskRun, TaskVersion
 
 
 class SessionBusyError(RuntimeError):
@@ -274,7 +276,7 @@ class SQLiteSessionStore:
         conn = sqlite3.connect(self.path, timeout=2.0)
         self._connection = conn
         version = conn.execute("PRAGMA user_version").fetchone()[0]
-        if version not in (0, 1, 2, 3, 4, 5, 6, 7):
+        if version not in (0, 1, 2, 3, 4, 5, 6, 7, 8):
             raise SessionConflictError("unsupported session database schema")
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA journal_mode=WAL")
@@ -335,6 +337,12 @@ class SQLiteSessionStore:
                     resolution_sequence INTEGER NOT NULL, work_id TEXT, semantic_sequence INTEGER
                 )""")
                 migration.execute("PRAGMA user_version=7")
+        if version < 8:
+            with self._transaction() as migration:
+                migration.execute("""CREATE TABLE continued_tasks(
+                    id TEXT PRIMARY KEY, version INTEGER NOT NULL, data TEXT NOT NULL
+                )""")
+                migration.execute("PRAGMA user_version=8")
         # Only the exclusive DB owner can classify an old live run as interrupted.
         active = conn.execute("SELECT id FROM runs WHERE status='running'").fetchall()
         for row in active:
@@ -1382,6 +1390,89 @@ class SQLiteSessionStore:
             return ConversationTurn.model_validate_json(row[0]) if row else None
 
         return await self._submit(read)
+
+    def _task_input(self, source: TaskRun) -> TaskInput:
+        row = (
+            self._conn()
+            .execute(
+                "SELECT report FROM runs WHERE session_id=? AND id=?",
+                (source.session_id, source.run_id),
+            )
+            .fetchone()
+        )
+        state = self._state(source.run_id) if row is not None else None
+        if row is None or row[0] is None or state is None:
+            raise SessionConflictError("task_source_not_terminal")
+        report = RunReport.model_validate_json(row[0])
+        if report.status.value not in {"completed", "budget_exhausted"}:
+            raise SessionConflictError("task_source_not_eligible")
+        return state.task
+
+    async def task_input(self, source: TaskRun) -> TaskInput:
+        return await self._submit(lambda: self._task_input(source))
+
+    async def task_semantic(self, source: TaskRun) -> SemanticSnapshot | None:
+        def read() -> SemanticSnapshot | None:
+            row = (
+                self._conn()
+                .execute(
+                    "SELECT data FROM semantic_commits WHERE session_id=? "
+                    "AND json_extract(data,'$.run_id')=? ORDER BY semantic_sequence DESC LIMIT 1",
+                    (source.session_id, source.run_id),
+                )
+                .fetchone()
+            )
+            return SemanticSnapshot.model_validate_json(row[0]) if row else None
+
+        return await self._submit(read)
+
+    async def task_version(self, task_id: str) -> TaskVersion | None:
+        def read() -> TaskVersion | None:
+            row = (
+                self._conn()
+                .execute("SELECT data FROM continued_tasks WHERE id=?", (task_id,))
+                .fetchone()
+            )
+            return TaskVersion.model_validate_json(row[0]) if row else None
+
+        return await self._submit(read)
+
+    async def publish_task(
+        self, task_id: str, source: TaskRun, *, expected: TaskVersion | None
+    ) -> TaskVersion:
+        """发布已持久化的工作成果, 并以任务头做原子比较交换。"""
+
+        def publish() -> TaskVersion:
+            with self._transaction() as conn:
+                row = conn.execute(
+                    "SELECT version,data FROM continued_tasks WHERE id=?", (task_id,)
+                ).fetchone()
+                if (row[1] if row else None) != (
+                    expected.model_dump_json() if expected is not None else None
+                ):
+                    raise SessionConflictError("task_version_changed")
+                self._task_input(source)
+                # 接续 Run 已经消费了受原任务授权约束的资料, 不能将其重登记为
+                # 无上游的新任务, 否则旧来源的权限检查会被绕开。
+                if (
+                    expected is None
+                    and conn.execute(
+                        """SELECT 1 FROM runs r, json_each(r.application_context) item
+                    WHERE r.id=? AND json_extract(item.value,'$.provider')=?""",
+                        (source.run_id, "weavria.task_continuation"),
+                    ).fetchone()
+                ):
+                    raise SessionConflictError("task_source_already_continued")
+                runs = (*expected.runs, source) if expected is not None else (source,)
+                result = TaskVersion(task_id=task_id, version=len(runs), runs=runs)
+                conn.execute(
+                    "INSERT INTO continued_tasks VALUES(?,?,?) "
+                    "ON CONFLICT(id) DO UPDATE SET version=excluded.version,data=excluded.data",
+                    (task_id, result.version, result.model_dump_json()),
+                )
+                return result
+
+        return await self._submit(publish)
 
     async def run_records(self, session_id: str, run_id: str) -> tuple[ToolRecord, ...]:
         """Return accepted current-run records as immutable contract snapshots."""

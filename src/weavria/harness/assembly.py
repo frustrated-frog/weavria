@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Self
 
+from weavria.artifacts import ArtifactSnapshot
 from weavria.context import (
     ContextCompilerConfig,
     HistoryRetrievalConfig,
@@ -24,7 +25,14 @@ from weavria.runtime import (
     ToolScheduling,
     settle_mutation,
 )
-from weavria.sessions import SessionBusyError, SessionEngine
+from weavria.sessions import (
+    SessionBusyError,
+    SessionEngine,
+    TaskAccessPolicy,
+    TaskContinuationResult,
+    TaskRun,
+    TaskVersion,
+)
 from weavria.tools import ToolPolicy, ToolRegistry
 
 from .configuration import HarnessConfig
@@ -36,6 +44,7 @@ from .memory_generation import MemoryGenerationPolicy
 from .memory_models import ModelMemoryExtractor, ModelMemoryReviewer
 from .memory_session import SessionMemoryBinding, SessionMemoryIngestor
 from .session import TaskAwareSessionPreparer
+from .task_continuation import TaskContinuation
 from .task_view import TaskModelViewProjector
 from .understanding import ModelTaskInterpreter, TaskUnderstandingEngine
 from .work import work_tool
@@ -402,6 +411,7 @@ class AgentHarness:
                 ),
             },
         )
+        self._task_continuation = TaskContinuation(self.sessions, tools, policy)
         self._ingestor = (
             SessionMemoryIngestor(
                 self.sessions.store,
@@ -493,6 +503,43 @@ class AgentHarness:
             )
         finally:
             self._active.pop(session_id, None)
+
+    async def register_task(
+        self, task_id: str, session_id: str, run_id: str, *, access: TaskAccessPolicy
+    ) -> TaskVersion:
+        """将已持久化的 Run 发布为可显式接续的任务。"""
+        self._require_open()
+        return await self._task_continuation.register(
+            task_id, TaskRun(session_id=session_id, run_id=run_id), access
+        )
+
+    async def continue_task(
+        self, task_id: str, session_id: str, *, expected_version: int, access: TaskAccessPolicy
+    ) -> TaskContinuationResult:
+        """在目标会话新建 Run, 用任务版本防止陈旧进度覆盖。"""
+        self._claim(session_id)
+        try:
+            async with asyncio.timeout(self._max_request_duration):
+                return await self._task_continuation.advance(
+                    task_id, session_id, expected_version, access
+                )
+        finally:
+            self._active.pop(session_id, None)
+
+    async def read_task_artifact(
+        self,
+        task_id: str,
+        session_id: str,
+        source_run_id: str,
+        artifact_id: str,
+        *,
+        access: TaskAccessPolicy,
+    ) -> ArtifactSnapshot:
+        """通过任务来源链及当前授权读取已接受的原始结果。"""
+        self._require_open()
+        return await self._task_continuation.read_artifact(
+            task_id, session_id, source_run_id, artifact_id, access
+        )
 
     async def resume(self, session_id: str, run_id: str) -> HarnessResult:
         """显式恢复 Run, 在同一会话所有权内消费本次接受的记忆事件。"""

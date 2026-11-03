@@ -20,6 +20,7 @@ from .store import (
     SessionInterruptedError,
     SQLiteSessionStore,
 )
+from .task_continuation import TaskAccessPolicy, TaskContinuationResult, TaskRun, TaskVersion
 
 __all__ = [
     "ClarificationAssociationPolicy",
@@ -38,4 +39,8 @@ __all__ = [
     "SessionTaskPreparation",
     "SessionTaskPreparationError",
     "SessionTaskPreparer",
+    "TaskAccessPolicy",
+    "TaskContinuationResult",
+    "TaskRun",
+    "TaskVersion",
 ]

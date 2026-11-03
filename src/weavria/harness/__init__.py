@@ -1,5 +1,7 @@
 """Domain-independent Agent Harness capabilities above the Runtime."""
 
+from weavria.sessions import TaskAccessPolicy, TaskContinuationResult, TaskVersion
+
 from .agent import TaskAwareAgent, TaskAwareExecution
 from .assembly import AgentHarness, HarnessMemory, HarnessResult, MemoryUpdateReport
 from .capabilities import (
@@ -244,10 +246,12 @@ __all__ = [
     "TargetResolution",
     "TargetResolver",
     "TargetSelection",
+    "TaskAccessPolicy",
     "TaskAwareAgent",
     "TaskAwareExecution",
     "TaskAwareSessionPreparer",
     "TaskCompletionEvaluator",
+    "TaskContinuationResult",
     "TaskFrame",
     "TaskFramePatch",
     "TaskInterpreter",
@@ -261,6 +265,7 @@ __all__ = [
     "TaskUnderstandingInput",
     "TaskUnderstandingInputAdmission",
     "TaskUnderstandingRecord",
+    "TaskVersion",
     "WorkNote",
     "WorkReference",
     "WorkUpdate",

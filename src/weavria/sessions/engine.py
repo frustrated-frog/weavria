@@ -1021,6 +1021,20 @@ class SessionEngine:
         """接续同一会话内最新的中断 Run, 仅限已结算的只读决策边界。"""
         return await self._run(session_id, "", resume_run_id=run_id)
 
+    async def continue_task(
+        self, session_id: str, task: TaskInput, observation: ApplicationObservation
+    ) -> SessionResult:
+        """由已授权的 Harness 传入原目标及跨会话来源投影。"""
+        if self._task_preparation is None or self._task_model_projector is None:
+            raise SessionConflictError("task_continuation_requires_task_view")
+        return await self._run(
+            session_id,
+            task.goal,
+            input_id=observation.input_id,
+            application_context=(observation,),
+            original_task=task,
+        )
+
     async def _run(
         self,
         session_id: str,
@@ -1031,6 +1045,7 @@ class SessionEngine:
         clarification_id: str | None = None,
         max_duration: float | None = None,
         resume_run_id: str | None = None,
+        original_task: TaskInput | None = None,
     ) -> SessionResult:
         if self._closing:
             raise RuntimeError("session engine is closing")
@@ -1177,7 +1192,13 @@ class SessionEngine:
             claimed_run = claim.run_id
             if cancelled:
                 raise asyncio.CancelledError
-            task = restored.state.task if restored is not None else TaskInput(goal=text)
+            task = (
+                restored.state.task
+                if restored is not None
+                else original_task
+                if original_task is not None
+                else TaskInput(goal=text)
+            )
             task_observation = None
             selected = self._tools
             capability_epoch = 1
@@ -1203,7 +1224,7 @@ class SessionEngine:
                 await self._expire_clarifications(session_id)
                 pending = await self.store.pending_clarifications(session_id)
                 associated_id = clarification_id
-                if associated_id is None:
+                if associated_id is None and original_task is None:
                     associated_id = await self._clarification_association.associate(text, pending)
                 semantic_base = next(
                     (
