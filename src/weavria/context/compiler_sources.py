@@ -234,6 +234,13 @@ class CoverageScorer:
                     (f"d:{identity}:t:{term}", weight * idf)
                 )
 
+    def excerpt_score(self, text: str) -> float:
+        return sum(
+            weight
+            for term in sorted(set(terms(text)))
+            for _, weight in self._term_features.get(term, ())
+        )
+
     @classmethod
     async def create(
         cls, demands: tuple[ContextDemand, ...], passages: tuple[Passage, ...], *, max_work: int

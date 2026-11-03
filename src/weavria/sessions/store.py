@@ -1318,10 +1318,24 @@ class SQLiteSessionStore:
         if (
             compilation is not None
             and compilation.supply is not None
-            and request.schema_version != 6
+            and request.schema_version < 6
         ):
             raise SessionConflictError("source supply requires a bundle-capable request")
-        if request.schema_version == 6:
+        if request.compaction is not None and (
+            compilation is None
+            or compilation.compaction_status != "delivered"
+            or request.compaction.run_id != run_id
+        ):
+            raise SessionConflictError("compaction disagrees with its run or compilation")
+        if compilation is not None and (compilation.compaction_status == "delivered") != (
+            request.compaction is not None
+        ):
+            raise SessionConflictError("compaction delivery disagrees with its request")
+        if (
+            request.schema_version == 6
+            or request.bundles
+            or (compilation is not None and compilation.supply is not None)
+        ):
             # 供给报告描述召回全集,choices 描述本次实际选择。落库前逐组复核
             # 身份与完整内容摘要,避免模型收到未记录或被二次截断的记忆正文。
             if compilation is None or compilation.supply is None:

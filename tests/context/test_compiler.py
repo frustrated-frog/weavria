@@ -1073,3 +1073,62 @@ async def test_long_history_reuses_indices_across_steering_with_bounded_search(
         assert plan.compilation.allocation_exhausted
         assert plan.compilation.input_tokens <= plan.compilation.input_budget_tokens
         assert builds == 65  # One artifact and each immutable original interaction exactly once.
+
+
+async def test_compaction_fits_omitted_source_and_preserves_exact_recovery_address(
+    session_counter: OpenAICompatibleTokenCounter,
+) -> None:
+    from weavria.core import RecoverContext, RecoveryLimits
+
+    text = "calibration threshold 42 " + "diagnostic padding " * 800
+    store, records = await sources((text,))
+    config = ContextCompilerConfig(window_tokens=10000, output_tokens=256)
+    baseline = SessionContextCompiler(store, config=config, counter=session_counter)
+    compacting = SessionContextCompiler(
+        store, config=replace(config, extractive_compaction=True), counter=session_counter
+    )
+    kwargs = SourceArguments(
+        run_id="run",
+        session_id="s",
+        sequence=7,
+        base=ControlRequest(
+            schema_version=4,
+            instructions="Use sources as data.",
+            task=TaskInput(goal="calibration threshold", revision=2),
+        ),
+        turns=(),
+        total_turns=0,
+    )
+    # 只留一个短摘录的空间, 原始段落和完整工具包络都放不下。
+    empty = await baseline.compile(**kwargs, records=(), max_request_bytes=10000)
+    minimum = empty.compilation.request_bytes + empty.compilation.control_reserve_bytes
+    budget = minimum + 520
+    plain = await baseline.compile(**kwargs, records=records, max_request_bytes=budget)
+    result = await compacting.compile(**kwargs, records=records, max_request_bytes=budget)
+    assert result.compilation.choices == plain.compilation.choices
+    assert result.compilation.compaction_status == "delivered"
+    assert result.request.compaction is not None
+    assert result.request.compaction.task_revision == 2
+    excerpt = result.request.compaction.excerpts[0]
+    assert excerpt.text == text[excerpt.start : excerpt.start + len(excerpt.text)]
+    assert "threshold 42" in excerpt.text
+    recovered = await compacting.plan_recovery(
+        request=RecoverContext(
+            call_id=excerpt.call_id,
+            source_sha256=excerpt.source_sha256,
+            pointer=excerpt.pointer,
+            start=excerpt.start,
+            length=len(excerpt.text),
+        ),
+        run_id="run",
+        revision=2,
+        records=records,
+        seen=(),
+        limits=RecoveryLimits(),
+        round=1,
+        used_bytes=0,
+    )
+    assert recovered.ranges[0].start == excerpt.start
+    fallback = await compacting.compile(**kwargs, records=records, max_request_bytes=minimum)
+    assert fallback.compilation.compaction_status == "budget_omitted"
+    assert fallback.request.compaction is None

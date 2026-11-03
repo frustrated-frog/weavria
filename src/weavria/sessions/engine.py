@@ -34,6 +34,7 @@ from weavria.core import (
     CONTROL_FEEDBACK_BYTES,
     ApplicationObservation,
     ContextBundle,
+    ContextCompaction,
     ContextCompilation,
     ContextSupply,
     ControlEvent,
@@ -234,18 +235,28 @@ class _SessionAdapter:
         self._context_source = context_source
         self._support_tools = support_tools
         self._bundles: tuple[ContextBundle, ...] = ()
+        self._compaction: ContextCompaction | None = None
 
     @property
     def capabilities(self) -> ModelCapabilities:
         return self._provider.capabilities
 
-    async def generate_turn(self, request: ControlRequest) -> ModelTurn:
-        outer = SessionRequest(
-            schema_version=6 if self._context_source is not None else 5,
+    def _outer_request(self, request: ControlRequest) -> SessionRequest:
+        # 发送与持久化必须重建相同包络, 否则请求摘要无法证明模型实际收到的内容。
+        return SessionRequest(
+            schema_version=7
+            if self._compaction is not None
+            else 6
+            if self._context_source is not None
+            else 5,
             bundles=self._bundles,
             conversation=self._prepared[request.task.revision],
+            compaction=self._compaction,
             current=request,
         )
+
+    async def generate_turn(self, request: ControlRequest) -> ModelTurn:
+        outer = self._outer_request(request)
         if len(outer.model_dump_json().encode()) > self._budget:
             raise ContextBudgetError(len(outer.model_dump_json().encode()), self._budget)
         return await self._provider.generate_session(
@@ -256,12 +267,7 @@ class _SessionAdapter:
         await self._store.append(event)
 
     async def record_request(self, request: ControlRequest) -> None:
-        outer = SessionRequest(
-            schema_version=6 if self._context_source is not None else 5,
-            bundles=self._bundles,
-            conversation=self._prepared[request.task.revision],
-            current=request,
-        )
+        outer = self._outer_request(request)
         if self._compilation is None:
             await self._store.prepare_request(self._session_id, self._run_id, outer, self._budget)
         else:
@@ -356,6 +362,7 @@ class _SessionAdapter:
         # Only one attempt is active; discard obsolete prepared views after the
         # previous model call/verification has joined, retaining bounded state.
         self._bundles = ()
+        self._compaction = None
         self._prepared = {task.revision: view}
         self._history, self._history_sequence, self._history_count = history, sequence, count
         self._prepared_task_revision = task.revision
@@ -605,6 +612,7 @@ class _SessionAdapter:
             compiled = await compile_with_floor(0)
         outer, report = compiled.request, compiled.compilation
         self._bundles = outer.bundles
+        self._compaction = outer.compaction
         self._prepared = {task.revision: outer.conversation}
         self._compilation = report
         overhead = report.request_bytes - len(outer.current.model_dump_json().encode())

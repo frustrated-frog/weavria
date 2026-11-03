@@ -33,7 +33,7 @@ class ContextCompilation(BaseModel):
     """Bind allocation diagnostics to the exact complete request sent to a provider."""
 
     model_config = ContractModel.model_config
-    schema_version: Literal[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12] = 1
+    schema_version: Literal[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13] = 1
 
     policy_version: NonBlankString
     counter_version: NonBlankString
@@ -64,6 +64,7 @@ class ContextCompilation(BaseModel):
     transport_request_bytes: int | None = Field(default=None, gt=0)
     transport_budget_bytes: int | None = Field(default=None, gt=0)
     task_model_view: TaskModelViewReceipt | None = None
+    compaction_status: Literal["no_candidate", "budget_omitted", "delivered"] | None = None
 
     @field_validator("schema_version", mode="before")
     @classmethod
@@ -93,6 +94,8 @@ class ContextCompilation(BaseModel):
             data.pop("task_model_view", None)
         if self.schema_version < 11:
             data.pop("supply", None)
+        if self.schema_version < 13:
+            data.pop("compaction_status", None)
         return data
 
     @model_validator(mode="after")
@@ -133,8 +136,10 @@ class ContextCompilation(BaseModel):
             self.transport_request_bytes is not None
         ):
             raise ValueError("transport accounting requires compilation v8")
-        if self.schema_version >= 11 and self.supply is None:
+        if self.schema_version in (11, 12) and self.supply is None:
             raise ValueError("compilation v11 requires its source supply report")
+        if (self.compaction_status is not None) != (self.schema_version == 13):
+            raise ValueError("compaction diagnostics require compilation v13")
         if self.task_model_view is not None and self.transport_request_bytes is None:
             raise ValueError("model-view compilation requires full transport accounting")
         if (

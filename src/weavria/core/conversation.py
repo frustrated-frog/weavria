@@ -13,6 +13,7 @@ from pydantic import (
 )
 
 from ._schema import ContractModel, NonBlankString
+from .compaction import ContextCompaction
 from .context import SessionContextCompiled
 from .context_supply import ContextBundle
 from .control import ControlEvent, ControlRequest, RunReport
@@ -259,12 +260,13 @@ class ConversationView(BaseModel):
 
 
 class SessionRequest(BaseModel):
-    """v5 observations, with optional v6 atomic low-trust source bundles."""
+    """Versioned observations with v6 source bundles and v7 compacted excerpts."""
 
     model_config = ContractModel.model_config
-    schema_version: Literal[5, 6] = 5
+    schema_version: Literal[5, 6, 7] = 5
     bundles: tuple[ContextBundle, ...] = Field(default=(), max_length=100)
     conversation: ConversationView
+    compaction: ContextCompaction | None = None
     current: ControlRequest
 
     @field_validator("schema_version", mode="before")
@@ -277,14 +279,24 @@ class SessionRequest(BaseModel):
         data = handler(self)
         if self.schema_version == 5:
             data.pop("bundles", None)
+        if self.schema_version < 7:
+            data.pop("compaction", None)
         return data
 
     @model_validator(mode="after")
     def validate_bundles(self) -> Self:
-        if self.bundles and self.schema_version != 6:
-            raise ValueError("context bundles require session request v6")
+        if self.bundles and self.schema_version < 6:
+            raise ValueError("context bundles require session request v6 or later")
         if len({b.bundle_id for b in self.bundles}) != len(self.bundles):
             raise ValueError("context bundle identities must be unique")
+        if (self.compaction is not None) != (self.schema_version == 7):
+            raise ValueError("compaction requires session request v7")
+        if self.compaction is not None and (
+            self.compaction.task_revision != self.current.task.revision
+            or self.compaction.through_sequence != self.conversation.through_sequence
+            or not self.current.recovery_enabled
+        ):
+            raise ValueError("compaction does not match the current recovery boundary")
         return self
 
 

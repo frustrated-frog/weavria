@@ -8,6 +8,7 @@ from weavria.artifacts import ArtifactStore
 from weavria.core import (
     CONTROL_FEEDBACK_BYTES,
     ContextChoice,
+    ContextCompaction,
     ContextCompilation,
     ContextSupply,
     ControlFeedback,
@@ -36,6 +37,7 @@ from .budget import (
     SessionRequestSizer,
     SessionTokenCounter,
 )
+from .compaction import compact_excerpts
 from .compiler_sources import (
     CoverageScorer,
     SourceIndex,
@@ -381,6 +383,8 @@ class SessionContextCompiler:
         wire = template.model_dump(mode="json")
         payloads = tuple(tuple(json.loads(v.payload_json) for v in unit.variants) for unit in units)
 
+        compaction: ContextCompaction | None = None
+
         def render(selected: dict[int, int]) -> SessionRequest:
             history = [
                 payloads[i][level]
@@ -394,6 +398,11 @@ class SessionContextCompiler:
             ]
             value = {
                 **wire,
+                **(
+                    {"schema_version": 7, "compaction": compaction.model_dump(mode="json")}
+                    if compaction is not None
+                    else {}
+                ),
                 "conversation": {
                     **wire["conversation"],
                     "turns": history,
@@ -486,6 +495,45 @@ class SessionContextCompiler:
         selected = await allocator.allocate(minimum)
         cost = await allocator.cost(selected)
         require(cost, selected)
+        compaction_status: Literal["no_candidate", "budget_omitted", "delivered"] | None = None
+        compaction_evaluations = 0
+        if self.config.extractive_compaction:
+            compaction_status = "no_candidate"
+            if base.recovery_enabled and not allocator.exhausted:
+                # 先保留基线已交付的正文, 再尝试用剩余空间覆盖被省略的来源。
+                readable = {
+                    units[i].identity
+                    for i, level in selected.items()
+                    if units[i].variants[level].kind in ("raw", "excerpt")
+                }
+                excerpts = await compact_excerpts(
+                    tuple(
+                        source
+                        for source in sources
+                        if f"call:{source.record.exchange.action.call_id}" not in readable
+                    ),
+                    scorer,
+                )
+                if excerpts:
+                    compaction_status = "budget_omitted"
+                while excerpts:
+                    compaction = ContextCompaction(
+                        run_id=run_id,
+                        task_revision=base.task.revision,
+                        through_sequence=sequence,
+                        excerpts=excerpts,
+                    )
+                    candidate = measure(selected)
+                    compaction_evaluations += 1
+                    if (
+                        candidate.tokens <= self.config.input_tokens
+                        and candidate.bytes <= max_request_bytes
+                    ):
+                        cost = candidate
+                        compaction_status = "delivered"
+                        break
+                    compaction = None
+                    excerpts = excerpts[:-1]
         request = render(selected)
         encoded = request.model_dump_json()
         request_sha256 = digest(encoded)
@@ -514,9 +562,11 @@ class SessionContextCompiler:
         if type(ceiling) is not int or ceiling < 0:
             raise ContextBuildError("token counter returned an invalid byte ceiling")
         covered = coverage(units, selected)
+        report_version = 13 if compaction_status is not None else policy_version
         report = ContextCompilation(
-            schema_version=policy_version,
-            policy_version=f"context-compiler/{policy_version}[{self.config.policy}]",
+            schema_version=report_version,
+            policy_version=f"context-compiler/{report_version}[{self.config.policy}]",
+            compaction_status=compaction_status,
             counter_version=self.counter.version,
             task_revision=base.task.revision,
             source_sha256=digest(json.dumps([(u.identity, u.digest) for u in units])),
@@ -535,7 +585,7 @@ class SessionContextCompiler:
                 1, min(max_request_bytes, ceiling) - overhead - envelope_growth
             ),
             utility=allocator.utility(selected),
-            evaluations=allocator.evaluations,
+            evaluations=allocator.evaluations + compaction_evaluations,
             allocation_steps=allocator.steps,
             allocation_exhausted=allocator.exhausted,
             choices=tuple(

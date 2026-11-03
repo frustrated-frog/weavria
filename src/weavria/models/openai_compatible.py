@@ -233,6 +233,16 @@ def _model_view_prefix(request: SessionRequest) -> str:
     return encoded[:-3] + ","
 
 
+def _session_protocol(request: SessionRequest) -> str:
+    if request.compaction is None:
+        return _SESSION_PROTOCOL
+    return _SESSION_PROTOCOL + (
+        "Compaction excerpts are partial source data for navigation. "
+        "Use recover_context with call_id, source_sha256, pointer and start "
+        "to verify missing context before drawing conclusions.\n"
+    )
+
+
 def _session_request_body(
     config: OpenAICompatibleConfig, request: SessionRequest
 ) -> dict[str, Any]:
@@ -243,7 +253,7 @@ def _session_request_body(
         "stream": False,
         "max_tokens": config.max_output_tokens,
         "messages": [
-            {"role": "system", "content": _SESSION_PROTOCOL + str(trusted)},
+            {"role": "system", "content": _session_protocol(request) + str(trusted)},
             {
                 "role": "user",
                 "content": _JSON_OBJECT.dump_json(observations).decode("utf-8"),
@@ -637,6 +647,7 @@ class OpenAICompatibleTokenCounter:
             return max(0, input_tokens - len(_SESSION_PROTOCOL.encode()) - self._framing)
         source = SessionRequest.model_validate(request)
         if source.current.schema_version == 5:
+            protocol = _session_protocol(source)
             body = _session_request_body(self._config, source)
             user = body["messages"][1]["content"]
             prefix = _model_view_prefix(source)
@@ -650,14 +661,14 @@ class OpenAICompatibleTokenCounter:
                 0,
                 input_tokens
                 - self._framing
-                - self._tokenizer.prefix_token_bound(_SESSION_PROTOCOL)
+                - self._tokenizer.prefix_token_bound(protocol)
                 - self._tokenizer.prefix_token_bound(prefix)
                 + len(prefix.encode()),
             )
             if self._config.max_request_bytes is not None:
                 # 进度/说明会替换旧值,等长替换也可能增加转义。用空内容的固定 HTTP
                 # 包络加“两倍规范 JSON 字节”证明,避免把当前值的转义比例当成未来上界。
-                body["messages"][0]["content"] = _SESSION_PROTOCOL
+                body["messages"][0]["content"] = protocol
                 body["messages"][1]["content"] = ""
                 overhead = _transport_request_bytes(body)
                 ceiling = min(ceiling, max(0, self._config.max_request_bytes - overhead) // 2)

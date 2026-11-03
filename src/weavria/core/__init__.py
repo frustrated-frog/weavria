@@ -1,6 +1,7 @@
 """Public, domain-independent data contracts and run lifecycle rules."""
 
 from .actions import AgentAction, FinishAction, ToolCallAction, parse_action
+from .compaction import CompactedExcerpt, ContextCompaction
 from .context import ContextChoice, ContextCompilation, SessionContextCompiled
 from .context_supply import ContextBundle, ContextSupply, ContextSupplyReport
 from .control import (
@@ -190,6 +191,7 @@ __all__ = [
     "BatchRejected",
     "CallFeedback",
     "CallSkipped",
+    "CompactedExcerpt",
     "CompletionAccept",
     "CompletionAssessment",
     "CompletionChecked",
@@ -200,6 +202,7 @@ __all__ = [
     "CompletionUnverifiable",
     "ContextBundle",
     "ContextChoice",
+    "ContextCompaction",
     "ContextCompilation",
     "ContextSelected",
     "ContextSupply",
