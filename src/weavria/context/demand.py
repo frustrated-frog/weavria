@@ -25,6 +25,23 @@ class EvidenceAnchor:
 
 
 @dataclass(frozen=True, slots=True)
+class EvidenceSpanAnchor(EvidenceAnchor):
+    """已接受工作结论关联的原文区间, 用于下一次上下文选择。"""
+
+    start: int = 0
+    end: int = 0
+
+    def __post_init__(self) -> None:
+        EvidenceAnchor.__post_init__(self)
+        if (
+            type(self.start) is not int
+            or type(self.end) is not int
+            or not 0 <= self.start < self.end
+        ):
+            raise ValueError("evidence span anchor requires a nonempty interval")
+
+
+@dataclass(frozen=True, slots=True)
 class ContextDemand:
     """Soft information need; the compiler discovers matching source ranges itself."""
 

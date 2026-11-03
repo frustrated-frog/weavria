@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import re
 from collections.abc import Awaitable, Callable
 from typing import Annotated, Literal, Self
 
@@ -43,6 +44,16 @@ class WorkContract(BaseModel):
 class WorkReference(WorkContract):
     artifact_id: Identity
     pointer: Annotated[str, StringConstraints(max_length=256)] = ""
+    start: int | None = Field(default=None, ge=0, exclude_if=lambda value: value is None)
+    end: int | None = Field(default=None, ge=1, exclude_if=lambda value: value is None)
+
+    @model_validator(mode="after")
+    def validate_range(self) -> Self:
+        if (self.start is None) != (self.end is None) or (
+            self.start is not None and self.end is not None and self.end <= self.start
+        ):
+            raise ValueError("work source requires a nonempty paired range")
+        return self
 
 
 class WorkNote(WorkContract):
@@ -74,6 +85,7 @@ class WorkUpdate(WorkContract):
 class WorkSource(WorkContract):
     reference: WorkReference
     artifact: ArtifactRef
+    source_label: str | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class WorkProposal(WorkContract):
@@ -115,6 +127,7 @@ def compact_work(state: WorkingState) -> dict[str, JsonValue]:
     for source in state.sources:
         ref = source.artifact
         addresses[ref.artifact_id] = {"call_id": ref.call_id, "source_sha256": ref.sha256}
+    labels = {source.reference: source.source_label for source in state.sources}
     compact: dict[str, JsonValue] = {
         **full,
         "schema_version": 2,
@@ -128,7 +141,10 @@ def compact_work(state: WorkingState) -> dict[str, JsonValue]:
                 **(
                     {
                         "sources": [
-                            ref.model_dump(mode="json", exclude={"schema_version"})
+                            {
+                                **ref.model_dump(mode="json", exclude={"schema_version"}),
+                                **({"source_label": label} if (label := labels.get(ref)) else {}),
+                            }
                             for ref in note.sources
                         ]
                     }
@@ -210,6 +226,21 @@ class _WorkTool(TypedTool[WorkDraft, WorkProposal]):
         return WorkDraft.model_validate_json(json.dumps(arguments))
 
 
+_SOURCE_HEADING = re.compile(r"^={3,} +([^\r\n]{1,240}?) +={3,} *$", re.MULTILINE)
+
+
+def _source_label(value: str, start: int, end: int) -> str | None:
+    """同一区间只能归于一个明确的原文章节, 跨文件区间不推断来源名。"""
+    label = None
+    for heading in _SOURCE_HEADING.finditer(value, 0, min(len(value), end + 250)):
+        if heading.start() >= end:
+            break
+        if heading.start() > start:
+            return None
+        label = heading[1]
+    return label
+
+
 def work_tool() -> TypedTool[WorkDraft, WorkProposal]:
     async def propose(draft: WorkDraft, context: ToolContext) -> WorkProposal:
         try:
@@ -225,12 +256,32 @@ def work_tool() -> TypedTool[WorkDraft, WorkProposal]:
                     continue
                 snapshot = await context.read_artifact(ref.artifact_id)
                 try:
-                    resolve_pointer(snapshot.value, ref.pointer)
+                    document = snapshot.value
+                    value = resolve_pointer(document, ref.pointer)
+                    label = None
+                    if ref.start is not None and ref.end is not None:
+                        if not isinstance(value, str) or ref.end > len(value):
+                            raise ValueError("work range outside source text")
+                        label = _source_label(value, ref.start, ref.end)
+                        if (
+                            label is None
+                            and not _SOURCE_HEADING.search(value)
+                            and isinstance(document, dict)
+                        ):
+                            path = document.get("path")
+                            if isinstance(path, str) and 0 < len(path) <= 240:
+                                label = path
                 except ValueError as exc:
                     raise ToolFault(
                         ErrorCategory.INVALID_TOOL_ARGUMENTS, "Invalid work source pointer"
                     ) from exc
-                sources.append(WorkSource(reference=ref, artifact=snapshot.reference))
+                sources.append(
+                    WorkSource(
+                        reference=ref,
+                        artifact=snapshot.reference,
+                        source_label=label,
+                    )
+                )
         # 这里只生成提议 Artifact,不写隐藏状态。Runtime 接受结果后才做归约;
         # 同批业务工具的新结果尚未接受,不能被工作提议提前引用。
         proposal = WorkProposal(update=update, sources=tuple(sources))
@@ -240,13 +291,14 @@ def work_tool() -> TypedTool[WorkDraft, WorkProposal]:
 
     return _WorkTool(
         name=WORK_TOOL,
-        version="3",
+        version="4",
         input_type=WorkDraft,
         output_type=WorkProposal,
         description=(
             "Keep bounded multi-step notes: results with accepted artifact IDs/pointers, "
             "open issues, plans, hypotheses or rejected attempts. Supply notes with kind, summary, "
-            "need_ids and sources (artifact_id/pointer). Revisions and note_id may be omitted; "
+            "need_ids and sources (artifact_id/pointer; copy start/end from the exact text span "
+            "for a source label). Revisions and note_id may be omitted; "
             "the host binds them to the task view that produced this call. "
             "Replace the whole set; retain useful notes. Sourced results lower acquired needs' "
             "exploration priority; issues and next_need_ids raise it. "

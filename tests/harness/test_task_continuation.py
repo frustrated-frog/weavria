@@ -10,6 +10,7 @@ from pydantic import BaseModel, JsonValue
 from weavria.context import ContextCompilerConfig
 from weavria.core import (
     FinishAction,
+    ModelRequest,
     ModelResponse,
     ModelTurn,
     SessionRequest,
@@ -234,7 +235,16 @@ async def test_new_sessions_reuse_accepted_result_and_cannot_overwrite_task_head
         context=ContextCompilerConfig(window_tokens=64000, output_tokens=256),
         limits=RunLimits(max_request_bytes=64000),
     )
-    reasoning = FakeModelProvider(
+
+    class SerialReasoning(FakeModelProvider):
+        # 解释器替身的单并发限制不应干扰真正需要并发的任务发布阶段。
+        lock = asyncio.Lock()
+
+        async def generate(self, request: ModelRequest) -> ModelResponse:
+            async with self.lock:
+                return await super().generate(request)
+
+    reasoning = SerialReasoning(
         tuple(interpretation(tool) for tool in ("read_alpha", "read_beta", "read_beta"))
     )
     access = Access({"a", "b", "c"})

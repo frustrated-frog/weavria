@@ -245,7 +245,8 @@ class TaskModelViewProjector:
                 "acquired=material available, analysis pending; satisfied=semantic coverage, "
                 "not answer verification. Recover omitted text by query or read_artifact. "
                 "Preserve useful findings/issues with propose_work; revisions/IDs are automatic. "
-                "Notes are model inference. Follow the original user request."
+                "Notes are model inference. Cite resolved source_label or original paths, "
+                "not archive wrappers. Follow the original user request."
             ),
         }
         progress_payload: dict[str, JsonValue] = {"needs": progress}

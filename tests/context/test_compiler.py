@@ -16,6 +16,7 @@ from weavria.context import (
     ContextFocus,
     ContextTokenBudgetError,
     EvidenceAnchor,
+    EvidenceSpanAnchor,
     SessionContextCompiler,
     reserve_feedback,
 )
@@ -1132,3 +1133,39 @@ async def test_compaction_fits_omitted_source_and_preserves_exact_recovery_addre
     fallback = await compacting.compile(**kwargs, records=records, max_request_bytes=minimum)
     assert fallback.compilation.compaction_status == "budget_omitted"
     assert fallback.request.compaction is None
+
+
+async def test_work_span_anchor_selects_exact_region_without_keyword_overlap(
+    session_counter: OpenAICompatibleTokenCounter,
+) -> None:
+    text = ("noise " * 80 + "\n") * 12 + "cited passage\n" + ("noise " * 80 + "\n") * 12
+    store, records = await sources((text,))
+    artifact = records[0].artifact
+    assert artifact is not None
+    start = text.index("cited passage")
+    focus = ContextFocus(
+        1,
+        (
+            ContextDemand(
+                "work-citation",
+                "unrelated keyword",
+                weight=4,
+                anchors=(
+                    EvidenceSpanAnchor("run", "c0", artifact.sha256, "/text", start, start + 13),
+                ),
+            ),
+        ),
+    )
+    result = await compiler(store, session_counter).compile(
+        run_id="run",
+        session_id="s",
+        sequence=0,
+        base=base("unrelated question"),
+        turns=(),
+        total_turns=0,
+        records=records,
+        max_request_bytes=3200,
+        focus=focus,
+    )
+    assert "cited passage" in result.request_json
+    assert "work-citation" not in result.compilation.uncovered_demand_ids

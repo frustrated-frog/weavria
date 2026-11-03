@@ -1,6 +1,6 @@
 """Translate accepted task semantics into soft, domain-neutral retrieval demands."""
 
-from weavria.context import ContextDemand, ContextFocus, EvidenceAnchor
+from weavria.context import ContextDemand, ContextFocus, EvidenceAnchor, EvidenceSpanAnchor
 from weavria.core import SemanticSnapshot
 
 from .requirements import InformationRequirement, NeedLedger, NeedStatus, load_need_ledger
@@ -74,6 +74,30 @@ def project_context_focus(snapshot: SemanticSnapshot) -> ContextFocus:
         demands.append(
             ContextDemand("working:next", working.next_query, weight=2.0, anchors=anchors)
         )
+    if working is not None and len(demands) < 128:
+        # 仅对已归约的精确工作引用加软优先级。预算紧张仍可省略原文,
+        # 但有空间时优先保留实际区间而非同一个大字段的任意片段。
+        spans = tuple(
+            EvidenceSpanAnchor(
+                source.artifact.run_id,
+                source.artifact.call_id,
+                source.artifact.sha256,
+                source.reference.pointer,
+                source.reference.start,
+                source.reference.end,
+            )
+            for source in working.sources
+            if source.reference.start is not None and source.reference.end is not None
+        )
+        if spans:
+            demands.append(
+                ContextDemand(
+                    "working:citations",
+                    "Prior accepted working references",
+                    weight=4,
+                    anchors=spans,
+                )
+            )
     return ContextFocus(snapshot.version.task_revision, tuple(demands))
 
 

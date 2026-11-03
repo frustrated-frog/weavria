@@ -22,7 +22,7 @@ from .delivery import (
     delivery_ranges,
     first_delivery_gap,
 )
-from .demand import ContextDemand, ContextFocus, EvidenceAnchor
+from .demand import ContextDemand, ContextFocus, EvidenceAnchor, EvidenceSpanAnchor
 from .evidence import (
     ControlEvidencePlan,
     EvidenceContextBuilder,
@@ -83,6 +83,7 @@ __all__ = [
     "EvidenceDecision",
     "EvidenceMode",
     "EvidencePlan",
+    "EvidenceSpanAnchor",
     "FeedbackReservation",
     "FocusedHistory",
     "FullHistory",

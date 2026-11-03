@@ -611,3 +611,57 @@ async def test_direct_task_can_record_work_without_changing_tool_epoch(
     assert second.task_model_view is not None
     raw = second.task_model_view.progress["working_state"]
     assert isinstance(raw, dict) and load_work(raw).revision == 1
+
+
+async def test_work_range_resolves_original_section_and_survives_work_projection() -> None:
+    from weavria.artifacts import InMemoryArtifactStore
+    from weavria.harness.work import WorkProposal, compact_work, work_tool
+    from weavria.tools import ReadOnlyPolicy, ToolExecutor
+
+    store = InMemoryArtifactStore()
+    text = "===== a.md =====\ndefault = 2\n===== b.md =====\nexample = 8\n"
+    artifact = await store.put("r", "source", {"path": "archive.txt", "text": text})
+    start = text.index("default")
+    end = text.index("\n", start)
+    executor = ToolExecutor("r", ToolRegistry((work_tool(),)), store, ReadOnlyPolicy())
+
+    async def propose(call: str, stop: int) -> WorkProposal | None:
+        result = await executor.execute(
+            ToolCallAction(
+                call_id=call,
+                tool_name="propose_work",
+                arguments={
+                    "task_revision": 1,
+                    "base_revision": 0,
+                    "notes": [
+                        {
+                            "kind": "result",
+                            "summary": "Found the declaration",
+                            "sources": [
+                                {
+                                    "artifact_id": artifact.reference.artifact_id,
+                                    "pointer": "/text",
+                                    "start": start,
+                                    "end": stop,
+                                }
+                            ],
+                        }
+                    ],
+                },
+            ),
+            max_duration=1,
+            accepted_artifacts=(artifact.reference,),
+        )
+        if result.artifact is None:
+            return None
+        saved = await store.get("r", result.artifact.artifact_id)
+        return WorkProposal.model_validate_json(saved.content_json)
+
+    exact = await propose("exact", end)
+    assert exact is not None and exact.sources[0].source_label == "a.md"
+    assert (exact.sources[0].reference.start, exact.sources[0].reference.end) == (start, end)
+    work = WorkingState(task_revision=1, notes=exact.update.notes, sources=exact.sources)
+    assert "a.md" in str(compact_work(work))
+    crossed = await propose("crossed", len(text))
+    assert crossed is not None and crossed.sources[0].source_label is None
+    assert await propose("out-of-range", len(text) + 1) is None

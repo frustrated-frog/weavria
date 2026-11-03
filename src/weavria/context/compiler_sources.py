@@ -31,7 +31,7 @@ from weavria.core import (
 from .allocation import ContextUnit, Representation
 from .budget import ContextCapacityError
 from .conversation import project_turn
-from .demand import ContextDemand
+from .demand import ContextDemand, EvidenceSpanAnchor
 from .evidence import Passage, index_passages, terms
 from .indexing import bounded_passages
 from .recovery_ranges import range_passage
@@ -300,17 +300,29 @@ class CoverageScorer:
                         and anchor.call_id == reference.call_id
                         and anchor.sha256 == reference.sha256
                         and any(
-                            not anchor.pointer
-                            or p.pointer == anchor.pointer
-                            or p.pointer.startswith(anchor.pointer + "/")
+                            (
+                                p.pointer == anchor.pointer
+                                and p.start < anchor.end
+                                and anchor.start < p.end
+                            )
+                            if isinstance(anchor, EvidenceSpanAnchor)
+                            else (
+                                not anchor.pointer
+                                or p.pointer == anchor.pointer
+                                or p.pointer.startswith(anchor.pointer + "/")
+                            )
                             for p in passages
                         )
                     ):
-                        key = digest(
-                            json.dumps(
-                                (anchor.run_id, anchor.call_id, anchor.sha256, anchor.pointer)
-                            )
+                        address: tuple[str | int, ...] = (
+                            anchor.run_id,
+                            anchor.call_id,
+                            anchor.sha256,
+                            anchor.pointer,
                         )
+                        if isinstance(anchor, EvidenceSpanAnchor):
+                            address += (anchor.start, anchor.end)
+                        key = digest(json.dumps(address))
                         result[f"d:{demand.demand_id}:a:{key}"] = demand.weight * 0.1
         return tuple(sorted(result.items()))
 
