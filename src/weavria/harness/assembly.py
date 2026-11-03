@@ -494,6 +494,19 @@ class AgentHarness:
         finally:
             self._active.pop(session_id, None)
 
+    async def resume(self, session_id: str, run_id: str) -> HarnessResult:
+        """显式恢复 Run, 在同一会话所有权内消费本次接受的记忆事件。"""
+        self._claim(session_id)
+        try:
+            result = await self.sessions.resume(session_id, run_id)
+            return HarnessResult(
+                result,
+                await self._update_memory(session_id),
+                MemoryUpdateReport("deferred"),
+            )
+        finally:
+            self._active.pop(session_id, None)
+
     async def steer(
         self,
         session_id: str,

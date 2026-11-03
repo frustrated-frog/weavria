@@ -387,9 +387,15 @@ class SessionControlDecided(ContractModel):
     resolution: TurnResolution
 
 
+class SessionResumeClaimed(ContractModel):
+    kind: Literal["resume_claimed"] = "resume_claimed"
+    run_id: NonBlankString
+    through_sequence: int = Field(ge=1)
+
+
 class SessionEvent(BaseModel):
     model_config = ContractModel.model_config
-    schema_version: Literal[1, 2, 3, 4, 5] = 3
+    schema_version: Literal[1, 2, 3, 4, 5, 6] = 3
 
     @field_validator("schema_version", mode="before")
     @classmethod
@@ -411,6 +417,7 @@ class SessionEvent(BaseModel):
         | SessionRunEvent
         | SessionSourceRead
         | SessionInterrupted
+        | SessionResumeClaimed
         | SessionTaskPreparationFailed
         | SessionContextPrepared
         | SessionContextCompiled
@@ -422,6 +429,8 @@ class SessionEvent(BaseModel):
 
     @model_validator(mode="after")
     def validate_payload_version(self) -> Self:
+        if self.schema_version < 6 and isinstance(self.data, SessionResumeClaimed):
+            raise ValueError("resume claims require session event v6")
         if self.schema_version < 5 and isinstance(self.data, SessionTaskPreparationFailed):
             raise ValueError("task preparation diagnostics require session event v5")
         if self.schema_version < 4 and isinstance(self.data, SessionContextCompiled):

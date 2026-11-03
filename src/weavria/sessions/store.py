@@ -10,6 +10,7 @@ from collections.abc import Callable, Generator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Self, cast
 
@@ -45,6 +46,7 @@ from weavria.core import (
     SessionInterrupted,
     SessionRequest,
     SessionResult,
+    SessionResumeClaimed,
     SessionRunEvent,
     SessionSemanticCommitted,
     SessionSourceRead,
@@ -60,6 +62,7 @@ from weavria.core import (
     ToolRecord,
     ToolRecorded,
     TurnResolution,
+    TurnSettled,
     task_view_digest,
 )
 from weavria.runtime import Clock, Phase, RunState, SystemClock, reduce_event, settle_mutation
@@ -97,6 +100,16 @@ class TurnClaim:
     input_id: str
     ordinal: int
     duplicate: SessionResult | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ResumeClaim:
+    turn: TurnClaim
+    state: RunState
+    events: tuple[ControlEvent, ...]
+    resolutions: tuple[TurnResolution, ...]
+    semantic: SemanticSnapshot | None
+    remaining_seconds: float
 
 
 def _validate_semantic_transition(
@@ -261,7 +274,7 @@ class SQLiteSessionStore:
         conn = sqlite3.connect(self.path, timeout=2.0)
         self._connection = conn
         version = conn.execute("PRAGMA user_version").fetchone()[0]
-        if version not in (0, 1, 2, 3, 4, 5, 6):
+        if version not in (0, 1, 2, 3, 4, 5, 6, 7):
             raise SessionConflictError("unsupported session database schema")
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA journal_mode=WAL")
@@ -315,6 +328,13 @@ class SQLiteSessionStore:
                 except HistoryIndexError as exc:
                     raise SessionConflictError(str(exc)) from exc
                 migration.execute("PRAGMA user_version=6")
+        if version < 7:
+            with self._transaction() as migration:
+                migration.execute("""CREATE TABLE resume_boundaries(
+                    run_id TEXT PRIMARY KEY REFERENCES runs(id), event_sequence INTEGER NOT NULL,
+                    resolution_sequence INTEGER NOT NULL, work_id TEXT, semantic_sequence INTEGER
+                )""")
+                migration.execute("PRAGMA user_version=7")
         # Only the exclusive DB owner can classify an old live run as interrupted.
         active = conn.execute("SELECT id FROM runs WHERE status='running'").fetchall()
         for row in active:
@@ -394,6 +414,7 @@ class SQLiteSessionStore:
         | SessionRunEvent
         | SessionSourceRead
         | SessionInterrupted
+        | SessionResumeClaimed
         | SessionTaskPreparationFailed
         | SessionContextPrepared
         | SessionContextCompiled
@@ -406,7 +427,9 @@ class SQLiteSessionStore:
         head = conn.execute("SELECT head FROM sessions WHERE id=?", (session_id,)).fetchone()[0]
         event = SessionEvent(
             schema_version=(
-                5
+                6
+                if isinstance(data, SessionResumeClaimed)
+                else 5
                 if isinstance(data, SessionTaskPreparationFailed)
                 else 4
                 if isinstance(data, SessionContextCompiled)
@@ -976,7 +999,13 @@ class SQLiteSessionStore:
 
         return await self._submit(read)
 
-    async def record_resolution(self, resolution: TurnResolution) -> None:
+    async def record_resolution(
+        self,
+        resolution: TurnResolution,
+        *,
+        settled: SemanticSnapshot | None = None,
+        settled_records: int | None = None,
+    ) -> None:
         encoded = resolution.model_dump_json()
 
         def record() -> None:
@@ -1018,8 +1047,158 @@ class SQLiteSessionStore:
                     ),
                 )
                 self._session_event(conn, row[0], SessionControlDecided(resolution=resolution))
+                # 同事务绑定执行游标和已归约语义头。下一个执行事件即使尚未触及
+                # 外部服务, 也使此恢复边界失效, 避免猜测半轮执行的位置。
+                if (
+                    resolution.stage == "execution"
+                    and resolution.proposal_revision == resolution.task_revision
+                    and state.phase is Phase.READY
+                    and state.finalization is None
+                    and state.records
+                    and settled_records == len(state.records)
+                ):
+                    semantic_sequence = None
+                    work_id = None
+                    if settled is not None:
+                        head = conn.execute(
+                            "SELECT data FROM semantic_heads WHERE session_id=? AND work_id=?",
+                            (row[0], settled.work_id),
+                        ).fetchone()
+                        if (
+                            head is None
+                            or head[0] != settled.model_dump_json()
+                            or settled.run_id != resolution.run_id
+                            or settled.version.task_revision != resolution.task_revision
+                            or settled.work_status != "active"
+                        ):
+                            return
+                        work_id = settled.work_id
+                        semantic_sequence = settled.version.semantic_sequence
+                    conn.execute(
+                        "INSERT OR REPLACE INTO resume_boundaries VALUES(?,?,?,?,?)",
+                        (
+                            resolution.run_id,
+                            state.sequence,
+                            resolution.sequence,
+                            work_id,
+                            semantic_sequence,
+                        ),
+                    )
 
         await self._submit(record)
+
+    async def claim_resume(self, session_id: str, run_id: str, config: str) -> ResumeClaim:
+        """原子取得最新中断 Run 的执行权, 并验证快照仍是可恢复的接受边界。"""
+
+        def claim() -> ResumeClaim:
+            with self._transaction() as conn:
+                row = conn.execute(
+                    """SELECT r.status,r.input_id,r.ordinal,r.config,r.last_sequence,s.active_run
+                    FROM runs r JOIN sessions s ON s.id=r.session_id
+                    WHERE r.id=? AND r.session_id=?""",
+                    (run_id, session_id),
+                ).fetchone()
+                if row is None:
+                    raise SessionConflictError("resume_run_not_found")
+                if row[5] is not None:
+                    raise SessionBusyError("session already has an active request")
+                if row[0] != "interrupted":
+                    raise SessionConflictError("resume_run_not_interrupted")
+                if conn.execute(
+                    "SELECT 1 FROM runs WHERE session_id=? AND ordinal>?", (session_id, row[2])
+                ).fetchone():
+                    raise SessionConflictError("resume_session_advanced")
+                boundary = conn.execute(
+                    "SELECT event_sequence,resolution_sequence,work_id,semantic_sequence "
+                    "FROM resume_boundaries WHERE run_id=?",
+                    (run_id,),
+                ).fetchone()
+                if boundary is None or boundary[0] != row[4]:
+                    raise SessionConflictError("resume_unsafe_boundary")
+                previous, current = json.loads(row[3]), json.loads(config)
+                duration = min(
+                    previous.pop("max_request_duration"), current.pop("max_request_duration")
+                )
+                if previous != current:
+                    raise SessionConflictError("resume_configuration_changed")
+                events = tuple(
+                    ControlEvent.model_validate_json(item[0])
+                    for item in conn.execute(
+                        "SELECT data FROM run_events WHERE run_id=? ORDER BY sequence", (run_id,)
+                    )
+                )
+                state = self._state(run_id)
+                if (
+                    state is None
+                    or state.phase is not Phase.READY
+                    or state.sequence != boundary[0]
+                    or not any(isinstance(event.data, TurnSettled) for event in events)
+                ):
+                    raise SessionConflictError("resume_unsafe_boundary")
+                resolutions = tuple(
+                    TurnResolution.model_validate_json(item[0])
+                    for item in conn.execute(
+                        "SELECT data FROM control_decisions WHERE run_id=? ORDER BY sequence",
+                        (run_id,),
+                    )
+                )
+                if not resolutions or resolutions[-1].sequence != boundary[1]:
+                    raise SessionConflictError("resume_resolution_changed")
+                semantic = None
+                if boundary[2] is not None:
+                    head = conn.execute(
+                        "SELECT data FROM semantic_heads WHERE session_id=? AND work_id=?",
+                        (session_id, boundary[2]),
+                    ).fetchone()
+                    semantic = SemanticSnapshot.model_validate_json(head[0]) if head else None
+                    if (
+                        semantic is None
+                        or semantic.run_id != run_id
+                        or semantic.version.semantic_sequence != boundary[3]
+                        or semantic.version.task_revision != state.task.revision
+                        or semantic.work_status != "active"
+                    ):
+                        raise SessionConflictError("resume_task_version_changed")
+                start = conn.execute(
+                    """SELECT json_extract(data,'$.occurred_at') FROM session_events
+                    WHERE session_id=? AND json_extract(data,'$.data.kind')='input_accepted'
+                    AND json_extract(data,'$.data.run_id')=?""",
+                    (session_id, run_id),
+                ).fetchone()
+                if not start:
+                    raise SessionConflictError("resume_input_missing")
+                elapsed = max(
+                    0.0, (self._clock.now() - datetime.fromisoformat(start[0])).total_seconds()
+                )
+                remaining = min(duration, previous["limits"]["max_duration"]) - elapsed
+                if remaining <= 0 or state.model_calls >= previous["limits"]["max_model_calls"]:
+                    raise SessionConflictError("resume_budget_exhausted")
+                # 中断视图是临时终态投影。只允许最新 ordinal, 从而不会改写已被后续
+                # Run 消费的历史。索引水位额外检查, 防止破坏已建立的来源索引。
+                indexed = conn.execute(
+                    "SELECT through_ordinal FROM history_index_state WHERE session_id=?",
+                    (session_id,),
+                ).fetchone()
+                if indexed is not None and indexed[0] >= row[2]:
+                    raise SessionConflictError("resume_history_already_indexed")
+                conn.execute("DELETE FROM history_catalog WHERE run_id=?", (run_id,))
+                conn.execute("UPDATE runs SET status='running',view=NULL WHERE id=?", (run_id,))
+                conn.execute("UPDATE sessions SET active_run=? WHERE id=?", (run_id, session_id))
+                self._session_event(
+                    conn,
+                    session_id,
+                    SessionResumeClaimed(run_id=run_id, through_sequence=state.sequence),
+                )
+                return ResumeClaim(
+                    TurnClaim(run_id, row[1], row[2]),
+                    state,
+                    events,
+                    resolutions,
+                    semantic,
+                    remaining,
+                )
+
+        return await self._submit(claim)
 
     async def interrupt(self, run_id: str, reason: str = "owner_exit") -> None:
         await self._submit(lambda: self._interrupt(run_id, reason))

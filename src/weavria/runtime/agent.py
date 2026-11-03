@@ -554,7 +554,7 @@ class _AgentKernel:
         cancellation_count = owner.cancelling() if owner else 0
         run_timeout = asyncio.timeout(self._limits.max_duration)
         try:
-            if self._journal is not None:
+            if self._journal is not None and len(self._events_json) == 1:
                 async with self._commit_lock:
                     initial = ControlEvent.model_validate_json(self._events_json[0])
                     cancelled = await self._persist(initial)
@@ -2632,6 +2632,31 @@ class AgentLoop(_AgentKernel):
             finalization=finalization,
             # 完成共享内核初始化;此时实例已拥有初始状态,但尚未进入异步执行循环。
         )
+
+    def restore_decision_boundary(
+        self, events: tuple[ControlEvent, ...], resolutions: tuple[TurnResolution, ...]
+    ) -> None:
+        """重放已接受事实, 由持久化宿主确认结算边界并持有执行权后调用。"""
+        if self._journal is None or self._executed or len(self._events_json) != 1:
+            raise ValueError("restore requires a fresh durable loop")
+        state = None
+        for event in events:
+            if event.run_id != self._run_id or event.schema_version != self._journal_version:
+                raise ValueError("restore journal identity changed")
+            state = reduce_event(state, event)
+        if (
+            state is None
+            or state.phase is not Phase.READY
+            or state.task != self.state.task
+            or state.finalization is not None
+            or not resolutions
+            or resolutions[-1].observed_sequence != state.sequence
+            or resolutions[-1].stage != "execution"
+        ):
+            raise ValueError("restore requires a settled decision boundary")
+        self._state = state
+        self._events_json = [event.model_dump_json() for event in events]
+        self._resolutions_json = [resolution.model_dump_json() for resolution in resolutions]
 
     # 将 plans 暴露为只读属性,调用方不能通过该接口替换内核保存的计划集合。
     @property

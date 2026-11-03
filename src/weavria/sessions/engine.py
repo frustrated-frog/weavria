@@ -81,7 +81,13 @@ from weavria.runtime import (
     TurnPreparation,
     settle_mutation,
 )
-from weavria.tools import RegisteredTool, ToolPolicy, ToolRegistry, artifact_read_tool
+from weavria.tools import (
+    ReadOnlyPolicy,
+    RegisteredTool,
+    ToolPolicy,
+    ToolRegistry,
+    artifact_read_tool,
+)
 
 from .evidence import session_history_tool, session_source_tool
 from .preparation import (
@@ -96,7 +102,7 @@ from .preparation import (
     SessionTaskPreparationError,
     SessionTaskPreparer,
 )
-from .store import SessionBusyError, SessionConflictError, SQLiteSessionStore
+from .store import ResumeClaim, SessionBusyError, SessionConflictError, SQLiteSessionStore
 
 
 def _status_transition(snapshot: SemanticSnapshot, *, cause: str) -> SemanticTransition:
@@ -176,6 +182,7 @@ class _SessionAdapter:
         task_model_projector: TaskModelProjector | None = None,
         context_source: ContextSource | None = None,
         support_tools: tuple[RegisteredTool, ...] = (),
+        settled_records: int = 0,
     ) -> None:
         self._provider, self._budget = provider, budget
         self._store, self._run_id = store, run_id
@@ -192,7 +199,7 @@ class _SessionAdapter:
         self._clock = clock
         self._clarification_timeout = clarification_timeout_seconds
         self._clarification_plan = clarification_plan
-        self._semantic_record_count = 0
+        self._semantic_record_count = settled_records
         self._prepared: dict[int, ConversationView] = {}
         self._compiler = (
             SessionContextCompiler(
@@ -283,7 +290,9 @@ class _SessionAdapter:
         await self._store.append_revision(event, update)
 
     async def record_resolution(self, resolution: TurnResolution) -> None:
-        await self._store.record_resolution(resolution)
+        await self._store.record_resolution(
+            resolution, settled=self._semantic, settled_records=self._semantic_record_count
+        )
 
     async def prepare_turn(self, task: TaskInput) -> TurnPreparation:
         await self._refresh_semantics(task)
@@ -641,6 +650,10 @@ class _SessionAdapter:
         """将工具事实归约到工作状态;不要求配置进展评估器。"""
         self._progress_before = self._semantic
         await self._refresh_semantics(task)
+        if self._task_preparer is None:
+            self._semantic_record_count = len(
+                await self._store.run_records(self._session_id, self._run_id)
+            )
 
     async def assess_progress(
         self,
@@ -995,6 +1008,30 @@ class SessionEngine:
 
         max_duration may shorten, never extend, the configured request deadline.
         """
+        return await self._run(
+            session_id,
+            text,
+            input_id=input_id,
+            application_context=application_context,
+            clarification_id=clarification_id,
+            max_duration=max_duration,
+        )
+
+    async def resume(self, session_id: str, run_id: str) -> SessionResult:
+        """接续同一会话内最新的中断 Run, 仅限已结算的只读决策边界。"""
+        return await self._run(session_id, "", resume_run_id=run_id)
+
+    async def _run(
+        self,
+        session_id: str,
+        text: str,
+        *,
+        input_id: str | None = None,
+        application_context: tuple[ApplicationObservation, ...] = (),
+        clarification_id: str | None = None,
+        max_duration: float | None = None,
+        resume_run_id: str | None = None,
+    ) -> SessionResult:
         if self._closing:
             raise RuntimeError("session engine is closing")
         # 外层 Harness 可以缩短本次期限,不能扩大构造时的 Session 上限。
@@ -1017,8 +1054,10 @@ class SessionEngine:
         interruption_reason = "owner_exit"
         try:
             root_budget = RootBudget.start(self._clock.monotonic(), duration)
-            run_id = self._ids()
-            identity = input_id if input_id is not None else self._ids()
+            run_id = resume_run_id if resume_run_id is not None else self._ids()
+            identity = (
+                input_id if input_id is not None else self._ids() if resume_run_id is None else ""
+            )
             config = json.dumps(
                 {
                     "schema_version": (
@@ -1110,16 +1149,27 @@ class SessionEngine:
                 },
                 ensure_ascii=False,
             )
-            claim, cancelled = await settle_mutation(
-                self.store.begin(
-                    session_id,
-                    identity,
-                    run_id,
-                    text,
-                    config,
-                    application_context,
+            restored: ResumeClaim | None = None
+            if resume_run_id is None:
+                claim, cancelled = await settle_mutation(
+                    self.store.begin(
+                        session_id, identity, run_id, text, config, application_context
+                    )
                 )
-            )
+            else:
+                if any(
+                    tool.behavior != "read_only" or tool.idempotency != "replay_safe"
+                    for tool in (
+                        *self._tools.descriptors,
+                        *(t.descriptor for t in self._support_tools),
+                    )
+                ):
+                    raise SessionConflictError("resume_requires_replay_safe_reads")
+                restored, cancelled = await settle_mutation(
+                    self.store.claim_resume(session_id, run_id, config)
+                )
+                claim = restored.turn
+                root_budget = RootBudget.start(self._clock.monotonic(), restored.remaining_seconds)
             if claim.duplicate is not None:
                 if cancelled:
                     raise asyncio.CancelledError
@@ -1127,7 +1177,7 @@ class SessionEngine:
             claimed_run = claim.run_id
             if cancelled:
                 raise asyncio.CancelledError
-            task = TaskInput(goal=text)
+            task = restored.state.task if restored is not None else TaskInput(goal=text)
             task_observation = None
             selected = self._tools
             capability_epoch = 1
@@ -1135,7 +1185,15 @@ class SessionEngine:
             semantic_base = None
             planned_clarification_text: str | None = None
             clarification_plan: ClarificationDeliveryPlan | None = None
-            if self._task_preparation is not None:
+            if restored is not None:
+                semantic = restored.semantic
+                if (semantic is not None) != (self._task_preparation is not None):
+                    raise SessionConflictError("resume_semantic_snapshot_missing")
+                if semantic is not None:
+                    task_observation = semantic.observation
+                    selected = self._tools.select(semantic.visible_tool_names)
+                    capability_epoch = semantic.version.capability_epoch
+            elif self._task_preparation is not None:
                 interruption_reason = "task_preparation_failure"
                 history = await self.store.history(
                     session_id,
@@ -1238,7 +1296,9 @@ class SessionEngine:
             include_support_tools = (
                 clarification_plan is None
                 if self._support_tools
-                else self._task_preparation is None or bool(selected.descriptors)
+                else self._task_preparation is None
+                or bool(selected.descriptors)
+                or (restored is not None and any(r.artifact for r in restored.state.records))
             )
             support = (
                 (artifact_read_tool(), *extra)
@@ -1301,11 +1361,38 @@ class SessionEngine:
                 self._task_model_projector,
                 self._context_source,
                 self._support_tools,
+                settled_records=len(restored.state.records) if restored is not None else 0,
             )
+            if restored is not None:
+                policy = self._policy if self._policy is not None else ReadOnlyPolicy()
+                async with asyncio.timeout(root_budget.remaining(self._clock.monotonic())):
+                    for record in restored.state.records:
+                        action = record.exchange.action
+                        descriptor = registry.get(action.tool_name).descriptor
+                        authorization = record.authorization
+                        if (
+                            authorization is None
+                            or not authorization.allowed
+                            or authorization.tool_version != descriptor.version
+                            or descriptor.behavior != "read_only"
+                            or descriptor.idempotency != "replay_safe"
+                        ):
+                            raise SessionConflictError("resume_source_authorization_unavailable")
+                        decision = await policy.authorize(
+                            run_id, descriptor, authorization.normalized_arguments
+                        )
+                        if not decision.allowed:
+                            raise SessionConflictError("resume_source_authorization_revoked")
+                        if record.artifact is not None:
+                            snapshot = await self.store.get(run_id, record.artifact.artifact_id)
+                            if snapshot.reference != record.artifact:
+                                raise SessionConflictError("resume_source_changed")
             remaining = min(
                 self._limits.max_duration,
                 root_budget.remaining(self._clock.monotonic()),
             )
+            if restored is not None and remaining <= 0:
+                raise SessionConflictError("resume_budget_exhausted")
             run_limits = replace(
                 self._limits,
                 max_duration=max(remaining, 0.000_001),
@@ -1345,6 +1432,8 @@ class SessionEngine:
                 context_builder=adapter if self._compiler_config is not None else None,
                 context_recovery=self._recovery_limits,
             )
+            if restored is not None:
+                loop.restore_decision_boundary(restored.events, restored.resolutions)
             self._loops[session_id] = loop
             self._run_tasks[run_id] = owner
             report = await loop.execute()
