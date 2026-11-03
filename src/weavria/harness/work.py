@@ -102,6 +102,49 @@ class WorkingState(WorkContract):
         return self
 
 
+def compact_work(state: WorkingState) -> dict[str, JsonValue]:
+    """压缩模型已有的阶段摘要, 保留语义及精确引用供后续工作更新。"""
+    full = state.model_dump(mode="json")
+    raw = state.model_dump_json().encode()
+    if not state.notes or len(raw) < 512:
+        return full
+
+    # 相同 Artifact 的来源证明只交付一次。笔记仍用原来的 artifact_id/pointer,
+    # 模型可以直接回取原文, 也可以把引用原样带到下一次工作提议。
+    addresses: dict[str, JsonValue] = {}
+    for source in state.sources:
+        ref = source.artifact
+        addresses[ref.artifact_id] = {"call_id": ref.call_id, "source_sha256": ref.sha256}
+    compact: dict[str, JsonValue] = {
+        **full,
+        "schema_version": 2,
+        "strategy": "stage-summary/1",
+        "state_sha256": hashlib.sha256(raw).hexdigest(),
+        "notes": [
+            {
+                **note.model_dump(
+                    mode="json", exclude={"schema_version", "sources"}, exclude_defaults=True
+                ),
+                **(
+                    {
+                        "sources": [
+                            ref.model_dump(mode="json", exclude={"schema_version"})
+                            for ref in note.sources
+                        ]
+                    }
+                    if note.sources
+                    else {}
+                ),
+            }
+            for note in state.notes
+        ],
+        "sources": addresses,
+    }
+    encoded = json.dumps(compact, ensure_ascii=False, separators=(",", ":")).encode()
+    # 收益不足时保留原投影, 避免短任务为摘要包络付出额外成本。
+    return compact if len(encoded) + 64 <= len(raw) else full
+
+
 class WorkDraftNote(WorkContract):
     """模型负责内容与关联;省略编号时由内容摘要确定稳定编号。"""
 
@@ -125,21 +168,15 @@ class WorkDraft(WorkContract):
 def _bind_draft(draft: WorkDraft, context: ToolContext) -> WorkUpdate:
     view = context.task_view
     raw = view.progress.get("working_state") if view else None
-    state = load_work(raw) if isinstance(raw, dict) else None
-    task_revision = (
-        draft.task_revision
-        if draft.task_revision is not None
-        else state.task_revision
-        if state
-        else None
-    )
-    base_revision = (
-        draft.base_revision
-        if draft.base_revision is not None
-        else state.revision
-        if state
-        else None
-    )
+    # 两种投影共用 CAS 标识。只读取宿主随本次请求绑定的版本, 不用摘要重建状态。
+    bound_task = raw.get("task_revision") if isinstance(raw, dict) else None
+    bound_work = raw.get("revision") if isinstance(raw, dict) else None
+    task_revision = draft.task_revision
+    if task_revision is None and isinstance(bound_task, int) and type(bound_task) is int:
+        task_revision = bound_task
+    base_revision = draft.base_revision
+    if base_revision is None and isinstance(bound_work, int) and type(bound_work) is int:
+        base_revision = bound_work
     if task_revision is None or base_revision is None:
         raise ToolFault(
             ErrorCategory.INVALID_TOOL_ARGUMENTS,

@@ -279,7 +279,11 @@ class AgentHarness:
             context_recovery=RecoveryLimits(schema_version=2, retention="chain")
             if config.context_recovery
             else None,
-            task_model_projector=TaskModelViewProjector() if config.task_understanding else None,
+            task_model_projector=(
+                TaskModelViewProjector(compact_work_summary=config.context.work_summary_compaction)
+                if config.task_understanding
+                else None
+            ),
             completion=completion,
             policy=policy,
             scheduling=scheduling,
@@ -322,7 +326,9 @@ class AgentHarness:
                         "custom work selection/projection must support working records v1"
                     )
         if working_records and task_model_projector is None:
-            task_model_projector = TaskModelViewProjector()
+            task_model_projector = TaskModelViewProjector(
+                compact_work_summary=context.work_summary_compaction
+            )
         if working_set is not None and understanding is None:
             raise ValueError("capability working set requires task understanding")
         duration = (

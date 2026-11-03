@@ -18,7 +18,13 @@ from weavria.harness import (
 )
 from weavria.harness.context import project_context_focus
 from weavria.harness.understanding import task_frame_observation
-from weavria.harness.work import reduce_work, work_analysis_status, work_need_weights, work_tool
+from weavria.harness.work import (
+    compact_work,
+    reduce_work,
+    work_analysis_status,
+    work_need_weights,
+    work_tool,
+)
 from weavria.tools import ReadOnlyPolicy, ToolExecutor, ToolRegistry
 
 
@@ -130,6 +136,18 @@ async def test_findings_and_open_questions_jointly_reallocate_tools_and_context(
     await apply((finding, wrong_source))
     assert selected(state) == ("read_beta",)
     assert work_analysis_status(ledger, state)["beta"] == "analysis_pending"
+    compressed = compact_work(state)
+    assert compressed["schema_version"] == 2
+    assert compressed["sources"] == {
+        source.artifact_id: {"call_id": source.call_id, "source_sha256": source.sha256}
+    }
+    assert isinstance(compressed["notes"], list)
+    assert all(
+        isinstance(note, dict)
+        and note["sources"] == [{"artifact_id": source.artifact_id, "pointer": "/value"}]
+        for note in compressed["notes"]
+    )
+    assert compact_work(WorkingState(task_revision=1))["schema_version"] == 1
 
     issue = WorkNote(
         note_id="alpha-gap",

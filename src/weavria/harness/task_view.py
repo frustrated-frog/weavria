@@ -17,7 +17,7 @@ from weavria.core import (
 
 from .requirements import EvidenceProbe, NeedStatus, load_need_ledger
 from .understanding import load_task_frame
-from .work import MAX_WORK_BYTES, load_work, work_analysis_status
+from .work import MAX_WORK_BYTES, compact_work, load_work, work_analysis_status
 
 _GAPS = ("$freshness", "$schema", "$proof", "$scope", "$producer", "$result", "$target")
 _MAX_NUMBER = 2**63 - 1
@@ -28,6 +28,11 @@ class TaskModelViewProjector:
 
     version = "task-model-view/4"
     working_records_version = 1
+
+    def __init__(self, *, compact_work_summary: bool = False) -> None:
+        self._compact_work_summary = compact_work_summary
+        if compact_work_summary:
+            self.version = "task-model-view/5"
 
     def project(
         self,
@@ -212,7 +217,9 @@ class TaskModelViewProjector:
         if work is not None:
             if work.task_revision != task.revision:
                 raise ValueError("working projection belongs to another task revision")
-            progress_payload["working_state"] = work.model_dump(mode="json")
+            progress_payload["working_state"] = (
+                compact_work(work) if self._compact_work_summary else work.model_dump(mode="json")
+            )
         return TaskModelView(
             projector_version=self.version,
             phase=phase,

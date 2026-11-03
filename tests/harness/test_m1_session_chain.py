@@ -2,8 +2,12 @@
 
 import asyncio
 import json
+from dataclasses import replace
 from pathlib import Path
 
+import pytest
+
+from weavria.artifacts import InMemoryArtifactStore
 from weavria.context import ContextCompilerConfig
 from weavria.core import (
     FinishAction,
@@ -28,6 +32,7 @@ from weavria.harness import (
     WorkNote,
     WorkUpdate,
 )
+from weavria.harness.work import WorkProposal, work_tool
 from weavria.models import (
     FakeModelProvider,
     FakeSessionProvider,
@@ -35,7 +40,7 @@ from weavria.models import (
     OpenAICompatibleTokenCounter,
 )
 from weavria.runtime import RunLimits
-from weavria.tools import ToolRegistry
+from weavria.tools import ReadOnlyPolicy, ToolExecutor, ToolRegistry
 
 
 def config() -> HarnessConfig:
@@ -163,11 +168,22 @@ async def test_recommended_entry_clarifies_and_resumes_persisted_work(
     assert all(r.current.task_model_view is not None for r in model.requests)
 
 
+@pytest.mark.parametrize("compact", [False, True])
 async def test_recommended_entry_steering_invalidates_old_work_and_model_answer(
     tmp_path: Path,
     session_counter: OpenAICompatibleTokenCounter,
+    compact: bool,
 ) -> None:
     entered, release = asyncio.Event(), asyncio.Event()
+    notes = (
+        WorkNote(note_id="old-plan", kind="plan", summary="Check the source constraints."),
+        WorkNote(note_id="finding", kind="result", summary="The source restricts the first case."),
+        WorkNote(note_id="rejected", kind="rejected", summary="The broader reading conflicts."),
+        WorkNote(note_id="issue", kind="issue", summary="Verify whether the second case applies."),
+        WorkNote(note_id="hypothesis", kind="hypothesis", summary="The rule could be local."),
+    )
+    profile = config()
+    profile = replace(profile, context=replace(profile.context, work_summary_compaction=compact))
 
     class Model:
         capabilities = ModelCapabilities(tool_calls=True, multi_tool_calls=True)
@@ -175,16 +191,78 @@ async def test_recommended_entry_steering_invalidates_old_work_and_model_answer(
         async def generate_session(self, request: SessionRequest) -> ModelTurn:
             view = request.current.task_model_view
             assert view is not None
-            work = WorkingState.model_validate_json(json.dumps(view.progress["working_state"]))
-            if request.current.task.revision > 1:
-                assert work.task_revision == 2 and work.last_notice == "revised"
-                assert work.notes == () and work.invalidated_note_ids == ("old-plan",)
-                return ModelTurn(decision=FinishAction(output="Updated answer"))
-            if work.revision == 0:
+            payload = view.progress["working_state"]
+            assert isinstance(payload, dict)
+            if payload.get("schema_version") == 2:
+                assert compact
+                assert payload["task_revision"] == 1 and payload["revision"] == 1
+                assert payload["notes"] == [
+                    note.model_dump(mode="json", exclude={"schema_version"}, exclude_defaults=True)
+                    for note in notes
+                ]
+                assert payload["next_query"] == "Verify the second case"
+                # 同一完整模型请求只替换工作表示, 用生产计量器比较而非用字符猜 Token。
+                full = WorkingState(
+                    task_revision=1,
+                    revision=1,
+                    processed_records=1,
+                    notes=notes,
+                    next_query="Verify the second case",
+                    last_notice="accepted",
+                )
+                baseline_view = view.model_copy(
+                    update={
+                        "progress": {**view.progress, "working_state": full.model_dump(mode="json")}
+                    }
+                )
+                baseline = request.model_copy(
+                    update={
+                        "current": request.current.model_copy(
+                            update={"task_model_view": baseline_view}
+                        )
+                    }
+                )
+                assert len(request.model_dump_json().encode()) < len(
+                    baseline.model_dump_json().encode()
+                )
+                assert session_counter.count(request) < session_counter.count(baseline)
+                # 直接验收工具的版本绑定, 不要求已经建议收尾的 Runtime 再跑一个工作轮。
+                store = InMemoryArtifactStore()
+                executor = ToolExecutor(
+                    "binding", ToolRegistry((work_tool(),)), store, ReadOnlyPolicy()
+                )
+                record = await executor.execute(
+                    ToolCallAction(
+                        call_id="update",
+                        tool_name="propose_work",
+                        arguments={"next_query": "Read appendix"},
+                    ),
+                    max_duration=1,
+                    task_view=view,
+                )
+                assert record.artifact is not None
+                saved = await store.get("binding", record.artifact.artifact_id)
+                proposal = WorkProposal.model_validate_json(saved.content_json)
+                assert (proposal.update.task_revision, proposal.update.base_revision) == (1, 1)
+            else:
+                work = WorkingState.model_validate_json(json.dumps(payload))
+                if request.current.task.revision > 1:
+                    assert work.task_revision == 2 and work.last_notice == "revised"
+                    assert work.notes == () and work.invalidated_note_ids == tuple(
+                        n.note_id for n in notes
+                    )
+                    return ModelTurn(decision=FinishAction(output="Updated answer"))
+                if work.revision:
+                    assert not compact
+                    assert work.notes == notes
+                    assert work.next_query == "Verify the second case"
+
+            if payload["revision"] == 0:
                 update = WorkUpdate(
                     task_revision=1,
                     base_revision=0,
-                    notes=(WorkNote(note_id="old-plan", kind="plan", summary="Initial plan"),),
+                    notes=notes,
+                    next_query="Verify the second case",
                 )
                 return ModelTurn(
                     decision=ToolBatch(
@@ -204,7 +282,7 @@ async def test_recommended_entry_steering_invalidates_old_work_and_model_answer(
     reasoning = FakeModelProvider((declaration(direct()), declaration(direct())))
     async with AgentHarness.from_config(
         tmp_path / "session.db",
-        config=config(),
+        config=profile,
         model=Model(),
         tools=ToolRegistry(()),
         token_counter=session_counter,

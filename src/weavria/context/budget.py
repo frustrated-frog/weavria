@@ -104,10 +104,14 @@ class ContextCompilerConfig:
     max_history_spans: int = 1
     next_step_reserve_bytes: int = 4096
     extractive_compaction: bool = False
+    work_summary_compaction: bool = False
 
     def __post_init__(self) -> None:
-        if type(self.extractive_compaction) is not bool:
-            raise ValueError("extractive compaction requires a boolean switch")
+        if any(
+            type(flag) is not bool
+            for flag in (self.extractive_compaction, self.work_summary_compaction)
+        ):
+            raise ValueError("compaction switches must be booleans")
         for value in (
             self.window_tokens,
             self.output_tokens,
