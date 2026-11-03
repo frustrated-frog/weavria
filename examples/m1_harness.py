@@ -32,7 +32,6 @@ from weavria.core import (
     SessionRunEvent,
     SessionSemanticCommitted,
     ToolExchange,
-    ToolRecord,
     ToolRecorded,
     ToolSucceededObservation,
 )
@@ -43,6 +42,7 @@ from weavria.harness import (
     HarnessMemory,
     HarnessResult,
     TaskUnderstandingError,
+    WorkingState,
 )
 from weavria.memory import MemoryAccess, MemoryScope
 from weavria.models import (
@@ -212,29 +212,28 @@ def grade_output(case: Case, output: str | None, *, first: bool = False) -> dict
 
 
 class LongTaskDelivery:
-    """长任务显式要求工作记录;只检查已接受的提案, 不用评分答案。"""
+    """长任务显式要求工作记录;检查当前已提交的工作记录, 不用评分答案。"""
 
     def __init__(self, output: JsonOutputContract) -> None:
         self._output = output
-        self.version = f"long-task-delivery/2:{output.version}"
+        self.version = f"long-task-delivery/3:{output.version}"
 
-    def can_finalize(self, records: tuple[ToolRecord, ...]) -> bool:
-        for record in records:
-            action = record.exchange.action
-            if action.tool_name != "propose_work" or not isinstance(
-                record.exchange.observation, ToolSucceededObservation
-            ):
-                continue
-            notes = action.arguments.get("notes")
-            if isinstance(notes, list) and any(
-                isinstance(note, dict) and note.get("kind") == "result" and note.get("sources")
-                for note in notes
-            ):
-                return True
-        return False
+    def can_finalize_committed(self, context: CompletionContext) -> bool:
+        snapshot = context.semantic_snapshot
+        if snapshot is None or snapshot.working_state is None:
+            return False
+        work = WorkingState.model_validate_json(json.dumps(snapshot.working_state))
+        if work.task_revision != context.task.revision:
+            return False
+        # 归约后的 notes 与 sources 属于同一次更新; 被拒的工具提案不参与判定。
+        resolved = tuple(source.reference for source in work.sources)
+        return any(
+            note.kind == "result" and note.sources and all(ref in resolved for ref in note.sources)
+            for note in work.notes
+        )
 
     async def verify(self, context: CompletionContext) -> CompletionDecision:
-        if not self.can_finalize(context.records):
+        if not self.can_finalize_committed(context):
             return CompletionRepair(
                 issue_codes=("work_record_missing",),
                 guidance="The request asks for working notes. Record a sourced finding via "

@@ -88,6 +88,7 @@ from weavria.core import (
     RunReport,
     RunStarted,
     RunStatus,
+    SemanticSnapshot,
     TaskDirective,
     TaskInput,
     TaskObservation,
@@ -128,12 +129,14 @@ from weavria.tools import (
 )
 
 from .completion import (
+    CommittedFinalizationPrerequisite,
     CompletionCheckError,
     CompletionContext,
     CompletionPolicy,
     FinalizationPrerequisite,
     NoVerification,
     check_completion,
+    finalization_prerequisites_met,
 )
 from .controller import (
     FinalizationPreparer,
@@ -408,6 +411,7 @@ class _AgentKernel:
             else None
         )
         self._semantic_state: dict[str, JsonValue] | None = None
+        self._semantic_snapshot: SemanticSnapshot | None = None
         self._journal_failed = False
         self._commit_lock = asyncio.Lock()
         self._clock = clock if clock is not None else SystemClock()
@@ -999,15 +1003,7 @@ class _AgentKernel:
             manifest = ContextCompilation.model_validate_json(
                 plan.compilation_json
             ).delivery_manifest
-        context = CompletionContext(
-            self._run_id,
-            task,
-            FinishAction(output="Readiness assessment"),
-            self.state.records,
-            self._artifacts,
-            self._task_observation,
-            self._semantic_state,
-        )
+        context = self._completion_context(task, FinishAction(output="Readiness assessment"))
         try:
             async with asyncio.timeout(self._limits.max_completion_duration):
                 return await self._finalization_policy.assess(
@@ -1024,6 +1020,8 @@ class _AgentKernel:
         assert self._finalization_policy is not None
         existing = self.state.finalization
         before = await self._assess_finalization(task)
+        if task.revision != self.state.task.revision:
+            return None
         reserve_reached = (
             force_reserve
             or self._limits.max_model_calls - self.state.model_calls
@@ -1034,12 +1032,18 @@ class _AgentKernel:
         if existing is None and not before.eligible and not reserve_reached and not tool_budget:
             return await self._build_context(task)
         # 已知还需执行工具的发布义务不能交给仅允许 Finish 的收尾阶段。
-        if isinstance(self._completion, FinalizationPrerequisite) and not (
-            self._completion.can_finalize(self.state.records)
+        if isinstance(
+            self._completion, (CommittedFinalizationPrerequisite, FinalizationPrerequisite)
         ):
-            if existing is None and not reserve_reached and not tool_budget:
-                return await self._build_context(task)
-            return None
+            readiness = self._completion_context(task, FinishAction(output="Readiness assessment"))
+            try:
+                ready = finalization_prerequisites_met(self._completion, readiness)
+            finally:
+                readiness.close()
+            if not ready:
+                if existing is None and not reserve_reached and not tool_budget:
+                    return await self._build_context(task)
+                return None
         known = {record.exchange.action.call_id for record in self.state.records}
         required = tuple(identity for identity in before.required_call_ids if identity in known)
         plan = await self._build_context(task, finalizing=True, required_call_ids=required)
@@ -1378,6 +1382,16 @@ class _AgentKernel:
         self._semantic_state = (
             TypeAdapter(dict[str, JsonValue]).validate_python(prepared.semantic_state, strict=True)
             if prepared.semantic_state is not None
+            else None
+        )
+        snapshot = prepared.semantic_snapshot
+        if snapshot is not None and (
+            snapshot.run_id != self._run_id or snapshot.version.task_revision != task.revision
+        ):
+            raise ValueError("turn semantics belong to another run or task revision")
+        self._semantic_snapshot = (
+            SemanticSnapshot.model_validate_json(snapshot.model_dump_json())
+            if snapshot is not None
             else None
         )
         if prepared.visible_tool_names is None:
@@ -2032,16 +2046,15 @@ class _AgentKernel:
             self._progress.record_admission(progress)
         return accepted, progress.action_identities if progress is not None else ()
 
-    async def _verify_completion(
-        self, candidate: FinishAction, deadline: float
-    ) -> CompletionAssessment | None:
-        task = self.state.task
-        version = self._completion.version
-        if not await self._accept(
-            VerificationStarted(policy_version=version), expected_revision=self.state.model_revision
-        ):
-            return None
-        context = CompletionContext(
+    def _completion_context(
+        self,
+        task: TaskInput,
+        candidate: FinishAction,
+        *,
+        finalization: FinalizationStarted | None = None,
+    ) -> CompletionContext:
+        current = self._prepared_task_revision == task.revision
+        return CompletionContext(
             self._run_id,
             task,
             candidate,
@@ -2051,9 +2064,21 @@ class _AgentKernel:
             if self._task_observation is not None
             and self._task_observation.task_revision == task.revision
             else None,
-            self._semantic_state,
-            self.state.finalization,
+            self._semantic_state if current else None,
+            finalization,
+            semantic_snapshot=self._semantic_snapshot if current else None,
         )
+
+    async def _verify_completion(
+        self, candidate: FinishAction, deadline: float
+    ) -> CompletionAssessment | None:
+        task = self.state.task
+        version = self._completion.version
+        if not await self._accept(
+            VerificationStarted(policy_version=version), expected_revision=self.state.model_revision
+        ):
+            return None
+        context = self._completion_context(task, candidate, finalization=self.state.finalization)
         assessment = await check_completion(
             self._completion,
             version,

@@ -395,6 +395,7 @@ class _SessionAdapter:
                 else None
             ),
             semantic_state=(self._semantic.need_ledger if self._semantic is not None else None),
+            semantic_snapshot=self._semantic,
         )
 
     async def plan_recovery(

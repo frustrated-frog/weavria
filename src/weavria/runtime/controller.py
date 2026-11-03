@@ -13,6 +13,7 @@ from weavria.core import (
     ModelTurn,
     ProgressAssessment,
     RecoverContext,
+    SemanticSnapshot,
     TaskDirective,
     TaskInput,
     TaskObservation,
@@ -31,6 +32,7 @@ class TurnPreparation:
     capability_epoch: int | None = None
     task_observation: TaskObservation | None = None
     semantic_state: dict[str, JsonValue] | None = None
+    semantic_snapshot: SemanticSnapshot | None = None
 
 
 class TurnPreparer(Protocol):

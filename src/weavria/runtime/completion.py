@@ -18,6 +18,7 @@ from weavria.core import (
     FinalizationStarted,
     FinishAction,
     RunError,
+    SemanticSnapshot,
     TaskInput,
     TaskObservation,
     ToolRecord,
@@ -38,6 +39,8 @@ class CompletionContext:
         task_observation: TaskObservation | None = None,
         semantic_state: dict[str, JsonValue] | None = None,
         finalization: FinalizationStarted | None = None,
+        *,
+        semantic_snapshot: SemanticSnapshot | None = None,
     ) -> None:
         if finalization is not None and finalization.task_revision != task.revision:
             raise ValueError("finalization belongs to another task revision")
@@ -56,6 +59,14 @@ class CompletionContext:
             TypeAdapter(dict[str, JsonValue]).validate_python(semantic_state, strict=True)
             if semantic_state is not None
             else None
+        )
+        if semantic_snapshot is not None and (
+            semantic_snapshot.run_id != run_id
+            or semantic_snapshot.version.task_revision != task.revision
+        ):
+            raise ValueError("committed semantics belong to another run or task revision")
+        self._semantic_snapshot_json = (
+            semantic_snapshot.model_dump_json() if semantic_snapshot is not None else None
         )
         self._records = tuple(ToolRecord.model_validate(r).model_dump_json() for r in records)
         self._references = {
@@ -106,6 +117,15 @@ class CompletionContext:
         return TypeAdapter(dict[str, JsonValue]).validate_python(self._semantic_state, strict=True)
 
     @property
+    def semantic_snapshot(self) -> SemanticSnapshot | None:
+        """Return an independent copy of the revision-bound committed semantic head."""
+        return (
+            SemanticSnapshot.model_validate_json(self._semantic_snapshot_json)
+            if self._semantic_snapshot_json is not None
+            else None
+        )
+
+    @property
     def evidence_call_ids(self) -> tuple[str, ...]:
         return tuple(self._reads)
 
@@ -147,6 +167,20 @@ class FinalizationPrerequisite(Protocol):
     def can_finalize(self, records: tuple[ToolRecord, ...]) -> bool: ...
 
 
+@runtime_checkable
+class CommittedFinalizationPrerequisite(Protocol):
+    """A publication condition evaluated against the current committed task state."""
+
+    def can_finalize_committed(self, context: CompletionContext) -> bool: ...
+
+
+def finalization_prerequisites_met(policy: CompletionPolicy, context: CompletionContext) -> bool:
+    # 新策略可以检查已归约状态; 原有仅依赖工具记录的策略仍按其原契约运行。
+    if isinstance(policy, CommittedFinalizationPrerequisite):
+        return policy.can_finalize_committed(context)
+    return not isinstance(policy, FinalizationPrerequisite) or policy.can_finalize(context.records)
+
+
 class NoVerification:
     """No supplied acceptance criterion means the candidate cannot be verified."""
 
@@ -170,6 +204,11 @@ class LayeredCompletionPolicy:
             for policy in (self._required, self._extension)
             if isinstance(policy, FinalizationPrerequisite)
         )
+
+    def can_finalize_committed(self, context: CompletionContext) -> bool:
+        return finalization_prerequisites_met(
+            self._required, context
+        ) and finalization_prerequisites_met(self._extension, context)
 
     async def verify(self, context: CompletionContext) -> CompletionDecision:
         adapter = TypeAdapter[CompletionDecision](CompletionDecision)

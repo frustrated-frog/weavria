@@ -706,3 +706,144 @@ async def test_whole_file_work_reference_keeps_original_path_without_fabricated_
     source = WorkProposal.model_validate_json(saved.content_json).sources[0]
     assert source.source_label == path
     assert source.reference.start is None and source.reference.end is None
+
+
+@pytest.mark.parametrize("mode", ["accepted", "stale_revision", "unknown_need", "revised"])
+async def test_finalization_requires_a_current_committed_finding(
+    tmp_path: Path, session_counter: OpenAICompatibleTokenCounter, mode: str
+) -> None:
+    import asyncio
+
+    from examples.m1_harness import LongTaskDelivery
+    from weavria.core import CompletionChecked, CompletionRepair, FinalizationStarted
+    from weavria.runtime import JsonOutputContract
+
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def short_read(arguments: Input, context: ToolContext) -> Output:
+        return Output(value="Original evidence")
+
+    class Understanding(Interpreter):
+        async def interpret(
+            self, request: TaskUnderstandingInput, *, max_duration: float
+        ) -> TaskSpecification:
+            if request.task.revision == 2:
+                return TaskSpecification(
+                    route="direct",
+                    intent="Answer revised request",
+                    goal=request.task.goal,
+                    completion_criteria=(
+                        CompletionCriterion(kind="response", description="Answer"),
+                    ),
+                )
+            return await super().interpret(request, max_duration=max_duration)
+
+    class Model(FakeSessionProvider):
+        calls = 0
+
+        async def generate_session(self, request: SessionRequest) -> ModelTurn:
+            self.calls += 1
+            if self.calls == 1:
+                return ModelTurn(
+                    decision=ToolBatch(
+                        calls=(
+                            ToolCallAction(
+                                call_id="source",
+                                tool_name="read_document",
+                                arguments={"key": "manual"},
+                            ),
+                        )
+                    )
+                )
+            if self.calls == 2:
+                source = next(
+                    item for item in request.current.history if isinstance(item, ToolExchange)
+                )
+                assert isinstance(source.observation, ToolSucceededObservation)
+                value = source.observation.output
+                assert isinstance(value, dict) and isinstance(value["artifact_id"], str)
+                update = WorkUpdate(
+                    task_revision=1,
+                    base_revision=1 if mode == "stale_revision" else 0,
+                    notes=(
+                        WorkNote(
+                            note_id="result",
+                            kind="result",
+                            summary="Found the original",
+                            need_ids=("unknown",) if mode == "unknown_need" else (),
+                            sources=(
+                                WorkReference(artifact_id=value["artifact_id"], pointer="/value"),
+                            ),
+                        ),
+                    ),
+                )
+                return ModelTurn(
+                    decision=ToolBatch(
+                        calls=(
+                            ToolCallAction(
+                                call_id="work",
+                                tool_name="propose_work",
+                                arguments=update.model_dump(mode="json"),
+                            ),
+                        )
+                    )
+                )
+            if mode == "revised" and request.current.task.revision == 1:
+                entered.set()
+                await release.wait()
+            return ModelTurn(decision=FinishAction(output='{"answer":"done"}'))
+
+    model = Model(())
+    async with AgentHarness(
+        tmp_path / "committed-work.db",
+        model=model,
+        tools=ToolRegistry(
+            (
+                TypedTool(
+                    name="read_document",
+                    version="1",
+                    description="Read a source",
+                    input_type=Input,
+                    output_type=Output,
+                    execute=short_read,
+                ),
+            )
+        ),
+        context=ContextCompilerConfig(window_tokens=128000, output_tokens=256),
+        token_counter=session_counter,
+        understanding=TaskUnderstandingEngine(Understanding()),
+        working_records=True,
+        completion=LongTaskDelivery(JsonOutputContract({"answer": "string"})),
+        limits=RunLimits(
+            max_request_bytes=128000,
+            max_model_calls=5 if mode == "revised" else 3,
+            finalization_model_calls=1,
+        ),
+    ) as harness:
+        await harness.create("s")
+        if mode == "revised":
+            async with asyncio.TaskGroup() as group:
+                send = group.create_task(harness.send("s", "Read a source and record findings"))
+                await asyncio.wait_for(entered.wait(), timeout=3)
+                await harness.steer("s", "Change the goal and keep a current finding")
+                release.set()
+            result = send.result()
+        else:
+            result = await harness.send("s", "Read a source and record findings")
+        records = await harness.sessions.store.run_records("s", result.session.run_id)
+        proposal = next(r for r in records if r.exchange.action.call_id == "work")
+        assert isinstance(proposal.exchange.observation, ToolSucceededObservation)
+        events = await harness.sessions.store.events("s")
+    data = [event.data.event.data for event in events if isinstance(event.data, SessionRunEvent)]
+    if mode == "accepted":
+        assert result.session.report.status is RunStatus.COMPLETED
+        assert any(isinstance(item, FinalizationStarted) for item in data)
+    else:
+        assert result.session.report.status is RunStatus.BUDGET_EXHAUSTED
+        assert all(not isinstance(item, FinalizationStarted) for item in data)
+    if mode == "revised":
+        repairs = [item.assessment.decision for item in data if isinstance(item, CompletionChecked)]
+        assert any(
+            isinstance(repair, CompletionRepair) and repair.issue_codes == ("work_record_missing",)
+            for repair in repairs
+        )

@@ -3,6 +3,7 @@
 from .agent import AgentLoop, AgentRun, Clock, LegacyAgentLoop, RunLimits, SystemClock
 from .budget import RootBudget
 from .completion import (
+    CommittedFinalizationPrerequisite,
     CompletionContext,
     CompletionPolicy,
     FinalizationPrerequisite,
@@ -64,6 +65,7 @@ __all__ = [
     "AgentRun",
     "AllowAllActionInterventionPolicy",
     "Clock",
+    "CommittedFinalizationPrerequisite",
     "CompletionContext",
     "CompletionPolicy",
     "EventAcceptanceError",
