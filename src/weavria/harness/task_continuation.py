@@ -4,7 +4,7 @@ import json
 import uuid
 from typing import Literal
 
-from pydantic import JsonValue
+from pydantic import JsonValue, ValidationError
 
 from weavria.artifacts import ArtifactSnapshot
 from weavria.core import ApplicationObservation, ToolRecord
@@ -16,7 +16,17 @@ from weavria.sessions import (
     TaskRun,
     TaskVersion,
 )
-from weavria.tools import ReadOnlyPolicy, ToolPolicy, ToolRegistry
+from weavria.tools import (
+    ArtifactReadInput,
+    ArtifactReadOutput,
+    ReadOnlyPolicy,
+    ToolFault,
+    ToolPolicy,
+    ToolRegistry,
+    artifact_read_tool,
+    project_artifact_page,
+    task_artifact_read_tool,
+)
 
 from .continuation_evidence import reconcile_evidence, requirement_digest
 from .requirements import load_need_ledger
@@ -65,13 +75,16 @@ class TaskContinuation:
             await self._authorize(access, task_id, source.session_id, "read")
         return version
 
-    async def _source(self, run: TaskRun, record: ToolRecord) -> ArtifactSnapshot:
-        ref = record.artifact
+    async def _authorize_source(self, run: TaskRun, record: ToolRecord) -> None:
         auth = record.authorization
         name = record.exchange.action.tool_name
         # 工作提议的原文只作为模型笔记投影。其他框架读工具可能间接携带
         # 不在本任务授权链上的历史, 因此整个接续需要显式的业务工具边界。
-        if name not in {d.name for d in self._tools.descriptors} or auth is None or ref is None:
+        if (
+            name not in {d.name for d in self._tools.descriptors}
+            or auth is None
+            or record.artifact is None
+        ):
             raise PermissionError("task_source_authorization_unavailable")
         descriptor = self._tools.get(name).descriptor
         if (
@@ -84,10 +97,56 @@ class TaskContinuation:
         decision = await self._policy.authorize(run.run_id, descriptor, auth.normalized_arguments)
         if not decision.allowed:
             raise PermissionError("task_source_authorization_revoked")
+
+    async def _source(self, run: TaskRun, record: ToolRecord) -> ArtifactSnapshot:
+        await self._authorize_source(run, record)
+        ref = record.artifact
+        assert ref is not None
         snapshot = await self._engine.store.get(run.run_id, ref.artifact_id)
         if snapshot.reference != ref:
             raise SessionConflictError("task_source_changed")
         return snapshot
+
+    async def _validate_page(
+        self,
+        run: TaskRun,
+        record: ToolRecord,
+        roots: dict[str, tuple[TaskRun, ToolRecord, ArtifactSnapshot]],
+    ) -> None:
+        """分页是原始来源的派生视图, 不能成为独立授权或消耗来源配额。"""
+        name = record.exchange.action.tool_name
+        auth, ref = record.authorization, record.artifact
+        if auth is None or ref is None or not auth.allowed:
+            raise PermissionError("task_page_authorization_unavailable")
+        local = name == "read_artifact"
+        descriptor = (
+            artifact_read_tool().descriptor
+            if local
+            else task_artifact_read_tool(self._unbound_read).descriptor
+        )
+        if auth.tool_version != descriptor.version:
+            raise PermissionError("task_page_version_changed")
+        try:
+            args = ArtifactReadInput.model_validate(auth.normalized_arguments)
+            source = roots.get(args.artifact_id)
+            if source is None:
+                raise PermissionError("task_page_source_outside_lineage")
+            origin, parent, snapshot = source
+            if local and (
+                origin != run or parent.exchange.action.call_id not in record.dependencies
+            ):
+                raise PermissionError("task_page_dependency_unavailable")
+            if not local and origin == run:
+                raise PermissionError("task_page_source_not_inherited")
+            page = await self._engine.store.get(run.run_id, ref.artifact_id)
+            actual = ArtifactReadOutput.model_validate_json(page.content_json)
+            if page.reference != ref or actual != project_artifact_page(snapshot, args):
+                raise PermissionError("task_page_source_mismatch")
+        except (ValidationError, ToolFault, ValueError) as exc:
+            raise PermissionError("task_page_source_mismatch") from exc
+
+    async def _unbound_read(self, artifact_id: str) -> ArtifactSnapshot:
+        raise PermissionError("task_artifact_not_granted")
 
     async def read_artifact(
         self,
@@ -132,11 +191,20 @@ class TaskContinuation:
         latest = await store.task_semantic(latest_run)
         sources: list[JsonValue] = []
         artifacts: dict[str, ArtifactSnapshot] = {}
+        roots: dict[str, tuple[TaskRun, ToolRecord, ArtifactSnapshot]] = {}
+        registered = {item.name for item in self._tools.descriptors}
+        if "read_task_source" in registered:
+            raise SessionConflictError("task_source_tool_name_reserved")
         for run in version.runs:
             for record in await store.run_records(run.session_id, run.run_id):
                 if record.artifact is None or record.exchange.action.tool_name == "propose_work":
                     continue
+                name = record.exchange.action.tool_name
+                if name in {"read_artifact", "read_task_source"} and name not in registered:
+                    await self._validate_page(run, record, roots)
+                    continue
                 source = await self._source(run, record)
+                roots[source.reference.artifact_id] = (run, record, source)
                 if len(sources) >= 12:
                     raise SessionConflictError("task_source_capacity")
                 if source.reference.size_bytes <= 1536:
@@ -183,6 +251,11 @@ class TaskContinuation:
                 "Recheck time-sensitive data."
             ),
         }
+        needs_source_tool = any(
+            snapshot.reference.size_bytes > 1536 for _, _, snapshot in roots.values()
+        )
+        if needs_source_tool:
+            payload["source_read_tool"] = "read_task_source"
         if evidence_reconciliation:
             payload["reconciliation_guidance"] = (
                 "Reuse assessments bind historical coverage to source addresses. "
@@ -201,8 +274,27 @@ class TaskContinuation:
             else "task-continuation/1",
             payload=payload,
         )
+
+        async def read_inherited(artifact_id: str) -> ArtifactSnapshot:
+            await self._authorize(access, task_id, session_id, "read")
+            origin = roots.get(artifact_id)
+            if origin is None:
+                raise PermissionError("task_artifact_not_granted")
+            run, record, _ = origin
+            # 新成果可能依赖早期 Run 的分页。读取期间重新校验整个有界来源链,
+            # 防止通过后续成果间接读回刚被撤回的上游资料。
+            for inherited in version.runs:
+                await self._authorize(access, task_id, inherited.session_id, "read")
+            for parent_run, parent_record, _ in roots.values():
+                if parent_record != record or parent_run != run:
+                    await self._authorize_source(parent_run, parent_record)
+            return await self._source(run, record)
+
         result = await self._engine.continue_task(
-            session_id, authoritative_task.model_copy(update={"revision": 1}), observation
+            session_id,
+            authoritative_task.model_copy(update={"revision": 1}),
+            observation,
+            source_tool=task_artifact_read_tool(read_inherited) if needs_source_tool else None,
         )
         # 两个只读分支允许独立完成, 但只有仍持有同一任务版本的一支能推进任务头。
         await self._authorize(access, task_id, session_id, "read")

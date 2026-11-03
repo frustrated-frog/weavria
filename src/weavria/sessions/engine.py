@@ -1022,7 +1022,12 @@ class SessionEngine:
         return await self._run(session_id, "", resume_run_id=run_id)
 
     async def continue_task(
-        self, session_id: str, task: TaskInput, observation: ApplicationObservation
+        self,
+        session_id: str,
+        task: TaskInput,
+        observation: ApplicationObservation,
+        *,
+        source_tool: RegisteredTool | None = None,
     ) -> SessionResult:
         """由已授权的 Harness 传入原目标及跨会话来源投影。"""
         if self._task_preparation is None or self._task_model_projector is None:
@@ -1033,6 +1038,7 @@ class SessionEngine:
             input_id=observation.input_id,
             application_context=(observation,),
             original_task=task,
+            source_tool=source_tool,
         )
 
     async def _run(
@@ -1046,7 +1052,9 @@ class SessionEngine:
         max_duration: float | None = None,
         resume_run_id: str | None = None,
         original_task: TaskInput | None = None,
+        source_tool: RegisteredTool | None = None,
     ) -> SessionResult:
+        support_tools = (*self._support_tools, source_tool) if source_tool else self._support_tools
         if self._closing:
             raise RuntimeError("session engine is closing")
         # 外层 Harness 可以缩短本次期限,不能扩大构造时的 Session 上限。
@@ -1124,10 +1132,8 @@ class SessionEngine:
                     + "."
                     + type(self._model).__qualname__,
                     "model_capabilities": asdict(self._model.capabilities),
-                    "session_tools_version": "3" if self._support_tools else "2",
-                    "support_tools": [
-                        t.descriptor.model_dump(mode="json") for t in self._support_tools
-                    ],
+                    "session_tools_version": "3" if support_tools else "2",
+                    "support_tools": [t.descriptor.model_dump(mode="json") for t in support_tools],
                     "session_lifecycle_version": "2",
                     "limits": asdict(self._limits),
                     "max_request_duration": duration,
@@ -1176,7 +1182,7 @@ class SessionEngine:
                     tool.behavior != "read_only" or tool.idempotency != "replay_safe"
                     for tool in (
                         *self._tools.descriptors,
-                        *(t.descriptor for t in self._support_tools),
+                        *(t.descriptor for t in support_tools),
                     )
                 ):
                     raise SessionConflictError("resume_requires_replay_safe_reads")
@@ -1316,7 +1322,7 @@ class SessionEngine:
             registered = tuple(self._tools.get(d.name) for d in self._tools.descriptors)
             include_support_tools = (
                 clarification_plan is None
-                if self._support_tools
+                if support_tools
                 else self._task_preparation is None
                 or bool(selected.descriptors)
                 or (restored is not None and any(r.artifact for r in restored.state.records))
@@ -1326,7 +1332,7 @@ class SessionEngine:
                 if not any(d.name == "read_artifact" for d in self._tools.descriptors)
                 else extra
             )
-            registry = ToolRegistry((*registered, *support, *self._support_tools))
+            registry = ToolRegistry((*registered, *support, *support_tools))
             visible_tool_names = tuple(d.name for d in selected.descriptors)
             if include_support_tools:
                 visible_tool_names = (
@@ -1336,7 +1342,7 @@ class SessionEngine:
             if clarification_plan is None:
                 visible_tool_names = (
                     *visible_tool_names,
-                    *(t.descriptor.name for t in self._support_tools),
+                    *(t.descriptor.name for t in support_tools),
                 )
             run_instructions = self._instructions
             if planned_clarification_text is not None:
@@ -1381,7 +1387,7 @@ class SessionEngine:
                 self._recovery_limits,
                 self._task_model_projector,
                 self._context_source,
-                self._support_tools,
+                support_tools,
                 settled_records=len(restored.state.records) if restored is not None else 0,
             )
             if restored is not None:

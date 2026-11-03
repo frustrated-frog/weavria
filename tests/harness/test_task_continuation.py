@@ -15,6 +15,8 @@ from weavria.core import (
     SessionRequest,
     ToolBatch,
     ToolCallAction,
+    ToolExchange,
+    ToolSucceededObservation,
 )
 from weavria.harness import (
     AgentHarness,
@@ -92,9 +94,11 @@ def interpretation(tool: str) -> ModelResponse:
     )
 
 
-@pytest.mark.parametrize("reconciliation", [False, True])
+@pytest.mark.parametrize(
+    ("reconciliation", "paged"), [(False, False), (True, False), (False, True)]
+)
 async def test_new_sessions_reuse_accepted_result_and_cannot_overwrite_task_head(
-    tmp_path: Path, session_counter: OpenAICompatibleTokenCounter, reconciliation: bool
+    tmp_path: Path, session_counter: OpenAICompatibleTokenCounter, reconciliation: bool, paged: bool
 ) -> None:
     calls: list[str] = []
     both_reading = asyncio.Event()
@@ -102,7 +106,7 @@ async def test_new_sessions_reuse_accepted_result_and_cannot_overwrite_task_head
 
     async def alpha(args: Empty, context: ToolContext) -> Value:
         calls.append("alpha")
-        return Value(value="alpha allows 10")
+        return Value(value="alpha allows 10" + (" supplemental" * 250 if paged else ""))
 
     async def beta(args: Empty, context: ToolContext) -> Value:
         calls.append("beta")
@@ -139,10 +143,23 @@ async def test_new_sessions_reuse_accepted_result_and_cannot_overwrite_task_head
                 assert isinstance(sources, list)
                 source = sources[0]
                 assert isinstance(source, dict)
-                assert source["content"] == {"value": "alpha allows 10"}
+                assert len(sources) == 1
+                assert source["content"] == (None if paged else {"value": "alpha allows 10"})
                 reference = source["reference"]
                 assert isinstance(reference, dict)
-                if request.current.feedback is not None:
+                feedback = request.current.feedback
+                if feedback is not None:
+                    if paged and feedback.calls[0].call_id == "inherited-page":
+                        assert "alpha allows 10" in request.current.model_dump_json()
+                        return ModelTurn(
+                            decision=ToolBatch(
+                                calls=(
+                                    ToolCallAction(
+                                        call_id="read", tool_name="read_beta", arguments={}
+                                    ),
+                                )
+                            )
+                        )
                     return ModelTurn(
                         decision=FinishAction(output=f"{reference['artifact_id']}: 10 vs 20")
                     )
@@ -150,9 +167,47 @@ async def test_new_sessions_reuse_accepted_result_and_cannot_overwrite_task_head
                 if continuation_count == 2:
                     both_reading.set()
                 await both_reading.wait()
+                if paged:
+                    return ModelTurn(
+                        decision=ToolBatch(
+                            calls=(
+                                ToolCallAction(
+                                    call_id="inherited-page",
+                                    tool_name="read_task_source",
+                                    arguments={
+                                        "artifact_id": reference["artifact_id"],
+                                        "pointer": "/value",
+                                        "length": 100,
+                                    },
+                                ),
+                            )
+                        )
+                    )
                 tool = "read_beta"
             else:
-                if request.current.feedback is not None:
+                feedback = request.current.feedback
+                if feedback is not None:
+                    if paged and feedback.calls[0].call_id == "read":
+                        exchange = request.current.history[0]
+                        assert isinstance(exchange, ToolExchange)
+                        archive = exchange.observation
+                        assert isinstance(archive, ToolSucceededObservation)
+                        assert isinstance(archive.output, dict)
+                        return ModelTurn(
+                            decision=ToolBatch(
+                                calls=(
+                                    ToolCallAction(
+                                        call_id="local-page",
+                                        tool_name="read_artifact",
+                                        arguments={
+                                            "artifact_id": archive.output["artifact_id"],
+                                            "pointer": "/value",
+                                            "length": 100,
+                                        },
+                                    ),
+                                )
+                            )
+                        )
                     return ModelTurn(decision=FinishAction(output="Alpha documented, beta pending"))
                 tool = "read_alpha"
             return ModelTurn(
@@ -198,7 +253,12 @@ async def test_new_sessions_reuse_accepted_result_and_cannot_overwrite_task_head
             await harness.create(session)
         initial = await harness.send("a", "Compare two public documents")
         task = await harness.register_task("compare", "a", initial.session.run_id, access=access)
-        (old,) = await harness.sessions.store.run_records("a", initial.session.run_id)
+        records = await harness.sessions.store.run_records("a", initial.session.run_id)
+        assert len(records) == (2 if paged else 1), initial.session.report
+        old = records[0]
+        if paged:
+            assert records[1].exchange.action.tool_name == "read_artifact"
+            assert records[1].artifact is not None
         ref = old.artifact
         assert ref is not None
         denied = Access({"b"})
@@ -251,7 +311,9 @@ async def test_new_sessions_reuse_accepted_result_and_cannot_overwrite_task_head
             ref.artifact_id,
             access=access,
         )
-        assert source.value == {"value": "alpha allows 10"}
+        assert source.value == {
+            "value": "alpha allows 10" + (" supplemental" * 250 if paged else "")
+        }
         policy.revoked = True
         with pytest.raises(PermissionError, match="task_source_authorization_revoked"):
             await harness.read_task_artifact(

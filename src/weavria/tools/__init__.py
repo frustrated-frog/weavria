@@ -4,7 +4,9 @@ from .artifact_read import (
     ArtifactReadInput,
     ArtifactReadOutput,
     artifact_read_tool,
+    project_artifact_page,
     resolve_pointer,
+    task_artifact_read_tool,
 )
 from .execution import (
     PolicyDecision,
@@ -39,5 +41,7 @@ __all__ = [
     "TypedTool",
     "artifact_read_tool",
     "model_schema_view",
+    "project_artifact_page",
     "resolve_pointer",
+    "task_artifact_read_tool",
 ]

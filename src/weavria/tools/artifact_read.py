@@ -1,9 +1,11 @@
 """Bounded Artifact recovery with RFC 6901 addressing and structured pagination."""
 
+from collections.abc import Awaitable, Callable
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, TypeAdapter
 
+from weavria.artifacts import ArtifactSnapshot
 from weavria.artifacts import resolve_pointer as resolve_pointer
 from weavria.core import ErrorCategory, FeedbackBounds
 
@@ -57,9 +59,17 @@ _PAGE = TypeAdapter(tuple[ArtifactPageItem, ...])
 
 
 async def _read(arguments: ArtifactReadInput, context: ToolContext) -> ArtifactReadOutput:
-    page = await _read_page(arguments, context)
-    # 下一页仍指向原始 Artifact,不会误把响应包络 /data/value 当成原文路径。
-    # start 是字符/子项游标,与本次 payload 的字节数无关。
+    return project_artifact_page(await context.read_artifact(arguments.artifact_id), arguments)
+
+
+def project_artifact_page(
+    snapshot: ArtifactSnapshot, arguments: ArtifactReadInput
+) -> ArtifactReadOutput:
+    """同一原文和分页参数产生同一结果, 供运行时读取与历史来源复核使用。"""
+    if snapshot.reference.artifact_id != arguments.artifact_id:
+        raise ValueError("artifact page identity differs from its source")
+    page = _project_page(snapshot, arguments)
+    # 下一页仍指向原始 Artifact,不会误把响应包络当成原文路径。
     if page.has_more:
         return page.model_copy(
             update={"next_read": arguments.model_copy(update={"start": page.end})}
@@ -67,8 +77,7 @@ async def _read(arguments: ArtifactReadInput, context: ToolContext) -> ArtifactR
     return page
 
 
-async def _read_page(arguments: ArtifactReadInput, context: ToolContext) -> ArtifactReadOutput:
-    snapshot = await context.read_artifact(arguments.artifact_id)
+def _project_page(snapshot: ArtifactSnapshot, arguments: ArtifactReadInput) -> ArtifactReadOutput:
     try:
         value = resolve_pointer(snapshot.value, arguments.pointer)
     except (KeyError, IndexError, ValueError) as exc:
@@ -274,6 +283,33 @@ def artifact_read_tool() -> TypedTool[ArtifactReadInput, ArtifactReadOutput]:
         input_type=ArtifactReadInput,
         output_type=ArtifactReadOutput,
         execute=_read,
+        context_paths=("",),
+        feedback_delivery="complete",
+        feedback_bound_version="artifact-read-output/2",
+        feedback_data_bound=_feedback_data_bound,
+        feedback_page_parameter="length",
+    )
+
+
+def task_artifact_read_tool(
+    read: Callable[[str], Awaitable[ArtifactSnapshot]],
+) -> TypedTool[ArtifactReadInput, ArtifactReadOutput]:
+    """复用原文分页契约, 来源读取由当前任务的授权闭包负责。"""
+
+    async def execute(arguments: ArtifactReadInput, context: ToolContext) -> ArtifactReadOutput:
+        try:
+            snapshot = await read(arguments.artifact_id)
+        except PermissionError as exc:
+            raise ToolFault(ErrorCategory.POLICY_DENIED, "Task source access denied") from exc
+        return project_artifact_page(snapshot, arguments)
+
+    return TypedTool(
+        name="read_task_source",
+        version="1",
+        description="Read an inherited task Artifact by ID and JSON Pointer with bounded pages.",
+        input_type=ArtifactReadInput,
+        output_type=ArtifactReadOutput,
+        execute=execute,
         context_paths=("",),
         feedback_delivery="complete",
         feedback_bound_version="artifact-read-output/2",

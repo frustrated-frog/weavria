@@ -1134,6 +1134,10 @@ class SQLiteSessionStore:
                 duration = min(
                     previous.pop("max_request_duration"), current.pop("max_request_duration")
                 )
+                # 澄清关联已随原输入和语义转换接受;恢复不会重新解释原请求。
+                # 此字段是请求身份, 不是可以从新调用的默认参数推导的运行配置。
+                previous.pop("clarification_id", None)
+                current.pop("clarification_id", None)
                 if previous != current:
                     raise SessionConflictError("resume_configuration_changed")
                 events = tuple(

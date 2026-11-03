@@ -115,13 +115,18 @@ async def semantic_main():
     async def crash_at_commit(self,resolution,**kwargs):
         await original_record(self,resolution,**kwargs)
         if resolution.stage=='execution': os._exit(73)
-    if point=='semantic-boundary':
+    if point in ('semantic-boundary', 'semantic-clarification-boundary'):
         SQLiteSessionStore.record_resolution=crash_at_commit
     class SemanticProvider:
         capabilities=ModelCapabilities(True,True)
         async def generate_session(self,request):
+            if point=='semantic-clarification-boundary' and request.current.task.revision==1:
+                return ModelTurn(decision=FinishAction(output='Which language?'))
             work=request.current.task_model_view.progress['working_state']
-            if point=='semantic-resume':
+            if point in ('semantic-resume','semantic-clarification-resume'):
+                if point=='semantic-clarification-resume':
+                    assert request.current.task.revision==2
+
                 assert work['revision']==1 and work['notes'][0]['summary']=='Check second case'
                 return ModelTurn(decision=FinishAction(output='resumed with working state'))
             assert work['revision']==0
@@ -130,24 +135,57 @@ async def semantic_main():
                     'notes':[{'kind':'plan','summary':'Check second case'}]}),)))
     spec=TaskSpecification(route='direct',intent='Answer',goal='Explain',
         completion_criteria=(CompletionCriterion(kind='response',description='Answer'),))
-    reply=ModelResponse(action=ToolCallAction(
-        call_id='interpret',tool_name='declare_task_specification',arguments=spec.model_dump(mode='json')))
-    reasoning=FakeModelProvider((reply,) if point=='semantic-boundary' else ())
+    def declare(specification):
+        return ModelResponse(action=ToolCallAction(
+            call_id='interpret',tool_name='declare_task_specification',
+            arguments=specification.model_dump(mode='json')))
+    if point=='semantic-clarification-boundary':
+        from weavria.harness import (
+            ClarificationAnswerOption, ClarificationQuestionCandidate, ClarificationResolution,
+            IntentHypothesis, IntentUncertainty,
+        )
+        ambiguity='Language unspecified'
+        choices=('chinese','english')
+        clarify=TaskSpecification(route='clarify',intent='Clarify',goal='Ask language',
+            ambiguities=(ambiguity,),
+            completion_criteria=(CompletionCriterion(kind='clarification',description='Ask'),),
+            uncertainty=IntentUncertainty(
+                hypotheses=tuple(IntentHypothesis(hypothesis_id=n,interpretation=n,
+                    intended_route='direct',outcome_key=n,support_weight=50) for n in choices),
+                candidate_questions=(ClarificationQuestionCandidate(question_id='language',
+                    question_text='Which language?',target_ambiguities=(ambiguity,),
+                    answer_options=tuple(ClarificationAnswerOption(answer_id=n,label=n,
+                        hypothesis_ids=(n,)) for n in choices)),)))
+        resolved=spec.model_copy(update={
+            'clarification_resolution':ClarificationResolution(
+                question_id='language',answer_id='chinese'),
+            'resolved_outcome_key':'chinese',
+        })
+        reasoning=FakeModelProvider((declare(clarify),declare(resolved)))
+    else:
+        reasoning=FakeModelProvider((declare(spec),) if point=='semantic-boundary' else ())
     counter=OpenAICompatibleTokenCounter(
         OpenAICompatibleConfig(model='fake',max_output_tokens=256,context_window_tokens=64000),
         encoding='cl100k_base')
     profile=HarnessConfig(configuration_id='resume-test/1',working_records=True,
         context=ContextCompilerConfig(window_tokens=64000,output_tokens=256),
-        limits=RunLimits(max_request_bytes=64000))
+        limits=RunLimits(max_request_bytes=64001 if point=='semantic-clarification-changed'
+                         else 64000))
     async with AgentHarness.from_config(Path(sys.argv[1]),config=profile,
             model=SemanticProvider(),tools=ToolRegistry(()),token_counter=counter,
             reasoning_model=reasoning,reasoning_counter=counter) as harness:
         if point=='semantic-boundary':
             await harness.create('s')
             await harness.send('s','Explain the rule',input_id='original')
+        elif point=='semantic-clarification-boundary':
+            await harness.create('s')
+            await harness.send('s','Explain the rule',input_id='original')
+            head,=await harness.sessions.store.pending_clarifications('s')
+            await harness.send('s','Chinese',input_id='answer',
+                               clarification_id=head.pending_clarification.clarification_id)
         else:
-            old,=await harness.sessions.store.history('s')
-            if point=='semantic-conflict':
+            old=(await harness.sessions.store.history('s'))[-1]
+            if point in ('semantic-conflict','semantic-clarification-changed'):
                 from weavria.sessions import SessionConflictError
                 try:
                     await harness.resume('s',old.run_id)
@@ -215,6 +253,12 @@ async def test_reopen_preserves_exact_acceptance_boundary_after_process_death(
     [
         ("boundary", "resume", ""),
         ("semantic-boundary", "semantic-resume", ""),
+        ("semantic-clarification-boundary", "semantic-clarification-resume", ""),
+        (
+            "semantic-clarification-boundary",
+            "semantic-clarification-changed",
+            "resume_configuration_changed",
+        ),
         ("semantic-boundary", "semantic-conflict", "resume_task_version_changed"),
         ("tool", "resume-unsafe", "resume_unsafe_boundary"),
         ("artifact", "resume-unsafe", "resume_unsafe_boundary"),
