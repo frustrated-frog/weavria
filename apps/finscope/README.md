@@ -1,8 +1,9 @@
 # FinScope Agent 适配器
 
 本目录是独立应用适配器，不属于 Weavria Core、Runtime 或 Harness。它通过 FinScope
-已有的只读 HTTP API 获取工作区数据，使用公开 `TaskAwareSessionPreparer`、
-`SessionEngine`、`TypedTool` 和 `CompletionPolicy` 运行多轮 Agent，并通过本地 HTTP API
+已有的只读 HTTP API 获取工作区数据，通过 `AgentHarness.from_config` 运行多轮 Agent。
+应用提供数据工具、访问与发现策略、领域证据配置和回答验收，Harness 负责组装任务理解、
+覆盖审计、证据归约、历史检索与原文恢复。Sidecar 通过本地 HTTP API
 向 FinScope 返回结构化结果。用户界面由 FinScope 原生组件负责。
 
 FinScope 可以在不启动本 sidecar 时独立运行；Weavria 核心测试也不依赖 FinScope。金融
@@ -86,8 +87,9 @@ Agent 执行时间。任务理解阶段另有 180 秒上限；两阶段受二者
 [ADR 0054](../../docs/decisions/0054-统一请求计量与反馈前缀预算.md)。
 
 启动成功时，日志输出 `FinScope effective runtime configuration` JSON，包含调用与时间上限、
-两阶段推理设置、上下文配置、接入类型、策略版本和 `sha256`。同一摘要保存在新 Run 的
-`runs.config.configuration_metadata` 中，配置版本为 5；重复 `input_id` 继续返回原 Run 与原配置。
+两阶段推理设置、上下文配置、Harness 配置标识和 `sha256`。同一摘要保存在新 Run 的
+`runs.config.configuration_metadata` 中。检索、恢复及装配后的策略版本由框架写入同一 Run 的配置。
+重复 `input_id` 继续返回原 Run 与原配置。
 摘要按明确字段名单构造，排除密钥、URL 和本地路径，不进入模型请求或用户回答。指纹用于比较
 宿主声明的运行设置，不能替代源码版本、任务数据、模型服务版本或成果核验；注入 Provider 时，
 记录其类型，不探查其内部设置。实现和故障验证见

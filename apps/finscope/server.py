@@ -12,22 +12,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from weavria.context import (
-    ContextCompilerConfig,
-    HistoryRetrievalConfig,
-    ModelRequestContextCompiler,
-    ModelRequestContextConfig,
-)
-from weavria.core import ApplicationObservation, CompletionUnverifiable, RecoveryLimits
-from weavria.harness import (
-    CapabilityResolver,
-    EvidenceResolver,
-    ModelRequirementCoverageValidator,
-    ModelTaskInterpreter,
-    TaskAwareSessionPreparer,
-    TaskUnderstandingEngine,
-    TaskUnderstandingError,
-)
+from weavria.context import ContextCompilerConfig, ModelRequestContextConfig
+from weavria.core import ApplicationObservation, CompletionUnverifiable
+from weavria.harness import AgentHarness, HarnessConfig, HarnessEvidence, TaskUnderstandingError
 from weavria.models.openai_compatible import (
     OpenAICompatibleConfig,
     OpenAICompatibleProvider,
@@ -36,7 +23,7 @@ from weavria.models.openai_compatible import (
 )
 from weavria.models.provider import ModelProvider, SessionModelProvider
 from weavria.runtime import RunLimits, TaskModelProjector
-from weavria.sessions import SessionConflictError, SessionEngine
+from weavria.sessions import SessionConflictError
 from weavria.tools import ToolRegistry
 
 from .completion import (
@@ -122,11 +109,9 @@ class MessageOutput(BaseModel):
 
 
 class _Runtime:
-    def __init__(
-        self,
-        engine: SessionEngine,
-    ) -> None:
-        self.engine = engine
+    def __init__(self, harness: AgentHarness) -> None:
+        self.harness = harness
+        self.engine = harness.sessions
 
 
 def create_app(
@@ -225,49 +210,14 @@ def create_app(
             understanding_model_config,
             encoding=resolved.context_encoding,
         )
-        understanding_context = ModelRequestContextCompiler(
-            ModelRequestContextConfig(
-                window_tokens=resolved.context_window_tokens,
-                output_tokens=resolved.understanding_model_max_output_tokens,
-                max_request_bytes=min(
-                    resolved.run_max_request_bytes,
-                    resolved.model_max_request_bytes or resolved.run_max_request_bytes,
-                ),
-                max_history_bytes=8_000,
-                max_history_entries=16,
-            ),
-            understanding_counter,
-        )
-        task_interpreter = ModelTaskInterpreter(
-            active_interpreter,
-            context_compiler=understanding_context,
-        )
-        task_preparer = TaskAwareSessionPreparer(
-            TaskUnderstandingEngine(
-                task_interpreter,
-                coverage_validator=(
-                    ModelRequirementCoverageValidator(
-                        active_interpreter,
-                        context_compiler=understanding_context,
-                    )
-                    if requirement_coverage
-                    else None
-                ),
-                coverage_repairer=task_interpreter if requirement_coverage else None,
-                evidence_profiles=(
-                    (
-                        market_pulse_evidence_profile(),
-                        *finscope_workspace_evidence_profiles(),
-                    )
-                    if use_evidence_guidance
-                    else ()
-                ),
-                max_duration=resolved.understanding_max_duration_seconds,
-            ),
-            evidence=EvidenceResolver(
-                (MarketPulseEvidenceExtractor(), FinScopeWorkspaceEvidenceExtractor())
-            ),
-            capabilities=CapabilityResolver(policy=access_policy),
+        assert active_interpreter is not None
+        evidence = HarnessEvidence(
+            profiles=(market_pulse_evidence_profile(), *finscope_workspace_evidence_profiles())
+            if use_evidence_guidance
+            else (),
+            extractors=(MarketPulseEvidenceExtractor(), FinScopeWorkspaceEvidenceExtractor()),
+            discovery_policy=access_policy,
+            audit_requirements=requirement_coverage,
         )
         limits = RunLimits(
             max_model_calls=resolved.run_max_model_calls,
@@ -284,52 +234,59 @@ def create_app(
             window_tokens=resolved.context_window_tokens,
             output_tokens=resolved.model_max_output_tokens,
         )
-        history = HistoryRetrievalConfig()
-        recovery = RecoveryLimits()
+        config = HarnessConfig(
+            configuration_id="finscope",
+            context=context,
+            limits=limits,
+            preparation_max_duration=resolved.understanding_max_duration_seconds,
+            max_request_duration=(
+                resolved.understanding_max_duration_seconds + resolved.run_max_duration_seconds
+            ),
+            project_task_view=task_model_projector is not None,
+        )
         answer_policy = FinScopeAnswerPolicy()
         profile = build_runtime_profile(
             resolved,
             limits=limits,
             context=context,
-            history=history,
-            recovery=recovery,
             completion_version=answer_policy.version,
-            finalization_version=task_preparer.finalization_policy.version,
             execution_provider=f"{type(active_provider).__module__}.{type(active_provider).__qualname__}",
             understanding_provider=(
                 f"{type(active_interpreter).__module__}.{type(active_interpreter).__qualname__}"
             ),
             token_counter_version=token_counter.version,
-            task_preparation_version=task_preparer.version,
             requirement_coverage=requirement_coverage,
             evidence_guidance=use_evidence_guidance,
             task_model_projector_version=(
                 task_model_projector.version if task_model_projector is not None else None
             ),
+            harness_configuration_id=config.configuration_id,
         )
-        engine = SessionEngine(
+        harness = AgentHarness.from_config(
             resolved.state_path,
+            config=config,
             model=active_provider,
             tools=tools,
             instructions=_instructions(),
-            limits=limits,
-            max_request_duration=(
-                resolved.understanding_max_duration_seconds + resolved.run_max_duration_seconds
-            ),
             completion=answer_policy,
             policy=access_policy,
-            history_budget_bytes=8_000,
-            task_preparation=task_preparer,
-            configuration_metadata=profile,
-            context_compiler=context,
             token_counter=token_counter,
-            history_retrieval=history,
-            context_recovery=recovery,
-            # 显式实验注入沿用 Runtime 的通用投影端口,应用默认仍发送完整状态。
+            reasoning_model=active_interpreter,
+            reasoning_counter=understanding_counter,
+            evidence=evidence,
+            preparation_context=ModelRequestContextConfig(
+                window_tokens=resolved.context_window_tokens,
+                output_tokens=understanding_counter.output_tokens,
+                max_request_bytes=min(
+                    resolved.run_max_request_bytes,
+                    resolved.model_max_request_bytes or resolved.run_max_request_bytes,
+                ),
+            ),
             task_model_projector=task_model_projector,
+            configuration_metadata=profile,
         )
-        await engine.__aenter__()
-        app.state.runtime = _Runtime(engine)
+        await harness.__aenter__()
+        app.state.runtime = _Runtime(harness)
         try:
             logging.getLogger("uvicorn.error").info(
                 "FinScope effective runtime configuration: %s",
@@ -337,7 +294,7 @@ def create_app(
             )
             yield
         finally:
-            await engine.close()
+            await harness.close()
             if created_transport is not None:
                 await created_transport.aclose()
             if created_market is not None:
@@ -387,7 +344,7 @@ def create_app(
     @app.post("/api/sessions", response_model=SessionCreated, status_code=201)
     async def create_session(request: Request) -> SessionCreated:
         runtime = _runtime(request)
-        return SessionCreated(session_id=await runtime.engine.create())
+        return SessionCreated(session_id=await runtime.harness.create())
 
     @app.post("/api/sessions/{session_id}/messages", response_model=MessageOutput)
     async def send_message(
@@ -397,21 +354,23 @@ def create_app(
     ) -> MessageOutput:
         runtime = _runtime(request)
         try:
-            result = await runtime.engine.send(
-                session_id,
-                payload.text.strip(),
-                input_id=payload.input_id,
-                application_context=(
-                    ApplicationObservation(
-                        observation_id=f"page-{payload.input_id}",
-                        input_id=payload.input_id,
-                        provider="finscope",
-                        payload_schema="finscope.page-context/1",
-                        payload=payload.context.model_dump(mode="json"),
+            result = (
+                await runtime.harness.send(
+                    session_id,
+                    payload.text.strip(),
+                    input_id=payload.input_id,
+                    application_context=(
+                        ApplicationObservation(
+                            observation_id=f"page-{payload.input_id}",
+                            input_id=payload.input_id,
+                            provider="finscope",
+                            payload_schema="finscope.page-context/1",
+                            payload=payload.context.model_dump(mode="json"),
+                        ),
                     ),
-                ),
-                clarification_id=payload.clarification_id,
-            )
+                    clarification_id=payload.clarification_id,
+                )
+            ).session
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="session not found") from exc
         turn = await runtime.engine.store.turn(session_id, result.run_id)

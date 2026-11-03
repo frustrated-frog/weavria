@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Self
 
+from pydantic import JsonValue
+
 from weavria.artifacts import ArtifactSnapshot
 from weavria.context import (
     ContextCompilerConfig,
@@ -36,7 +38,9 @@ from weavria.sessions import (
 )
 from weavria.tools import ToolPolicy, ToolRegistry
 
+from .capabilities import CapabilityDiscoveryPolicy, CapabilityResolver
 from .configuration import HarnessConfig
+from .coverage import CapabilityEvidenceProfile, ModelRequirementCoverageValidator
 from .memory_admission import ConservativeMemoryAdmission, MemoryFormationError
 from .memory_context import MemoryContextSource
 from .memory_features import MemoryReviewFeatureProvider, MemoryReviewFeatures
@@ -44,12 +48,23 @@ from .memory_formation import MemoryExtractor, MemoryFormationEngine, MemoryRevi
 from .memory_generation import MemoryGenerationPolicy
 from .memory_models import ModelMemoryExtractor, ModelMemoryReviewer
 from .memory_session import SessionMemoryBinding, SessionMemoryIngestor
+from .requirements import EvidenceExtractor, EvidenceResolver
 from .session import TaskAwareSessionPreparer
 from .task_continuation import TaskContinuation
 from .task_view import TaskModelViewProjector
 from .understanding import ModelTaskInterpreter, TaskUnderstandingEngine
 from .work import work_tool
 from .working_set import AdaptiveCapabilityPolicy, CapabilityWorkingSetPolicy
+
+
+@dataclass(frozen=True)
+class HarnessEvidence:
+    """声明应用证据与发现策略, 由统一入口组装理解、审计和归约。"""
+
+    profiles: tuple[CapabilityEvidenceProfile, ...] = ()
+    extractors: tuple[EvidenceExtractor, ...] = ()
+    discovery_policy: CapabilityDiscoveryPolicy | None = None
+    audit_requirements: bool = False
 
 
 @dataclass(frozen=True)
@@ -210,6 +225,10 @@ class AgentHarness:
         token_counter: SessionTokenCounter,
         reasoning_model: ModelProvider | None = None,
         reasoning_counter: ModelRequestTokenCounter | None = None,
+        evidence: HarnessEvidence | None = None,
+        preparation_context: ModelRequestContextConfig | None = None,
+        task_model_projector: TaskModelProjector | None = None,
+        configuration_metadata: dict[str, JsonValue] | None = None,
         memory: HarnessMemory | None = None,
         memory_model: ModelProvider | None = None,
         instructions: str = "",
@@ -221,9 +240,17 @@ class AgentHarness:
 
         reasoning_model 供任务理解使用,也是未单独指定 memory_model 时的形成
         模型。模型连接和匹配的计量器由宿主提供,框架不猜测供应商或认证信息。
-        高级组件替换仍使用底层构造函数,本入口不混合两套配置来源。
+        evidence 声明应用证据和发现约束; 审计复用理解模型及其独立预算。
         """
         understanding = None
+        if not config.task_understanding and (
+            evidence is not None or preparation_context is not None
+        ):
+            raise ValueError("evidence and preparation context require task understanding")
+        if task_model_projector is not None and not (
+            config.task_understanding and config.project_task_view
+        ):
+            raise ValueError("custom task projector requires an enabled task view")
         if config.task_understanding:
             if reasoning_model is None or reasoning_counter is None:
                 raise ValueError("task understanding requires reasoning model and counter")
@@ -231,21 +258,28 @@ class AgentHarness:
                 raise ValueError("task understanding requires structured tool-call capability")
             # 显式采用调用方提供的窗口作为两种模型角色的共同允许窗口。
             # 准备角色输出上限用自己的计量器,不会复制执行模型的输出额度。
-            preparation_context = ModelRequestContextConfig(
+            preparation_context = preparation_context or ModelRequestContextConfig(
                 window_tokens=config.context.window_tokens,
                 output_tokens=reasoning_counter.output_tokens,
                 safety_tokens=config.context.safety_tokens,
                 max_request_bytes=config.limits.max_request_bytes,
                 max_history_bytes=min(8000, config.limits.max_request_bytes),
             )
+            compiler = ModelRequestContextCompiler(
+                counter=reasoning_counter,
+                config=preparation_context,
+            )
+            interpreter = ModelTaskInterpreter(reasoning_model, context_compiler=compiler)
+            audit = evidence is not None and evidence.audit_requirements
             understanding = TaskUnderstandingEngine(
-                ModelTaskInterpreter(
-                    reasoning_model,
-                    context_compiler=ModelRequestContextCompiler(
-                        counter=reasoning_counter,
-                        config=preparation_context,
-                    ),
+                interpreter,
+                coverage_validator=(
+                    ModelRequirementCoverageValidator(reasoning_model, context_compiler=compiler)
+                    if audit
+                    else None
                 ),
+                coverage_repairer=interpreter if audit else None,
+                evidence_profiles=evidence.profiles if evidence is not None else (),
                 max_duration=config.preparation_max_duration,
             )
         if memory is not None and (memory.extractor is not None or memory.admission is not None):
@@ -283,6 +317,8 @@ class AgentHarness:
             max_request_duration=config.max_request_duration,
             memory_catchup_fraction=config.memory_catchup_fraction,
             understanding=understanding,
+            evidence_extractors=evidence.extractors if evidence is not None else (),
+            discovery_policy=evidence.discovery_policy if evidence is not None else None,
             working_records=config.working_records,
             memory=memory,
             history_retrieval=HistoryRetrievalConfig() if config.history_retrieval else None,
@@ -290,14 +326,18 @@ class AgentHarness:
             if config.context_recovery
             else None,
             task_model_projector=(
-                TaskModelViewProjector(compact_work_summary=config.context.work_summary_compaction)
-                if config.task_understanding
+                task_model_projector
+                or TaskModelViewProjector(
+                    compact_work_summary=config.context.work_summary_compaction
+                )
+                if config.task_understanding and config.project_task_view
                 else None
             ),
             completion=completion,
             policy=policy,
             scheduling=scheduling,
             configuration_id=config.configuration_id,
+            configuration_metadata=configuration_metadata,
         )
 
     def __init__(
@@ -314,6 +354,8 @@ class AgentHarness:
         memory_catchup_fraction: float = 0.1,
         completion: CompletionPolicy | None = None,
         understanding: TaskUnderstandingEngine | None = None,
+        evidence_extractors: tuple[EvidenceExtractor, ...] = (),
+        discovery_policy: CapabilityDiscoveryPolicy | None = None,
         working_records: bool = False,
         working_set: CapabilityWorkingSetPolicy | None = None,
         memory: HarnessMemory | None = None,
@@ -323,6 +365,7 @@ class AgentHarness:
         policy: ToolPolicy | None = None,
         scheduling: ToolScheduling | None = None,
         configuration_id: str | None = None,
+        configuration_metadata: dict[str, JsonValue] | None = None,
     ) -> None:
         if working_records and understanding is None:
             raise ValueError("working records require task understanding")
@@ -381,6 +424,10 @@ class AgentHarness:
             token_counter=token_counter,
             task_preparation=TaskAwareSessionPreparer(
                 understanding,
+                evidence=EvidenceResolver(evidence_extractors) if evidence_extractors else None,
+                capabilities=CapabilityResolver(policy=discovery_policy)
+                if discovery_policy
+                else None,
                 working_set=working_set or AdaptiveCapabilityPolicy(),
                 working_records=working_records,
             )
@@ -393,7 +440,9 @@ class AgentHarness:
             task_model_projector=task_model_projector,
             policy=policy,
             scheduling=scheduling,
-            configuration_metadata={
+            configuration_metadata=configuration_metadata
+            if configuration_metadata is not None
+            else {
                 "harness_version": "unified-harness/8",
                 "configuration_id": configuration_id,
                 "working_records": working_records,

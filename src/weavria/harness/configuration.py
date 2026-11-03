@@ -27,12 +27,14 @@ class HarnessConfig:
     preparation_max_duration: float = 30
     max_request_duration: float | None = None
     memory_catchup_fraction: float = 0.1
+    project_task_view: bool = True
 
     def __post_init__(self) -> None:
         if not self.configuration_id.strip() or len(self.configuration_id) > 128:
             raise ValueError("configuration ID must be nonblank and at most 128 characters")
         for enabled in (
             self.task_understanding,
+            self.project_task_view,
             self.history_retrieval,
             self.context_recovery,
             self.working_records,
@@ -41,6 +43,8 @@ class HarnessConfig:
                 raise ValueError("Harness feature switches must be booleans")
         if self.working_records and not self.task_understanding:
             raise ValueError("working records require task understanding")
+        if self.working_records and not self.project_task_view:
+            raise ValueError("working records require task model projection")
         if self.memory_write not in {"off", "basic", "fact_sets", "conditions"}:
             raise ValueError("unknown memory write profile")
         for duration in (self.preparation_max_duration, self.max_request_duration):

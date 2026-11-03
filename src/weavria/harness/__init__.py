@@ -8,7 +8,13 @@ from weavria.sessions import (
 )
 
 from .agent import TaskAwareAgent, TaskAwareExecution
-from .assembly import AgentHarness, HarnessMemory, HarnessResult, MemoryUpdateReport
+from .assembly import (
+    AgentHarness,
+    HarnessEvidence,
+    HarnessMemory,
+    HarnessResult,
+    MemoryUpdateReport,
+)
 from .capabilities import (
     BM25CapabilityRetriever,
     CapabilityCandidate,
@@ -200,6 +206,7 @@ __all__ = [
     "EvidenceTargetBinding",
     "EvidenceTargetRule",
     "HarnessConfig",
+    "HarnessEvidence",
     "HarnessMemory",
     "HarnessResult",
     "InformationNeed",
