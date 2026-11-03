@@ -1145,9 +1145,6 @@ class SessionEngine:
                 input_id if input_id is not None else self._ids() if resume_run_id is None else ""
             )
             retrieval_config = self._retrieval_config
-            if retrieval_config is not None and await self.store.is_fork(session_id):
-                # 分叉首版使用统一的有界历史窗口, 避免索引只召回本地轮次而漏掉快照。
-                retrieval_config = None
             config = json.dumps(
                 {
                     "schema_version": (
@@ -1253,9 +1250,24 @@ class SessionEngine:
                     )
                 ):
                     raise SessionConflictError("resume_requires_replay_safe_reads")
+                legacy_fork_config = None
+                if retrieval_config is not None:
+                    legacy = json.loads(config)
+                    legacy.pop("history_retrieval")
+                    assert self._compiler_config is not None
+                    if (
+                        legacy["schema_version"] == 3
+                        and self._compiler_config.max_history_spans == 1
+                    ):
+                        legacy["schema_version"] = 2
+                    legacy_fork_config = json.dumps(legacy)
                 restored, cancelled = await settle_mutation(
-                    self.store.claim_resume(session_id, run_id, config)
+                    self.store.claim_resume(
+                        session_id, run_id, config, legacy_fork_config=legacy_fork_config
+                    )
                 )
+                if restored.legacy_fork_history:
+                    retrieval_config = None
                 claim = restored.turn
                 root_budget = RootBudget.start(self._clock.monotonic(), restored.remaining_seconds)
             if claim.duplicate is not None:

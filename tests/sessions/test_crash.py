@@ -24,6 +24,7 @@ from weavria.sessions import SessionEngine, SQLiteSessionStore
 from weavria.tools import PolicyDecision, ToolRegistry, TypedTool
 from weavria.runtime import SystemClock
 point=sys.argv[2]
+crash_fork=False
 class In(BaseModel):
     value: str
 class Out(BaseModel):
@@ -43,7 +44,7 @@ class CrashStore(SQLiteSessionStore):
         return snapshot
     async def record_resolution(self,resolution,**kwargs):
         await super().record_resolution(resolution,**kwargs)
-        if point=='boundary' and resolution.stage=='execution': os._exit(73)
+        if (point=='boundary' or crash_fork) and resolution.stage=='execution': os._exit(73)
     async def append(self,event):
         await super().append(event)
         if point=='finish' and isinstance(event.data,RunEnded): os._exit(73)
@@ -65,15 +66,41 @@ class ExpiredClock(SystemClock):
     def now(self):
         return super().now()+timedelta(days=1)
 async def main():
+    global crash_fork
+    config={}
+    if point.startswith('fork-'):
+        from weavria.context import ContextCompilerConfig, HistoryRetrievalConfig
+        from weavria.models import OpenAICompatibleConfig, OpenAICompatibleTokenCounter
+        config={
+            'context_compiler': ContextCompilerConfig(window_tokens=32000,output_tokens=256),
+            'token_counter': OpenAICompatibleTokenCounter(
+                OpenAICompatibleConfig(model='fixture',max_output_tokens=256),
+                encoding='cl100k_base'),
+            'history_retrieval': HistoryRetrievalConfig() if point=='fork-resume' else None,
+        }
     tool=TypedTool(name='produce',version='1',description='produce evidence',
                    input_type=In,output_type=Out,execute=produce)
     engine=SessionEngine(Path(sys.argv[1]),model=Provider(),
                          tools=ToolRegistry((tool,)),
                          clock=ExpiredClock() if point=='resume-expired' else None,
-                         policy=Revoked() if point=='resume-revoked' else None)
+                         policy=Revoked() if point=='resume-revoked' else None, **config)
     engine.store=CrashStore(Path(sys.argv[1]), clock=engine._clock)
     async with engine:
-        if point.startswith('resume'):
+        if point=='fork-boundary':
+            await engine.create('s')
+            parent=await engine.send('s','parent')
+            await engine.store.fork('s',parent.run_id,'fork')
+            crash_fork=True
+            await engine.send('fork','child')
+        elif point=='fork-resume':
+            old=(await engine.store.history('fork'))[-1]
+            assert old.status=='interrupted'
+            result=await engine.resume('fork',old.run_id)
+            assert result.report.output=='actual answer'
+            facts=[e.data.event.data.kind for e in await engine.store.events('fork')
+                   if e.data.kind=='run_event']
+            assert facts.count('tool_started')==1 and facts.count('model_started')==2
+        elif point.startswith('resume'):
             old, = await engine.store.history('s')
             if point=='resume':
                 a,b=await asyncio.gather(engine.resume('s',old.run_id),
@@ -252,6 +279,7 @@ async def test_reopen_preserves_exact_acceptance_boundary_after_process_death(
     ("crash", "resume", "reason"),
     [
         ("boundary", "resume", ""),
+        ("fork-boundary", "fork-resume", ""),
         ("semantic-boundary", "semantic-resume", ""),
         ("semantic-clarification-boundary", "semantic-clarification-resume", ""),
         (

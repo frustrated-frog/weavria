@@ -24,12 +24,13 @@ from weavria.core import (
 )
 
 from .history_index import (
-    MODEL_VISIBLE_RUN_PREDICATE,
+    HISTORY_VISIBLE_PREDICATE,
     HistoryIndexError,
     HistoryLimit,
     HistoryWork,
     catch_up_index,
     digest,
+    history_view,
     index_state,
 )
 
@@ -104,9 +105,9 @@ class _Search:
                 f"""SELECT COUNT(*) FROM history_postings t
                     JOIN history_passages p ON p.id=t.passage_id
                     JOIN history_sources s ON s.session_id=p.session_id AND s.source_id=p.source_id
-                    JOIN history_catalog c ON c.run_id=s.run_id
+                    JOIN history_catalog c ON c.session_id=s.session_id AND c.run_id=s.run_id
                     JOIN runs r ON r.id=s.run_id
-                    WHERE {MODEL_VISIBLE_RUN_PREDICATE}
+                    WHERE {HISTORY_VISIBLE_PREDICATE}
                     AND t.session_id=? AND t.term=? AND c.ordinal<?
                     AND c.accepted_sequence<=?""",
                 (self.session_id, term, self.before, self.sequence),
@@ -123,9 +124,9 @@ class _Search:
                     s.field,s.update_id,s.sha256,p.start,p.end FROM history_postings t
                     JOIN history_passages p ON p.id=t.passage_id
                     JOIN history_sources s ON s.session_id=p.session_id AND s.source_id=p.source_id
-                    JOIN history_catalog c ON c.run_id=s.run_id
+                    JOIN history_catalog c ON c.session_id=s.session_id AND c.run_id=s.run_id
                     JOIN runs r ON r.id=s.run_id
-                    WHERE {MODEL_VISIBLE_RUN_PREDICATE}
+                    WHERE {HISTORY_VISIBLE_PREDICATE}
                     AND t.session_id=? AND t.term=? AND c.ordinal<?
                     AND c.accepted_sequence<=?
                     ORDER BY t.passage_id LIMIT ?""",
@@ -216,7 +217,7 @@ def search_history(
         row[0]
         for row in conn.execute(
             f"""SELECT c.run_id FROM history_catalog c JOIN runs r ON r.id=c.run_id
-                WHERE {MODEL_VISIBLE_RUN_PREDICATE}
+                WHERE {HISTORY_VISIBLE_PREDICATE}
                 AND c.session_id=? AND c.ordinal<? AND c.accepted_sequence<=?
                 ORDER BY c.ordinal DESC LIMIT ?""",
             (
@@ -247,7 +248,7 @@ def search_history(
         row = conn.execute(
             f"""SELECT c.view_sha256,c.size_bytes FROM history_catalog c
                 JOIN runs r ON r.id=c.run_id
-                WHERE {MODEL_VISIBLE_RUN_PREDICATE}
+                WHERE {HISTORY_VISIBLE_PREDICATE}
                 AND c.session_id=? AND c.run_id=?""",
             (session_id, run),
         ).fetchone()
@@ -261,9 +262,7 @@ def search_history(
                 )
             stop, search_complete = "candidate_budget", False
             continue
-        encoded = conn.execute("SELECT view FROM runs WHERE id=?", (run,)).fetchone()[0]
-        if encoded is None or digest(encoded) != expected:
-            raise HistoryIndexError("retrieval candidate differs from its accepted projection")
+        encoded = history_view(conn, session_id, run, expected)
         used += size
         turns.append((ConversationTurn.model_validate_json(encoded), encoded, expected))
     turns.sort(key=lambda entry: entry[0].ordinal)
@@ -350,7 +349,7 @@ def _resolve_anchors(
                     ON o.run_id=a.run_id AND o.artifact_id=a.id
                     JOIN history_catalog c ON c.run_id=o.run_id
                     JOIN runs r ON r.id=o.run_id
-                    WHERE {MODEL_VISIBLE_RUN_PREDICATE}
+                    WHERE {HISTORY_VISIBLE_PREDICATE} AND c.inherited_view IS NULL
                     AND c.session_id=? AND c.ordinal<? AND c.accepted_sequence<=?
                     AND o.run_id=? AND o.call_id=?""",
                 (session_id, before, sequence, anchor.run_id, anchor.call_id),

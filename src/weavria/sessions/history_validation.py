@@ -13,7 +13,7 @@ from weavria.core import (
     TextExcerpt,
 )
 
-from .history_index import HistoryIndexError, digest
+from .history_index import HistoryIndexError, digest, history_view
 
 
 def validate_history_request(
@@ -49,10 +49,8 @@ def validate_history_request(
         candidate = candidates.get(item.run_id)
         if candidate is None:
             raise HistoryIndexError("delivered history was not a retrieval candidate")
-        row = conn.execute("SELECT view FROM runs WHERE id=?", (item.run_id,)).fetchone()
-        if row is None or row[0] is None or digest(row[0]) != candidate.view_sha256:
-            raise HistoryIndexError("delivered history differs from its accepted original")
-        validate_history_item(ConversationTurn.model_validate_json(row[0]), item)
+        encoded = history_view(conn, session_id, item.run_id, candidate.view_sha256)
+        validate_history_item(ConversationTurn.model_validate_json(encoded), item)
 
 
 def validate_history_item(turn: ConversationTurn, item: ConversationItem) -> None:

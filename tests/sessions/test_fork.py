@@ -1,17 +1,25 @@
 """分叉以已完成轮次为边界, 子会话从自己的执行日志开始。"""
 
 import asyncio
+import sqlite3
 from pathlib import Path
 from typing import Literal
 
 import pytest
 from pydantic import BaseModel
 
-from weavria.context import ContextCompilerConfig, HistoryRetrievalConfig
+from weavria.context import (
+    ContextCompilerConfig,
+    ContextDemand,
+    EvidenceAnchor,
+    HistoryRetrievalConfig,
+)
 from weavria.core import (
     ErrorCategory,
     FinishAction,
+    LocatedTextExcerpt,
     ModelTurn,
+    MultiRangeTextView,
     RunStatus,
     SessionForked,
     SessionInput,
@@ -22,7 +30,8 @@ from weavria.core import (
 )
 from weavria.harness import AgentHarness
 from weavria.models import FakeSessionProvider, OpenAICompatibleTokenCounter
-from weavria.sessions import SessionConflictError, SessionEngine
+from weavria.runtime import RunLimits
+from weavria.sessions import SessionConflictError, SessionEngine, SQLiteSessionStore
 from weavria.tools import ToolContext, ToolRegistry, TypedTool
 
 
@@ -164,6 +173,7 @@ async def test_fork_does_not_grant_parent_artifact_access(tmp_path: Path) -> Non
                 )
             ),
             finish("Source is unavailable here."),
+            finish("New local turn."),
         )
     )
     async with SessionEngine(path, model=model, tools=ToolRegistry((tool,))) as engine:
@@ -172,6 +182,25 @@ async def test_fork_does_not_grant_parent_artifact_access(tmp_path: Path) -> Non
         observation = records[0].exchange.observation
         assert isinstance(observation, ToolFailedObservation)
         assert observation.error.category is ErrorCategory.POLICY_DENIED
+        await engine.send("child", "Another local turn")
+        sequence, _ = await engine.store.head("child")
+        queried = await engine.store.retrieve_history(
+            "child",
+            task_revision=1,
+            before_ordinal=4,
+            through_sequence=sequence,
+            demands=(
+                ContextDemand(
+                    "source",
+                    "unmatchablez",
+                    anchors=(
+                        EvidenceAnchor(reference.run_id, reference.call_id, reference.sha256),
+                    ),
+                ),
+            ),
+            config=HistoryRetrievalConfig(recent_turns=2, max_candidates=4),
+        )
+        assert reference.run_id not in {t.run_id for t in queried.turns}
 
 
 async def test_active_anchor_is_rejected_without_creating_a_destination(tmp_path: Path) -> None:
@@ -237,3 +266,156 @@ async def test_cancelled_fork_authorization_can_be_retried(tmp_path: Path) -> No
         assert await engine.store.events("child") == ()
         await engine.fork("parent", anchor.run_id, session_id="child", access=Access())
         assert len(await engine.store.events("child")) == 1
+
+
+async def test_fork_retrieval_unifies_old_sources_and_survives_v9_migration(
+    tmp_path: Path, session_counter: OpenAICompatibleTokenCounter
+) -> None:
+    path = tmp_path / "long-fork.db"
+    phrase = "violetframe means use the violet report template."
+    inherited_text = "unrelated appendix " * 900 + phrase + " closing details" * 900
+    local_text = "branchmemo means include a brief decision log."
+    model = FakeSessionProvider(
+        tuple(
+            map(
+                finish,
+                (
+                    inherited_text,
+                    "violetframe branchmemo parent-only",
+                    local_text,
+                    *("unrelated lunch notes" for _ in range(65)),
+                ),
+            )
+        )
+    )
+    config = HistoryRetrievalConfig(max_candidates=6, recent_turns=2)
+    async with SessionEngine(path, model=model, tools=ToolRegistry(())) as engine:
+        await engine.create("parent")
+        anchor = await engine.send("parent", "Original report agreement")
+        await engine.fork("parent", anchor.run_id, session_id="child", access=Access())
+        parent_only = await engine.send("parent", "Future report agreement")
+        local = await engine.send("child", "Branch-specific agreement")
+        for i in range(65):
+            await engine.send("child", f"Filler {i}")
+        parent_head, _ = await engine.store.head("parent")
+        await engine.store.retrieve_history(
+            "parent",
+            task_revision=1,
+            before_ordinal=3,
+            through_sequence=parent_head,
+            demands=(ContextDemand("parent", "violetframe"),),
+            config=config,
+        )
+        assert {anchor.run_id, local.run_id}.isdisjoint(
+            t.run_id for t in await engine.store.history("child")
+        )
+        cutoff, count = await engine.store.head("child")
+
+    # 用上一版目录结构验证迁移. 旧版只有分叉事件及父会话索引, 没有继承目录行.
+    with sqlite3.connect(path) as conn:
+        conn.executescript("""
+            CREATE TABLE old_catalog(
+                session_id TEXT NOT NULL REFERENCES sessions, ordinal INTEGER NOT NULL,
+                run_id TEXT NOT NULL UNIQUE REFERENCES runs, accepted_sequence INTEGER NOT NULL,
+                view_sha256 TEXT NOT NULL, size_bytes INTEGER NOT NULL,
+                PRIMARY KEY(session_id,ordinal));
+            INSERT INTO old_catalog SELECT session_id,ordinal,run_id,accepted_sequence,
+                view_sha256,size_bytes FROM history_catalog WHERE inherited_view IS NULL;
+            DROP TABLE history_catalog;
+            ALTER TABLE old_catalog RENAME TO history_catalog;
+            PRAGMA user_version=9;
+        """)
+
+    demands = (ContextDemand("agreement", "violetframe branchmemo"),)
+    model = FakeSessionProvider((finish("Found both agreements"),))
+    async with SessionEngine(
+        path,
+        model=model,
+        tools=ToolRegistry(()),
+        context_compiler=ContextCompilerConfig(
+            window_tokens=24000,
+            output_tokens=256,
+            max_history_spans=4,
+        ),
+        limits=RunLimits(max_request_bytes=9000),
+        token_counter=session_counter,
+        history_retrieval=config,
+    ) as engine:
+        parent = await engine.store.retrieve_history(
+            "parent",
+            task_revision=1,
+            before_ordinal=3,
+            through_sequence=parent_head,
+            demands=(ContextDemand("parent", "violetframe"),),
+            config=config,
+        )
+        assert parent.report.indexed_turns == 0
+        result = await engine.send("child", "Find the violetframe and branchmemo agreements")
+        assert result.report.status is RunStatus.COMPLETED
+        delivered = {t.run_id: t.assistant for t in model.requests[0].conversation.turns}
+        inherited = delivered[anchor.run_id]
+        assert isinstance(inherited, (LocatedTextExcerpt, MultiRangeTextView))
+        assert not inherited.complete and phrase in inherited.text
+        if isinstance(inherited, MultiRangeTextView):
+            assert all(
+                part.text == inherited_text[part.start : part.end] for part in inherited.ranges
+            )
+        else:
+            assert (
+                inherited.text
+                == inherited_text[inherited.start : inherited.start + len(inherited.text)]
+            )
+        branch_local = delivered[local.run_id]
+        assert branch_local is not None and branch_local.text == local_text
+        assert parent_only.run_id not in delivered
+        cold = await engine.store.retrieve_history(
+            "child",
+            task_revision=1,
+            before_ordinal=count + 1,
+            through_sequence=cutoff,
+            demands=demands,
+            config=config,
+        )
+        assert {m.address.run_id for m in cold.report.matches} == {anchor.run_id, local.run_id}
+        inherited_match = next(
+            m.address for m in cold.report.matches if m.address.run_id == anchor.run_id
+        )
+        assert inherited_match.accepted_sequence == 1
+        assert "violetframe" in inherited_text[inherited_match.start : inherited_match.end]
+
+    async with SQLiteSessionStore(path) as store:
+        warm = await store.retrieve_history(
+            "child",
+            task_revision=1,
+            before_ordinal=count + 1,
+            through_sequence=cutoff,
+            demands=demands,
+            config=config,
+        )
+        assert warm.report.indexed_turns == 0
+        assert warm.report.matches == cold.report.matches
+        with sqlite3.connect(path) as conn:
+            conn.execute(
+                "UPDATE history_catalog SET inherited_view='invalid' "
+                "WHERE session_id='child' AND run_id=?",
+                (anchor.run_id,),
+            )
+        with pytest.raises(SessionConflictError, match="accepted projection"):
+            await store.retrieve_history(
+                "child",
+                task_revision=1,
+                before_ordinal=count + 1,
+                through_sequence=cutoff,
+                demands=demands,
+                config=config,
+            )
+        await store.rebuild_history_index("child")
+        rebuilt = await store.retrieve_history(
+            "child",
+            task_revision=1,
+            before_ordinal=count + 1,
+            through_sequence=cutoff,
+            demands=demands,
+            config=config,
+        )
+        assert rebuilt.report.matches == cold.report.matches

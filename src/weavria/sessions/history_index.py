@@ -27,6 +27,29 @@ MODEL_VISIBLE_RUN_PREDICATE = """NOT EXISTS (
 )"""
 
 
+# 分叉目录中的原文来自已授权的快照; 本地轮次仍按原有事件可见性判断。
+HISTORY_VISIBLE_PREDICATE = f"""(
+    c.inherited_view IS NOT NULL OR (r.session_id=c.session_id AND {MODEL_VISIBLE_RUN_PREDICATE})
+)"""
+
+
+def migrate_fork_catalog(conn: sqlite3.Connection) -> None:
+    """Expand identity to (session_id, run_id), preserving existing postings."""
+    conn.execute("""CREATE TABLE history_catalog_v10(
+        session_id TEXT NOT NULL REFERENCES sessions, ordinal INTEGER NOT NULL,
+        run_id TEXT NOT NULL REFERENCES runs, accepted_sequence INTEGER NOT NULL,
+        view_sha256 TEXT NOT NULL, size_bytes INTEGER NOT NULL, inherited_view TEXT,
+        PRIMARY KEY(session_id,ordinal), UNIQUE(session_id,run_id),
+        CHECK(inherited_view IS NULL OR accepted_sequence=1))""")
+    conn.execute(
+        "INSERT INTO history_catalog_v10(session_id,ordinal,run_id,accepted_sequence,"
+        "view_sha256,size_bytes) SELECT session_id,ordinal,run_id,accepted_sequence,"
+        "view_sha256,size_bytes FROM history_catalog"
+    )
+    conn.execute("DROP TABLE history_catalog")
+    conn.execute("ALTER TABLE history_catalog_v10 RENAME TO history_catalog")
+
+
 class HistoryIndexError(ValueError):
     """Derived history or its accepted source identity is inconsistent."""
 
@@ -158,9 +181,41 @@ def register_history(
 ) -> None:
     """Register immutable source identity in the same transaction as its accepted projection."""
     conn.execute(
-        "INSERT INTO history_catalog VALUES(?,?,?,?,?,?)",
+        "INSERT INTO history_catalog(session_id,ordinal,run_id,accepted_sequence,"
+        "view_sha256,size_bytes) VALUES(?,?,?,?,?,?)",
         (session_id, ordinal, run_id, sequence, digest(encoded), len(encoded.encode())),
     )
+
+
+def register_fork_history(
+    conn: sqlite3.Connection, session_id: str, turns: tuple[ConversationTurn, ...]
+) -> None:
+    for turn in turns:
+        encoded = turn.model_dump_json()
+        conn.execute(
+            "INSERT INTO history_catalog(session_id,ordinal,run_id,accepted_sequence,"
+            "view_sha256,size_bytes,inherited_view) VALUES(?,?,?,1,?,?,?)",
+            (
+                session_id,
+                turn.ordinal,
+                turn.run_id,
+                digest(encoded),
+                len(encoded.encode()),
+                encoded,
+            ),
+        )
+
+
+def history_view(conn: sqlite3.Connection, session_id: str, run_id: str, expected: str) -> str:
+    row = conn.execute(
+        "SELECT COALESCE(c.inherited_view,r.view) FROM history_catalog c "
+        "JOIN runs r ON r.id=c.run_id WHERE c.session_id=? AND c.run_id=? "
+        "AND (c.inherited_view IS NOT NULL OR r.session_id=c.session_id)",
+        (session_id, run_id),
+    ).fetchone()
+    if row is None or row[0] is None or digest(row[0]) != expected:
+        raise HistoryIndexError("history source differs from its accepted projection")
+    return row[0]
 
 
 def index_state(conn: sqlite3.Connection, session_id: str) -> tuple[int, int, int]:
@@ -199,7 +254,7 @@ def catch_up_index(
     _, ordinal, _ = index_state(conn, session_id)
     rows = conn.execute(
         f"""SELECT c.ordinal,c.run_id,c.accepted_sequence,c.view_sha256,c.size_bytes,
-            {MODEL_VISIBLE_RUN_PREDICATE} AS model_visible
+            {HISTORY_VISIBLE_PREDICATE} AS model_visible
             FROM history_catalog c JOIN runs r ON r.id=c.run_id
             WHERE c.session_id=? AND c.ordinal>? AND c.ordinal<?
             AND c.accepted_sequence<=? ORDER BY c.ordinal LIMIT ?""",
@@ -213,9 +268,7 @@ def catch_up_index(
         ordinal, run_id, sequence, expected, size, model_visible = item
         if work.index_bytes + size > work.config.max_index_bytes:
             break
-        encoded = conn.execute("SELECT view FROM runs WHERE id=?", (run_id,)).fetchone()[0]
-        if encoded is None or digest(encoded) != expected:
-            raise HistoryIndexError("history index source differs from accepted projection")
+        encoded = history_view(conn, session_id, run_id, expected)
         turn = ConversationTurn.model_validate_json(encoded)
         work.index_bytes += size
         with work.guard(conn):

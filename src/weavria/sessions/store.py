@@ -77,7 +77,9 @@ from .history_index import (
     HistoryIndexError,
     HistoryWork,
     create_history_schema,
+    migrate_fork_catalog,
     rebuild_index,
+    register_fork_history,
     register_history,
 )
 from .history_search import search_history
@@ -114,6 +116,7 @@ class ResumeClaim:
     resolutions: tuple[TurnResolution, ...]
     semantic: SemanticSnapshot | None
     remaining_seconds: float
+    legacy_fork_history: bool = False
 
 
 def _validate_semantic_transition(
@@ -278,7 +281,7 @@ class SQLiteSessionStore:
         conn = sqlite3.connect(self.path, timeout=2.0)
         self._connection = conn
         version = conn.execute("PRAGMA user_version").fetchone()[0]
-        if version not in (0, 1, 2, 3, 4, 5, 6, 7, 8, 9):
+        if version not in (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10):
             raise SessionConflictError("unsupported session database schema")
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA journal_mode=WAL")
@@ -348,10 +351,34 @@ class SQLiteSessionStore:
         if version < 9:
             with self._transaction() as migration:
                 migration.execute("PRAGMA user_version=9")
+        if version < 10:
+            self._migrate_v10()
         # Only the exclusive DB owner can classify an old live run as interrupted.
         active = conn.execute("SELECT id FROM runs WHERE status='running'").fetchall()
         for row in active:
             self._interrupt(row[0], "process_exit")
+
+    def _migrate_v10(self) -> None:
+        conn = self._conn()
+        # SQLite 需要暂时关闭外键才能替换父表. 迁移仍原子提交, 既有索引水位不变.
+        conn.execute("PRAGMA foreign_keys=OFF")
+        try:
+            with self._transaction() as migration:
+                migrate_fork_catalog(migration)
+                for (encoded,) in migration.execute(
+                    "SELECT e.data FROM sessions s CROSS JOIN session_events e "
+                    "WHERE e.session_id=s.id AND e.sequence=1 "
+                    "AND json_extract(e.data,'$.data.kind')='forked'"
+                ):
+                    event = SessionEvent.model_validate_json(encoded)
+                    assert isinstance(event.data, SessionForked)
+                    register_fork_history(migration, event.session_id, event.data.turns)
+                for table in ("history_catalog", "history_turn_stats"):
+                    if migration.execute(f"PRAGMA foreign_key_check({table})").fetchone():
+                        raise SessionConflictError("history migration violated foreign keys")
+                migration.execute("PRAGMA user_version=10")
+        finally:
+            conn.execute("PRAGMA foreign_keys=ON")
 
     def _migrate_v2(self) -> None:
         # Raw run/session events and v4 request snapshots are immutable. Only
@@ -682,9 +709,6 @@ class SQLiteSessionStore:
         assert isinstance(data, SessionForked)
         return data
 
-    async def is_fork(self, session_id: str) -> bool:
-        return await self._submit(lambda: self._fork_baseline(session_id) is not None)
-
     async def fork(self, source_session_id: str, through_run_id: str, session_id: str) -> None:
         """Atomically copy an authorized historical prefix into a new local session."""
         if not session_id.strip() or len(session_id.encode()) > 128:
@@ -742,6 +766,7 @@ class SQLiteSessionStore:
                 )
                 conn.execute("INSERT INTO sessions(id) VALUES(?)", (session_id,))
                 self._session_event(conn, session_id, snapshot)
+                register_fork_history(conn, session_id, snapshot.turns)
 
         await self._submit(fork)
 
@@ -1192,7 +1217,9 @@ class SQLiteSessionStore:
 
         await self._submit(record)
 
-    async def claim_resume(self, session_id: str, run_id: str, config: str) -> ResumeClaim:
+    async def claim_resume(
+        self, session_id: str, run_id: str, config: str, *, legacy_fork_config: str | None = None
+    ) -> ResumeClaim:
         """原子取得最新中断 Run 的执行权, 并验证快照仍是可恢复的接受边界。"""
 
         def claim() -> ResumeClaim:
@@ -1228,8 +1255,17 @@ class SQLiteSessionStore:
                 # 此字段是请求身份, 不是可以从新调用的默认参数推导的运行配置。
                 previous.pop("clarification_id", None)
                 current.pop("clarification_id", None)
+                legacy_fork_history = False
                 if previous != current:
-                    raise SessionConflictError("resume_configuration_changed")
+                    if legacy_fork_config is None:
+                        raise SessionConflictError("resume_configuration_changed")
+                    legacy = json.loads(legacy_fork_config)
+                    legacy.pop("max_request_duration", None)
+                    legacy.pop("clarification_id", None)
+                    # v9 分叉的中断 Run 继续使用原窗口, 新 Run 才启用分叉索引.
+                    if previous != legacy or self._fork_baseline(session_id) is None:
+                        raise SessionConflictError("resume_configuration_changed")
+                    legacy_fork_history = True
                 events = tuple(
                     ControlEvent.model_validate_json(item[0])
                     for item in conn.execute(
@@ -1290,7 +1326,10 @@ class SQLiteSessionStore:
                 ).fetchone()
                 if indexed is not None and indexed[0] >= row[2]:
                     raise SessionConflictError("resume_history_already_indexed")
-                conn.execute("DELETE FROM history_catalog WHERE run_id=?", (run_id,))
+                conn.execute(
+                    "DELETE FROM history_catalog WHERE session_id=? AND run_id=?",
+                    (session_id, run_id),
+                )
                 conn.execute("UPDATE runs SET status='running',view=NULL WHERE id=?", (run_id,))
                 conn.execute("UPDATE sessions SET active_run=? WHERE id=?", (run_id, session_id))
                 self._session_event(
@@ -1305,6 +1344,7 @@ class SQLiteSessionStore:
                     resolutions,
                     semantic,
                     remaining,
+                    legacy_fork_history,
                 )
 
         return await self._submit(claim)
@@ -1400,8 +1440,6 @@ class SQLiteSessionStore:
         )
 
         def retrieve() -> RetrievedHistory:
-            if self._fork_baseline(session_id) is not None:
-                raise SessionConflictError("fork history uses bounded chronological selection")
             try:
                 return search_history(
                     self._conn(),
@@ -1445,6 +1483,14 @@ class SQLiteSessionStore:
                 ):
                     raise SessionConflictError("unknown history Session")
                 rebuild_index(conn, session_id)
+                baseline = self._fork_baseline(session_id)
+                if baseline is not None:
+                    conn.execute(
+                        "DELETE FROM history_catalog "
+                        "WHERE session_id=? AND inherited_view IS NOT NULL",
+                        (session_id,),
+                    )
+                    register_fork_history(conn, session_id, baseline.turns)
 
         await self._submit(rebuild)
 
