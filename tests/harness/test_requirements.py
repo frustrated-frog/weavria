@@ -24,6 +24,7 @@ from weavria.harness import (
     NeedStatus,
     load_need_ledger,
 )
+from weavria.harness.continuation_evidence import reconcile_evidence
 from weavria.tools import (
     ReadOnlyPolicy,
     ToolContext,
@@ -1100,3 +1101,42 @@ async def test_new_failed_query_does_not_masquerade_as_semantic_progress() -> No
     assert second.states[0].can_retry
     assert second.evidence_revision > first.evidence_revision
     assert second.progress_sha256() == first.progress_sha256()
+
+
+async def test_continuation_reconciles_accepted_addresses_and_invalidates_changed_needs() -> None:
+    store, record = await _success_record()
+    prior = _requirement()
+    ledger = await EvidenceResolver().resolve(
+        work_id="work-a",
+        task_revision=1,
+        frame_revision=1,
+        requirements=(prior,),
+        records=(record,),
+        read_artifact=lambda artifact_id: store.get("run-1", artifact_id),
+    )
+    assert record.artifact is not None
+    snapshot = await store.get("run-1", record.artifact.artifact_id)
+    sources = {record.artifact.artifact_id: snapshot}
+    result = reconcile_evidence(prior, prior, ledger, sources)
+    assert result.status == "reusable"
+    assert result.addresses == ledger.bindings[0].addresses
+
+    assert reconcile_evidence(prior, prior, ledger, {}).reason == "source_unavailable"
+    changed = _requirement(required_fields=("/source_time",))
+    assert reconcile_evidence(changed, prior, ledger, sources).reason == "requirement_changed"
+
+    current = _requirement(freshness="current")
+    assert reconcile_evidence(current, current, ledger, sources).status == "recheck"
+    stale = ledger.model_copy(
+        update={"bindings": (ledger.bindings[0].model_copy(update={"freshness": "stale"}),)}
+    )
+    assert reconcile_evidence(prior, prior, stale, sources).reason == "stale_binding"
+    empty = await EvidenceResolver().resolve(
+        work_id="work-a",
+        task_revision=1,
+        frame_revision=1,
+        requirements=(prior,),
+        records=(),
+        read_artifact=lambda artifact_id: store.get("run-1", artifact_id),
+    )
+    assert reconcile_evidence(prior, prior, empty, sources).status == "missing"

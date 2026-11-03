@@ -18,6 +18,7 @@ from weavria.sessions import (
 )
 from weavria.tools import ReadOnlyPolicy, ToolPolicy, ToolRegistry
 
+from .continuation_evidence import reconcile_evidence, requirement_digest
 from .requirements import load_need_ledger
 from .understanding import load_task_frame
 
@@ -106,7 +107,13 @@ class TaskContinuation:
         raise PermissionError("task_artifact_not_granted")
 
     async def advance(
-        self, task_id: str, session_id: str, expected_version: int, access: TaskAccessPolicy
+        self,
+        task_id: str,
+        session_id: str,
+        expected_version: int,
+        access: TaskAccessPolicy,
+        *,
+        evidence_reconciliation: bool,
     ) -> TaskContinuationResult:
         version = await self._read_version(task_id, session_id, access, "write")
         if version.version != expected_version:
@@ -124,6 +131,7 @@ class TaskContinuation:
         authoritative_task = await store.task_input(latest_run)
         latest = await store.task_semantic(latest_run)
         sources: list[JsonValue] = []
+        artifacts: dict[str, ArtifactSnapshot] = {}
         for run in version.runs:
             for record in await store.run_records(run.session_id, run.run_id):
                 if record.artifact is None or record.exchange.action.tool_name == "propose_work":
@@ -131,6 +139,8 @@ class TaskContinuation:
                 source = await self._source(run, record)
                 if len(sources) >= 12:
                     raise SessionConflictError("task_source_capacity")
+                if source.reference.size_bytes <= 1536:
+                    artifacts[source.reference.artifact_id] = source
                 sources.append(
                     {
                         "reference": source.reference.model_dump(mode="json"),
@@ -141,14 +151,25 @@ class TaskContinuation:
         if latest is not None:
             frame = load_task_frame(latest.observation.payload)
             ledger = load_need_ledger(latest.need_ledger)
-            needs = [
-                {
+            for need in frame.requirements:
+                item: dict[str, JsonValue] = {
                     "id": need.need_id,
                     "description": need.description,
                     "status": ledger.state_for(need.need_id).status.value,
                 }
-                for need in frame.requirements
-            ]
+                if evidence_reconciliation:
+                    decision = reconcile_evidence(need, need, ledger, artifacts)
+                    item.update(
+                        {
+                            "contract_sha256": requirement_digest(need),
+                            "reuse": decision.status,
+                            "reason": decision.reason,
+                            "evidence": [
+                                address.model_dump(mode="json") for address in decision.addresses
+                            ],
+                        }
+                    )
+                needs.append(item)
         payload: dict[str, JsonValue] = {
             "task_id": task_id,
             "task_version": version.version,
@@ -162,6 +183,11 @@ class TaskContinuation:
                 "Recheck time-sensitive data."
             ),
         }
+        if evidence_reconciliation:
+            payload["reconciliation_guidance"] = (
+                "Reuse assessments bind historical coverage to source addresses. "
+                "Recheck or missing items need current evidence."
+            )
         # 不把任意大的历史复制进新会话。整个接续资料包无法适配时明确拒绝。
         if len(json.dumps(payload, ensure_ascii=False).encode()) > 12_000:
             raise SessionConflictError("task_context_capacity")
@@ -170,7 +196,9 @@ class TaskContinuation:
             observation_id=identity,
             input_id=identity,
             provider="weavria.task_continuation",
-            payload_schema="task-continuation/1",
+            payload_schema="task-continuation/2"
+            if evidence_reconciliation
+            else "task-continuation/1",
             payload=payload,
         )
         result = await self._engine.continue_task(

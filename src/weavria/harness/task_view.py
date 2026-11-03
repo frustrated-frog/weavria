@@ -7,6 +7,7 @@ from typing import Literal
 from pydantic import JsonValue
 
 from weavria.core import (
+    ApplicationObservation,
     ErrorCategory,
     SemanticSnapshot,
     TaskInput,
@@ -15,12 +16,45 @@ from weavria.core import (
     task_view_digest,
 )
 
-from .requirements import EvidenceProbe, NeedStatus, load_need_ledger
+from .continuation_evidence import requirement_digest
+from .requirements import EvidenceProbe, InformationRequirement, NeedStatus, load_need_ledger
 from .understanding import load_task_frame
 from .work import MAX_WORK_BYTES, compact_work, load_work, work_analysis_status
 
 _GAPS = ("$freshness", "$schema", "$proof", "$scope", "$producer", "$result", "$target")
 _MAX_NUMBER = 2**63 - 1
+
+
+def _continuation_observation(
+    observation: ApplicationObservation,
+    requirements: tuple[InformationRequirement, ...],
+    revision: int,
+) -> dict[str, JsonValue]:
+    view = observation.model_dump(mode="json")
+    if (
+        observation.provider != "weavria.task_continuation"
+        or observation.payload_schema != "task-continuation/2"
+    ):
+        return view
+    prior = observation.payload.get("prior_needs")
+    if not isinstance(prior, list):
+        return view
+    active: dict[str, set[str]] = {}
+    for requirement in requirements:
+        active.setdefault(requirement.description, set()).add(requirement_digest(requirement))
+    # 新解释更改同名需求或用户主动修订时, 历史判定不再用于当前决策。
+    projected: list[JsonValue] = []
+    for item in prior:
+        if isinstance(item, dict) and item.get("reuse") == "reusable":
+            description = item.get("description")
+            if revision != 1 or (
+                isinstance(description, str)
+                and description in active
+                and active[description] != {str(item.get("contract_sha256"))}
+            ):
+                item = {**item, "reuse": "recheck", "reason": "requirement_changed", "evidence": []}
+        projected.append(item)
+    return {**view, "payload": {**observation.payload, "prior_needs": projected}}
 
 
 class TaskModelViewProjector:
@@ -204,7 +238,8 @@ class TaskModelViewProjector:
                 for target in need.targets
             ],
             "navigation_context": [
-                item.model_dump(mode="json") for item in frame.application_context
+                _continuation_observation(item, frame.requirements, task.revision)
+                for item in frame.application_context
             ],
             "interpretation": (
                 "acquired=material available, analysis pending; satisfied=semantic coverage, "

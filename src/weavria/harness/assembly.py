@@ -514,14 +514,24 @@ class AgentHarness:
         )
 
     async def continue_task(
-        self, task_id: str, session_id: str, *, expected_version: int, access: TaskAccessPolicy
+        self,
+        task_id: str,
+        session_id: str,
+        *,
+        expected_version: int,
+        access: TaskAccessPolicy,
+        evidence_reconciliation: bool = False,
     ) -> TaskContinuationResult:
         """在目标会话新建 Run, 用任务版本防止陈旧进度覆盖。"""
         self._claim(session_id)
         try:
             async with asyncio.timeout(self._max_request_duration):
                 return await self._task_continuation.advance(
-                    task_id, session_id, expected_version, access
+                    task_id,
+                    session_id,
+                    expected_version,
+                    access,
+                    evidence_reconciliation=evidence_reconciliation,
                 )
         finally:
             self._active.pop(session_id, None)

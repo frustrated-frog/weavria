@@ -285,10 +285,13 @@ async def test_input_identity_deduplicates_even_after_restart_and_rejects_change
     async with SessionEngine(path, model=model, tools=tools()) as engine:
         session = await engine.create("s")
         original = await engine.send(session, "remember", input_id="stable")
+        # 同一个 input_id 重试时应返回首次持久化结果, 模型不能再次执行.
         assert await engine.send(session, "remember", input_id="stable") == original
         assert len(model.requests) == 1
+        # 幂等键不能被另一段文本复用, 否则旧结果会被错误解释成新请求的结果.
         with pytest.raises(SessionConflictError):
             await engine.send(session, "changed", input_id="stable")
+    # 重启后仍能重放原结果, 证明去重事实来自持久化状态而不是进程内缓存.
     async with SessionEngine(path, model=Reader(), tools=tools()) as engine:
         assert await engine.send("s", "remember", input_id="stable") == original
 

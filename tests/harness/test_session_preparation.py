@@ -969,6 +969,8 @@ async def test_pending_clarification_resumes_the_same_work_across_runs(
         clarification = pending[0].pending_clarification
         assert clarification is not None
 
+        # 澄清回答必须显式携带 clarification_id, 才能恢复到发出该问题的原 work.
+        # 不能只按消息先后顺序关联, 否则并发任务或迟到回答可能更新错误的任务状态.
         second = await engine.send(
             "s",
             "Read alpha from the trusted source.",
@@ -1026,6 +1028,8 @@ async def test_unlabelled_input_does_not_capture_the_only_pending_clarification(
         await engine.send("s", "Read it.", input_id="input-1")
         waiting = (await engine.store.pending_clarifications("s"))[0]
 
+        # 即使当前只有一个待澄清任务, 无标识的新输入也应作为独立任务处理.
+        # 这里验证普通对话不会误消费 pending clarification, 原 work 仍保持等待状态.
         independent = await engine.send("s", "Who are you?", input_id="input-2")
         pending = await engine.store.pending_clarifications("s")
         original = await engine.store.semantic_head("s", waiting.work_id)
@@ -1097,13 +1101,16 @@ async def test_expired_clarification_is_persisted_and_not_matched_to_new_input(
         assert clarification.parent_frame_id == waiting.observation.observation_id
         assert clarification.parent_task_revision == 1
         assert clarification.created_at == clock.value
+        # 过期时间是澄清请求自身的业务边界, 不能依赖进程内的定时器是否仍然存活.
         assert clarification.expires_at == clock.value + timedelta(seconds=60)
 
+        # 推进时钟后再发送一条无关消息, 验证旧澄清不会吸附或污染这次新输入.
         clock.value += timedelta(seconds=61)
         await engine.send("s", "Who are you?", input_id="input-2")
         expired = await engine.store.semantic_head("s", waiting.work_id)
         events = await engine.store.events("s")
 
+    # 超时不仅要退出等待态, 还要留下可回放的 expired 事件供恢复和审计使用.
     assert expired is not None and expired.work_status == "abandoned"
     changes = [
         item.data.clarification

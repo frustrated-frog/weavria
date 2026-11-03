@@ -21,6 +21,7 @@ from weavria.harness import (
     CapabilityNeed,
     CompletionCriterion,
     HarnessConfig,
+    InformationNeed,
     TaskSpecification,
 )
 from weavria.models import FakeModelProvider, ModelCapabilities, OpenAICompatibleTokenCounter
@@ -65,6 +66,16 @@ def interpretation(tool: str) -> ModelResponse:
         capability_needs=(
             CapabilityNeed(name=tool, purpose="Read the missing document", necessity="required"),
         ),
+        information_needs=(
+            InformationNeed(
+                description=f"Find the value from {tool}",
+                source="external",
+                freshness="stable",
+                required=False,
+                required_fields=("/value",),
+                capability_names=(tool,),
+            ),
+        ),
         completion_criteria=(
             CompletionCriterion(
                 kind="capability_result", description="Read source", capability=tool
@@ -81,8 +92,9 @@ def interpretation(tool: str) -> ModelResponse:
     )
 
 
+@pytest.mark.parametrize("reconciliation", [False, True])
 async def test_new_sessions_reuse_accepted_result_and_cannot_overwrite_task_head(
-    tmp_path: Path, session_counter: OpenAICompatibleTokenCounter
+    tmp_path: Path, session_counter: OpenAICompatibleTokenCounter, reconciliation: bool
 ) -> None:
     calls: list[str] = []
     both_reading = asyncio.Event()
@@ -111,6 +123,18 @@ async def test_new_sessions_reuse_accepted_result_and_cannot_overwrite_task_head
                 assert isinstance(item, dict)
                 payload = item["payload"]
                 assert isinstance(payload, dict)
+                prior_needs = payload["prior_needs"]
+                assert isinstance(prior_needs, list) and len(prior_needs) == 1
+                need = prior_needs[0]
+                assert isinstance(need, dict)
+                if reconciliation:
+                    assert need["reuse"] == "reusable"
+                    evidence = need["evidence"]
+                    assert isinstance(evidence, list) and len(evidence) == 1
+                    assert isinstance(evidence[0], dict)
+                    assert evidence[0]["json_pointer"] == "/value"
+                else:
+                    assert "reuse" not in need
                 sources = payload["sources"]
                 assert isinstance(sources, list)
                 source = sources[0]
@@ -179,7 +203,13 @@ async def test_new_sessions_reuse_accepted_result_and_cannot_overwrite_task_head
         assert ref is not None
         denied = Access({"b"})
         with pytest.raises(PermissionError):
-            await harness.continue_task("compare", "b", expected_version=1, access=denied)
+            await harness.continue_task(
+                "compare",
+                "b",
+                expected_version=1,
+                access=denied,
+                evidence_reconciliation=reconciliation,
+            )
         with pytest.raises(PermissionError):
             await harness.read_task_artifact(
                 "compare", "b", ref.run_id, ref.artifact_id, access=denied
@@ -189,7 +219,11 @@ async def test_new_sessions_reuse_accepted_result_and_cannot_overwrite_task_head
             asyncio.gather(
                 *(
                     harness.continue_task(
-                        "compare", session, expected_version=task.version, access=access
+                        "compare",
+                        session,
+                        expected_version=task.version,
+                        access=access,
+                        evidence_reconciliation=reconciliation,
                     )
                     for session in ("b", "c")
                 ),

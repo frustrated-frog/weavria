@@ -698,6 +698,8 @@ class SQLiteSessionStore:
                     (session_id, input_id),
                 ).fetchone()
                 if old:
+                    # input_id 表达的是调用方认定的同一次请求, 不能只凭文本相同猜测重试.
+                    # 复用标识时必须连正文和应用上下文一起核对, 否则旧结果可能被错误套到新意图上.
                     if old[1] != text:
                         raise SessionConflictError(
                             "input identity was reused with different content"
@@ -707,6 +709,8 @@ class SQLiteSessionStore:
                             "input identity was reused with different application context"
                         )
                     if old[3]:
+                        # 首次请求已经终结时直接重放持久化结果, 不再进入模型和工具链.
+                        # 这样网络超时后的重试能拿到相同语义, 也不会再次触发外部副作用.
                         return TurnClaim(
                             old[0],
                             input_id,
@@ -718,6 +722,9 @@ class SQLiteSessionStore:
                                 report=RunReport.model_validate_json(old[3]),
                             ),
                         )
+                    # 没有终态报告不等于可以重跑. 运行中的请求需要拒绝并发占用.
+                    # 已中断的请求则要求调用方使用新输入显式继续.
+                    # 这能避免两个执行者同时消费同一请求, 也不会把不完整现场伪装成成功重放.
                     if old[4] == "interrupted":
                         raise SessionInterruptedError(
                             "this input was interrupted; use a new input to continue"
