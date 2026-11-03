@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
-from weavria.core import ControlRequest, EvidenceDeliveryManifest
+from weavria.core import ControlRequest, EvidenceDeliveryManifest, RecoveryRange
 
 from .completion import CompletionContext
 
@@ -20,6 +20,7 @@ class FinalizationAssessment:
     mode: Literal["complete", "limited", "unavailable"]
     required_call_ids: tuple[str, ...] = ()
     missing_need_ids: tuple[str, ...] = ()
+    delivery_gap: RecoveryRange | None = None
 
 
 class FinalizationPolicy(Protocol):

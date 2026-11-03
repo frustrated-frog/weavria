@@ -209,6 +209,7 @@ class _SessionAdapter:
             else None
         )
         self._compilation: ContextCompilation | None = None
+        self._targeted_candidate: tuple[ControlEvidencePlan, CompiledSessionContext] | None = None
         self._history: tuple[ConversationTurn, ...] = ()
         self._history_sequence = 0
         self._history_count = 0
@@ -515,6 +516,40 @@ class _SessionAdapter:
         )
         return projected.model_copy(update={"feedback": base.feedback})
 
+    async def build_targeted_synthesis(
+        self,
+        *,
+        base: ControlRequest,
+        records: tuple[ToolRecord, ...],
+        max_request_bytes: int,
+        required_call_ids: tuple[str, ...],
+        recovery_ranges: tuple[RecoveryRange, ...],
+        delivery_gap: RecoveryRange,
+    ) -> ControlEvidencePlan:
+        # 此地址只作用于这一份收尾视图。模型发起的恢复租约继续独立计量和留证。
+        return await self.build_control_request(
+            base=base,
+            phase="synthesis",
+            records=records,
+            max_request_bytes=max_request_bytes,
+            required_call_ids=required_call_ids,
+            recovery_ranges=recovery_ranges,
+            synthesis_range=delivery_gap,
+        )
+
+    def select_targeted_synthesis(self, plan: ControlEvidencePlan) -> None:
+        candidate = self._targeted_candidate
+        if candidate is None or candidate[0] is not plan:
+            raise ValueError("targeted synthesis plan does not match the prepared view")
+        self._targeted_candidate = None
+        self._install_control_context(candidate[1].request, candidate[1].compilation)
+
+    def _install_control_context(self, outer: SessionRequest, report: ContextCompilation) -> None:
+        self._bundles = outer.bundles
+        self._compaction = outer.compaction
+        self._prepared = {outer.current.task.revision: outer.conversation}
+        self._compilation = report
+
     async def build_control_request(
         self,
         *,
@@ -525,6 +560,7 @@ class _SessionAdapter:
         required_call_ids: tuple[str, ...] = (),
         recovery_ranges: tuple[RecoveryRange, ...] = (),
         feedback_reserve_floor_bytes: int = 0,
+        synthesis_range: RecoveryRange | None = None,
     ) -> ControlEvidencePlan:
         if self._compiler is None:
             raise ValueError("model-view builder requires the context compiler")
@@ -599,6 +635,7 @@ class _SessionAdapter:
                 retrieval=retrieval,
                 supply=supply,
                 recovery_ranges=recovery_ranges,
+                synthesis_range=synthesis_range,
                 next_step_reserve_bytes=(
                     min(
                         compiler.config.next_step_reserve_bytes,
@@ -620,10 +657,6 @@ class _SessionAdapter:
             # path instead of converting that condition into Run exhaustion.
             compiled = await compile_with_floor(0)
         outer, report = compiled.request, compiled.compilation
-        self._bundles = outer.bundles
-        self._compaction = outer.compaction
-        self._prepared = {task.revision: outer.conversation}
-        self._compilation = report
         overhead = report.request_bytes - len(outer.current.model_dump_json().encode())
         choices = {c.source_id: c for c in report.choices}
         decisions = tuple(
@@ -637,7 +670,7 @@ class _SessionAdapter:
             )
             for r in records
         )
-        return ControlEvidencePlan(
+        plan = ControlEvidencePlan(
             outer.current.model_dump_json(),
             EvidenceMode.RELEVANT,
             min(max_request_bytes, self._budget - overhead),
@@ -645,6 +678,11 @@ class _SessionAdapter:
             report.model_dump_json(),
             report.feedback_budget_bytes,
         )
+        # 只有 Runtime 采用候选后才替换活跃视图, 避免回退时把新报告配给旧请求。
+        self._targeted_candidate = (plan, compiled) if synthesis_range is not None else None
+        if synthesis_range is None:
+            self._install_control_context(outer, report)
+        return plan
 
     async def settle_turn(self, task: TaskInput) -> None:
         """将工具事实归约到工作状态;不要求配置进展评估器。"""

@@ -17,6 +17,7 @@ from weavria.core import (
     FinishAction,
     ModelResponse,
     ModelTurn,
+    RecoveryRange,
     RunStatus,
     TaskDirective,
     TaskInput,
@@ -761,6 +762,8 @@ async def test_partial_text_delivery_allows_only_limited_synthesis() -> None:
     assessed = await NeedFinalizationPolicy().assess(context, request=request, manifest=manifest)
     assert assessed.mode == "limited"
     assert assessed.missing_need_ids
+    assert assessed.delivery_gap is not None
+    assert assessed.delivery_gap.pointer == "/value"
     assert not assessed.eligible  # 结构读取不升级为语义证明。
     wrong = manifest.model_copy(update={"control_request_sha256": "f" * 64})
     assert (
@@ -813,3 +816,116 @@ async def test_partial_text_delivery_allows_only_limited_synthesis() -> None:
     assert page_assessed.mode == "limited" and page_assessed.missing_need_ids
     page_context.close()
     context.close()
+
+
+@pytest.mark.parametrize("outcome", ["improved", "budget", "timeout", "unchanged"])
+async def test_synthesis_recompiles_once_and_only_selects_improved_coverage(
+    outcome: str,
+) -> None:
+    from weavria.context import ContextBudgetError
+
+    gap = RecoveryRange(
+        call_id="read-1",
+        source_sha256="a" * 64,
+        pointer="/value",
+        kind="text",
+        start=0,
+        end=1,
+        value_sha256="b" * 64,
+        value_bytes=3,
+    )
+
+    class Builder(EvidenceContextBuilder):
+        attempts = 0
+        selected = False
+
+        async def build_control_request(
+            self,
+            *,
+            base: ControlRequest,
+            phase: str,
+            records: tuple[ToolRecord, ...],
+            max_request_bytes: int,
+            required_call_ids: tuple[str, ...] = (),
+            recovery_ranges: tuple[RecoveryRange, ...] = (),
+            feedback_reserve_floor_bytes: int = 0,
+        ) -> ControlEvidencePlan:
+            return await self.build_control(
+                run_id="run",
+                instructions=base.instructions,
+                task=base.task,
+                task_observation=base.task_observation,
+                records=records,
+                max_request_bytes=max_request_bytes,
+                feedback=base.feedback,
+                control=base.control,
+                required_call_ids=required_call_ids,
+            )
+
+        async def build_targeted_synthesis(
+            self,
+            *,
+            base: ControlRequest,
+            records: tuple[ToolRecord, ...],
+            max_request_bytes: int,
+            required_call_ids: tuple[str, ...],
+            recovery_ranges: tuple[RecoveryRange, ...],
+            delivery_gap: RecoveryRange,
+        ) -> ControlEvidencePlan:
+            self.attempts += 1
+            assert delivery_gap == gap
+            if outcome == "budget":
+                raise ContextBudgetError(max_request_bytes + 1, max_request_bytes)
+            if outcome == "timeout":
+                raise TimeoutError
+            return await self.build_control_request(
+                base=base.model_copy(update={"instructions": base.instructions + " targeted"}),
+                phase="synthesis",
+                records=records,
+                max_request_bytes=max_request_bytes,
+                required_call_ids=required_call_ids,
+            )
+
+        def select_targeted_synthesis(self, plan: ControlEvidencePlan) -> None:
+            assert plan.request.instructions.endswith(" targeted")
+            self.selected = True
+
+    class Policy:
+        version = "test-targeted/1"
+
+        async def assess(
+            self,
+            context: CompletionContext,
+            *,
+            request: ControlRequest | None,
+            manifest: EvidenceDeliveryManifest | None,
+        ) -> FinalizationAssessment:
+            if not context.records:
+                return FinalizationAssessment(False, "unavailable")
+            if (
+                outcome == "improved"
+                and request is not None
+                and request.instructions.endswith(" targeted")
+            ):
+                return FinalizationAssessment(True, "complete", ("read-1",))
+            return FinalizationAssessment(
+                True,
+                "limited",
+                ("read-1",),
+                ("missing",),
+                gap if request else None,
+            )
+
+    store = InMemoryArtifactStore()
+    builder = Builder(store)
+    agent, provider = await setup(
+        (read(), finish()), store=store, context_builder=builder, finalization=Policy()
+    )
+    result = await agent.execute()
+    assert result.status is RunStatus.COMPLETED
+    assert builder.attempts == 1
+    improved = outcome == "improved"
+    assert builder.selected is improved
+    assert agent.state.tool_calls == 1 and agent.state.model_calls == 2
+    assert ("targeted" in provider.requests[-1].instructions) is improved
+    assert (agent.state.finalization is not None) is improved

@@ -2,11 +2,12 @@
 
 import hashlib
 
-from weavria.context import first_delivery_gap
+from weavria.context import first_delivery_gap, synthesis_range
 from weavria.core import (
     ControlRequest,
     EvidenceDelivery,
     EvidenceDeliveryManifest,
+    RecoveryRange,
     ToolExchange,
     ToolSucceededObservation,
 )
@@ -23,7 +24,7 @@ from .understanding import load_task_frame
 
 
 class NeedFinalizationPolicy:
-    version = "need-finalization/4"
+    version = "need-finalization/5"
 
     def __init__(self, evidence: EvidenceResolver | None = None) -> None:
         self._evidence = evidence or EvidenceResolver()
@@ -175,6 +176,7 @@ class NeedFinalizationPolicy:
             item.action.call_id: item for item in request.history if isinstance(item, ToolExchange)
         }
         delivered_bindings: list[EvidenceBinding] = []
+        gaps: dict[str, RecoveryRange] = {}
         usable = False
         for binding in bindings:
             complete = True
@@ -192,28 +194,35 @@ class NeedFinalizationPolicy:
                     complete = False
                     continue
                 delivery = deliveries.get(address.producer_call_id)
-                if delivery is not None:
-                    if delivery.artifact_sha256 != address.artifact_sha256:
+                if delivery is not None or manifest is not None:
+                    if delivery is not None and delivery.artifact_sha256 != address.artifact_sha256:
                         complete = False
-                    elif delivery.representation == "raw":
+                    elif delivery is not None and delivery.representation == "raw":
                         usable = True
                     else:
-                        # 局部原文允许有限回答,但不能据此声称整字段已交付或穷举完成。
+                        ranges = delivery.ranges if delivery is not None else ()
                         usable = usable or any(
                             not address.json_pointer
                             or part.pointer == address.json_pointer
                             or part.pointer.startswith(address.json_pointer + "/")
-                            for part in delivery.ranges
+                            for part in ranges
                         )
                         try:
                             target = resolve_pointer(snapshot.value, address.json_pointer)
-                            complete = (
-                                complete
-                                and first_delivery_gap(
-                                    target, pointer=address.json_pointer, delivered=delivery.ranges
-                                )
-                                is None
+                            gap = first_delivery_gap(
+                                target, pointer=address.json_pointer, delivered=ranges
                             )
+                            complete = complete and delivery is not None and gap is None
+                            if (
+                                gap is not None
+                                and binding.need_id not in gaps
+                                and ledger.state_for(binding.need_id).acquisition_complete
+                                and snapshot.reference.call_id == address.producer_call_id
+                            ):
+                                # 用来源快照绑定区间摘要, 编译器会重新验证后才交付。
+                                candidate = synthesis_range(snapshot, gap)
+                                if candidate is not None:
+                                    gaps[binding.need_id] = candidate
                         except (KeyError, IndexError, ValueError):
                             complete = False
                 else:
@@ -244,4 +253,10 @@ class NeedFinalizationPolicy:
             or not ledger.state_for(item.need_id).acquisition_complete
         )
         mode = "complete" if not missing else "limited" if usable else "unavailable"
-        return FinalizationAssessment(eligible, mode, call_ids, missing)
+        return FinalizationAssessment(
+            eligible,
+            mode,
+            call_ids,
+            missing,
+            next((gaps[need_id] for need_id in missing if need_id in gaps), None),
+        )

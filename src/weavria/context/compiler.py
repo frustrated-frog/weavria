@@ -45,6 +45,7 @@ from .compiler_sources import (
     digest,
     source_units,
 )
+from .delivery import MAX_SYNTHESIS_RANGE_BYTES
 from .demand import ContextDemand, ContextFocus
 from .evidence import ControlEvidencePlan
 from .indexing import bounded_passages
@@ -86,6 +87,24 @@ class BaseControlContextBuilder(Protocol):
         recovery_ranges: tuple[RecoveryRange, ...] = (),
         feedback_reserve_floor_bytes: int = 0,
     ) -> ControlEvidencePlan: ...
+
+
+@runtime_checkable
+class TargetedSynthesisBuilder(BaseControlContextBuilder, Protocol):
+    """Prepare an exact source range without replacing the active view."""
+
+    async def build_targeted_synthesis(
+        self,
+        *,
+        base: ControlRequest,
+        records: tuple[ToolRecord, ...],
+        max_request_bytes: int,
+        required_call_ids: tuple[str, ...],
+        recovery_ranges: tuple[RecoveryRange, ...],
+        delivery_gap: RecoveryRange,
+    ) -> ControlEvidencePlan: ...
+
+    def select_targeted_synthesis(self, plan: ControlEvidencePlan) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,6 +192,7 @@ class SessionContextCompiler:
         retrieval: HistoryRetrievalReport | None = None,
         supply: ContextSupply | None = None,
         recovery_ranges: tuple[RecoveryRange, ...] = (),
+        synthesis_range: RecoveryRange | None = None,
         next_step_reserve_bytes: int = 0,
         feedback_reserve_floor_bytes: int = 0,
     ) -> CompiledSessionContext:
@@ -188,8 +208,13 @@ class SessionContextCompiler:
         bundles = supply.bundles if supply else ()
         if recovery_ranges and not base.recovery_enabled:
             raise ContextBuildError("recovery requires control request v4")
+        if synthesis_range is not None and synthesis_range.value_bytes > MAX_SYNTHESIS_RANGE_BYTES:
+            raise ValueError("synthesis range exceeds its delivery bound")
+        protected_ranges = tuple(
+            dict.fromkeys((*recovery_ranges, *((synthesis_range,) if synthesis_range else ())))
+        )
         required_call_ids = tuple(
-            dict.fromkeys((*required_call_ids, *(p.call_id for p in recovery_ranges)))
+            dict.fromkeys((*required_call_ids, *(p.call_id for p in protected_ranges)))
         )
         if type(max_request_bytes) is not int or max_request_bytes <= 0:
             raise ValueError("request byte budget must be positive")
@@ -301,7 +326,7 @@ class SessionContextCompiler:
             offset=len(history_units),
             mandatory=mandatory,
             max_passages=self.config.max_passages,
-            recovery_ranges=recovery_ranges,
+            recovery_ranges=protected_ranges,
         )
         # bundle 的唯一可选表示是整组 raw:片段索引用来评分,不生成模型可见摘录。
         # 与历史/工具竞争同一预算时可以整体落选,不能只留下规则值而丢掉条件。

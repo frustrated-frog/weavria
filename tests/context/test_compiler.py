@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import json
 from dataclasses import replace
 from typing import TypedDict
 
@@ -1169,3 +1170,48 @@ async def test_work_span_anchor_selects_exact_region_without_keyword_overlap(
     )
     assert "cited passage" in result.request_json
     assert "work-citation" not in result.compilation.uncovered_demand_ids
+
+
+async def test_synthesis_range_delivers_exact_source_without_creating_recovery_lease(
+    session_counter: OpenAICompatibleTokenCounter,
+) -> None:
+    from weavria.core import EvidenceDeliveryRange, RecoveryRange
+
+    target = "decisive contract clause"
+    text = "noise " * 2400 + target
+    store, records = await sources((text,))
+    ref = records[0].artifact
+    assert ref is not None
+    encoded = json.dumps(target).encode()
+    gap = RecoveryRange(
+        call_id=ref.call_id,
+        source_sha256=ref.sha256,
+        pointer="/text",
+        kind="text",
+        start=text.index(target),
+        end=len(text),
+        value_bytes=len(encoded),
+        value_sha256=hashlib.sha256(encoded).hexdigest(),
+    )
+    kwargs = SourceArguments(
+        run_id="run",
+        session_id="s",
+        sequence=0,
+        base=base("unrelated question"),
+        turns=(),
+        total_turns=0,
+    )
+    selected = compiler(store, session_counter)
+    plain = await selected.compile(**kwargs, records=records, max_request_bytes=4000)
+    targeted = await selected.compile(
+        **kwargs, records=records, max_request_bytes=4000, synthesis_range=gap
+    )
+    assert target not in plain.request_json
+    assert target in targeted.request_json
+    assert targeted.compilation.recovery_ranges == ()
+    manifest = targeted.compilation.delivery_manifest
+    assert manifest is not None
+    delivered = manifest.for_call(ref.call_id)
+    assert delivered is not None and delivered.covers(
+        EvidenceDeliveryRange(pointer=gap.pointer, kind="text", start=gap.start, end=gap.end)
+    )

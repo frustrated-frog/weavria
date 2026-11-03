@@ -1,10 +1,16 @@
 """Exact, content-free coverage checks for model-visible Artifact evidence."""
 
+import hashlib
+
 from pydantic import JsonValue
 
-from weavria.core import EvidenceDeliveryRange
+from weavria.artifacts import ArtifactSnapshot, resolve_pointer
+from weavria.core import EvidenceDeliveryRange, RecoveryRange
 
 from .evidence import index_passages
+from .recovery_ranges import encoded_value
+
+MAX_SYNTHESIS_RANGE_BYTES = 768
 
 
 def delivery_ranges(value: JsonValue, *, pointer: str = "") -> tuple[EvidenceDeliveryRange, ...]:
@@ -31,6 +37,30 @@ def first_delivery_gap(
         if not delivery_range_is_covered(required, delivered):
             return required
     return None
+
+
+def synthesis_range(source: ArtifactSnapshot, gap: EvidenceDeliveryRange) -> RecoveryRange | None:
+    """Bind one short delivery gap to the immutable source and its exact encoded value."""
+    value = resolve_pointer(source.value, gap.pointer)
+    if gap.kind == "text":
+        if not isinstance(value, str):
+            return None
+        value = value[gap.start : gap.end]
+    elif isinstance(value, str):
+        return None
+    raw = encoded_value(value)
+    if len(raw) > MAX_SYNTHESIS_RANGE_BYTES:
+        return None
+    return RecoveryRange(
+        call_id=source.reference.call_id,
+        source_sha256=source.reference.sha256,
+        pointer=gap.pointer,
+        kind=gap.kind,
+        start=gap.start,
+        end=gap.end,
+        value_sha256=hashlib.sha256(raw).hexdigest(),
+        value_bytes=len(raw),
+    )
 
 
 def delivery_range_is_covered(

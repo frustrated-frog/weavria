@@ -14,6 +14,7 @@ from pydantic import JsonValue, TypeAdapter
 
 from weavria.artifacts import ArtifactAccessError, ArtifactStore, resolve_pointer
 from weavria.context import (
+    MAX_SYNTHESIS_RANGE_BYTES,
     BaseControlContextBuilder,
     ContextBudgetError,
     ContextCapacityError,
@@ -25,6 +26,7 @@ from weavria.context import (
     EvidenceMode,
     EvidencePlan,
     RecoveryContextBuilder,
+    TargetedSynthesisBuilder,
     TurnEvidencePlan,
     first_delivery_gap,
     reserve_feedback,
@@ -78,6 +80,7 @@ from weavria.core import (
     RecoverContext,
     RecoveryLimits,
     RecoveryNotice,
+    RecoveryRange,
     RecoveryResolved,
     RunEnded,
     RunError,
@@ -1032,6 +1035,45 @@ class _AgentKernel:
         plan = await self._build_context(task, finalizing=True, required_call_ids=required)
         assert isinstance(plan, ControlEvidencePlan)
         assessed = await self._assess_finalization(task, plan)
+        selected_targeted = False
+        gap = assessed.delivery_gap
+        if (
+            gap is not None
+            and self._journal_version >= 3
+            and assessed.missing_need_ids
+            and gap.value_bytes <= MAX_SYNTHESIS_RANGE_BYTES
+            and isinstance(self._control_builder, TargetedSynthesisBuilder)
+            and task.revision == self.state.task.revision
+        ):
+            # 仅多编译一次, 并把剩余时间的一部分留给正式交付。候选失败时
+            # 沿用原计划, 不提交新的恢复事件, 不增加模型或工具调用。
+            allowance = min(self._limits.max_completion_duration, self._remaining(deadline) / 4)
+            if allowance > 0:
+                try:
+                    async with asyncio.timeout(allowance):
+                        targeted = await self._build_context(
+                            task, finalizing=True, required_call_ids=required, synthesis_range=gap
+                        )
+                        assert isinstance(targeted, ControlEvidencePlan)
+                        after = await self._assess_finalization(task, targeted)
+                        if (
+                            task.revision == self.state.task.revision
+                            and after.mode != "unavailable"
+                            and set(after.missing_need_ids) < set(assessed.missing_need_ids)
+                        ):
+                            plan, assessed = targeted, after
+                            selected_targeted = True
+                except (
+                    ContextBudgetError,
+                    ContextTokenBudgetError,
+                    ContextCapacityError,
+                    _ContextDependencyTimeout,
+                    TimeoutError,
+                ):
+                    pass
+        if task.revision != self.state.task.revision:
+            return None
+
         if assessed.mode == "unavailable":
             if existing is None and not reserve_reached and not tool_budget:
                 return await self._build_context(task)
@@ -1052,7 +1094,7 @@ class _AgentKernel:
             # 这也防止自定义策略误把 eligible=True 的 limited 结果当成全量就绪。
             return await self._build_context(task)
         if existing is None:
-            await self._accept(
+            accepted = await self._accept(
                 FinalizationStarted(
                     task_revision=task.revision,
                     policy_version=self._finalization_policy.version,
@@ -1067,8 +1109,13 @@ class _AgentKernel:
                 ),
                 expected_revision=task.revision,
             )
+            if not accepted:
+                return None
         elif existing.mode == "complete" and assessed.mode != "complete":
             return None
+        if selected_targeted:
+            assert isinstance(self._control_builder, TargetedSynthesisBuilder)
+            self._control_builder.select_targeted_synthesis(plan)
         return plan
 
     async def _build_context(
@@ -1078,6 +1125,7 @@ class _AgentKernel:
         recovery: RecoveryResolved | None = None,
         finalizing: bool = False,
         required_call_ids: tuple[str, ...] = (),
+        synthesis_range: RecoveryRange | None = None,
     ) -> EvidencePlan | TurnEvidencePlan | ControlEvidencePlan:
         instructions = self._instructions
         if finalizing:
@@ -1104,6 +1152,18 @@ class _AgentKernel:
                     task_observation=task_observation,
                     control=recovery.notice if recovery is not None else self.state.control,
                 ).model_copy(update={"feedback": self.state.feedback})
+                if synthesis_range is not None:
+                    assert finalizing and isinstance(
+                        self._control_builder, TargetedSynthesisBuilder
+                    )
+                    return await self._control_builder.build_targeted_synthesis(
+                        base=base,
+                        records=self.state.records,
+                        max_request_bytes=self._request_budget,
+                        required_call_ids=required_call_ids,
+                        recovery_ranges=self.state.recovery_ranges,
+                        delivery_gap=synthesis_range,
+                    )
                 return await self._control_builder.build_control_request(
                     base=base,
                     phase="synthesis" if finalizing else "decision",

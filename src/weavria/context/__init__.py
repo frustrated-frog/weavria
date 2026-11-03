@@ -15,12 +15,15 @@ from .compiler import (
     CompiledSessionContext,
     ControlContextBuilder,
     SessionContextCompiler,
+    TargetedSynthesisBuilder,
 )
 from .conversation import ConversationPlan, project_turn, select_conversation
 from .delivery import (
+    MAX_SYNTHESIS_RANGE_BYTES,
     delivery_range_is_covered,
     delivery_ranges,
     first_delivery_gap,
+    synthesis_range,
 )
 from .demand import ContextDemand, ContextFocus, EvidenceAnchor, EvidenceSpanAnchor
 from .evidence import (
@@ -63,6 +66,7 @@ from .selection import (
 from .supply import ContextSource, ContextSourceError
 
 __all__ = [
+    "MAX_SYNTHESIS_RANGE_BYTES",
     "BaseControlContextBuilder",
     "CompiledSessionContext",
     "ContextBudgetError",
@@ -103,6 +107,7 @@ __all__ = [
     "SessionContextCompiler",
     "SessionRequestSizer",
     "SessionTokenCounter",
+    "TargetedSynthesisBuilder",
     "TurnEvidencePlan",
     "build_context",
     "delivery_range_is_covered",
@@ -114,5 +119,6 @@ __all__ = [
     "project_turn",
     "reserve_feedback",
     "select_conversation",
+    "synthesis_range",
     "validate_recovery_view",
 ]
