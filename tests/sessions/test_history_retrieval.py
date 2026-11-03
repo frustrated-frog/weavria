@@ -516,7 +516,7 @@ async def test_migration_from_v5_keeps_interrupted_original_out_of_model_retriev
         model_history = await store.history("s", model_visible_only=True)
         assert {turn.run_id for turn in model_history} == {runs[0], "process-run"}
         with sqlite3.connect(path) as conn:
-            assert conn.execute("PRAGMA user_version").fetchone()[0] == 8
+            assert conn.execute("PRAGMA user_version").fetchone()[0] == 9
 
 
 async def test_cancelled_catchup_retains_only_previously_committed_turns(

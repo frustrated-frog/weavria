@@ -1,6 +1,11 @@
 """Domain-independent Agent Harness capabilities above the Runtime."""
 
-from weavria.sessions import TaskAccessPolicy, TaskContinuationResult, TaskVersion
+from weavria.sessions import (
+    SessionForkAccess,
+    TaskAccessPolicy,
+    TaskContinuationResult,
+    TaskVersion,
+)
 
 from .agent import TaskAwareAgent, TaskAwareExecution
 from .assembly import AgentHarness, HarnessMemory, HarnessResult, MemoryUpdateReport
@@ -240,6 +245,7 @@ __all__ = [
     "RiskAwareAskOrActPolicy",
     "SchemaAwareSelector",
     "SemanticObligation",
+    "SessionForkAccess",
     "SessionMemoryBinding",
     "SessionMemoryIngestor",
     "StructuralEvidenceExtractor",

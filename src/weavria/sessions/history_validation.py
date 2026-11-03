@@ -4,6 +4,7 @@ import sqlite3
 
 from weavria.context import project_turn
 from weavria.core import (
+    ConversationItem,
     ConversationTurn,
     HistoryRetrievalReport,
     LocatedTextExcerpt,
@@ -51,25 +52,29 @@ def validate_history_request(
         row = conn.execute("SELECT view FROM runs WHERE id=?", (item.run_id,)).fetchone()
         if row is None or row[0] is None or digest(row[0]) != candidate.view_sha256:
             raise HistoryIndexError("delivered history differs from its accepted original")
-        turn = ConversationTurn.model_validate_json(row[0])
-        original = project_turn(turn, full=False)
-        exclude = {"user", "assistant", "updates"}
-        if item.model_dump(exclude=exclude) != original.model_dump(exclude=exclude):
-            raise HistoryIndexError("historical metadata was changed by compilation")
-        _validate_text(turn.user, item.user)
-        if (turn.assistant is None) != (item.assistant is None):
-            raise HistoryIndexError("historical assistant presence changed")
-        if turn.assistant is not None and item.assistant is not None:
-            _validate_text(turn.assistant, item.assistant)
-        if len(turn.updates) != len(item.updates):
-            raise HistoryIndexError("historical directives were removed")
-        for update, selected in zip(turn.updates, item.updates, strict=True):
-            if (update.directive.input_id, update.task.revision) != (
-                selected.input_id,
-                selected.revision,
-            ):
-                raise HistoryIndexError("historical directive identity changed")
-            _validate_text(update.directive.text, selected.text)
+        validate_history_item(ConversationTurn.model_validate_json(row[0]), item)
+
+
+def validate_history_item(turn: ConversationTurn, item: ConversationItem) -> None:
+    """Check exact content and source metadata for one delivered historical turn."""
+    original = project_turn(turn, full=False)
+    exclude = {"user", "assistant", "updates"}
+    if item.model_dump(exclude=exclude) != original.model_dump(exclude=exclude):
+        raise HistoryIndexError("historical metadata was changed by compilation")
+    _validate_text(turn.user, item.user)
+    if (turn.assistant is None) != (item.assistant is None):
+        raise HistoryIndexError("historical assistant presence changed")
+    if turn.assistant is not None and item.assistant is not None:
+        _validate_text(turn.assistant, item.assistant)
+    if len(turn.updates) != len(item.updates):
+        raise HistoryIndexError("historical directives were removed")
+    for update, selected in zip(turn.updates, item.updates, strict=True):
+        if (update.directive.input_id, update.task.revision) != (
+            selected.input_id,
+            selected.revision,
+        ):
+            raise HistoryIndexError("historical directive identity changed")
+        _validate_text(update.directive.text, selected.text)
 
 
 def _validate_text(

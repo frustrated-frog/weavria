@@ -393,9 +393,44 @@ class SessionResumeClaimed(ContractModel):
     through_sequence: int = Field(ge=1)
 
 
+MAX_FORK_TURNS = 64
+MAX_FORK_BYTES = 262_144
+
+
+class SessionForked(ContractModel):
+    """Immutable conversation baseline copied at an accepted historical boundary."""
+
+    kind: Literal["forked"] = "forked"
+    source_session_id: NonBlankString
+    through_run_id: NonBlankString
+    turns: tuple[ConversationTurn, ...] = Field(min_length=1, max_length=MAX_FORK_TURNS)
+
+    @model_validator(mode="after")
+    def validate_baseline(self) -> Self:
+        ordinals = tuple(turn.ordinal for turn in self.turns)
+        if (
+            ordinals != tuple(sorted(set(ordinals)))
+            or len({turn.run_id for turn in self.turns}) != len(self.turns)
+            or self.turns[-1].run_id != self.through_run_id
+        ):
+            raise ValueError("fork history does not end at its ordered anchor")
+        if any(
+            turn.status != "completed"
+            or turn.calls
+            or turn.source_uses
+            or turn.unfinished_call_ids
+            or turn.undispatched_call_ids
+            for turn in self.turns
+        ):
+            raise ValueError("fork history must contain only settled conversation text")
+        if len(self.model_dump_json().encode()) > MAX_FORK_BYTES:
+            raise ValueError("fork history exceeds its byte limit")
+        return self
+
+
 class SessionEvent(BaseModel):
     model_config = ContractModel.model_config
-    schema_version: Literal[1, 2, 3, 4, 5, 6] = 3
+    schema_version: Literal[1, 2, 3, 4, 5, 6, 7] = 3
 
     @field_validator("schema_version", mode="before")
     @classmethod
@@ -418,6 +453,7 @@ class SessionEvent(BaseModel):
         | SessionSourceRead
         | SessionInterrupted
         | SessionResumeClaimed
+        | SessionForked
         | SessionTaskPreparationFailed
         | SessionContextPrepared
         | SessionContextCompiled
@@ -429,6 +465,12 @@ class SessionEvent(BaseModel):
 
     @model_validator(mode="after")
     def validate_payload_version(self) -> Self:
+        if isinstance(self.data, SessionForked) and (
+            self.schema_version != 7
+            or self.sequence != 1
+            or self.session_id == self.data.source_session_id
+        ):
+            raise ValueError("fork baseline requires a new session's v7 initial event")
         if self.schema_version < 6 and isinstance(self.data, SessionResumeClaimed):
             raise ValueError("resume claims require session event v6")
         if self.schema_version < 5 and isinstance(self.data, SessionTaskPreparationFailed):

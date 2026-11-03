@@ -23,6 +23,7 @@ from weavria.context import (
     validate_recovery_view,
 )
 from weavria.core import (
+    MAX_FORK_TURNS,
     ApplicationObservation,
     ArtifactRef,
     ContextCompilation,
@@ -42,6 +43,7 @@ from weavria.core import (
     SessionContextPrepared,
     SessionControlDecided,
     SessionEvent,
+    SessionForked,
     SessionInput,
     SessionInterrupted,
     SessionRequest,
@@ -79,7 +81,7 @@ from .history_index import (
     register_history,
 )
 from .history_search import search_history
-from .history_validation import validate_history_request
+from .history_validation import validate_history_item, validate_history_request
 from .preparation import SemanticTransitionReducer
 from .task_continuation import TaskRun, TaskVersion
 
@@ -276,7 +278,7 @@ class SQLiteSessionStore:
         conn = sqlite3.connect(self.path, timeout=2.0)
         self._connection = conn
         version = conn.execute("PRAGMA user_version").fetchone()[0]
-        if version not in (0, 1, 2, 3, 4, 5, 6, 7, 8):
+        if version not in (0, 1, 2, 3, 4, 5, 6, 7, 8, 9):
             raise SessionConflictError("unsupported session database schema")
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA journal_mode=WAL")
@@ -343,6 +345,9 @@ class SQLiteSessionStore:
                     id TEXT PRIMARY KEY, version INTEGER NOT NULL, data TEXT NOT NULL
                 )""")
                 migration.execute("PRAGMA user_version=8")
+        if version < 9:
+            with self._transaction() as migration:
+                migration.execute("PRAGMA user_version=9")
         # Only the exclusive DB owner can classify an old live run as interrupted.
         active = conn.execute("SELECT id FROM runs WHERE status='running'").fetchall()
         for row in active:
@@ -423,6 +428,7 @@ class SQLiteSessionStore:
         | SessionSourceRead
         | SessionInterrupted
         | SessionResumeClaimed
+        | SessionForked
         | SessionTaskPreparationFailed
         | SessionContextPrepared
         | SessionContextCompiled
@@ -435,7 +441,9 @@ class SQLiteSessionStore:
         head = conn.execute("SELECT head FROM sessions WHERE id=?", (session_id,)).fetchone()[0]
         event = SessionEvent(
             schema_version=(
-                6
+                7
+                if isinstance(data, SessionForked)
+                else 6
                 if isinstance(data, SessionResumeClaimed)
                 else 5
                 if isinstance(data, SessionTaskPreparationFailed)
@@ -658,6 +666,85 @@ class SQLiteSessionStore:
 
         await self._submit(create)
 
+    def _fork_baseline(self, session_id: str) -> SessionForked | None:
+        row = (
+            self._conn()
+            .execute(
+                "SELECT data FROM session_events WHERE session_id=? AND sequence=1 "
+                "AND json_extract(data,'$.data.kind')='forked'",
+                (session_id,),
+            )
+            .fetchone()
+        )
+        if row is None:
+            return None
+        data = SessionEvent.model_validate_json(row[0]).data
+        assert isinstance(data, SessionForked)
+        return data
+
+    async def is_fork(self, session_id: str) -> bool:
+        return await self._submit(lambda: self._fork_baseline(session_id) is not None)
+
+    async def fork(self, source_session_id: str, through_run_id: str, session_id: str) -> None:
+        """Atomically copy an authorized historical prefix into a new local session."""
+        if not session_id.strip() or len(session_id.encode()) > 128:
+            raise ValueError("session identity must contain 1 to 128 bytes")
+
+        def fork() -> None:
+            with self._transaction() as conn:
+                if conn.execute("SELECT 1 FROM sessions WHERE id=?", (session_id,)).fetchone():
+                    existing = self._fork_baseline(session_id)
+                    if existing and (existing.source_session_id, existing.through_run_id) == (
+                        source_session_id,
+                        through_run_id,
+                    ):
+                        return
+                    raise SessionConflictError("fork destination already exists")
+                parent = self._fork_baseline(source_session_id)
+                inherited = parent.turns if parent is not None else ()
+                inherited_anchor = next((t for t in inherited if t.run_id == through_run_id), None)
+                row = conn.execute(
+                    "SELECT r.ordinal FROM runs r WHERE r.session_id=? AND r.id=? "
+                    "AND r.status='completed' AND r.view IS NOT NULL "
+                    f"AND {MODEL_VISIBLE_RUN_PREDICATE}",
+                    (source_session_id, through_run_id),
+                ).fetchone()
+                if row is None and inherited_anchor is None:
+                    raise SessionConflictError("fork anchor is not a completed turn in the source")
+                if row is not None:
+                    through = row[0]
+                else:
+                    assert inherited_anchor is not None
+                    through = inherited_anchor.ordinal
+                prefix = tuple(t for t in inherited if t.ordinal <= through)
+                rows = conn.execute(
+                    "SELECT r.view FROM runs r WHERE r.session_id=? AND r.ordinal<=? "
+                    "AND r.status='completed' AND r.view IS NOT NULL "
+                    f"AND {MODEL_VISIBLE_RUN_PREDICATE} ORDER BY r.ordinal LIMIT ?",
+                    (source_session_id, through, MAX_FORK_TURNS + 1),
+                ).fetchall()
+                if len(prefix) + len(rows) > MAX_FORK_TURNS:
+                    raise SessionConflictError("fork history exceeds its turn limit")
+                # 原执行记录保留在所属会话。快照只复制可阅读内容, 不授予 Artifact 权限。
+                turns = prefix + tuple(
+                    ConversationTurn.model_validate_json(encoded).model_copy(
+                        update={
+                            "calls": (),
+                            "source_uses": (),
+                            "unfinished_call_ids": (),
+                            "undispatched_call_ids": (),
+                        }
+                    )
+                    for (encoded,) in rows
+                )
+                snapshot = SessionForked(
+                    source_session_id=source_session_id, through_run_id=through_run_id, turns=turns
+                )
+                conn.execute("INSERT INTO sessions(id) VALUES(?)", (session_id,))
+                self._session_event(conn, session_id, snapshot)
+
+        await self._submit(fork)
+
     async def begin(
         self,
         session_id: str,
@@ -735,6 +822,9 @@ class SQLiteSessionStore:
                 ordinal = conn.execute(
                     "SELECT COALESCE(MAX(ordinal),0)+1 FROM runs WHERE session_id=?", (session_id,)
                 ).fetchone()[0]
+                baseline = self._fork_baseline(session_id)
+                if baseline is not None:
+                    ordinal = max(ordinal, baseline.turns[-1].ordinal + 1)
                 conn.execute(
                     (
                         "INSERT INTO "
@@ -1310,6 +1400,8 @@ class SQLiteSessionStore:
         )
 
         def retrieve() -> RetrievedHistory:
+            if self._fork_baseline(session_id) is not None:
+                raise SessionConflictError("fork history uses bounded chronological selection")
             try:
                 return search_history(
                     self._conn(),
@@ -1384,7 +1476,20 @@ class SQLiteSessionStore:
                 )
                 .fetchall()
             )
-            return tuple(ConversationTurn.model_validate_json(r[0]) for r in reversed(rows))
+            local = tuple(ConversationTurn.model_validate_json(r[0]) for r in reversed(rows))
+            if len(local) == limit:
+                return local
+            baseline = self._fork_baseline(session_id)
+            inherited = (
+                tuple(
+                    t
+                    for t in baseline.turns
+                    if before_ordinal is None or t.ordinal < before_ordinal
+                )
+                if baseline is not None
+                else ()
+            )
+            return (*inherited, *local)[-limit:]
 
         return await self._submit(read)
 
@@ -1398,7 +1503,12 @@ class SQLiteSessionStore:
                 )
                 .fetchone()
             )
-            return ConversationTurn.model_validate_json(row[0]) if row else None
+            if row is not None:
+                return ConversationTurn.model_validate_json(row[0])
+            baseline = self._fork_baseline(session_id)
+            return (
+                next((t for t in baseline.turns if t.run_id == run_id), None) if baseline else None
+            )
 
         return await self._submit(read)
 
@@ -1518,7 +1628,8 @@ class SQLiteSessionStore:
                 )
                 .fetchone()[0]
             )
-            return row[0], count
+            baseline = self._fork_baseline(session_id)
+            return row[0], count + (len(baseline.turns) if baseline is not None else 0)
 
         return await self._submit(read)
 
@@ -1730,6 +1841,28 @@ class SQLiteSessionStore:
                         )
                     except HistoryIndexError as exc:
                         raise SessionConflictError(str(exc)) from exc
+                baseline = self._fork_baseline(session_id)
+                if baseline is not None:
+                    # 继承轮次没有本地 Run, 请求落库时以分叉快照为准核对原文。
+                    inherited = {turn.run_id: turn for turn in baseline.turns}
+                    for item in request.conversation.turns:
+                        original = inherited.get(item.run_id)
+                        if original is None:
+                            local = conn.execute(
+                                "SELECT r.view FROM runs r WHERE r.session_id=? AND r.id=? "
+                                "AND r.ordinal<? AND r.view IS NOT NULL "
+                                f"AND {MODEL_VISIBLE_RUN_PREDICATE}",
+                                (session_id, item.run_id, row[2]),
+                            ).fetchone()
+                            if local is None:
+                                raise SessionConflictError(
+                                    "fork request history is outside session"
+                                )
+                            original = ConversationTurn.model_validate_json(local[0])
+                        try:
+                            validate_history_item(original, item)
+                        except HistoryIndexError as exc:
+                            raise SessionConflictError(str(exc)) from exc
                 conn.execute(
                     "INSERT INTO request_views VALUES(?,?,?)", (run_id, state.model_calls, encoded)
                 )

@@ -8,7 +8,7 @@ from collections.abc import Callable
 from dataclasses import asdict, replace
 from datetime import timedelta
 from pathlib import Path
-from typing import Literal, Self, cast
+from typing import Literal, Protocol, Self, cast
 
 from pydantic import JsonValue, TypeAdapter
 
@@ -103,6 +103,12 @@ from .preparation import (
     SessionTaskPreparer,
 )
 from .store import ResumeClaim, SessionBusyError, SessionConflictError, SQLiteSessionStore
+
+
+class SessionForkAccess(Protocol):
+    """Authorization bound by the host to the authenticated principal."""
+
+    async def authorize(self, session_id: str, operation: Literal["read", "write"]) -> bool: ...
 
 
 def _status_transition(snapshot: SemanticSnapshot, *, cause: str) -> SemanticTransition:
@@ -1032,6 +1038,25 @@ class SessionEngine:
         await self.store.create(identity)
         return identity
 
+    async def fork(
+        self,
+        source_session_id: str,
+        through_run_id: str,
+        *,
+        session_id: str,
+        access: SessionForkAccess,
+    ) -> str:
+        """Start an independent conversation at a completed historical turn."""
+        if self._closing:
+            raise RuntimeError("session engine is closing")
+        async with asyncio.timeout(self._max_request_duration):
+            if not await access.authorize(source_session_id, "read") or not await access.authorize(
+                session_id, "write"
+            ):
+                raise PermissionError("session_fork_access_denied")
+            await self.store.fork(source_session_id, through_run_id, session_id)
+        return session_id
+
     async def send(
         self,
         session_id: str,
@@ -1119,6 +1144,10 @@ class SessionEngine:
             identity = (
                 input_id if input_id is not None else self._ids() if resume_run_id is None else ""
             )
+            retrieval_config = self._retrieval_config
+            if retrieval_config is not None and await self.store.is_fork(session_id):
+                # 分叉首版使用统一的有界历史窗口, 避免索引只召回本地轮次而漏掉快照。
+                retrieval_config = None
             config = json.dumps(
                 {
                     "schema_version": (
@@ -1129,7 +1158,7 @@ class SessionEngine:
                         else 4
                         if self._recovery_limits is not None
                         else 3
-                        if self._retrieval_config is not None
+                        if retrieval_config is not None
                         or (
                             self._compiler_config is not None
                             and self._compiler_config.max_history_spans > 1
@@ -1144,8 +1173,8 @@ class SessionEngine:
                         else {}
                     ),
                     **(
-                        {"history_retrieval": asdict(self._retrieval_config)}
-                        if self._retrieval_config is not None
+                        {"history_retrieval": asdict(retrieval_config)}
+                        if retrieval_config is not None
                         else {}
                     ),
                     **(
@@ -1421,7 +1450,7 @@ class SessionEngine:
                 clarification_plan,
                 self._compiler_config,
                 self._token_counter,
-                self._retrieval_config,
+                retrieval_config,
                 self._recovery_limits,
                 self._task_model_projector,
                 self._context_source,

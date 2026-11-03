@@ -37,6 +37,7 @@ from .control import (
     fit_completion_guidance,
 )
 from .conversation import (
+    MAX_FORK_TURNS,
     ConversationItem,
     ConversationTurn,
     ConversationView,
@@ -48,6 +49,7 @@ from .conversation import (
     SessionContextPrepared,
     SessionControlDecided,
     SessionEvent,
+    SessionForked,
     SessionInput,
     SessionInterrupted,
     SessionRequest,
@@ -175,6 +177,7 @@ from .turns import (
 __all__ = [
     "COMPLETION_GUIDANCE_JSON_BYTES",
     "CONTROL_FEEDBACK_BYTES",
+    "MAX_FORK_TURNS",
     "ActionCostSignal",
     "ActionGainEstimate",
     "ActionInterventionChecked",
@@ -293,6 +296,7 @@ __all__ = [
     "SessionContextPrepared",
     "SessionControlDecided",
     "SessionEvent",
+    "SessionForked",
     "SessionInput",
     "SessionInterrupted",
     "SessionRequest",

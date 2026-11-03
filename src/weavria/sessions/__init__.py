@@ -1,6 +1,6 @@
 """Persistent single-user conversations, accepted evidence and explicit interruption."""
 
-from .engine import SessionEngine
+from .engine import SessionEngine, SessionForkAccess
 from .preparation import (
     ClarificationAssociationPolicy,
     ClarificationDeliveryPlan,
@@ -31,6 +31,7 @@ __all__ = [
     "SessionBusyError",
     "SessionConflictError",
     "SessionEngine",
+    "SessionForkAccess",
     "SessionInterruptedError",
     "SessionProgressAssessor",
     "SessionProgressContext",

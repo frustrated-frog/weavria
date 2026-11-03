@@ -28,6 +28,7 @@ from weavria.runtime import (
 from weavria.sessions import (
     SessionBusyError,
     SessionEngine,
+    SessionForkAccess,
     TaskAccessPolicy,
     TaskContinuationResult,
     TaskRun,
@@ -447,6 +448,20 @@ class AgentHarness:
     async def create(self, session_id: str | None = None) -> str:
         self._require_open()
         return await self.sessions.create(session_id)
+
+    async def fork(
+        self,
+        source_session_id: str,
+        through_run_id: str,
+        *,
+        session_id: str,
+        access: SessionForkAccess,
+    ) -> str:
+        """从已完成轮次分叉对话, 由宿主授权源会话读取与目标会话写入。"""
+        self._require_open()
+        return await self.sessions.fork(
+            source_session_id, through_run_id, session_id=session_id, access=access
+        )
 
     def _require_open(self) -> None:
         if not self._opened or self._closing:
