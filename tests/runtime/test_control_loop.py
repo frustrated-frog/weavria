@@ -88,6 +88,7 @@ from weavria.runtime import (
     CompletionContext,
     CompletionPolicy,
     EventAcceptanceError,
+    JsonOutputContract,
     Phase,
     ProgressAssessor,
     RunLimits,
@@ -3120,4 +3121,33 @@ async def test_steering_wins_before_exhausted_rejection_is_accepted() -> None:
     assert result.status is RunStatus.COMPLETED and result.output == "revised"
     assert agent.state.tool_calls == 0
     assert len([event for event in journal.events if isinstance(event.data, BatchRejected)]) == 1
+    replay(agent)
+
+
+async def test_declared_json_output_repairs_only_delivery_after_tool_success() -> None:
+    provider = FakeControlProvider(
+        (
+            ModelTurn(
+                decision=ToolBatch(
+                    calls=(
+                        ToolCallAction(
+                            call_id="read",
+                            tool_name="echo",
+                            arguments={"value": "offset 12"},
+                        ),
+                    )
+                )
+            ),
+            finish('{"offset":"12"}'),
+            finish('{"offset":12}'),
+        )
+    )
+    agent = make_loop(provider, completion=JsonOutputContract({"offset": "integer"}))
+    result = await agent.execute()
+    assert result.output == '{"offset":12}'
+    assert agent.state.tool_calls == 1 and agent.state.model_calls == 3
+    notice = provider.requests[-1].control
+    assert isinstance(notice, CompletionNotice)
+    assert "offset: integer" in notice.decision.guidance
+    assert '{"offset":"12"}' in notice.decision.guidance
     replay(agent)

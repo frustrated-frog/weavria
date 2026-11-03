@@ -35,6 +35,7 @@ from .journal import (
     RunJournal,
     settle_mutation,
 )
+from .output_contract import JsonOutputContract
 from .progress import (
     ProgressCheck,
     ProgressPolicy,
@@ -66,6 +67,7 @@ __all__ = [
     "HardStopActionInterventionPolicy",
     "InterventionJournal",
     "JournalCommitError",
+    "JsonOutputContract",
     "LayeredCompletionPolicy",
     "LegacyAgentLoop",
     "NoVerification",

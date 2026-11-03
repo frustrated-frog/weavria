@@ -131,3 +131,24 @@ async def test_external_update_owns_a_separate_task_and_is_cleaned_up() -> None:
             await task
     assert cleaned.is_set()
     assert len(delegate.requests) == 1
+
+
+async def test_output_contract_repairs_shape_without_requiring_a_known_answer() -> None:
+    from weavria.core import CompletionAccept, CompletionRepair, FinishAction, TaskInput
+    from weavria.runtime import CompletionContext, JsonOutputContract
+
+    contract = JsonOutputContract({"offset": "integer", "cursor": "expression"})
+    store = InMemoryArtifactStore()
+
+    def context(output: str) -> CompletionContext:
+        return CompletionContext(
+            "r", TaskInput(goal="Report fields"), FinishAction(output=output), (), store
+        )
+
+    invalid = await contract.verify(context('{"offset":"12","cursor":"start == page.end"}'))
+    assert isinstance(invalid, CompletionRepair)
+    assert "offset: integer" in invalid.guidance
+    assert "cursor: expression" in invalid.guidance
+    assert "Previous JSON" in invalid.guidance
+    accepted = await contract.verify(context('{"offset":12,"cursor":"page.end"}'))
+    assert isinstance(accepted, CompletionAccept) and accepted.outcome == "unverified"
