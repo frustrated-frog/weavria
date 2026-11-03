@@ -6,7 +6,9 @@ from pathlib import Path
 import pytest
 from pydantic import BaseModel, JsonValue
 
+from weavria.context import ContextCompilerConfig
 from weavria.core import (
+    AdmissionNotice,
     ApplicationObservation,
     ContextCompilation,
     FinishAction,
@@ -24,7 +26,13 @@ from weavria.core import (
     ToolFailedObservation,
     ToolSucceededObservation,
 )
-from weavria.models import FakeSessionProvider, ModelCapabilities, ModelOutputError
+from weavria.models import (
+    FakeSessionProvider,
+    ModelCapabilities,
+    ModelOutputError,
+    OpenAICompatibleTokenCounter,
+)
+from weavria.runtime import RunLimits
 from weavria.sessions import SessionBusyError, SessionConflictError, SessionEngine
 from weavria.tools import ToolContext, ToolRegistry, TypedTool
 
@@ -542,8 +550,6 @@ async def test_projection_can_be_rebuilt_from_execution_facts(tmp_path: Path) ->
 async def test_context_budget_failure_is_durable_and_consumes_no_model_attempt(
     tmp_path: Path,
 ) -> None:
-    from weavria.runtime import RunLimits
-
     model = Reader()
     async with SessionEngine(
         tmp_path / "db", model=model, tools=tools(), limits=RunLimits(max_request_bytes=1000)
@@ -671,3 +677,105 @@ async def test_configuration_metadata_is_snapshotted_outside_model_input(tmp_pat
         "flags": {"enabled": True},
     }
     assert configs[1]["configuration_metadata"] == {"profile": "new"}
+
+
+async def test_feedback_replan_carries_the_rejected_artifact_cursor(
+    tmp_path: Path, session_counter: OpenAICompatibleTokenCounter
+) -> None:
+    async def document(arguments: Input, context: ToolContext) -> Output:
+        return Output(value="original text " * 1200)
+
+    class Reader:
+        capabilities = ModelCapabilities(True, True)
+        attempts = 0
+        source_id: str | None = None
+
+        async def generate_session(self, request: SessionRequest) -> ModelTurn:
+            if not request.current.history:
+                return ModelTurn(
+                    decision=ToolBatch(
+                        calls=(
+                            ToolCallAction(
+                                call_id="source", tool_name="document", arguments={"name": "a"}
+                            ),
+                        )
+                    )
+                )
+            if self.attempts == 2:
+                return finish("The bounded page was delivered.")
+            exchange = request.current.history[0]
+            assert isinstance(exchange, ToolExchange)
+            assert isinstance(exchange.observation, ToolSucceededObservation)
+            output = exchange.observation.output
+            assert isinstance(output, dict) and isinstance(output["artifact_id"], str)
+            self.source_id = output["artifact_id"]
+            self.attempts += 1
+            if self.attempts == 1:
+                return ModelTurn(
+                    decision=ToolBatch(
+                        calls=tuple(
+                            ToolCallAction(
+                                call_id=f"page-{start}",
+                                tool_name="read_artifact",
+                                arguments={
+                                    "artifact_id": self.source_id,
+                                    "pointer": "/value",
+                                    "start": start,
+                                    "length": 4000,
+                                },
+                            )
+                            for start in (900, 2000, 3000)
+                        )
+                    )
+                )
+            notice = request.current.control
+            assert isinstance(notice, AdmissionNotice)
+            cursor = notice.artifact_page_retry
+            assert cursor is not None
+            assert (cursor.artifact_id, cursor.pointer, cursor.start) == (
+                self.source_id,
+                "/value",
+                900,
+            )
+            assert notice.page_maximum is not None and notice.page_maximum > 0
+            return ModelTurn(
+                decision=ToolBatch(
+                    calls=(
+                        ToolCallAction(
+                            call_id="short-page",
+                            tool_name="read_artifact",
+                            arguments={
+                                "artifact_id": cursor.artifact_id,
+                                "pointer": cursor.pointer,
+                                "start": cursor.start,
+                                "length": min(notice.page_maximum, 400),
+                            },
+                        ),
+                    )
+                )
+            )
+
+    model = Reader()
+    async with SessionEngine(
+        tmp_path / "retry-cursor.db",
+        model=model,
+        tools=ToolRegistry(
+            (
+                TypedTool(
+                    name="document",
+                    version="1",
+                    description="Read an original file",
+                    input_type=Input,
+                    output_type=Output,
+                    execute=document,
+                ),
+            )
+        ),
+        limits=RunLimits(max_request_bytes=9500),
+        context_compiler=ContextCompilerConfig(window_tokens=64000, output_tokens=256),
+        token_counter=session_counter,
+    ) as engine:
+        await engine.create("session")
+        result = await engine.send("session", "Read the original", input_id="input")
+    assert result.report.status is RunStatus.COMPLETED
+    assert model.attempts == 2

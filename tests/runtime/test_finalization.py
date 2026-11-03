@@ -7,7 +7,9 @@ from pydantic import BaseModel, Field
 from weavria.artifacts import ArtifactSnapshot, InMemoryArtifactStore
 from weavria.context import ControlContextBuilder, ControlEvidencePlan, EvidenceContextBuilder
 from weavria.core import (
+    CompletionAccept,
     CompletionChecked,
+    CompletionDecision,
     CompletionRepair,
     ControlFeedback,
     ControlRequest,
@@ -929,3 +931,32 @@ async def test_synthesis_recompiles_once_and_only_selects_improved_coverage(
     assert agent.state.tool_calls == 1 and agent.state.model_calls == 2
     assert ("targeted" in provider.requests[-1].instructions) is improved
     assert (agent.state.finalization is not None) is improved
+
+
+@pytest.mark.parametrize("max_calls", [3, 5])
+async def test_publication_prerequisite_keeps_tools_open_or_reports_exhaustion(
+    max_calls: int,
+) -> None:
+    class NeedsSecondRead:
+        version = "two-reads/1"
+
+        def can_finalize(self, records: tuple[ToolRecord, ...]) -> bool:
+            return len(records) == 2
+
+        async def verify(self, context: CompletionContext) -> CompletionDecision:
+            return CompletionAccept(outcome="unverified")
+
+    policy = LayeredCompletionPolicy(TaskObligationCompletionPolicy(), NeedsSecondRead())
+    agent, provider = await setup(
+        (read(), read("read-2"), finish()), max_calls=max_calls, completion=policy
+    )
+    result = await agent.execute()
+    if max_calls == 3:
+        assert result.status is RunStatus.BUDGET_EXHAUSTED
+        assert agent.state.finalization is None
+        assert len(provider.requests) == 1
+    else:
+        assert result.status is RunStatus.COMPLETED
+        assert agent.state.finalization is not None
+        assert "FINALIZATION" not in provider.requests[1].instructions
+        assert "FINALIZATION" in provider.requests[2].instructions

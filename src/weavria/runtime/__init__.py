@@ -2,7 +2,13 @@
 
 from .agent import AgentLoop, AgentRun, Clock, LegacyAgentLoop, RunLimits, SystemClock
 from .budget import RootBudget
-from .completion import CompletionContext, CompletionPolicy, LayeredCompletionPolicy, NoVerification
+from .completion import (
+    CompletionContext,
+    CompletionPolicy,
+    FinalizationPrerequisite,
+    LayeredCompletionPolicy,
+    NoVerification,
+)
 from .controller import (
     FinalizationPreparer,
     ProgressAssessor,
@@ -64,6 +70,7 @@ __all__ = [
     "FinalizationAssessment",
     "FinalizationPolicy",
     "FinalizationPreparer",
+    "FinalizationPrerequisite",
     "HardStopActionInterventionPolicy",
     "InterventionJournal",
     "JournalCommitError",

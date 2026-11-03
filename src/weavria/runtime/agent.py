@@ -38,6 +38,7 @@ from weavria.core import (
     ActionValueScope,
     AdmissionNotice,
     AgentResult,
+    ArtifactPageRetry,
     ArtifactRef,
     BatchAdmitted,
     BatchRejected,
@@ -130,6 +131,7 @@ from .completion import (
     CompletionCheckError,
     CompletionContext,
     CompletionPolicy,
+    FinalizationPrerequisite,
     NoVerification,
     check_completion,
 )
@@ -330,9 +332,10 @@ def _instructions_for(instructions: str, tools: ToolRegistry, journal_version: i
         )
     if journal_version >= 3:
         assembled += (
-            "\nRejected calls were not dispatched. For feedback_budget retry page_call_index "
-            "alone with page_parameter <= page_maximum (0: impossible), else obey "
-            "recommended_max_calls. Correct completion gaps; later task.constraints prevail."
+            "\nRejected calls did not run. For feedback_budget retry the advised page alone "
+            "within page_maximum. For artifact_page_retry use its cursor and set length "
+            "to page_maximum or less. Otherwise obey recommended_max_calls. If page_maximum=0 or "
+            "no_progress, change operation or source. Correct completion gaps."
         )
     if journal_version == 4:
         assembled += (
@@ -1030,6 +1033,13 @@ class _AgentKernel:
         tool_budget = self.state.tool_calls >= self._limits.max_tool_calls
         if existing is None and not before.eligible and not reserve_reached and not tool_budget:
             return await self._build_context(task)
+        # 已知还需执行工具的发布义务不能交给仅允许 Finish 的收尾阶段。
+        if isinstance(self._completion, FinalizationPrerequisite) and not (
+            self._completion.can_finalize(self.state.records)
+        ):
+            if existing is None and not reserve_reached and not tool_budget:
+                return await self._build_context(task)
+            return None
         known = {record.exchange.action.call_id for record in self.state.records}
         required = tuple(identity for identity in before.required_call_ids if identity in known)
         plan = await self._build_context(task, finalizing=True, required_call_ids=required)
@@ -1745,6 +1755,29 @@ class _AgentKernel:
             return index, parameter, feasible
         return None
 
+    def _artifact_page_retry(
+        self, batch: ToolBatch, page_advice: tuple[int, str, int] | None
+    ) -> ArtifactPageRetry | None:
+        if page_advice is None:
+            return None
+        index, parameter, maximum = page_advice
+        call = batch.calls[index]
+        if call.tool_name != "read_artifact" or parameter != "length" or maximum == 0:
+            return None
+        try:
+            proposed = ArtifactReadInput.model_validate(call.arguments)
+            if self._evidence_access is None or not any(
+                ref.artifact_id == proposed.artifact_id for ref in self._evidence_access.artifacts
+            ):
+                return None
+            retry = ArtifactPageRetry(
+                artifact_id=proposed.artifact_id, pointer=proposed.pointer, start=proposed.start
+            )
+        except ValueError:
+            return None
+        # 防止转义后的路径挤占已预留的控制反馈通道。
+        return retry if len(retry.model_dump_json().encode()) <= 256 else None
+
     async def _admit_batch(
         self,
         batch: ToolBatch,
@@ -1840,6 +1873,7 @@ class _AgentKernel:
                 reason = "no_progress"
         if reason is not None:
             page_advice = self._page_advice(batch) if reason == "feedback_budget" else None
+            page_retry = self._artifact_page_retry(batch, page_advice)
             async with self._commit_lock:
                 if revision != self.state.task.revision:
                     return False, ()
@@ -1914,7 +1948,8 @@ class _AgentKernel:
                 await self._accept_locked(
                     BatchRejected(
                         notice=AdmissionNotice(
-                            schema_version=2 if page_advice else 1,
+                            schema_version=3 if page_retry else 2 if page_advice else 1,
+                            artifact_page_retry=page_retry,
                             page_call_index=page_advice[0] if page_advice else None,
                             page_parameter=page_advice[1] if page_advice else None,
                             page_maximum=page_advice[2] if page_advice else None,

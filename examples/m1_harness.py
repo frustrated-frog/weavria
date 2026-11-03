@@ -21,7 +21,6 @@ from examples.m1_corpus import SnapshotCorpus
 from weavria.context import ContextCompilerConfig
 from weavria.core import (
     ApplicationObservation,
-    CompletionAccept,
     CompletionDecision,
     CompletionRepair,
     ModelTurn,
@@ -33,6 +32,7 @@ from weavria.core import (
     SessionRunEvent,
     SessionSemanticCommitted,
     ToolExchange,
+    ToolRecord,
     ToolRecorded,
     ToolSucceededObservation,
 )
@@ -214,12 +214,12 @@ def grade_output(case: Case, output: str | None, *, first: bool = False) -> dict
 class LongTaskDelivery:
     """长任务显式要求工作记录;只检查已接受的提案, 不用评分答案。"""
 
-    def __init__(self, output: JsonOutputContract | None) -> None:
+    def __init__(self, output: JsonOutputContract) -> None:
         self._output = output
-        self.version = f"long-task-delivery/1:{output.version if output else 'work-only'}"
+        self.version = f"long-task-delivery/2:{output.version}"
 
-    async def verify(self, context: CompletionContext) -> CompletionDecision:
-        for record in context.records:
+    def can_finalize(self, records: tuple[ToolRecord, ...]) -> bool:
+        for record in records:
             action = record.exchange.action
             if action.tool_name != "propose_work" or not isinstance(
                 record.exchange.observation, ToolSucceededObservation
@@ -230,16 +230,17 @@ class LongTaskDelivery:
                 isinstance(note, dict) and note.get("kind") == "result" and note.get("sources")
                 for note in notes
             ):
-                break
-        else:
+                return True
+        return False
+
+    async def verify(self, context: CompletionContext) -> CompletionDecision:
+        if not self.can_finalize(context.records):
             return CompletionRepair(
                 issue_codes=("work_record_missing",),
                 guidance="The request asks for working notes. Record a sourced finding via "
                 "propose_work, then submit the final JSON.",
             )
-        if self._output is not None:
-            return await self._output.verify(context)
-        return CompletionAccept(outcome="unverified")
+        return await self._output.verify(context)
 
 
 class ObservedModel:
@@ -402,7 +403,15 @@ async def run_trial(
                         }
                     )
                     if case.domain == "repository"
-                    else None
+                    else JsonOutputContract(
+                        {
+                            "memory_write": "string",
+                            "max_notes": "integer",
+                            "summary_characters": "integer",
+                            "state_bytes": "integer",
+                            "sources": "string_array",
+                        }
+                    )
                 )
                 if case.scenario == "long_context"
                 else None,
@@ -416,12 +425,13 @@ async def run_trial(
                 instructions=(
                     (
                         "Use original sources; verify defaults in declarations. "
-                        "Read small pages singly. Save a sourced propose_work note. "
+                        "Read pages singly. Save a sourced propose_work note. "
                         "Cite original paths. Return JSON integers as numbers."
                         + (
-                            " Locate design records in the catalogue. "
-                            "Verify a short primary excerpt "
-                            "with recover_context or read_artifact before recording a finding."
+                            " Read the primary ADRs listed in design_records. Record the findings "
+                            'via propose_work with original artifact_id and pointer "/text". '
+                            "Omit start/end for whole-file citations. Spot-check one original "
+                            "using read_artifact alone, then finish."
                             if case.domain == "documents"
                             else " Return the required value expression, not the comparison."
                         )
@@ -445,11 +455,22 @@ async def run_trial(
                             observation_id="original-file-catalogue",
                             input_id=input_id,
                             provider="m1.snapshot",
-                            payload_schema="original-file-catalogue/1",
-                            payload={"original_paths": original_paths},
+                            payload_schema="original-file-catalogue/2",
+                            payload={
+                                **(
+                                    {"original_paths": original_paths}
+                                    if case.domain == "repository"
+                                    else {}
+                                ),
+                                "design_records": [
+                                    path
+                                    for path in sorted(corpus.documents)
+                                    if path.startswith("docs/decisions/")
+                                ],
+                            },
                         ),
                     )
-                    if case.case_id == "documents_long_context"
+                    if case.scenario == "long_context"
                     else ()
                 )
 

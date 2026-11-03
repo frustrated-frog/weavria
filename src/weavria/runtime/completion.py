@@ -3,7 +3,7 @@
 import asyncio
 import hashlib
 import math
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from pydantic import JsonValue, TypeAdapter
 
@@ -140,6 +140,13 @@ class CompletionPolicy(Protocol):
     async def verify(self, context: CompletionContext) -> CompletionDecision: ...
 
 
+@runtime_checkable
+class FinalizationPrerequisite(Protocol):
+    """A publication condition that requires tools and must precede synthesis."""
+
+    def can_finalize(self, records: tuple[ToolRecord, ...]) -> bool: ...
+
+
 class NoVerification:
     """No supplied acceptance criterion means the candidate cannot be verified."""
 
@@ -156,6 +163,13 @@ class LayeredCompletionPolicy:
         self._required = required
         self._extension = extension
         self.version = f"layered/2[{required.version};{extension.version}]"
+
+    def can_finalize(self, records: tuple[ToolRecord, ...]) -> bool:
+        return all(
+            policy.can_finalize(records)
+            for policy in (self._required, self._extension)
+            if isinstance(policy, FinalizationPrerequisite)
+        )
 
     async def verify(self, context: CompletionContext) -> CompletionDecision:
         adapter = TypeAdapter[CompletionDecision](CompletionDecision)

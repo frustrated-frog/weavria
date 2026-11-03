@@ -83,6 +83,14 @@ class FeedbackEnvelopeBound(ContractModel):
     max_exchange_bytes: int = Field(gt=0)
 
 
+class ArtifactPageRetry(ContractModel):
+    """Original source cursor for a rejected read, excluding untrusted result content."""
+
+    artifact_id: str = Field(pattern=r"^[a-f0-9]{64}$")
+    pointer: str = Field(max_length=128)
+    start: int = Field(ge=0, le=2**63 - 1)
+
+
 class AdmissionNotice(BaseModel):
     model_config = ContractModel.model_config
 
@@ -91,18 +99,22 @@ class AdmissionNotice(BaseModel):
     def version_type(cls, value: object) -> object:
         return ContractModel.validate_version_type(value)
 
-    schema_version: Literal[1, 2] = 1
+    schema_version: Literal[1, 2, 3] = 1
     # 建议只针对原提案中指定的一次调用单独重提,0 表示最低页也无法容纳。
     page_call_index: int | None = Field(default=None, ge=0, le=31)
     page_parameter: str | None = Field(default=None, min_length=1, max_length=64)
     page_maximum: int | None = Field(default=None, ge=0)
 
+    artifact_page_retry: ArtifactPageRetry | None = None
+
     @model_serializer(mode="wrap")
-    def preserve_v1_wire(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+    def preserve_legacy_wire(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
         data = handler(self)
         if self.schema_version == 1:
             for key in ("page_call_index", "page_parameter", "page_maximum"):
                 data.pop(key, None)
+        if self.schema_version < 3:
+            data.pop("artifact_page_retry", None)
         return data
 
     kind: Literal["admission_rejected"] = "admission_rejected"
@@ -124,13 +136,18 @@ class AdmissionNotice(BaseModel):
         advice = (self.page_call_index, self.page_parameter, self.page_maximum)
         if any(x is not None for x in advice):
             if (
-                self.schema_version != 2
+                self.schema_version not in {2, 3}
                 or self.reason != "feedback_budget"
                 or any(x is None for x in advice)
             ):
-                raise ValueError("page advice requires a complete v2 feedback-budget notice")
+                raise ValueError("page advice requires a complete feedback-budget notice")
             if self.page_call_index is not None and self.page_call_index >= self.proposed_calls:
                 raise ValueError("page advice must reference a proposed call")
+        if (self.schema_version == 3) != (self.artifact_page_retry is not None) or (
+            self.artifact_page_retry is not None
+            and (self.page_parameter != "length" or not self.page_maximum)
+        ):
+            raise ValueError("an artifact retry cursor requires feasible v3 length advice")
         progress = self.reason == "no_progress"
         if progress != (
             self.progress_fingerprint_sha256 is not None

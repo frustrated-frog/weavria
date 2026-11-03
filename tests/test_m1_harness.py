@@ -152,3 +152,19 @@ async def test_output_contract_repairs_shape_without_requiring_a_known_answer() 
     assert "Previous JSON" in invalid.guidance
     accepted = await contract.verify(context('{"offset":12,"cursor":"page.end"}'))
     assert isinstance(accepted, CompletionAccept) and accepted.outcome == "unverified"
+
+
+async def test_snapshot_resolves_unique_relative_suffix_to_canonical_source() -> None:
+    path = "src/weavria/runtime/agent.py"
+    corpus = SnapshotCorpus({path: "Original", "src/weavria/other/agent.py": "Other"})
+    context = ToolContext("run", InMemoryArtifactStore())
+    try:
+        tool = corpus.registry(documents=False).get("read_source")
+        value = await tool.invoke(ReadInput(path="runtime/agent.py"), context)
+        assert isinstance(value, dict) and value["path"] == path
+        for ambiguous_or_unsafe in ("agent.py", "../runtime/agent.py"):
+            with pytest.raises(ToolFault):
+                await tool.invoke(ReadInput(path=ambiguous_or_unsafe), context)
+        assert corpus.reads == [("read_source", path)]
+    finally:
+        context.close()

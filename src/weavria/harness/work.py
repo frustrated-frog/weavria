@@ -263,17 +263,22 @@ def work_tool() -> TypedTool[WorkDraft, WorkProposal]:
                         if not isinstance(value, str) or ref.end > len(value):
                             raise ValueError("work range outside source text")
                         label = _source_label(value, ref.start, ref.end)
-                        if (
-                            label is None
-                            and not _SOURCE_HEADING.search(value)
-                            and isinstance(document, dict)
-                        ):
-                            path = document.get("path")
-                            if isinstance(path, str) and 0 < len(path) <= 240:
-                                label = path
-                except ValueError as exc:
+                    if (
+                        label is None
+                        and isinstance(value, str)
+                        and not _SOURCE_HEADING.search(value)
+                        and isinstance(document, dict)
+                    ):
+                        # 直接原文允许整个字段引用; 聚合原文仍必须提供精确区间来归属章节。
+                        path = document.get("path")
+                        if isinstance(path, str) and 0 < len(path) <= 240:
+                            label = path
+                except (KeyError, IndexError, ValueError) as exc:
                     raise ToolFault(
-                        ErrorCategory.INVALID_TOOL_ARGUMENTS, "Invalid work source pointer"
+                        ErrorCategory.INVALID_TOOL_ARGUMENTS,
+                        "Invalid work source pointer or range. Use the original Artifact JSON "
+                        "pointer from its excerpt, without the observation wrapper, "
+                        "and copy the exact start/end.",
                     ) from exc
                 sources.append(
                     WorkSource(
@@ -298,8 +303,8 @@ def work_tool() -> TypedTool[WorkDraft, WorkProposal]:
             "Keep bounded multi-step notes: results with accepted artifact IDs/pointers, "
             "open issues, plans, hypotheses or rejected attempts. Supply notes with kind, summary, "
             "need_ids and sources (artifact_id/pointer; copy start/end from the exact text span "
-            "for a source label). Revisions and note_id may be omitted; "
-            "the host binds them to the task view that produced this call. "
+            "for a source label; omit the observation wrapper). The host binds omitted "
+            "revisions and note_id to the current proposal. "
             "Replace the whole set; retain useful notes. Sourced results lower acquired needs' "
             "exploration priority; issues and next_need_ids raise it. "
             "Check working_state.last_notice "

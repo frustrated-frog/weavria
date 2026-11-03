@@ -83,16 +83,26 @@ class SnapshotCorpus:
                         "Primary archive unavailable; mirror remains available",
                         retryable=False,
                     )
-                text = content.get(arguments.path)
+                path = arguments.path
+                if (
+                    path not in content
+                    and not path.startswith("/")
+                    and ".." not in Path(path).parts
+                ):
+                    # 只在冻结索引中解析唯一的路径后缀, 输出始终保留可引用的完整路径。
+                    matches = [item for item in content if item.endswith("/" + path)]
+                    if len(matches) == 1:
+                        path = matches[0]
+                text = content.get(path)
                 if text is None:
                     raise ToolFault(
                         ErrorCategory.TOOL_FAILURE,
                         "Unknown path; search the snapshot catalogue",
                         retryable=False,
                     )
-                self.reads.append((name, arguments.path))
+                self.reads.append((name, path))
                 return ReadOutput(
-                    path=arguments.path, sha256=hashlib.sha256(text.encode()).hexdigest(), text=text
+                    path=path, sha256=hashlib.sha256(text.encode()).hexdigest(), text=text
                 )
 
             return TypedTool(

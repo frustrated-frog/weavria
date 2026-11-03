@@ -1161,6 +1161,24 @@ def _reduce_control(
             or notice.reason in ("capability_view", "no_progress"),
             "rejection contradicts its budget",
         )
+        cursor = notice.artifact_page_retry
+        if cursor is not None:
+            assert notice.page_call_index is not None
+            call = turn.decision.calls[notice.page_call_index]
+            selected = set(state.context_call_ids)
+            _require(
+                call.tool_name == "read_artifact"
+                and call.arguments.get("artifact_id") == cursor.artifact_id
+                and call.arguments.get("pointer", "") == cursor.pointer
+                and call.arguments.get("start", 0) == cursor.start
+                and any(
+                    record.artifact is not None
+                    and record.artifact.call_id in selected
+                    and record.artifact.artifact_id == cursor.artifact_id
+                    for record in state.records
+                ),
+                "artifact retry cursor must match the rejected call and selected source",
+            )
         # Denial is a new observation, not a reason to remove prior mandatory
         # failures, source receipts or verification evidence from the next frame.
         return replace(

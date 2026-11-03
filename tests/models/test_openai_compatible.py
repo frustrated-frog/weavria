@@ -395,3 +395,36 @@ async def test_session_provider_assigns_deterministic_request_scoped_call_ids() 
     assert first_ids == tuple(call.call_id for call in repeated.decision.calls)
     assert first_ids != tuple(call.call_id for call in advanced.decision.calls)
     assert [call.arguments for call in first.decision.calls] == [{"part": 1}, {"part": 2}]
+
+
+@pytest.mark.parametrize(
+    ("enabled", "explicit_version"), [(True, False), (False, False), (True, True)]
+)
+async def test_session_recovery_normalizes_omitted_envelope_version_only_if_enabled(
+    enabled: bool,
+    explicit_version: bool,
+) -> None:
+    # 复现源码长任务中三个完全相同的 66 字节回复。
+    content = '{"decision":{"kind":"recover_context","query":"runtime/agent.py"}}'
+    if explicit_version:
+        content = '{"schema_version":1,' + content[1:]
+    provider = OpenAICompatibleSessionProvider(
+        OpenAICompatibleConfig(model="model"), transport=Transport(_response(content))
+    )
+    request = _session_request()
+    if enabled:
+        request = request.model_copy(
+            update={
+                "current": ControlRequest(
+                    schema_version=4, instructions="", task=request.current.task
+                ),
+            }
+        )
+    if not enabled or explicit_version:
+        with pytest.raises(ModelOutputError, match="valid JSON turn"):
+            await provider.generate_session(request)
+        return
+    turn = await provider.generate_session(request)
+    assert turn.schema_version == 2
+    assert turn.decision.kind == "recover_context"
+    assert turn.decision.query == "runtime/agent.py"

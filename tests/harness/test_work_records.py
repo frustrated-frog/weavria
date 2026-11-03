@@ -394,14 +394,14 @@ async def test_proposal_conflict_replay_and_unknown_need_are_observable() -> Non
 
 async def test_source_access_and_pointer_failure_do_not_publish_work() -> None:
     from weavria.artifacts import InMemoryArtifactStore
-    from weavria.core import ToolFailedObservation
+    from weavria.core import ErrorCategory, ToolFailedObservation
     from weavria.harness.work import work_tool
     from weavria.tools import ReadOnlyPolicy, ToolExecutor
 
     store = InMemoryArtifactStore()
     source = await store.put("r", "source", {"text": "source"})
     executor = ToolExecutor("r", ToolRegistry((work_tool(),)), store, ReadOnlyPolicy())
-    for pointer, permitted in (("/text", False), ("/missing", True)):
+    for pointer, permitted in (("/text", False), ("/data/text", True)):
         proposal = WorkUpdate(
             task_revision=1,
             base_revision=0,
@@ -426,6 +426,10 @@ async def test_source_access_and_pointer_failure_do_not_publish_work() -> None:
             accepted_artifacts=(source.reference,) if permitted else (),
         )
         assert isinstance(result.exchange.observation, ToolFailedObservation)
+        if permitted:
+            error = result.exchange.observation.error
+            assert error.category is ErrorCategory.INVALID_TOOL_ARGUMENTS
+            assert "without the observation wrapper" in error.message
         assert result.artifact is None
 
 
@@ -665,3 +669,40 @@ async def test_work_range_resolves_original_section_and_survives_work_projection
     crossed = await propose("crossed", len(text))
     assert crossed is not None and crossed.sources[0].source_label is None
     assert await propose("out-of-range", len(text) + 1) is None
+
+
+async def test_whole_file_work_reference_keeps_original_path_without_fabricated_offsets() -> None:
+    from weavria.artifacts import InMemoryArtifactStore
+    from weavria.harness.work import WorkProposal, work_tool
+    from weavria.tools import ReadOnlyPolicy, ToolExecutor
+
+    store = InMemoryArtifactStore()
+    path = "docs/decision.md"
+    original = await store.put("r", "original", {"path": path, "text": "default = 2"})
+    executor = ToolExecutor("r", ToolRegistry((work_tool(),)), store, ReadOnlyPolicy())
+    record = await executor.execute(
+        ToolCallAction(
+            call_id="cite",
+            tool_name="propose_work",
+            arguments={
+                "task_revision": 1,
+                "base_revision": 0,
+                "notes": [
+                    {
+                        "kind": "result",
+                        "summary": "The default is 2",
+                        "sources": [
+                            {"artifact_id": original.reference.artifact_id, "pointer": "/text"}
+                        ],
+                    }
+                ],
+            },
+        ),
+        max_duration=1,
+        accepted_artifacts=(original.reference,),
+    )
+    assert record.artifact is not None
+    saved = await store.get("r", record.artifact.artifact_id)
+    source = WorkProposal.model_validate_json(saved.content_json).sources[0]
+    assert source.source_label == path
+    assert source.reference.start is None and source.reference.end is None
