@@ -348,9 +348,13 @@ class CapabilityResolver:
         trigger: CapabilityTrigger,
     ) -> tuple[CapabilityEpochView, tuple[CapabilityChoice, ...]]:
         catalogue = CatalogSnapshot.from_registry(registry)
+        # 先按宿主策略收窄可发现边界, 再做相关性召回. 私有或不可发现工具不能进入候选池.
+        # 这个顺序很重要: 检索器只负责相关性, 不能反过来决定模型有权看见哪些能力.
         safe = tuple(item for item in catalogue.capabilities if self._policy.can_discover(item))
         safe_names = {item.name for item in safe}
         safe_by_id = {item.capability_id: item for item in safe}
+        # 上一轮留下的工具名只是召回提示, 不是执行授权. 不在安全目录中的提示会被直接丢弃.
+        # 这样澄清回答可以帮助找回原能力, 却不能借旧状态扩大当前请求的可见范围.
         query = query.model_copy(
             update={
                 "recall_seed_names": tuple(
@@ -363,6 +367,8 @@ class CapabilityResolver:
             safe,
             limit=min(len(safe), self._limit * 3) or self._limit,
         )
+        # 自定义检索器也被视为不可信组件. 一旦返回目录外能力, 宿主立即拒绝整次解析.
+        # 不能为了召回率而静默接纳越权结果, 否则工具发现会变成绕过策略的后门.
         if any(
             item.capability_id not in safe_by_id or safe_by_id[item.capability_id].name != item.name
             for item in recalled
@@ -375,6 +381,7 @@ class CapabilityResolver:
             limit=min(len(safe), self._limit * 3) or self._limit,
         )
         choices = self._selector.select(query, catalogue, recalled, limit=self._limit)
+        # 选择器只能在安全候选内排序和延后高风险工具, 最终结果仍要再次核验身份.
         if any(
             item.capability_id not in safe_by_id or safe_by_id[item.capability_id].name != item.name
             for item in choices
@@ -382,6 +389,8 @@ class CapabilityResolver:
             raise ValueError("capability selection escaped the discovery policy")
         selected = tuple(item for item in choices if item.decision == "select")
         descriptors = tuple(safe_by_id[item.capability_id] for item in selected)
+        # 每轮只固化本次允许暴露的最小工具视图, 并绑定目录摘要与 capability_epoch.
+        # 后续目录变化或任务澄清会生成新视图, 不能沿用一份失去来源的旧工具列表.
         view = CapabilityEpochView(
             capability_epoch=epoch,
             catalogue_sha256=catalogue.catalogue_sha256,

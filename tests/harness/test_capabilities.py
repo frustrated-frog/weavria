@@ -89,6 +89,8 @@ def test_bm25_discovery_returns_bounded_relevant_view_not_the_registry() -> None
         trigger="initial",
     )
 
+    # 目录中即使有大量无关工具, 当前模型视图也只保留有界且相关的候选.
+    # 这里验证能力发现不会把完整注册表直接塞进上下文, 同时保留可解释的选择原因.
     assert view.allowed_tool_names[0] == "read_market"
     assert len(view.allowed_tool_names) <= 2 < len(registry.descriptors)
     assert choices[0].reason == "goal_relevance"
@@ -139,6 +141,7 @@ def test_irrelevant_goal_does_not_fall_back_to_exposing_all_capabilities() -> No
         epoch=1,
         trigger="initial",
     )
+    # 没有相关候选时宁可返回空视图, 也不能用“暴露全部工具”作为兜底.
     assert view.allowed_tool_names == ()
     assert choices == ()
 
