@@ -56,14 +56,14 @@ class ToolDescriptor(BaseModel):
         validate_default=True,
         revalidate_instances="always",
     )
-    schema_version: Literal[2, 3, 4, 5, 6, 7] = 2
+    schema_version: Literal[2, 3, 4, 5, 6, 7, 8] = 2
     name: str = Field(min_length=1, pattern=r"^[a-zA-Z][a-zA-Z0-9_]*$")
     version: str = Field(min_length=1)
     description: str = Field(min_length=1)
     intent_signals: tuple[str, ...] = Field(default=(), max_length=32)
     input_schema: dict[str, JsonValue]
     output_schema: dict[str, JsonValue]
-    behavior: Literal["read_only", "side_effect"] = "read_only"
+    behavior: Literal["read_only", "side_effect", "isolated_compute"] = "read_only"
     idempotency: Literal["replay_safe", "unknown"] = "replay_safe"
     risk: Literal["low", "medium", "high"] = "low"
     approval_required: bool = False
@@ -104,6 +104,12 @@ class ToolDescriptor(BaseModel):
 
     @model_validator(mode="after")
     def validate_feedback_delivery_version(self) -> "ToolDescriptor":
+        if (self.schema_version == 8) != (self.behavior == "isolated_compute"):
+            raise ValueError("isolated computation requires descriptor v8")
+        if self.behavior == "isolated_compute" and (
+            self.idempotency != "replay_safe" or self.approval_required
+        ):
+            raise ValueError("isolated computation must not have external effects or approvals")
         if self.schema_version == 2 and self.feedback_delivery != "adaptive":
             raise ValueError("complete feedback delivery requires descriptor schema version 3")
         if self.schema_version < 4 and self.feedback_bound_version is not None:
@@ -281,7 +287,7 @@ class TypedTool[Input: BaseModel, Output: BaseModel]:
         input_type: type[Input],
         output_type: type[Output],
         execute: Callable[[Input, ToolContext], Awaitable[Output]],
-        behavior: Literal["read_only", "side_effect"] = "read_only",
+        behavior: Literal["read_only", "side_effect", "isolated_compute"] = "read_only",
         idempotency: Literal["replay_safe", "unknown"] = "replay_safe",
         risk: Literal["low", "medium", "high"] = "low",
         approval_required: bool = False,
@@ -306,7 +312,9 @@ class TypedTool[Input: BaseModel, Output: BaseModel]:
             raise ValueError("adaptive feedback cannot declare a complete-data bound")
         adapter = TypeAdapter[dict[str, JsonValue]](dict[str, JsonValue])
         descriptor = ToolDescriptor(
-            schema_version=7
+            schema_version=8
+            if behavior == "isolated_compute"
+            else 7
             if poll_interval_seconds is not None
             else 6
             if source_group is not None
@@ -617,13 +625,13 @@ class ToolExecutor:
             ):
                 raise ToolExecutionError("tool version changed after admission")
             if (
-                descriptor.behavior != "read_only"
+                descriptor.behavior not in ("read_only", "isolated_compute")
                 or descriptor.idempotency != "replay_safe"
                 or descriptor.approval_required
             ):
                 raise ToolFault(
                     ErrorCategory.POLICY_DENIED,
-                    "This executor supports replay-safe reads without approval only",
+                    "This executor supports replay-safe reads and isolated computation only",
                 )
             deadline = loop.time() + min(max_duration, descriptor.timeout_seconds)
             limit = asyncio.timeout_at(deadline)

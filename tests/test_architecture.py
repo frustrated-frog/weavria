@@ -11,7 +11,8 @@ LAYERS = {
     "models": ("core",),
     "memory": (),
     "artifacts": ("core",),
-    "tools": ("core", "artifacts"),
+    "sandbox": (),
+    "tools": ("core", "artifacts", "sandbox"),
     "context": ("core", "artifacts"),
     "runtime": ("core", "models", "artifacts", "tools", "context"),
     "harness": (

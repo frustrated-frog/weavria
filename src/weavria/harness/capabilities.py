@@ -8,7 +8,15 @@ from collections import Counter
 from math import log
 from typing import Annotated, Literal, Protocol, Self
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, StringConstraints, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    JsonValue,
+    StringConstraints,
+    field_validator,
+    model_validator,
+)
 
 from weavria.tools import ToolDescriptor, ToolRegistry
 
@@ -41,9 +49,11 @@ class _Contract(BaseModel):
     schema_version: Literal[1] = 1
 
 
-class CapabilityDescriptor(_Contract):
+class CapabilityDescriptor(BaseModel):
     """Discoverable metadata derived from, but unable to execute, a Tool."""
 
+    model_config = _Contract.model_config
+    schema_version: Literal[1, 2] = 1
     capability_id: _Identifier
     name: _Identifier
     version: str = Field(min_length=1, max_length=128)
@@ -53,7 +63,7 @@ class CapabilityDescriptor(_Contract):
     input_schema: dict[str, JsonValue] | None = None
     output_schema_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
     output_schema: dict[str, JsonValue] | None = None
-    behavior: Literal["read_only", "side_effect"]
+    behavior: Literal["read_only", "side_effect", "isolated_compute"]
     idempotency: Literal["replay_safe", "unknown"]
     risk: Literal["low", "medium", "high"]
     approval_required: bool
@@ -61,6 +71,20 @@ class CapabilityDescriptor(_Contract):
     provider_namespace: _Identifier = "built_in"
     discoverable: bool = True
     availability: Literal["available", "unavailable"] = "available"
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def validate_version_type(cls, value: object) -> object:
+        if type(value) is not int:
+            raise ValueError("schema_version must be an integer")
+        return value
+
+    @model_validator(mode="after")
+    def validate_behavior_version(self) -> Self:
+        # 保留旧目录快照的序列化与哈希;新计算行为必须显式使用 v2。
+        if (self.schema_version == 2) != (self.behavior == "isolated_compute"):
+            raise ValueError("isolated computation requires capability descriptor v2")
+        return self
 
 
 class CatalogSnapshot(_Contract):
@@ -404,6 +428,7 @@ class CapabilityResolver:
 
 def _descriptor(descriptor: ToolDescriptor) -> CapabilityDescriptor:
     return CapabilityDescriptor(
+        schema_version=2 if descriptor.behavior == "isolated_compute" else 1,
         capability_id=f"tool:{descriptor.name}:{hashlib.sha256(descriptor.model_dump_json().encode()).hexdigest()[:24]}",
         name=descriptor.name,
         version=descriptor.version,

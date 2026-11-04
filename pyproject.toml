@@ -47,6 +47,7 @@ packages = ["src/weavria", "apps"]
 addopts = "-ra --strict-config --strict-markers"
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = ["docker: explicit local Docker sandbox integration tests"]
 
 [tool.ruff]
 line-length = 100

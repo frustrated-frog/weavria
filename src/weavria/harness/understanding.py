@@ -794,22 +794,33 @@ def load_task_frame_patch(value: str | dict[str, JsonValue]) -> TaskFramePatch:
     )
 
 
-class CapabilityView(_Contract):
+class CapabilityView(BaseModel):
     """Bounded, immutable capability metadata visible to task understanding."""
 
+    model_config = _Contract.model_config
+    schema_version: Literal[1, 2] = 1
     name: _CapabilityName
     version: _Text
     description: Annotated[str, StringConstraints(min_length=1, pattern=r"\S")]
     input_schema: dict[str, JsonValue]
-    behavior: Literal["read_only", "side_effect"]
+    behavior: Literal["read_only", "side_effect", "isolated_compute"]
     risk: Literal["low", "medium", "high"]
     approval_required: bool
     output_schema: dict[str, JsonValue] = Field(default_factory=dict)
     evidence_profile_version: str | None = Field(default=None, min_length=1, max_length=128)
     evidence_surfaces: tuple[EvidenceSurface, ...] = Field(default=(), max_length=32)
 
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def validate_version_type(cls, value: object) -> object:
+        if type(value) is not int:
+            raise ValueError("schema_version must be an integer")
+        return value
+
     @model_validator(mode="after")
     def validate_evidence_profile(self) -> Self:
+        if (self.schema_version == 2) != (self.behavior == "isolated_compute"):
+            raise ValueError("isolated computation requires capability view v2")
         if (self.evidence_profile_version is None) != (not self.evidence_surfaces):
             raise ValueError("capability evidence profile metadata must be complete")
         identities = [surface.surface_id for surface in self.evidence_surfaces]
@@ -2641,6 +2652,7 @@ def _capability_view(
                     "evidence surface declares an input value outside the capability contract"
                 )
     return CapabilityView(
+        schema_version=2 if descriptor.behavior == "isolated_compute" else 1,
         name=descriptor.name,
         version=descriptor.version,
         description=descriptor.description,
