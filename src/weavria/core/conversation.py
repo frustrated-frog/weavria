@@ -22,6 +22,7 @@ from .execution import ArtifactRef, ExecutionEvent
 from .intervention import TaskUpdate, TurnResolution
 from .model_io import ApplicationObservation
 from .semantics import SessionClarificationChanged, SessionSemanticCommitted
+from .summaries import ContextSummaryView, SummaryAdvice
 
 
 class PastCall(ContractModel):
@@ -248,6 +249,10 @@ class ConversationView(BaseModel):
         "context-compiler/10",
         "context-compiler/11",
         "context-compiler/12",
+        "context-compiler/14",
+        "context-compiler/15",
+        "context-compiler/16",
+        "context-compiler/17",
     ] = "conversation/2"
 
     @model_validator(mode="after")
@@ -260,13 +265,15 @@ class ConversationView(BaseModel):
 
 
 class SessionRequest(BaseModel):
-    """Versioned observations with v6 source bundles and v7 compacted excerpts."""
+    """版本化上下文。v8 增加与执行历史分离的派生摘要视图。"""
 
     model_config = ContractModel.model_config
-    schema_version: Literal[5, 6, 7] = 5
+    schema_version: Literal[5, 6, 7, 8, 9, 10] = 5
     bundles: tuple[ContextBundle, ...] = Field(default=(), max_length=100)
     conversation: ConversationView
     compaction: ContextCompaction | None = None
+    summaries: tuple[ContextSummaryView, ...] = Field(default=(), max_length=1024)
+    summary_advice: SummaryAdvice | None = None
     current: ControlRequest
 
     @field_validator("schema_version", mode="before")
@@ -281,6 +288,10 @@ class SessionRequest(BaseModel):
             data.pop("bundles", None)
         if self.schema_version < 7:
             data.pop("compaction", None)
+        if self.schema_version < 8:
+            data.pop("summaries", None)
+        if self.schema_version < 9:
+            data.pop("summary_advice", None)
         return data
 
     @model_validator(mode="after")
@@ -289,8 +300,30 @@ class SessionRequest(BaseModel):
             raise ValueError("context bundles require session request v6 or later")
         if len({b.bundle_id for b in self.bundles}) != len(self.bundles):
             raise ValueError("context bundle identities must be unique")
-        if (self.compaction is not None) != (self.schema_version == 7):
+        if self.schema_version < 8 and (
+            (self.compaction is not None) != (self.schema_version == 7)
+        ):
             raise ValueError("compaction requires session request v7")
+        if (
+            self.summary_advice
+            and self.summary_advice.schema_version == 2
+            and self.schema_version < 10
+        ):
+            raise ValueError("preparation advice requires request v10")
+        if self.summary_advice is not None and (
+            self.schema_version < 9
+            or not self.current.recovery_enabled
+            or self.summary_advice.task_revision != self.current.task.revision
+        ):
+            raise ValueError("summary advice requires current revision and request v9")
+        if self.summaries and (self.schema_version < 8 or not self.current.recovery_enabled):
+            raise ValueError("semantic summaries require session request v8 and recovery")
+        if len({v.artifact.call_id for v in self.summaries}) != len(self.summaries):
+            raise ValueError("summary calls must be unique")
+        if any(
+            v.statements and v.task_revision != self.current.task.revision for v in self.summaries
+        ):
+            raise ValueError("summary content belongs to another task revision")
         if self.compaction is not None and (
             self.compaction.task_revision != self.current.task.revision
             or self.compaction.through_sequence != self.conversation.through_sequence

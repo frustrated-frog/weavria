@@ -1,0 +1,286 @@
+[
+  {
+    "schema_version": 1,
+    "case_id": "recovery",
+    "source_path": "docs/主动上下文恢复与预算闭环.md",
+    "source_sha256": "e65badc5d87b04f32d371cdcad1192dd7a72f94876c29a57e686a4f143763f70",
+    "task": "保留主动恢复的权限范围、额度、去重条件和失败行为,供后续实施核对。",
+    "probes": [
+      {
+        "probe_id": "cross_session",
+        "facet": "scope",
+        "question": "本文机制是否扩展了跨 Session 的原文恢复权限? 回答 yes/no。",
+        "answers": [
+          "no"
+        ],
+        "evidence": [
+          "不扩展 Memory 或跨 Session 权限"
+        ]
+      },
+      {
+        "probe_id": "requires_compiler",
+        "facet": "condition",
+        "question": "配置 context_recovery 但没有编译器时是否立即报错? 回答 yes/no。",
+        "answers": [
+          "yes"
+        ],
+        "evidence": [
+          "配置它但没有编译器会立即报错"
+        ]
+      },
+      {
+        "probe_id": "new_record_retry",
+        "facet": "exception",
+        "question": "有新 ToolRecord 后,是否允许重新提交之前相同的查询? 回答 yes/no。",
+        "answers": [
+          "yes"
+        ],
+        "evidence": [
+          "有新 ToolRecord 后允许重新查询"
+        ]
+      },
+      {
+        "probe_id": "window_limit",
+        "facet": "fact",
+        "question": "精确字符串读取长度上限是多少字符? 只回答整数。",
+        "answers": [
+          "4000"
+        ],
+        "evidence": [
+          "精确字符串读取长度上限 4000"
+        ]
+      },
+      {
+        "probe_id": "revision_quota",
+        "facet": "scope",
+        "question": "任务修订后是否清零累计恢复字节? 回答 yes/no。",
+        "answers": [
+          "no"
+        ],
+        "evidence": [
+          "跨任务修订保留总轮数和累计字节"
+        ]
+      },
+      {
+        "probe_id": "backoff",
+        "facet": "unknown",
+        "question": "此文规定的恢复重试退避初值是多少秒? 未说明则 abstain。",
+        "answers": [],
+        "evidence": []
+      }
+    ]
+  },
+  {
+    "schema_version": 1,
+    "case_id": "deadline",
+    "source_path": "docs/decisions/0077-统一执行链的组合契约与请求期限.md",
+    "source_sha256": "7569c3691b9000269fc41791aaaa6660a144db3e49eb71d833f2b5a3e13121ee",
+    "task": "保留统一执行链中记忆配置、父期限与各阶段预算的边界和例外。",
+    "probes": [
+      {
+        "probe_id": "repair",
+        "facet": "condition",
+        "question": "额外修复调用是否须显式配置? 回答 yes/no。",
+        "answers": [
+          "yes"
+        ],
+        "evidence": [
+          "额外修复调用须显式配置"
+        ]
+      },
+      {
+        "probe_id": "completed_run",
+        "facet": "exception",
+        "question": "后置记忆形成超时是否会改写已经完成的 Run? 回答 yes/no。",
+        "answers": [
+          "no"
+        ],
+        "evidence": [
+          "已完成 Run 不被形成超时改写"
+        ]
+      },
+      {
+        "probe_id": "token_scope",
+        "facet": "scope",
+        "question": "本轮父期限是否也强制统一了所有阶段的 Token 账本? 回答 yes/no。",
+        "answers": [
+          "no"
+        ],
+        "evidence": [
+          "此轮只统一**时间**，并非所有阶段的模型调用计数或 Token 账本。"
+        ]
+      },
+      {
+        "probe_id": "catchup",
+        "facet": "fact",
+        "question": "默认 memory_catchup_fraction 是多少? 只回答小数。",
+        "answers": [
+          "0.1"
+        ],
+        "evidence": [
+          "f=0.1"
+        ]
+      },
+      {
+        "probe_id": "flush",
+        "facet": "exception",
+        "question": "flush_memory 是否使用记忆自身期限而非 send 的同一次父期限? 回答 yes/no。",
+        "answers": [
+          "yes"
+        ],
+        "evidence": [
+          "`flush_memory` 是独立显式操作，使用记忆自身期限"
+        ]
+      },
+      {
+        "probe_id": "busy_timeout",
+        "facet": "unknown",
+        "question": "本文规定 SQLite busy_timeout 默认为多少毫秒? 未说明则 abstain。",
+        "answers": [],
+        "evidence": []
+      }
+    ]
+  },
+  {
+    "schema_version": 1,
+    "case_id": "harness_config",
+    "source_path": "src/weavria/harness/configuration.py",
+    "source_sha256": "aadc1af879067155f95301e9cd37c172a42165f6ce071d5cead6ed366087d01b",
+    "task": "保留 HarnessConfig 的关键默认值、开关组合、非法输入和边界取值,用于代码审查。",
+    "probes": [
+      {
+        "probe_id": "memory_default",
+        "facet": "fact",
+        "question": "memory_write 默认配置字符串是什么? 只回答字符串值。",
+        "answers": [
+          "off"
+        ],
+        "evidence": [
+          "memory_write: Literal[\"off\", \"basic\", \"fact_sets\", \"conditions\"] = \"off\""
+        ]
+      },
+      {
+        "probe_id": "working_requires",
+        "facet": "condition",
+        "question": "working_records=True 且 task_understanding=False 是否通过校验? 回答 yes/no。",
+        "answers": [
+          "no"
+        ],
+        "evidence": [
+          "if self.working_records and not self.task_understanding:"
+        ]
+      },
+      {
+        "probe_id": "optional_duration",
+        "facet": "exception",
+        "question": "max_request_duration=None 是否通过本配置的时长校验? 回答 yes/no。",
+        "answers": [
+          "yes"
+        ],
+        "evidence": [
+          "if duration is not None and ("
+        ]
+      },
+      {
+        "probe_id": "catchup_one",
+        "facet": "scope",
+        "question": "memory_catchup_fraction=1 是否通过校验? 回答 yes/no。",
+        "answers": [
+          "no"
+        ],
+        "evidence": [
+          "not 0 <= self.memory_catchup_fraction < 1"
+        ]
+      },
+      {
+        "probe_id": "preparation_default",
+        "facet": "fact",
+        "question": "preparation_max_duration 默认多少秒? 只回答整数。",
+        "answers": [
+          "30"
+        ],
+        "evidence": [
+          "preparation_max_duration: float = 30"
+        ]
+      },
+      {
+        "probe_id": "hash_algorithm",
+        "facet": "unknown",
+        "question": "本文件为 configuration_id 指定了哪个密码学哈希算法? 未说明则 abstain。",
+        "answers": [],
+        "evidence": []
+      }
+    ]
+  },
+  {
+    "schema_version": 1,
+    "case_id": "context_budget",
+    "source_path": "src/weavria/context/budget.py",
+    "source_sha256": "29ea60b550e705c77e94e78774abd9c2a7078915fefe899846881a9a140b0d20",
+    "task": "保留上下文预算计算、各个上限、零值和字节/Token边界,用于代码审查。",
+    "probes": [
+      {
+        "probe_id": "passages",
+        "facet": "fact",
+        "question": "ContextCompilerConfig 的 max_passages 允许上限是多少? 只回答整数。",
+        "answers": [
+          "32"
+        ],
+        "evidence": [
+          "self.max_passages > 32"
+        ]
+      },
+      {
+        "probe_id": "exhausted",
+        "facet": "condition",
+        "question": "window_tokens 等于 output_tokens+safety_tokens 时是否允许创建配置? 回答 yes/no。",
+        "answers": [
+          "no"
+        ],
+        "evidence": [
+          "if self.input_tokens <= 0:"
+        ]
+      },
+      {
+        "probe_id": "zero_safety",
+        "facet": "exception",
+        "question": "safety_tokens=0 是否被其非负校验允许? 回答 yes/no。",
+        "answers": [
+          "yes"
+        ],
+        "evidence": [
+          "type(self.safety_tokens) is not int or self.safety_tokens < 0"
+        ]
+      },
+      {
+        "probe_id": "history_bound",
+        "facet": "scope",
+        "question": "ModelRequestContextConfig 允许 max_history_bytes 大于 max_request_bytes 吗? 回答 yes/no。",
+        "answers": [
+          "no"
+        ],
+        "evidence": [
+          "self.max_history_bytes > self.max_request_bytes"
+        ]
+      },
+      {
+        "probe_id": "zero_ceiling",
+        "facet": "fact",
+        "question": "request_byte_ceiling 契约是否允许返回0? 回答 yes/no。",
+        "answers": [
+          "yes"
+        ],
+        "evidence": [
+          "It may return zero."
+        ]
+      },
+      {
+        "probe_id": "eviction",
+        "facet": "unknown",
+        "question": "本文件规定了缓存驱逐采用哪种算法? 未说明则 abstain。",
+        "answers": [],
+        "evidence": []
+      }
+    ]
+  }
+]

@@ -13,6 +13,7 @@ from weavria.core import (
     ModelTurn,
     ProgressAssessment,
     RecoverContext,
+    ReplanNeed,
     SemanticSnapshot,
     TaskDirective,
     TaskInput,
@@ -61,6 +62,15 @@ class TurnSettler(Protocol):
     """Fold accepted tool facts before optional progress assessment and the next decision."""
 
     async def settle_turn(self, task: TaskInput) -> None: ...
+
+
+@runtime_checkable
+class ProgressReplanAdvisor(Protocol):
+    """Read committed task gaps only when an action needs reconsideration."""
+
+    def replan_needs(
+        self, snapshot: SemanticSnapshot, tool_name: str
+    ) -> tuple[ReplanNeed, ...]: ...
 
 
 class ProgressAssessor(Protocol):

@@ -48,13 +48,15 @@ class ToolRecord(BaseModel):
     """An executed exchange plus the results it actually read."""
 
     model_config = ContractModel.model_config
-    schema_version: Literal[1, 2] = 1
+    schema_version: Literal[1, 2, 3] = 1
     exchange: ToolExchange
     artifact: ArtifactRef | None = None
     dependencies: tuple[NonBlankString, ...] = ()
     authorization: ToolAuthorization | None = None
     context_paths: tuple[JsonPointer, ...] = ()
     feedback_delivery: FeedbackDelivery = "adaptive"
+    # 只有通过工具契约验证的 running 结果才能携带此值。
+    poll_after_seconds: float | None = Field(default=None, ge=0.001, le=86400, allow_inf_nan=False)
 
     @field_validator("schema_version", mode="before")
     @classmethod
@@ -66,12 +68,22 @@ class ToolRecord(BaseModel):
         data = handler(self)
         if self.schema_version == 1:
             data.pop("feedback_delivery", None)
+        if self.schema_version < 3:
+            data.pop("poll_after_seconds", None)
         return data
 
     @model_validator(mode="after")
     def validate_result(self) -> Self:
         if self.schema_version == 1 and self.feedback_delivery != "adaptive":
             raise ValueError("complete feedback delivery requires ToolRecord schema version 2")
+        if (self.schema_version == 3) != (self.poll_after_seconds is not None) or (
+            self.poll_after_seconds is not None
+            and (
+                self.feedback_delivery != "complete"
+                or not isinstance(self.exchange.observation, ToolSucceededObservation)
+            )
+        ):
+            raise ValueError("pending poll requires a successful complete-feedback v3 record")
         if isinstance(self.exchange.observation, ToolSucceededObservation):
             if self.artifact is None or self.artifact.call_id != self.exchange.action.call_id:
                 raise ValueError("successful execution requires its own artifact")

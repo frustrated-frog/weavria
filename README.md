@@ -111,4 +111,20 @@ uv run python examples/live_progress_control.py --repeats 3
 
 实验设计、隔离不变量和证据边界见 [ADR 0023](docs/decisions/0023-进度策略隔离与真实模型对照.md)。
 
+离线坏例回归覆盖原文交付、重复调用重规划和后台任务恢复。可以重跑当前执行链、导出脱敏检查点并复查首处偏差。见[坏例回放与轨迹回归](docs/decisions/0098-坏例回放与轨迹回归.md)。
+
+`ContextCompilerConfig(semantic_compaction=True)` 可显式启用带来源的分层摘要：模型通过 `compact_context` 生成或合并摘要，编译器重建来源图、按预算选择，并沿原文地址恢复证据。当前默认关闭，真实任务收益尚未通过验收。接入、算法、失败边界与真实模型实验见[分层语义压缩的执行过程与实验](docs/分层语义压缩的执行过程与实验.md)。
+
+```bash
+uv run python -m examples.trajectory_regression
+```
+
 工作状态：统一 Harness 可显式启用[有界工作记录](docs/工作记录的执行过程与使用.md)，由当前工作意图影响上下文与工具选择。该机制尚未通过真实长任务评测证明收益。
+
+实验性的分层摘要可进一步设置 `summary_guidance=True`，启用上下文压力建议与多来源联合选择。设计与当前限制见 [ADR 0100](docs/decisions/0100-上下文压力建议与多来源联合替换.md)；该策略尚未取得真实任务收益验收，保持显式开启。
+
+在此基础上，`summary_preparation=True` 按真实来源成本判断是否值得压缩；材料不足时建议一个已接受原文的补读窗口，并先预检恢复后的完整请求。设计见 [ADR 0101](docs/decisions/0101-压缩前的有界阅读规划与容量预检.md)。补读与压缩仍由模型显式选择，建议不能绕过恢复配额，也不保证模型采纳或任务收益。
+
+质量验证可运行 `uv run python -m examples.summary_fidelity`，默认仅校验冻结资料。显式模型对照将原文、摘录和摘要的可回答性与生成成本配对，详见[摘要保真与压缩成本实验](docs/摘要保真与压缩成本实验.md)。
+
+`summary_selection="token_savings"` 可在摘要生成后，用完整请求的同源 Token 比较过滤不划算的正文，保留原文、必要反馈与恢复能力；默认仍为 `coverage`。真实候选回放、使用条件与局限见[摘要选择的成本回放与边界](docs/摘要选择的成本回放与边界.md)。

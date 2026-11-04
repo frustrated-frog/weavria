@@ -36,6 +36,7 @@ from weavria.core import (
     ContextBundle,
     ContextCompaction,
     ContextCompilation,
+    ContextSummaryView,
     ContextSupply,
     ControlEvent,
     ControlFeedback,
@@ -49,11 +50,13 @@ from weavria.core import (
     RecoveryLimits,
     RecoveryRange,
     RecoveryResolved,
+    ReplanNeed,
     SemanticSnapshot,
     SemanticTransition,
     SemanticVersion,
     SessionRequest,
     SessionResult,
+    SummaryAdvice,
     TaskDirective,
     TaskInput,
     TaskObservation,
@@ -209,7 +212,10 @@ class _SessionAdapter:
         self._prepared: dict[int, ConversationView] = {}
         self._compiler = (
             SessionContextCompiler(
-                _RunArtifacts(store, run_id), config=compiler_config, counter=token_counter
+                _RunArtifacts(store, run_id),
+                config=compiler_config,
+                counter=token_counter,
+                recovery_limits=context_recovery,
             )
             if compiler_config is not None and token_counter is not None
             else None
@@ -250,6 +256,11 @@ class _SessionAdapter:
         self._support_tools = support_tools
         self._bundles: tuple[ContextBundle, ...] = ()
         self._compaction: ContextCompaction | None = None
+        self._summaries: tuple[ContextSummaryView, ...] = ()
+        self._summary_advice: SummaryAdvice | None = None
+        self._summary_preparation = bool(compiler_config and compiler_config.summary_preparation)
+        self._summary_guidance = bool(compiler_config and compiler_config.summary_guidance)
+        self._semantic_compaction = bool(compiler_config and compiler_config.semantic_compaction)
 
     @property
     def capabilities(self) -> ModelCapabilities:
@@ -258,7 +269,13 @@ class _SessionAdapter:
     def _outer_request(self, request: ControlRequest) -> SessionRequest:
         # 发送与持久化必须重建相同包络, 否则请求摘要无法证明模型实际收到的内容。
         return SessionRequest(
-            schema_version=7
+            schema_version=10
+            if self._summary_preparation
+            else 9
+            if self._summary_guidance
+            else 8
+            if self._semantic_compaction
+            else 7
             if self._compaction is not None
             else 6
             if self._context_source is not None
@@ -266,6 +283,8 @@ class _SessionAdapter:
             bundles=self._bundles,
             conversation=self._prepared[request.task.revision],
             compaction=self._compaction,
+            summaries=self._summaries,
+            summary_advice=self._summary_advice,
             current=request,
         )
 
@@ -379,6 +398,8 @@ class _SessionAdapter:
         # previous model call/verification has joined, retaining bounded state.
         self._bundles = ()
         self._compaction = None
+        self._summaries = ()
+        self._summary_advice = None
         self._prepared = {task.revision: view}
         self._history, self._history_sequence, self._history_count = history, sequence, count
         self._prepared_task_revision = task.revision
@@ -554,6 +575,8 @@ class _SessionAdapter:
     def _install_control_context(self, outer: SessionRequest, report: ContextCompilation) -> None:
         self._bundles = outer.bundles
         self._compaction = outer.compaction
+        self._summaries = outer.summaries
+        self._summary_advice = outer.summary_advice
         self._prepared = {outer.current.task.revision: outer.conversation}
         self._compilation = report
 
@@ -700,6 +723,15 @@ class _SessionAdapter:
                 await self._store.run_records(self._session_id, self._run_id)
             )
 
+    def replan_needs(self, snapshot: SemanticSnapshot, tool_name: str) -> tuple[ReplanNeed, ...]:
+        advisor = cast(
+            Callable[[SemanticSnapshot, str], tuple[ReplanNeed, ...]] | None,
+            getattr(self._task_preparer, "replan_needs", None),
+        )
+        if advisor is None or self._semantic != snapshot:
+            return ()
+        return advisor(snapshot, tool_name)
+
     async def assess_progress(
         self,
         *,
@@ -762,6 +794,7 @@ class _SessionAdapter:
                 base_semantic=self._semantic,
                 context_supply=supply,
                 records=records,
+                settled_record_count=self._semantic_record_count,
                 read_artifact=lambda artifact_id: self._store.get(self._run_id, artifact_id),
                 trigger=(
                     "steering"

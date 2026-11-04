@@ -18,7 +18,7 @@ from pydantic import (
 from ._schema import ContractModel, NonBlankString
 from .actions import FinishAction
 from .delivery import EvidenceAccessProof, EvidenceNavigationProof
-from .errors import ModelOutputDiagnostic, RunError
+from .errors import ErrorCategory, ModelOutputDiagnostic, RunError
 from .evidence_access import EvidenceAccessView
 from .execution import (
     ContextSelected,
@@ -91,6 +91,45 @@ class ArtifactPageRetry(ContractModel):
     start: int = Field(ge=0, le=2**63 - 1)
 
 
+class ReplanNeed(ContractModel):
+    """A bounded gap selected from the current committed need ledger."""
+
+    need_id: str = Field(min_length=1, max_length=128)
+    missing_fields: tuple[Annotated[str, Field(min_length=1, max_length=96)], ...] = Field(
+        default=(), max_length=3
+    )
+
+
+class ReplanPrior(ContractModel):
+    """A reference to an accepted outcome, without copying its payload."""
+
+    call_id: str = Field(min_length=1, max_length=128)
+    source_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    failure_category: ErrorCategory | None = None
+
+    @model_validator(mode="after")
+    def require_one_outcome(self) -> Self:
+        if (self.source_sha256 is None) == (self.failure_category is None):
+            raise ValueError("replan reference requires exactly one accepted outcome")
+        return self
+
+
+class ToolReplan(ContractModel):
+    call_index: int = Field(ge=0, le=31)
+    tool_name: str | None = Field(default=None, min_length=1, max_length=64)
+    duplicate_of_index: int | None = Field(default=None, ge=0, le=31)
+    prior: ReplanPrior | None = None
+    open_needs: tuple[ReplanNeed, ...] = Field(default=(), max_length=3)
+
+    @model_validator(mode="after")
+    def bind_duplicate(self) -> Self:
+        if self.duplicate_of_index is not None and (
+            self.duplicate_of_index >= self.call_index or self.prior is not None
+        ):
+            raise ValueError("an in-batch duplicate must point to an earlier proposal")
+        return self
+
+
 class AdmissionNotice(BaseModel):
     model_config = ContractModel.model_config
 
@@ -99,22 +138,33 @@ class AdmissionNotice(BaseModel):
     def version_type(cls, value: object) -> object:
         return ContractModel.validate_version_type(value)
 
-    schema_version: Literal[1, 2, 3] = 1
+    schema_version: Literal[1, 2, 3, 4, 5, 6] = 1
     # 建议只针对原提案中指定的一次调用单独重提,0 表示最低页也无法容纳。
     page_call_index: int | None = Field(default=None, ge=0, le=31)
     page_parameter: str | None = Field(default=None, min_length=1, max_length=64)
     page_maximum: int | None = Field(default=None, ge=0)
 
     artifact_page_retry: ArtifactPageRetry | None = None
+    unavailable_calls: tuple[
+        tuple[int, Annotated[str, Field(min_length=1, max_length=64)] | None], ...
+    ] = Field(default=(), max_length=32)
+    capability_epoch_changed: bool | None = None
+    replan: ToolReplan | None = None
 
     @model_serializer(mode="wrap")
     def preserve_legacy_wire(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
         data = handler(self)
-        if self.schema_version == 1:
+        if self.schema_version in {1, 5, 6}:
             for key in ("page_call_index", "page_parameter", "page_maximum"):
                 data.pop(key, None)
-        if self.schema_version < 3:
+        if self.schema_version != 3:
             data.pop("artifact_page_retry", None)
+        if self.schema_version not in {4, 5}:
+            data.pop("unavailable_calls", None)
+        if self.schema_version != 5:
+            data.pop("capability_epoch_changed", None)
+        if self.schema_version != 6:
+            data.pop("replan", None)
         return data
 
     kind: Literal["admission_rejected"] = "admission_rejected"
@@ -133,6 +183,36 @@ class AdmissionNotice(BaseModel):
 
     @model_validator(mode="after")
     def bound_notice(self) -> Self:
+        if (self.schema_version == 5) != (self.capability_epoch_changed is not None):
+            raise ValueError("v5 must declare whether the capability epoch changed")
+        if self.schema_version == 4 and any(name is None for _, name in self.unavailable_calls):
+            raise ValueError("v4 capability diagnostics require tool names")
+        if (
+            self.schema_version == 5
+            and not self.capability_epoch_changed
+            and not self.unavailable_calls
+        ):
+            raise ValueError("capability rejection needs unavailable calls or an epoch change")
+        if self.schema_version in {4, 5}:
+            indices = tuple(index for index, _ in self.unavailable_calls)
+            if self.reason != "capability_view" or indices != tuple(
+                sorted({index for index in indices if 0 <= index < self.proposed_calls})
+            ):
+                raise ValueError("capability rejection requires ordered proposal indices")
+        elif self.unavailable_calls:
+            raise ValueError("unavailable calls require a capability rejection")
+        if (self.schema_version == 6) != (self.replan is not None):
+            raise ValueError("replan feedback requires a v6 notice")
+        if self.replan is not None and (
+            self.reason != "no_progress"
+            or self.progress_reason is None
+            or self.replan.call_index >= self.proposed_calls
+            or (
+                self.replan.duplicate_of_index is not None
+                and self.progress_reason != "repeated_action"
+            )
+        ):
+            raise ValueError("replan feedback must bind a rejected no-progress call")
         advice = (self.page_call_index, self.page_parameter, self.page_maximum)
         if any(x is not None for x in advice):
             if (

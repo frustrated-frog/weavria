@@ -21,6 +21,7 @@ from .compiler_sources import CoverageScorer, IndexedSource, SourceIndex, digest
 from .demand import ContextDemand
 from .evidence import ControlEvidencePlan, Passage, terms
 from .recovery_ranges import encoded_value, novel_passages, to_range
+from .summaries import is_summary
 
 
 @runtime_checkable
@@ -112,6 +113,10 @@ async def plan_recovery(
         # Passive scoring hints are not source authorization. Explicit queries may
         # discover any original field in an accepted current-run artifact.
         sources = await index.load(run_id, records, respect_context_paths=False)
+        # 生成摘要的 Artifact 可显式 read_artifact 查看,但它不是 recover_context
+        # 所承诺的原文。摘要视图已经给出底层地址,这里不能以摘要替代证据交付。
+        if config.semantic_compaction:
+            sources = tuple(source for source in sources if not is_summary(source))
         candidates: list[tuple[IndexedSource, Passage]] = []
         matched = False
         if request.query is None:

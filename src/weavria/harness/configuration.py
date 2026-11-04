@@ -28,6 +28,7 @@ class HarnessConfig:
     max_request_duration: float | None = None
     memory_catchup_fraction: float = 0.1
     project_task_view: bool = True
+    adaptive_capabilities: bool = True
 
     def __post_init__(self) -> None:
         if not self.configuration_id.strip() or len(self.configuration_id) > 128:
@@ -35,16 +36,21 @@ class HarnessConfig:
         for enabled in (
             self.task_understanding,
             self.project_task_view,
+            self.adaptive_capabilities,
             self.history_retrieval,
             self.context_recovery,
             self.working_records,
         ):
             if type(enabled) is not bool:
                 raise ValueError("Harness feature switches must be booleans")
+        if self.task_understanding and self.adaptive_capabilities and not self.project_task_view:
+            raise ValueError("adaptive capabilities require task model projection")
         if self.working_records and not self.task_understanding:
             raise ValueError("working records require task understanding")
         if self.working_records and not self.project_task_view:
             raise ValueError("working records require task model projection")
+        if self.context.semantic_compaction and not self.context_recovery:
+            raise ValueError("semantic compaction requires context recovery")
         if self.memory_write not in {"off", "basic", "fact_sets", "conditions"}:
             raise ValueError("unknown memory write profile")
         for duration in (self.preparation_max_duration, self.max_request_duration):

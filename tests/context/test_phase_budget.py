@@ -225,9 +225,12 @@ async def test_synthesis_releases_only_exploration_growth_and_keeps_complete_evi
 
 
 @pytest.mark.parametrize("dimension", ["tokens", "normalized_bytes", "http_bytes"])
+@pytest.mark.parametrize("guidance,preparation", ((False, False), (True, False), (True, True)))
 async def test_obsolete_growth_cannot_block_a_fitting_synthesis_in_any_budget_dimension(
     case: PreparedCase,
     dimension: str,
+    guidance: bool,
+    preparation: bool,
 ) -> None:
     store, record = await _evidence()
     view = TaskModelViewProjector().project(
@@ -236,13 +239,24 @@ async def test_obsolete_growth_cannot_block_a_fitting_synthesis_in_any_budget_di
         phase="synthesis",
         max_instruction_bytes=30_000,
     )
-    config = ContextCompilerConfig(window_tokens=64_000, output_tokens=256, safety_tokens=64)
+    config = ContextCompilerConfig(
+        window_tokens=64_000,
+        output_tokens=256,
+        safety_tokens=64,
+        semantic_compaction=guidance,
+        summary_guidance=guidance,
+        summary_preparation=preparation,
+    )
     model_config = OpenAICompatibleConfig(
         model="test", max_output_tokens=256, max_request_bytes=128_000
     )
     counter = OpenAICompatibleTokenCounter(model_config, encoding="cl100k_base")
     base = ControlRequest(
-        schema_version=5, instructions="Finish", task=case.task, task_model_view=view
+        schema_version=5,
+        instructions="Finish",
+        task=case.task,
+        task_model_view=view,
+        allow_context_recovery=guidance,
     )
     compiler = SessionContextCompiler(store, config=config, counter=counter)
     wide = await compiler.compile(
@@ -256,6 +270,7 @@ async def test_obsolete_growth_cannot_block_a_fitting_synthesis_in_any_budget_di
         required_call_ids=("read",),
         max_request_bytes=64_000,
     )
+    assert wide.request.summary_advice is None  # 收尾只保留回答空间,不预留压缩动作。
     report = wide.compilation
     byte_limit = 64_000
     growth = view.growth_reserve_bytes(base.instructions)

@@ -134,17 +134,13 @@ class _EvidenceAwareScenarioModel:
             )
             return self._batch(proposed)
 
-        call_ids = {item.action.call_id for item in exchanges}
-        if not any(call_id.startswith("verify-breadth-") for call_id in call_ids):
-            return self._batch(("breadth",), prefix="verify")
-
         control = request.current.control
         if control is not None and control.kind == "action_reconsideration":
             assert control.trigger == "completion_recommended"
             return self._finish(snapshot)
-        if not any(call_id.startswith("redundant-overview-") for call_id in call_ids):
-            return self._batch(("overview",), prefix="redundant")
-        raise AssertionError("a redundant verification call escaped pre-dispatch intervention")
+        # 故意提出一次额外核验,复现证据已齐且来源已退出视图的组合。
+        assert "read_market_pulse" not in request.current.instructions
+        return self._batch(("breadth",), prefix="verify")
 
     def _batch(self, focuses: tuple[str, ...], *, prefix: str = "weekly") -> ModelTurn:
         self._proposal += 1
@@ -254,7 +250,7 @@ async def test_weekly_summary_closes_every_observable_layer(
     assert payload.task_outcome == "unverified"
     assert grade_weekly_answer(case, payload.answer).correct
     assert payload.answer is not None and "[来源:" not in payload.answer
-    assert len(market_calls) == 4
+    assert len(market_calls) == 3
 
     run_facts = tuple(
         event.data.event
@@ -293,17 +289,17 @@ async def test_weekly_summary_closes_every_observable_layer(
     assert all(state.evidence_binding_ids for state in ledger.states)
 
     records = tuple(fact.data.record for fact in run_facts if isinstance(fact.data, ToolRecorded))
-    assert len(records) == 4
+    assert len(records) == 3
     assert all(record.artifact is not None for record in records)
     assert sum(record.artifact.size_bytes for record in records if record.artifact) > 40_000
-    assert not any(record.exchange.action.call_id.startswith("redundant-") for record in records)
+    assert not any(record.exchange.action.call_id.startswith("verify-") for record in records)
 
     progress = tuple(
         fact.data.assessment for fact in run_facts if isinstance(fact.data, ProgressAssessed)
     )
     assert any(item.continuation.recommended_action == "verify" for item in progress)
     assert progress[-1].continuation.recommended_action == "verify"
-    assert progress[-1].material_progress is False
+    assert progress[-1].material_progress is True
     interventions = tuple(
         fact.data.decision for fact in run_facts if isinstance(fact.data, ActionInterventionChecked)
     )

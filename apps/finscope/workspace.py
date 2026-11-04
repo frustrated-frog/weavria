@@ -592,7 +592,8 @@ class FinScopeResourceInput(_WorkspaceModel):
         max_length=64,
         pattern=_IDENTIFIER_PATTERN,
         description=(
-            "Copy the resource identifier from its catalogue. Financial instrument subviews "
+            "Copy the resource identifier from its catalogue. For watchlist_daily_bars use "
+            "the stock code, not the financial instrument ID. Financial instrument subviews "
             "require financial_instruments[].id, never a stock code or company name. "
             "If the target is absent from that catalogue, report the gap rather than "
             "guessing an ID."
@@ -757,6 +758,8 @@ class FinScopeWorkspaceClient:
             raise ToolFault(
                 ErrorCategory.INVALID_TOOL_ARGUMENTS
                 if status in (400, 422)
+                else ErrorCategory.SOURCE_UNAVAILABLE
+                if status in (502, 503, 504)
                 else ErrorCategory.TOOL_FAILURE,
                 (
                     f"FinScope rejected workspace query parameters (HTTP {status}); "
@@ -771,7 +774,9 @@ class FinScopeWorkspaceClient:
             ) from exc
         except (httpx.TimeoutException, httpx.TransportError) as exc:
             raise ToolFault(
-                ErrorCategory.TOOL_FAILURE,
+                ErrorCategory.SOURCE_UNAVAILABLE
+                if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout))
+                else ErrorCategory.TOOL_FAILURE,
                 "FinScope workspace data is unavailable",
                 retryable=True,
             ) from exc
@@ -834,6 +839,7 @@ def finscope_workspace_tools(client: FinScopeWorkspaceClient) -> tuple[Registere
             output_type=FinScopeReadOutput,
             execute=read_catalogue,
             behavior="read_only",
+            source_group="finscope-api",
             idempotency="replay_safe",
             risk="low",
             approval_required=False,
@@ -861,6 +867,7 @@ def finscope_workspace_tools(client: FinScopeWorkspaceClient) -> tuple[Registere
             output_type=FinScopeReadOutput,
             execute=read_resource,
             behavior="read_only",
+            source_group="finscope-api",
             idempotency="replay_safe",
             risk="low",
             approval_required=False,
@@ -887,6 +894,7 @@ def finscope_workspace_tools(client: FinScopeWorkspaceClient) -> tuple[Registere
             output_type=FinScopeReadOutput,
             execute=search,
             behavior="read_only",
+            source_group="finscope-api",
             idempotency="replay_safe",
             risk="low",
             approval_required=False,
@@ -1030,8 +1038,19 @@ def finscope_workspace_evidence_profiles() -> tuple[CapabilityEvidenceProfile, .
         CapabilityEvidenceProfile(
             capability_name="read_finscope_resource",
             capability_version="1",
-            profile_version="finscope-resource-evidence/2",
+            profile_version="finscope-resource-evidence/3",
             surfaces=(
+                EvidenceSurface(
+                    surface_id="workspace.resource.stock_price_performance",
+                    description=(
+                        "A named stock's observed price performance to date, including "
+                        "the latest available daily closes and price changes from watchlist "
+                        "daily bars, keyed by stock code"
+                    ),
+                    demand_policy="broad_or_explicit",
+                    required_fields=("/data",),
+                    parameter_constraints=constraint("/kind", "watchlist_daily_bars"),
+                ),
                 EvidenceSurface(
                     surface_id="workspace.resource.detail",
                     description="One typed FinScope resource or fixed detail subview",

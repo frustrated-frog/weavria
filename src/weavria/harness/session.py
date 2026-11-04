@@ -3,17 +3,21 @@
 import hashlib
 import json
 from dataclasses import replace
-from typing import NoReturn
+from typing import Literal, NoReturn
 
 from weavria.context import ContextFocus
 from weavria.core import (
     ConversationTurn,
+    ErrorCategory,
     Message,
     MessageRole,
     ProgressAssessment,
+    ReplanNeed,
     SemanticSnapshot,
     SemanticTransition,
     TaskObservation,
+    ToolFailedObservation,
+    ToolSucceededObservation,
 )
 from weavria.sessions import (
     ClarificationDeliveryPlan,
@@ -95,7 +99,7 @@ class TaskAwareSessionPreparer:
     @property
     def version(self) -> str:
         return (
-            f"task-aware-session/12[work={self._working_records};"
+            f"task-aware-session/13[work={self._working_records};"
             f"{self._understanding.version};{self._evidence.version};"
             f"{self._capabilities.version};{self._clarification.version};"
             f"{self._working_set.version if self._working_set else 'monotonic-view/1'}]"
@@ -108,6 +112,29 @@ class TaskAwareSessionPreparer:
     def context_focus(self, snapshot: SemanticSnapshot) -> ContextFocus:
         """Project the current accepted ledger into soft retrieval hints."""
         return project_context_focus(snapshot)
+
+    def replan_needs(self, snapshot: SemanticSnapshot, tool_name: str) -> tuple[ReplanNeed, ...]:
+        frame = load_task_frame(snapshot.observation.payload)
+        ledger = load_need_ledger(snapshot.need_ledger)
+        # 先显示被拦工具关联的必需缺口,再显示其他缺口。已取得资料但尚待分析的项
+        # 由任务视图继续表达,不能误报为需要再次取证。
+        unresolved = [
+            (need, state)
+            for need in frame.requirements
+            if need.required
+            and need.source == "external"
+            and not (state := ledger.state_for(need.need_id)).acquisition_complete
+        ]
+        unresolved.sort(key=lambda pair: tool_name not in pair[0].capability_names)
+        return tuple(
+            ReplanNeed(
+                need_id=need.need_id,
+                missing_fields=tuple(
+                    field for field in state.missing_fields if 0 < len(field) <= 96
+                )[:3],
+            )
+            for need, state in unresolved[:3]
+        )
 
     async def assess_progress(self, context: SessionProgressContext) -> ProgressAssessment:
         """Evaluate the just-settled turn against committed before/after semantic heads."""
@@ -363,6 +390,32 @@ class TaskAwareSessionPreparer:
             read_artifact=context.read_artifact,
             previous=previous,
         )
+        descriptors = context.tools.descriptors
+        groups = {item.name: item.source_group for item in descriptors if item.source_group}
+        failure_rounds = dict(previous.source_failure_rounds)
+        observations: dict[str, list[ToolFailedObservation | ToolSucceededObservation]] = {}
+        for record in context.records[context.settled_record_count :]:
+            group = groups.get(record.exchange.action.tool_name)
+            if group is not None:
+                observations.setdefault(group, []).append(record.exchange.observation)
+        for group, results in observations.items():
+            if any(isinstance(result, ToolSucceededObservation) for result in results):
+                # 同一批存在成功兄弟调用,不能把局部失败扩大到整个来源。
+                failure_rounds.pop(group, None)
+            elif all(
+                isinstance(result, ToolFailedObservation)
+                and result.error.category is ErrorCategory.SOURCE_UNAVAILABLE
+                for result in results
+            ):
+                failure_rounds[group] = 2 if group in failure_rounds else 1
+        closed_tools = {name for name, group in groups.items() if failure_rounds.get(group) == 2}
+        selectable = (
+            context.tools.select(
+                tuple(item.name for item in descriptors if item.name not in closed_tools)
+            )
+            if closed_tools
+            else context.tools
+        )
         unresolved = tuple(
             requirement
             for requirement in base.requirements
@@ -399,17 +452,20 @@ class TaskAwareSessionPreparer:
                 context.records,
                 context.read_artifact,
             )
+        uncovered_targets: tuple[str, ...] = ()
         if self._working_set is not None:
-            visible = self._working_set.select(
+            working_set = self._working_set.select(
                 frame=base,
                 ledger=ledger,
-                tools=context.tools,
+                tools=selectable,
                 resolver=self._capabilities,
                 previous=existing,
                 records=context.records,
                 discover=True,
                 **({"working_state": working} if self._working_records else {}),
-            ).names
+            )
+            visible = working_set.names
+            uncovered_targets = working_set.uncovered_targets
         else:
             discovered, _ = self._capabilities.resolve(
                 CapabilityQuery(
@@ -419,11 +475,75 @@ class TaskAwareSessionPreparer:
                     requirements=unresolved,
                     allow_side_effects=False,
                 ),
-                context.tools,
+                selectable,
                 epoch=base.capability_epoch + 1,
                 trigger=trigger,
             )
-            visible = tuple(dict.fromkeys((*existing, *discovered.allowed_tool_names)))
+            visible = tuple(
+                dict.fromkeys(
+                    (
+                        *(name for name in existing if name not in closed_tools),
+                        *discovered.allowed_tool_names,
+                    )
+                )
+            )
+        incomplete = tuple(
+            need
+            for need in base.requirements
+            if need.required and not ledger.state_for(need.need_id).acquisition_complete
+        )
+        # 只有每个未满足的必需项都依赖已暂停的来源,且发现没有给出替代工具,
+        # 才结束取证。未声明来源、描述预算缺口或独立动作义务均不能充当耗尽证明。
+        sources_exhausted = (
+            bool(closed_tools and incomplete)
+            and (
+                not visible
+                or all(f"need:{need.need_id}" in uncovered_targets for need in incomplete)
+            )
+            and all(
+                need.source == "external"
+                and need.capability_names
+                and set(need.capability_names) <= closed_tools
+                and ledger.state_for(need.need_id).status is not NeedStatus.CONTRADICTED
+                for need in incomplete
+            )
+            and not any(
+                obligation.required
+                and obligation.kind == "capability_result"
+                and not obligation.need_ids
+                for obligation in base.obligations
+            )
+        )
+        if sources_exhausted:
+            incomplete_ids = {need.need_id for need in incomplete}
+            ledger = ledger.model_copy(
+                update={
+                    "states": tuple(
+                        state.model_copy(
+                            update={"acquisition_status": "unavailable", "can_retry": False}
+                        )
+                        if state.need_id in incomplete_ids
+                        else state
+                        for state in ledger.states
+                    )
+                }
+            )
+        if failure_rounds or previous.source_failure_rounds:
+            schema_version: Literal[5, 6] = 6 if failure_rounds else 5
+            ledger = ledger.model_copy(
+                update={
+                    "schema_version": schema_version,
+                    "source_failure_rounds": failure_rounds,
+                    "sources_exhausted": sources_exhausted,
+                }
+            )
+            same_facts = (
+                ledger.model_copy(update={"evidence_revision": previous.evidence_revision})
+                == previous
+            )
+            ledger = ledger.model_copy(
+                update={"evidence_revision": previous.evidence_revision + int(not same_facts)}
+            )
         capability_changed = visible != existing
         ledger_changed = ledger.evidence_revision != previous.evidence_revision
         frame_revision = base.revision + int(capability_changed or ledger_changed)

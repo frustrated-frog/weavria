@@ -1,4 +1,5 @@
 import itertools
+from dataclasses import replace
 
 from weavria.context.allocation import (
     AllocationCost,
@@ -131,3 +132,66 @@ async def test_exhausted_search_keeps_required_closure_and_feasible_incumbent() 
     assert {0, 3} <= selected.keys()
     assert allocator.fits(cost(selected))
     assert allocator.exhausted and allocator.steps <= 7
+
+
+async def test_summary_group_exchange_releases_multiple_sources_for_missing_requirement() -> None:
+    # 两份原文共享大部分需求。两个贪心种子均选择原文;单来源交换腾不出空间。
+    # 一起降级为引用后,合并摘要与新需求可在同一硬预算内交付。
+    features = (
+        (("shared", 18.0), ("a", 2.0)),
+        (("shared", 18.0), ("b", 2.0)),
+        (("c", 10.0),),
+    )
+    originals = tuple(
+        ContextUnit(
+            str(i),
+            "0" * 64,
+            "current",
+            (
+                Representation("reference", "x", ()),
+                Representation("raw", "x" * (5 if i < 2 else 8), features[i]),
+            ),
+        )
+        for i in range(3)
+    )
+    units = (
+        *originals,
+        ContextUnit(
+            "s",
+            "0" * 64,
+            "summary",
+            (
+                Representation("reference", "x", ()),
+                Representation("summary", "xx", (("shared", 12.6), ("a", 1.4), ("b", 1.4))),
+            ),
+            dependencies=(0, 1),
+            replacements=(0, 1),
+        ),
+    )
+
+    def cost(selected: dict[int, int]) -> AllocationCost:
+        size = sum(len(units[i].variants[v].payload_json) for i, v in selected.items())
+        return AllocationCost(size, size)
+
+    baseline = ContextAllocator(
+        tuple(replace(u, replacements=()) for u in units),
+        cost,
+        token_limit=12,
+        byte_limit=12,
+        policy="coverage",
+    )
+    candidate = ContextAllocator(units, cost, token_limit=12, byte_limit=12, policy="coverage")
+    assert baseline.utility(await baseline.allocate({})) == 22
+    result = await candidate.allocate({})
+    assert result == {0: 0, 1: 0, 2: 1, 3: 1}
+    oracle = max(
+        candidate.utility(s)
+        for levels in itertools.product((-1, 0, 1), repeat=4)
+        if (s := {i: v for i, v in enumerate(levels) if v >= 0})
+        and (3 not in s or {0, 1} <= s.keys())
+        and candidate.fits(cost(s))
+    )
+    assert candidate.utility(result) == oracle == 25.4
+    # 恢复固定的原文最低级别不能被联合替换突破。
+    protected = await candidate.allocate({0: 1})
+    assert protected[0] == 1 and candidate.fits(cost(protected))

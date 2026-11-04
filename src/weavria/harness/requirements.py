@@ -43,11 +43,6 @@ class _SemanticContract(BaseModel):
     schema_version: Literal[1] = 1
 
 
-class _SemanticLedgerContract(BaseModel):
-    model_config = _SemanticContract.model_config
-    schema_version: Literal[5] = 5
-
-
 class NeedStatus(StrEnum):
     PENDING = "pending"
     ACQUIRING = "acquiring"
@@ -265,7 +260,9 @@ class NeedState(BaseModel):
         return self.status in {NeedStatus.ACQUIRED, NeedStatus.SATISFIED}
 
 
-class NeedLedger(_SemanticLedgerContract):
+class NeedLedger(BaseModel):
+    model_config = _SemanticContract.model_config
+    schema_version: Literal[5, 6] = 5
     work_id: _Identifier
     task_revision: int = Field(ge=1)
     frame_revision: int = Field(ge=1)
@@ -274,8 +271,25 @@ class NeedLedger(_SemanticLedgerContract):
     bindings: tuple[EvidenceBinding, ...] = ()
     probes: tuple["EvidenceProbe", ...] = ()
 
+    source_failure_rounds: dict[_Identifier, Literal[1, 2]] = Field(default_factory=dict)
+    sources_exhausted: bool = False
+
+    @model_serializer(mode="wrap")
+    def preserve_source_tracking_wire(
+        self, handler: SerializerFunctionWrapHandler
+    ) -> dict[str, object]:
+        data = handler(self)
+        if self.schema_version == 5:
+            data.pop("source_failure_rounds", None)
+            data.pop("sources_exhausted", None)
+        return data
+
     @model_validator(mode="after")
     def validate_ledger(self) -> Self:
+        if (self.schema_version == 6) != bool(self.source_failure_rounds):
+            raise ValueError("source failure tracking requires a nonempty v6 ledger")
+        if self.sources_exhausted and 2 not in self.source_failure_rounds.values():
+            raise ValueError("source exhaustion requires a closed group")
         need_ids = [state.need_id for state in self.states]
         if len(need_ids) != len(set(need_ids)):
             raise ValueError("need ledger states must be unique")
@@ -387,6 +401,13 @@ class NeedLedger(_SemanticLedgerContract):
                     }
                 )
             payload.append(state_payload)
+        if self.source_failure_rounds:
+            payload.append(
+                {
+                    "source_failure_rounds": self.source_failure_rounds,
+                    "sources_exhausted": self.sources_exhausted,
+                }
+            )
         return hashlib.sha256(
             json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()

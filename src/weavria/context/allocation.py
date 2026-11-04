@@ -10,7 +10,7 @@ from weavria.core import EvidenceDelivery
 
 @dataclass(frozen=True, slots=True)
 class Representation:
-    kind: Literal["raw", "excerpt", "reference"]
+    kind: Literal["raw", "excerpt", "reference", "summary"]
     payload_json: str
     features: tuple[tuple[str, float], ...]
     delivery: EvidenceDelivery | None = None
@@ -24,6 +24,8 @@ class ContextUnit:
     variants: tuple[Representation, ...]
     dependencies: tuple[int, ...] = ()
     required: bool = False
+    # 可由本单元共同替换的祖先。仅扩大搜索邻域,不会授权删除事实或跳过预算。
+    replacements: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,6 +77,8 @@ class ContextAllocator:
             for parent in unit.dependencies:
                 ancestors.update(closures[parent])
             closures.append(frozenset(ancestors))
+            if any(parent not in ancestors or parent == index for parent in unit.replacements):
+                raise ValueError("replacement groups must contain strict dependency ancestors")
         self.closures = tuple(closures)
         self.order = tuple(sorted(range(len(units)), key=lambda i: units[i].identity))
 
@@ -150,7 +154,54 @@ class ContextAllocator:
             limit=min(self.max_steps, self.steps + max(1, self.max_steps // 3)),
         )
         selected = density if await self._better(density, absolute) else absolute
+        # 联合替换先于单来源局部修复,并只使用剩余搜索预算的一半。
+        selected = await self._group_exchange(selected, minimum)
         return await self._exchange(selected, minimum)
+
+    async def _group_exchange(
+        self, selected: dict[int, int], minimum: dict[int, int]
+    ) -> dict[int, int]:
+        """发现多个来源→合并摘要→补入另一需求的交换,仍用实际可见覆盖计分。
+
+        一次只换出一个来源可能始终腾不出足够空间。这里按已验证来源图提出
+        联合降级,然后尝试一个额外接收者。最小表示和因果闭包始终保留。
+        搜索有界且仅接受效用增加/同效用成本下降,不保证全局最优。
+        """
+        if not any(unit.replacements for unit in self.units):
+            return selected
+        limit = self.steps + max(1, (self.max_steps - self.steps) // 2)
+        for _ in range(2):
+            best = selected
+            for i in self.order:
+                unit = self.units[i]
+                if not unit.replacements:
+                    continue
+                for level, variant in enumerate(unit.variants):
+                    if variant.kind != "summary":
+                        continue
+                    changes = tuple((p, minimum.get(p, 0)) for p in unit.replacements)
+                    base = self._change(selected, (*changes, (i, level)), minimum)
+                    if not await self._step(limit):
+                        return best
+                    if self.fits(await self.cost(base)) and await self._better(base, best):
+                        best = base
+                    for recipient in self.order:
+                        if recipient == i or recipient in unit.replacements:
+                            continue
+                        for target in range(
+                            base.get(recipient, -1) + 1, len(self.units[recipient].variants)
+                        ):
+                            if not await self._step(limit):
+                                return best
+                            proposal = self.proposal(base, recipient, target)
+                            if self.fits(await self.cost(proposal)) and await self._better(
+                                proposal, best
+                            ):
+                                best = proposal
+            if best == selected:
+                break
+            selected = best
+        return selected
 
     async def _better(self, candidate: dict[int, int], incumbent: dict[int, int]) -> bool:
         candidate_cost, incumbent_cost = await self.cost(candidate), await self.cost(incumbent)

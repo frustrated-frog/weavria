@@ -1712,6 +1712,45 @@ async def test_no_progress_rejects_repeated_canonical_call_after_unchanged_feedb
     assert notice.action_family_sha256 is not None
     assert notice.prior_family_attempts == 1
     assert provider.requests[-1].control == notice
+    assert notice.replan is not None and notice.replan.call_index == 0
+    assert notice.replan.prior is not None
+    assert notice.replan.prior.call_id == "missing-2"
+    assert notice.replan.prior.failure_category is ErrorCategory.UNKNOWN_TOOL
+    assert notice.replan.prior.source_sha256 is None
+    state = None
+    for event in agent.events:
+        if isinstance(event.data, BatchRejected):
+            forged_prior = notice.replan.prior.model_copy(update={"call_id": "missing-3"})
+            forged_notice = notice.model_copy(
+                update={"replan": notice.replan.model_copy(update={"prior": forged_prior})}
+            )
+            forged = event.model_copy(update={"data": BatchRejected(notice=forged_notice)})
+            with pytest.raises(EventAcceptanceError, match="accepted tool outcome"):
+                reduce_event(state, forged)
+            break
+        state = reduce_event(state, event)
+    replay(agent)
+
+
+async def test_replan_distinguishes_unexecuted_sibling_from_accepted_result() -> None:
+    provider = FakeControlProvider(
+        (
+            batch(call("first", "same"), call("sibling", "same")),
+            batch(call("retry-alone", "same")),
+            finish(),
+        )
+    )
+    agent = make_loop(provider)
+    result = await agent.execute()
+
+    assert result.status is RunStatus.COMPLETED
+    assert [record.exchange.action.call_id for record in agent.state.records] == ["retry-alone"]
+    notice = provider.requests[1].control
+    assert isinstance(notice, AdmissionNotice)
+    assert notice.replan is not None
+    assert notice.replan.call_index == 1 and notice.replan.duplicate_of_index == 0
+    assert notice.replan.prior is None
+    replay(agent)
 
 
 async def test_persistent_no_progress_stops_as_explicit_failure_not_budget_exhaustion() -> None:
@@ -1961,6 +2000,9 @@ async def test_semantic_frontier_bounds_volatile_outputs_from_one_action_family(
             "specification": {"goal": "Read a stable value"},
         },
     )
+    # 四次返回值故意都不同, 模拟时间戳、请求 ID 等易变字段让结果哈希持续变化。
+    # 真正的任务前沿没有更新, 因此前三次允许有限探索, 第四次必须在工具派发前拒绝;
+    # 这个断言避免把“输出看起来不同”误当成“任务确实取得了新进展”。
     provider = FakeControlProvider(
         (
             batch(call("attempt-1", "volatile-1")),

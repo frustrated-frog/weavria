@@ -465,6 +465,7 @@ async def test_replay_rejects_early_settlement_and_missing_sibling_feedback() ->
     assert (await agent.execute()).status is RunStatus.COMPLETED
     events = agent.events
     state = None
+    # 在第一个工具刚启动时伪造 TurnSettled, 验证运行时不会把部分批次交给下一轮模型。
     for event in events:
         if isinstance(event.data, ToolStarted):
             break
@@ -479,6 +480,7 @@ async def test_replay_rejects_early_settlement_and_missing_sibling_feedback() ->
             break
         state = reduce_event(state, event)
     assert state is not None
+    # 两个兄弟调用都结算后, 上下文仍不能只挑其中一个结果来伪造完整反馈。
     bad_context = ContextSelected(
         request_bytes=10, budget_bytes=10, request_sha256="0" * 64, selected_call_ids=("b",)
     )

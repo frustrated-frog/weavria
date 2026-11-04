@@ -13,8 +13,14 @@ from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from weavria.context import ContextCompilerConfig, ModelRequestContextConfig
-from weavria.core import ApplicationObservation, CompletionUnverifiable
-from weavria.harness import AgentHarness, HarnessConfig, HarnessEvidence, TaskUnderstandingError
+from weavria.core import ApplicationObservation, CompletionUnverifiable, ErrorCategory
+from weavria.harness import (
+    AgentHarness,
+    HarnessConfig,
+    HarnessEvidence,
+    TaskModelViewProjector,
+    TaskUnderstandingError,
+)
 from weavria.models.openai_compatible import (
     OpenAICompatibleConfig,
     OpenAICompatibleProvider,
@@ -124,8 +130,11 @@ def create_app(
     requirement_coverage: bool = True,
     evidence_guidance: bool | None = None,
     task_model_projector: TaskModelProjector | None = None,
+    project_task_view: bool = True,
 ) -> FastAPI:
     """Create a sidecar. Uvicorn should invoke this as an application factory."""
+    if task_model_projector is not None and not project_task_view:
+        raise ValueError("a custom task projector requires project_task_view")
     if type(requirement_coverage) is not bool:
         raise TypeError("requirement_coverage must be a boolean")
     if evidence_guidance is not None and type(evidence_guidance) is not bool:
@@ -234,6 +243,10 @@ def create_app(
             window_tokens=resolved.context_window_tokens,
             output_tokens=resolved.model_max_output_tokens,
         )
+        # 让执行模型看到需求账本的进度,避免把原始能力需求误当作下一轮调用计划。
+        projector = (
+            (task_model_projector or TaskModelViewProjector()) if project_task_view else None
+        )
         config = HarnessConfig(
             configuration_id="finscope",
             context=context,
@@ -242,7 +255,8 @@ def create_app(
             max_request_duration=(
                 resolved.understanding_max_duration_seconds + resolved.run_max_duration_seconds
             ),
-            project_task_view=task_model_projector is not None,
+            project_task_view=project_task_view,
+            adaptive_capabilities=project_task_view,
         )
         answer_policy = FinScopeAnswerPolicy()
         profile = build_runtime_profile(
@@ -257,9 +271,7 @@ def create_app(
             token_counter_version=token_counter.version,
             requirement_coverage=requirement_coverage,
             evidence_guidance=use_evidence_guidance,
-            task_model_projector_version=(
-                task_model_projector.version if task_model_projector is not None else None
-            ),
+            task_model_projector_version=projector.version if projector is not None else None,
             harness_configuration_id=config.configuration_id,
         )
         harness = AgentHarness.from_config(
@@ -282,7 +294,7 @@ def create_app(
                     resolved.model_max_request_bytes or resolved.run_max_request_bytes,
                 ),
             ),
-            task_model_projector=task_model_projector,
+            task_model_projector=projector,
             configuration_metadata=profile,
         )
         await harness.__aenter__()
@@ -382,7 +394,14 @@ def create_app(
             )
             for call in (turn.calls if turn else ())
         )
-        error = result.report.error.message if result.report.error else None
+        run_error = result.report.error
+        error = (
+            "FinScope 数据服务暂时不可用。重试后仍未取得所需数据。"
+            if run_error is not None and run_error.category is ErrorCategory.SOURCE_UNAVAILABLE
+            else run_error.message
+            if run_error is not None
+            else None
+        )
         completion_reason = (
             result.report.assessment.decision.reason
             if result.report.assessment is not None

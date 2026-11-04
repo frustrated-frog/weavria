@@ -123,6 +123,7 @@ class SessionSemanticContext:
     read_artifact: Callable[[str], Awaitable[ArtifactSnapshot]]
     trigger: Literal["tool_feedback", "steering"]
     context_supply: ContextSupply | None = None
+    settled_record_count: int = 0
 
 
 @dataclass(frozen=True, slots=True)

@@ -39,7 +39,6 @@ from weavria.harness import (
     ObligationCoverage,
     RequirementCoverageAssessment,
     SemanticObligation,
-    TaskFrame,
     TaskModelViewProjector,
     TaskSpecification,
 )
@@ -406,17 +405,13 @@ async def test_session_api_executes_real_runtime_and_reports_tool_trace(
     interpreted = interpreter.requests[0].task
     assert interpreted.goal == "今天是什么市场阶段?"
     assert "2026-10-15" in interpreter.requests[0].task.constraints[-1]
-    runtime_observation = provider.requests[0].current.task_observation
-    if projected:
-        view = provider.requests[0].current.task_model_view
-        assert runtime_observation is None and view is not None
-        assert "2026-10-15" in json.dumps(view.definition["navigation_context"])
-        assert provider.requests[-1].current.task_model_view is not None
-        assert provider.requests[-1].current.task_model_view.phase == "synthesis"
-    else:
-        assert runtime_observation is not None
-        runtime_frame = TaskFrame.model_validate_json(json.dumps(runtime_observation.payload))
-        assert runtime_frame.application_context[0].payload["business_date"] == "2026-10-15"
+    view = provider.requests[0].current.task_model_view
+    assert provider.requests[0].current.task_observation is None and view is not None
+    assert "2026-10-15" in json.dumps(view.definition["navigation_context"])
+    final_view = provider.requests[-1].current.task_model_view
+    assert final_view is not None
+    if reserved_calls:
+        assert final_view.phase == "synthesis"
     assert provider.requests[0].current.task.goal == "今天是什么市场阶段?"
     assert any(isinstance(event.data, SessionContextCompiled) for event in events)
     assert stored_config["limits"] == {
@@ -528,11 +523,14 @@ async def test_workspace_context_executes_private_get_tool_with_provenance(
         ("GET", "/api/articles/paged")
     ]
     assert dict(requests[0].url.params) == {"page": "0", "pageSize": "5"}
-    observation = provider.requests[0].current.task_observation
-    assert observation is not None
-    frame = TaskFrame.model_validate_json(json.dumps(observation.payload))
-    assert frame.application_context[0].payload["surface"] == "finscope_workspace"
-    assert frame.application_context[0].payload["navigation"] == {
+    view = provider.requests[0].current.task_model_view
+    assert view is not None
+    navigation = view.definition["navigation_context"]
+    assert isinstance(navigation, list) and isinstance(navigation[0], dict)
+    page = navigation[0]["payload"]
+    assert isinstance(page, dict)
+    assert page["surface"] == "finscope_workspace"
+    assert page["navigation"] == {
         "view": "agent",
         "label": "Agent",
         "hint": "全域问答",
@@ -635,10 +633,11 @@ async def test_finscope_retries_ungrounded_model_evidence_path_before_execution(
     assert "one or more selectors are unsupported" in interpreter.requests[1].task.constraints[-1]
     assert "/regime" not in interpreter.requests[1].instructions
     assert "Independently audit" in interpreter.requests[2].instructions
-    observation = provider.requests[0].current.task_observation
-    assert observation is not None
-    frame = TaskFrame.model_validate_json(json.dumps(observation.payload))
-    assert frame.requirements[0].required_fields == ("/data/regime",)
+    view = provider.requests[0].current.task_model_view
+    assert view is not None
+    needs = view.definition["needs"]
+    assert isinstance(needs, list) and isinstance(needs[0], dict)
+    assert needs[0]["required_fields"] == ["/data/regime"]
     await market_http.aclose()
 
 
@@ -826,7 +825,7 @@ async def test_application_completion_cannot_bypass_selected_clarification(
     assert len(provider.requests) == 2
 
 
-async def test_market_source_failure_finishes_unverifiable_without_completion_loop(
+async def test_market_source_outage_reports_upstream_failure_without_another_model_call(
     tmp_path: Path,
 ) -> None:
     market_calls = 0
@@ -834,7 +833,7 @@ async def test_market_source_failure_finishes_unverifiable_without_completion_lo
     def market_response(_request: httpx.Request) -> httpx.Response:
         nonlocal market_calls
         market_calls += 1
-        return httpx.Response(503, json={"success": False})
+        return httpx.Response(502, json={"success": False})
 
     market_http = httpx.AsyncClient(transport=httpx.MockTransport(market_response))
     provider = FakeSessionProvider(
@@ -864,7 +863,6 @@ async def test_market_source_failure_finishes_unverifiable_without_completion_lo
                     )
                 )
             ),
-            ModelTurn(decision=FinishAction(output="市场数据源暂时不可用, 本次无法判断市场阶段。")),
         )
     )
     app = create_app(
@@ -904,10 +902,10 @@ async def test_market_source_failure_finishes_unverifiable_without_completion_lo
 
     assert response.status_code == 200
     payload = MessageOutput.model_validate(response.json())
-    assert payload.status == "completed"
-    assert payload.task_outcome == "unverifiable"
-    assert payload.answer == "市场数据源暂时不可用, 本次无法判断市场阶段。"
-    assert payload.completion_reason == "attempted_paths_unavailable"
+    assert payload.status == "failed"
+    assert payload.task_outcome == "unverified"
+    assert payload.answer is None
+    assert payload.error is not None and "数据服务暂时不可用" in payload.error
     assert [tool.model_dump() for tool in payload.tools] == [
         {
             "call_id": "market-read-failed",
@@ -921,14 +919,114 @@ async def test_market_source_failure_finishes_unverifiable_without_completion_lo
         },
     ]
     assert market_calls == 2
-    assert len(provider.requests) == 3
+    assert len(provider.requests) == 2
     failure = provider.requests[1].current.feedback
     assert failure is not None and failure.calls[0].status == "failed"
     exchange = provider.requests[1].current.history[0]
     assert isinstance(exchange, ToolExchange)
     assert isinstance(exchange.observation, ToolFailedObservation)
+    assert exchange.observation.error.category.value == "source_unavailable"
     assert exchange.observation.error.retryable is True
     await market_http.aclose()
+
+
+async def test_company_search_does_not_treat_three_scopes_as_independent_sources(
+    tmp_path: Path,
+) -> None:
+    paths: list[str] = []
+
+    def outage(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        return httpx.Response(502, json={"message": "private gateway detail"})
+
+    spec = TaskSpecification(
+        route="execute",
+        intent="Read the current company evidence",
+        goal="Read company evidence for 澳弘电子",
+        information_needs=(
+            InformationNeed(
+                description="Company data for 澳弘电子",
+                source="external",
+                required_fields=("/data",),
+                capability_names=("search_finscope",),
+            ),
+        ),
+        capability_needs=(
+            CapabilityNeed(name="search_finscope", purpose="Find evidence", necessity="required"),
+        ),
+        completion_criteria=(
+            CompletionCriterion(kind="response", description="Answer"),
+            CompletionCriterion(
+                kind="capability_result", description="Search data", capability="search_finscope"
+            ),
+        ),
+    )
+
+    def search_batch(turn: int, scopes: tuple[str, ...]) -> ModelTurn:
+        return ModelTurn(
+            decision=ToolBatch(
+                calls=tuple(
+                    ToolCallAction(
+                        call_id=f"search-{turn}-{scope}",
+                        tool_name="search_finscope",
+                        arguments={"scope": scope, "query": "澳弘电子"},
+                    )
+                    for scope in scopes
+                )
+            )
+        )
+
+    provider = FakeSessionProvider(
+        (
+            search_batch(1, ("companies", "news_window", "reaction_events")),
+            search_batch(2, ("companies",)),
+        )
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(outage)) as upstream:
+        app = create_app(
+            FinScopeSettings(
+                model_base_url="http://model.test",
+                model_name="fake",
+                model_api_key="",
+                finscope_base_url="http://finscope.test",
+                state_path=tmp_path / "sessions.sqlite3",
+            ),
+            provider=provider,
+            interpreter_provider=FakeModelProvider((_declaration(spec),)),
+            requirement_coverage=False,
+            workspace_client=FinScopeWorkspaceClient("http://finscope.test", client=upstream),
+        )
+        async with (
+            app.router.lifespan_context(app),
+            httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://sidecar.test"
+            ) as client,
+        ):
+            created = SessionCreated.model_validate((await client.post("/api/sessions")).json())
+            response = await client.post(
+                f"/api/sessions/{created.session_id}/messages",
+                json={
+                    "input_id": "company-search-outage",
+                    "text": "澳弘电子今天的情况怎么样",
+                    "context": {
+                        "surface": "finscope_workspace",
+                        "current_view": "agent",
+                        "navigation": {"view": "agent", "label": "Agent"},
+                    },
+                },
+            )
+
+    assert response.status_code == 200
+    payload = MessageOutput.model_validate(response.json())
+    assert payload.status == "failed" and payload.answer is None
+    assert payload.error is not None and "数据服务暂时不可用" in payload.error
+    assert len(provider.requests) == 2
+    assert set(paths[:3]) == {
+        "/api/companies/search",
+        "/api/news/window",
+        "/api/investment-reactions/events",
+    }
+    assert paths[3:] == ["/api/companies/search"]
 
 
 async def test_invalid_task_understanding_returns_safe_gateway_error(tmp_path: Path) -> None:

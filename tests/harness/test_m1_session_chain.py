@@ -52,6 +52,14 @@ def config() -> HarnessConfig:
     )
 
 
+def test_recommended_entry_requires_progress_projection_with_adaptive_capabilities() -> None:
+    base = replace(config(), working_records=False)
+    with pytest.raises(ValueError, match="adaptive capabilities require task model projection"):
+        replace(base, project_task_view=False)
+    baseline = replace(base, project_task_view=False, adaptive_capabilities=False)
+    assert not baseline.project_task_view
+
+
 def declaration(specification: TaskSpecification) -> ModelResponse:
     return ModelResponse(
         action=ToolCallAction(

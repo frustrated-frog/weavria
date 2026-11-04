@@ -105,13 +105,31 @@ class ContextCompilerConfig:
     next_step_reserve_bytes: int = 4096
     extractive_compaction: bool = False
     work_summary_compaction: bool = False
+    semantic_compaction: bool = False
+    summary_guidance: bool = False
+    summary_preparation: bool = False
+    summary_selection: Literal["coverage", "token_savings"] = "coverage"
 
     def __post_init__(self) -> None:
         if any(
             type(flag) is not bool
-            for flag in (self.extractive_compaction, self.work_summary_compaction)
+            for flag in (
+                self.extractive_compaction,
+                self.work_summary_compaction,
+                self.semantic_compaction,
+                self.summary_guidance,
+                self.summary_preparation,
+            )
         ):
             raise ValueError("compaction switches must be booleans")
+        if self.summary_preparation and not self.summary_guidance:
+            raise ValueError("summary preparation requires summary guidance")
+        if self.summary_guidance and not self.semantic_compaction:
+            raise ValueError("summary guidance requires semantic compaction")
+        if self.summary_selection not in ("coverage", "token_savings"):
+            raise ValueError("unknown summary selection policy")
+        if self.summary_selection == "token_savings" and not self.semantic_compaction:
+            raise ValueError("summary token selection requires semantic compaction")
         for value in (
             self.window_tokens,
             self.output_tokens,

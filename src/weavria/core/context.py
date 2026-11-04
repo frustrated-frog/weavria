@@ -16,6 +16,8 @@ from .context_supply import ContextSupplyReport
 from .delivery import EvidenceDeliveryManifest
 from .recovery import RecoveryRange
 from .retrieval import HistoryRetrievalReport
+from .summaries import SummaryAdvice, SummaryCompilation
+from .summary_cost import SummarySelectionReport
 from .task_view import TaskModelViewReceipt
 
 
@@ -24,7 +26,7 @@ class ContextChoice(ContractModel):
 
     source_id: NonBlankString
     source_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
-    representation: Literal["raw", "excerpt", "reference", "omitted"]
+    representation: Literal["raw", "excerpt", "reference", "summary", "omitted"]
     required: bool
     dependencies: tuple[str, ...] = ()
 
@@ -33,7 +35,7 @@ class ContextCompilation(BaseModel):
     """Bind allocation diagnostics to the exact complete request sent to a provider."""
 
     model_config = ContractModel.model_config
-    schema_version: Literal[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13] = 1
+    schema_version: Literal[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17] = 1
 
     policy_version: NonBlankString
     counter_version: NonBlankString
@@ -65,6 +67,9 @@ class ContextCompilation(BaseModel):
     transport_budget_bytes: int | None = Field(default=None, gt=0)
     task_model_view: TaskModelViewReceipt | None = None
     compaction_status: Literal["no_candidate", "budget_omitted", "delivered"] | None = None
+    summaries: SummaryCompilation | None = None
+    summary_advice: SummaryAdvice | None = None
+    summary_selection: SummarySelectionReport | None = None
 
     @field_validator("schema_version", mode="before")
     @classmethod
@@ -96,6 +101,12 @@ class ContextCompilation(BaseModel):
             data.pop("supply", None)
         if self.schema_version < 13:
             data.pop("compaction_status", None)
+        if self.schema_version < 14:
+            data.pop("summaries", None)
+        if self.schema_version < 15:
+            data.pop("summary_advice", None)
+        if self.schema_version < 17:
+            data.pop("summary_selection", None)
         return data
 
     @model_validator(mode="after")
@@ -138,8 +149,44 @@ class ContextCompilation(BaseModel):
             raise ValueError("transport accounting requires compilation v8")
         if self.schema_version in (11, 12) and self.supply is None:
             raise ValueError("compilation v11 requires its source supply report")
-        if (self.compaction_status is not None) != (self.schema_version == 13):
+        if self.schema_version < 14 and (
+            (self.compaction_status is not None) != (self.schema_version == 13)
+        ):
             raise ValueError("compaction diagnostics require compilation v13")
+        if (self.summaries is not None) != (self.schema_version >= 14):
+            raise ValueError("semantic summary diagnostics require compilation v14")
+        if (self.summary_selection is not None) != (self.schema_version >= 17):
+            raise ValueError("summary token selection requires compilation v17")
+        if self.summary_selection is not None:
+            allowed = {
+                f"call:{item.artifact.call_id}"
+                for item in self.summary_selection.comparisons
+                if item.decision == "saves_tokens"
+            }
+            if any(
+                c.representation == "summary" and c.source_id not in allowed for c in self.choices
+            ):
+                raise ValueError("selected summary has no positive token comparison")
+            if (
+                self.summaries is None
+                or self.summary_selection.candidates != self.summaries.eligible
+            ):
+                raise ValueError("summary selection must cover all eligible candidates")
+        if (
+            self.summary_advice
+            and self.summary_advice.schema_version == 2
+            and self.schema_version < 16
+        ):
+            raise ValueError("preparation advice requires compilation v16")
+        if self.summary_advice is not None and (
+            self.schema_version < 15 or self.summary_advice.task_revision != self.task_revision
+        ):
+            raise ValueError("summary advice requires current compilation v15")
+        selected_summaries = sum(c.representation == "summary" for c in self.choices)
+        if (selected_summaries and self.summaries is None) or (
+            self.summaries is not None and self.summaries.selected != selected_summaries
+        ):
+            raise ValueError("summary choices disagree with compilation diagnostics")
         if self.task_model_view is not None and self.transport_request_bytes is None:
             raise ValueError("model-view compilation requires full transport accounting")
         if (
@@ -172,6 +219,11 @@ class ContextCompilation(BaseModel):
         ):
             raise ValueError("supplied bundles must be accounted for without lossy representations")
         choices = {c.source_id: c for c in self.choices}
+        if self.summary_selection is not None and any(
+            f"call:{item.artifact.call_id}" not in choices
+            for item in self.summary_selection.comparisons
+        ):
+            raise ValueError("summary cost comparison has no accepted source choice")
         for part in self.recovery_ranges:
             choice = choices.get(f"call:{part.call_id}")
             if (

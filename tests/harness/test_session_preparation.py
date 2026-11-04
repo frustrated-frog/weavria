@@ -533,6 +533,43 @@ async def test_task_frame_preserves_raw_request_and_hides_business_tools_in_v4_s
     ]
 
 
+async def test_interpreter_keeps_standalone_scope_and_history_for_explicit_followups(
+    tmp_path: Path,
+) -> None:
+    # Fake 只验证实际解释请求的作用域约束和历史接线,不代替真实模型质量评测。
+    interpreter = FakeModelProvider(tuple(_declaration(_direct()) for _ in range(3)))
+    preparer = TaskAwareSessionPreparer(TaskUnderstandingEngine(ModelTaskInterpreter(interpreter)))
+    prompts = (
+        "Pick three records from my saved list.",
+        "What is the overall status today?",
+        "How does that compare with the three records I asked for?",
+    )
+    async with SessionEngine(
+        tmp_path / "scope.db",
+        model=_DirectSessionModel(),
+        tools=_registry(),
+        task_preparation=preparer,
+    ) as engine:
+        await engine.create("s")
+        for prompt in prompts:
+            result = await engine.send("s", prompt)
+            assert result.report.status is RunStatus.COMPLETED
+
+    standalone, followup = interpreter.requests[1:]
+    assert standalone.task.goal == prompts[1]
+    assert "If the current request stands on its own" in standalone.instructions
+    assert "resolve references or continuations expressed by the current user" in (
+        standalone.instructions
+    )
+    assert not any("Accepted prior interpretation" in c for c in standalone.task.constraints)
+    assert followup.task.goal == prompts[2]
+    assert [
+        item.content
+        for item in followup.history
+        if isinstance(item, Message) and item.role.value == "user"
+    ] == list(prompts[:2])
+
+
 @pytest.mark.parametrize(
     ("max_request_duration", "expected_status"),
     ((None, RunStatus.BUDGET_EXHAUSTED), (200.0, RunStatus.COMPLETED)),
@@ -1123,13 +1160,23 @@ async def test_expired_clarification_is_persisted_and_not_matched_to_new_input(
 class _GuessHiddenToolModel:
     capabilities = ModelCapabilities(tool_calls=True, multi_tool_calls=True)
 
-    def __init__(self) -> None:
+    def __init__(self, width: int) -> None:
         self.calls = 0
+        self.width = width
 
     async def generate_session(self, request: SessionRequest) -> ModelTurn:
         self.calls += 1
         if isinstance(request.current.control, AdmissionNotice):
             assert request.current.control.reason == "capability_view"
+            notice = request.current.control
+            assert notice.capability_epoch_changed is False
+            assert tuple(index for index, _ in notice.unavailable_calls) == tuple(range(self.width))
+            if self.width == 1:
+                assert notice.unavailable_calls == ((0, "send_value"),)
+            else:
+                assert any(name is not None for _, name in notice.unavailable_calls)
+                assert any(name is None for _, name in notice.unavailable_calls)
+                assert len(notice.model_dump_json().encode()) <= 1024
             return ModelTurn(decision=FinishAction(output="The hidden action was not executed."))
         exchanges = [entry for entry in request.current.history if isinstance(entry, ToolExchange)]
         if exchanges:
@@ -1139,20 +1186,24 @@ class _GuessHiddenToolModel:
             return ModelTurn(decision=FinishAction(output="The hidden action was not executed."))
         return ModelTurn(
             decision=ToolBatch(
-                calls=(
+                calls=tuple(
                     ToolCallAction(
-                        call_id="guessed-call",
-                        tool_name="send_value",
+                        call_id=f"guessed-{index}",
+                        tool_name="send_value" if index == 0 else "\u4e00" * 64,
                         arguments={"value": "secret"},
-                    ),
+                    )
+                    for index in range(self.width)
                 )
             )
         )
 
 
-async def test_hidden_capability_name_cannot_bypass_runtime_registry(tmp_path: Path) -> None:
+@pytest.mark.parametrize("width", [1, 32])
+async def test_hidden_capability_name_cannot_bypass_runtime_registry(
+    tmp_path: Path, width: int
+) -> None:
     effects: list[str] = []
-    model = _GuessHiddenToolModel()
+    model = _GuessHiddenToolModel(width)
     preparer = TaskAwareSessionPreparer(
         TaskUnderstandingEngine(ModelTaskInterpreter(FakeModelProvider((_declaration(_direct()),))))
     )

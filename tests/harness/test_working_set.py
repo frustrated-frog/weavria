@@ -6,6 +6,7 @@ import pytest
 from pydantic import BaseModel
 
 from weavria.core import (
+    AdmissionNotice,
     ErrorCategory,
     FinishAction,
     ModelTurn,
@@ -347,6 +348,12 @@ async def test_session_failure_switches_tool_then_keeps_acquired_material_readab
 
     class ReadbackModel(FakeSessionProvider):
         async def generate_session(self, request: SessionRequest) -> ModelTurn:
+            if isinstance(request.current.control, AdmissionNotice):
+                assert request.current.control.reason == "capability_view"
+                assert request.current.control.unavailable_calls == ((0, "a_source"),)
+                assert calls == ["a_source"]
+                assert "b_source" in request.current.instructions
+                assert "a_source" not in request.current.instructions
             exchanges = [e for e in request.current.history if isinstance(e, ToolExchange)]
             if any(e.action.call_id == "b" for e in exchanges) and not any(
                 e.action.call_id == "readback" for e in exchanges
@@ -388,6 +395,19 @@ async def test_session_failure_switches_tool_then_keeps_acquired_material_readab
                     calls=(
                         ToolCallAction(
                             call_id="a", tool_name="a_source", arguments={"key": "alpha"}
+                        ),
+                    )
+                )
+            ),
+            ModelTurn(
+                decision=ToolBatch(
+                    calls=(
+                        # 整批拒绝后,重规划只提交仍可见的来源。
+                        ToolCallAction(
+                            call_id="a-retry", tool_name="a_source", arguments={"key": "alpha"}
+                        ),
+                        ToolCallAction(
+                            call_id="b-rejected", tool_name="b_source", arguments={"key": "alpha"}
                         ),
                     )
                 )
@@ -689,3 +709,300 @@ def test_action_without_information_need_keeps_its_unresolved_obligation() -> No
         discover=False,
     )
     assert selected.names == ("perform",)
+
+
+@pytest.mark.parametrize("scenario", ["recovers", "backup", "exhausted", "partial"])
+async def test_shared_source_outage_uses_settled_turns_and_preserves_partial_delivery(
+    tmp_path: Path, scenario: str
+) -> None:
+    calls: list[tuple[str, str]] = []
+
+    async def primary(arguments: Input, context: ToolContext) -> Output:
+        calls.append(("primary", arguments.key))
+        if scenario == "recovers" and calls.count(("primary", "one")) == 2:
+            return Output(value="fresh value")
+        raise ToolFault(ErrorCategory.SOURCE_UNAVAILABLE, "Service unreachable", retryable=True)
+
+    async def backup(arguments: Input, context: ToolContext) -> Output:
+        calls.append(("backup", arguments.key))
+        return Output(value="independent value")
+
+    class ArchiveOutput(BaseModel):
+        timestamp: str
+
+    async def archive(arguments: Input, context: ToolContext) -> ArchiveOutput:
+        calls.append(("backup", arguments.key))
+        return ArchiveOutput(timestamp="a recorded timestamp")
+
+    use_backup = scenario in {"backup", "partial"}
+    registry = ToolRegistry(
+        (
+            TypedTool(
+                name="primary",
+                version="1",
+                description="Read value",
+                input_type=Input,
+                output_type=Output,
+                execute=primary,
+                source_group="primary-service",
+            ),
+            *(
+                (
+                    TypedTool(
+                        name="backup",
+                        version="1",
+                        description="Read an independently stored copy. " * 15,
+                        input_type=Input,
+                        output_type=Output,
+                        execute=backup,
+                        source_group="backup-service",
+                    ),
+                )
+                if scenario == "backup"
+                else (
+                    TypedTool(
+                        name="backup",
+                        version="1",
+                        description="Retrieve archival timestamp",
+                        input_type=Input,
+                        output_type=ArchiveOutput,
+                        execute=archive,
+                        source_group="backup-service",
+                    ),
+                )
+                if scenario == "partial"
+                else ()
+            ),
+        )
+    )
+
+    class Interpreter:
+        version = "source-outage-fixture/1"
+
+        async def interpret(
+            self, request: TaskUnderstandingInput, *, max_duration: float
+        ) -> TaskSpecification:
+            names = ("primary", "backup") if use_backup else ("primary",)
+            needs = (
+                InformationNeed(
+                    description="Read primary value",
+                    source="external",
+                    capability_names=("primary",) if scenario == "partial" else names,
+                    required_fields=("/value",),
+                ),
+                *(
+                    (
+                        InformationNeed(
+                            description="Retrieve archival timestamp",
+                            source="external",
+                            capability_names=("backup",),
+                            required_fields=("/timestamp",),
+                        ),
+                    )
+                    if scenario == "partial"
+                    else ()
+                ),
+            )
+            return TaskSpecification(
+                route="execute",
+                intent="Read values",
+                goal="Read values",
+                information_needs=needs,
+                capability_needs=tuple(
+                    CapabilityNeed(name=name, purpose="Read value", necessity="required")
+                    for name in names
+                ),
+                completion_criteria=(
+                    CompletionCriterion(kind="response", description="Answer"),
+                    *(
+                        CompletionCriterion(
+                            kind="capability_result", description="Read value", capability=name
+                        )
+                        for name in names
+                    ),
+                ),
+            )
+
+    def batch(*items: tuple[str, str], attempt: int = 1) -> ModelTurn:
+        return ModelTurn(
+            decision=ToolBatch(
+                calls=tuple(
+                    ToolCallAction(
+                        call_id=f"{name}-{key}" if attempt == 1 else f"{name}-{key}-{attempt}",
+                        tool_name=name,
+                        arguments={"key": key},
+                    )
+                    for name, key in items
+                )
+            )
+        )
+
+    initial_calls = (("primary", "one"), ("primary", "two"), ("primary", "three"))
+    output = (
+        "The archive records a timestamp. The primary source is unavailable."
+        if scenario == "partial"
+        else "Report what is available."
+    )
+    model = FakeSessionProvider(
+        (
+            # 三个兄弟失败仍只记一轮,保留下一轮重试机会。
+            batch(*initial_calls, *((("backup", "read"),) if scenario == "partial" else ())),
+            batch(("primary", "one" if scenario == "recovers" else "retry"), attempt=2),
+            *((batch(("backup", "read")),) if scenario == "backup" else ()),
+            *(
+                (ModelTurn(decision=FinishAction(output=output)),)
+                if scenario != "exhausted"
+                else ()
+            ),
+        )
+    )
+    preparer = TaskAwareSessionPreparer(
+        TaskUnderstandingEngine(Interpreter()), working_set=AdaptiveCapabilityPolicy()
+    )
+    async with SessionEngine(
+        tmp_path / "outage.db", model=model, tools=registry, task_preparation=preparer
+    ) as session:
+        await session.create("s")
+        result = await session.send("s", "Read values")
+        events = await session.store.events("s")
+
+    snapshots = [
+        item.data.snapshot for item in events if isinstance(item.data, SessionSemanticCommitted)
+    ]
+    assert "primary" in snapshots[1].visible_tool_names
+    assert snapshots[1].need_ledger["source_failure_rounds"] == {"primary-service": 1}
+    if scenario == "recovers":
+        assert "source_failure_rounds" not in snapshots[2].need_ledger
+        assert result.report.status is RunStatus.COMPLETED
+        assert calls.count(("primary", "one")) == 2
+        assert not any(
+            isinstance(request.current.control, AdmissionNotice) for request in model.requests
+        )
+    else:
+        assert "primary" not in snapshots[2].visible_tool_names
+        assert snapshots[2].need_ledger["source_failure_rounds"] == {"primary-service": 2}
+        if scenario == "exhausted":
+            assert result.report.error is not None
+            assert result.report.error.category is ErrorCategory.SOURCE_UNAVAILABLE
+            assert len(model.requests) == 2
+        else:
+            assert result.report.status is RunStatus.COMPLETED
+            if scenario == "backup":
+                assert snapshots[2].visible_tool_names == ("backup",)
+                assert calls[-1] == ("backup", "read")
+            else:
+                assert result.report.task_outcome == "unverifiable"
+                assert result.report.output == output
+                assert snapshots[2].need_ledger["sources_exhausted"] is True
+                assert any(
+                    isinstance(item, ToolExchange) and item.action.call_id == "backup-read"
+                    for item in model.requests[-1].current.history
+                )
+
+
+async def test_model_replans_from_rejected_call_and_committed_evidence_gap(tmp_path: Path) -> None:
+    from weavria.core import SessionRequest
+
+    class Page(BaseModel):
+        fields: dict[str, str]
+
+    executed: list[str] = []
+
+    async def read(arguments: Input, context: ToolContext) -> Page:
+        executed.append(arguments.key)
+        return Page(
+            fields={
+                "title": "Accepted title",
+                **({"detail": "Missing detail now obtained"} if arguments.key == "detail" else {}),
+            }
+        )
+
+    class Interpreter:
+        version = "replan-fixture/1"
+
+        async def interpret(
+            self, request: TaskUnderstandingInput, *, max_duration: float
+        ) -> TaskSpecification:
+            return TaskSpecification(
+                route="execute",
+                intent="Read a title and its detail",
+                goal="Read the title and detail",
+                information_needs=(
+                    InformationNeed(
+                        description="Title and detail",
+                        source="external",
+                        capability_names=("read_page",),
+                        required_fields=("/fields/title", "/fields/detail"),
+                    ),
+                ),
+                capability_needs=(
+                    CapabilityNeed(name="read_page", purpose="Read page", necessity="required"),
+                ),
+                completion_criteria=(
+                    CompletionCriterion(kind="response", description="Answer"),
+                    CompletionCriterion(
+                        kind="capability_result", description="Read page", capability="read_page"
+                    ),
+                ),
+            )
+
+    class ReplanModel(FakeSessionProvider):
+        async def generate_session(self, request: SessionRequest) -> ModelTurn:
+            control = request.current.control
+            if isinstance(control, AdmissionNotice):
+                assert control.progress_reason == "repeated_action"
+                replan = control.replan
+                assert replan is not None
+                assert replan.call_index == 0 and replan.tool_name == "read_page"
+                prior = replan.prior
+                assert prior is not None and prior.source_sha256 is not None
+                assert prior.call_id == "second-title"
+                assert len(replan.open_needs) == 1
+                assert replan.open_needs[0].missing_fields == ("/fields/detail",)
+                # 由拒绝反馈决定下一动作。重复提案未实际调用,只补账本里仍缺的字段。
+                assert executed == ["title", "title"]
+                return proposal("read-detail", "detail")
+            return await super().generate_session(request)
+
+    def proposal(call_id: str, key: str) -> ModelTurn:
+        return ModelTurn(
+            decision=ToolBatch(
+                calls=(
+                    ToolCallAction(call_id=call_id, tool_name="read_page", arguments={"key": key}),
+                )
+            )
+        )
+
+    model = ReplanModel(
+        (
+            proposal("first-title", "title"),
+            proposal("second-title", "title"),
+            proposal("third-title", "title"),
+            ModelTurn(decision=FinishAction(output="Accepted title and its detail.")),
+        )
+    )
+    registry = ToolRegistry(
+        (
+            TypedTool(
+                name="read_page",
+                version="1",
+                description="Read a field on the page",
+                input_type=Input,
+                output_type=Page,
+                execute=read,
+            ),
+        )
+    )
+    async with SessionEngine(
+        tmp_path / "replan.db",
+        model=model,
+        tools=registry,
+        task_preparation=TaskAwareSessionPreparer(
+            TaskUnderstandingEngine(Interpreter()), working_set=AdaptiveCapabilityPolicy()
+        ),
+    ) as session:
+        await session.create("s")
+        result = await session.send("s", "Read the title and detail")
+
+    assert result.report.status is RunStatus.COMPLETED, result.report.error
+    assert executed == ["title", "title", "detail"]

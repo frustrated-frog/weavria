@@ -42,6 +42,7 @@ class ProgressCheck:
     reservations: tuple[ProgressReservation, ...]
     action_identities: tuple[ToolActionIdentity, ...]
     adaptive_exploration: bool = False
+    blocked_call_index: int | None = None
 
 
 class ProgressPolicy(Protocol):
@@ -182,7 +183,11 @@ class SemanticProgressPolicy:
         blocked_action = actions[0][0]
         blocked_family = actions[0][1]
         blocked_prior = len(self._admitted.get((fingerprint, blocked_family), set()))
-        for action, family in actions:
+        blocked_index = None
+        # 这里检查的不是“工具调用次数”, 而是同一任务前沿下是否仍在重复同一动作,
+        # 或者只换参数继续尝试同一动作族。前者可以直接判重; 后者必须在有限次探索后
+        # 才拦截, 否则会把搜索翻页、逐个读取文件等确实在推进的长任务误判成死循环。
+        for index, (action, family) in enumerate(actions):
             admitted = self._admitted.get((fingerprint, family), set())
             family_proposal = proposed.setdefault(family, [])
             if action in admitted or action in family_proposal:
@@ -190,6 +195,9 @@ class SemanticProgressPolicy:
             elif not adaptive_exploration and len(admitted) >= self._max_stagnant_actions:
                 blocked_reason = "stagnant_action_family"
             if blocked_reason is not None:
+                # 批量调用只要有一个成员不再满足进展约束, 整批都不能被提前记为已接纳;
+                # 同时保留具体下标, 让上层能解释是哪一个候选触发了重新规划。
+                blocked_index = index
                 blocked_action = action
                 blocked_family = family
                 blocked_prior = len(admitted)
@@ -237,6 +245,7 @@ class SemanticProgressPolicy:
             reservations=reservations,
             action_identities=action_identities,
             adaptive_exploration=adaptive_exploration,
+            blocked_call_index=blocked_index,
         )
 
     def record_admission(self, check: ProgressCheck) -> None:

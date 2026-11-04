@@ -36,7 +36,7 @@ from weavria.sessions import (
     TaskRun,
     TaskVersion,
 )
-from weavria.tools import ToolPolicy, ToolRegistry
+from weavria.tools import ToolPolicy, ToolRegistry, context_summary_tool
 
 from .capabilities import CapabilityDiscoveryPolicy, CapabilityResolver
 from .configuration import HarnessConfig
@@ -320,6 +320,7 @@ class AgentHarness:
             evidence_extractors=evidence.extractors if evidence is not None else (),
             discovery_policy=evidence.discovery_policy if evidence is not None else None,
             working_records=config.working_records,
+            adaptive_capabilities=config.adaptive_capabilities,
             memory=memory,
             history_retrieval=HistoryRetrievalConfig() if config.history_retrieval else None,
             context_recovery=RecoveryLimits(schema_version=2, retention="chain")
@@ -358,6 +359,7 @@ class AgentHarness:
         discovery_policy: CapabilityDiscoveryPolicy | None = None,
         working_records: bool = False,
         working_set: CapabilityWorkingSetPolicy | None = None,
+        adaptive_capabilities: bool = True,
         memory: HarnessMemory | None = None,
         history_retrieval: HistoryRetrievalConfig | None = None,
         context_recovery: RecoveryLimits | None = None,
@@ -367,6 +369,8 @@ class AgentHarness:
         configuration_id: str | None = None,
         configuration_metadata: dict[str, JsonValue] | None = None,
     ) -> None:
+        if context.semantic_compaction and context_recovery is None:
+            raise ValueError("semantic compaction requires context recovery")
         if working_records and understanding is None:
             raise ValueError("working records require task understanding")
         if working_records:
@@ -382,6 +386,8 @@ class AgentHarness:
             task_model_projector = TaskModelViewProjector(
                 compact_work_summary=context.work_summary_compaction
             )
+        if working_set is not None and not adaptive_capabilities:
+            raise ValueError("a custom working set requires adaptive capabilities")
         if working_set is not None and understanding is None:
             raise ValueError("capability working set requires task understanding")
         duration = (
@@ -428,13 +434,18 @@ class AgentHarness:
                 capabilities=CapabilityResolver(policy=discovery_policy)
                 if discovery_policy
                 else None,
-                working_set=working_set or AdaptiveCapabilityPolicy(),
+                working_set=(working_set or AdaptiveCapabilityPolicy())
+                if adaptive_capabilities
+                else None,
                 working_records=working_records,
             )
             if understanding
             else None,
             context_source=source,
-            support_tools=(work_tool(),) if working_records else (),
+            support_tools=(
+                *((work_tool(),) if working_records else ()),
+                *((context_summary_tool(),) if context.semantic_compaction else ()),
+            ),
             history_retrieval=history_retrieval,
             context_recovery=context_recovery,
             task_model_projector=task_model_projector,

@@ -23,6 +23,7 @@ from weavria.context import (
     validate_recovery_view,
 )
 from weavria.core import (
+    CONTEXT_SUMMARY_TOOL,
     MAX_FORK_TURNS,
     ApplicationObservation,
     ArtifactRef,
@@ -30,6 +31,7 @@ from weavria.core import (
     ContextSelected,
     ControlEvent,
     ConversationTurn,
+    EvidenceDeliveryRange,
     PastCall,
     RecoveryResolved,
     RunEnded,
@@ -1769,6 +1771,24 @@ class SQLiteSessionStore:
             request.compaction is not None
         ):
             raise SessionConflictError("compaction delivery disagrees with its request")
+        if request.summary_advice != (compilation.summary_advice if compilation else None):
+            raise SessionConflictError("summary advice disagrees with compilation")
+        if request.schema_version >= 8:
+            if compilation is None or compilation.summaries is None:
+                raise SessionConflictError("summary request requires its compilation report")
+            choices = {c.source_id: c for c in compilation.choices}
+            for view in request.summaries:
+                choice = choices.get(f"call:{view.artifact.call_id}")
+                if (
+                    view.artifact.run_id != run_id
+                    or choice is None
+                    or choice.representation != ("summary" if view.statements else "reference")
+                ):
+                    raise SessionConflictError("summary view disagrees with compilation choices")
+            if compilation.summaries.selected != sum(bool(v.statements) for v in request.summaries):
+                raise SessionConflictError("summary delivery disagrees with its report")
+        elif compilation is not None and compilation.summaries is not None:
+            raise SessionConflictError("summary compilation requires session request v8")
         if (
             request.schema_version == 6
             or request.bundles
@@ -1804,6 +1824,87 @@ class SQLiteSessionStore:
                     or state.phase is not Phase.MODEL
                 ):
                     raise SessionConflictError("model request has no active session attempt")
+                selection = compilation.summary_selection if compilation else None
+                if request.summaries or request.summary_advice or selection:
+                    accepted = {
+                        r.artifact.artifact_id: r for r in state.records if r.artifact is not None
+                    }
+                    # 成本报告可以包含落选摘要,不能只校验本次真正交付的视图。
+                    for comparison in selection.comparisons if selection else ():
+                        producer = accepted.get(comparison.artifact.artifact_id)
+                        if (
+                            producer is None
+                            or producer.artifact != comparison.artifact
+                            or producer.exchange.action.tool_name != CONTEXT_SUMMARY_TOOL
+                        ):
+                            raise SessionConflictError(
+                                "summary cost comparison does not bind an accepted producer"
+                            )
+                    if request.summary_advice and request.summary_advice.recovery:
+                        target = request.summary_advice.recovery
+                        if not any(
+                            r.artifact
+                            and r.artifact.call_id == target.call_id
+                            and r.artifact.sha256 == target.source_sha256
+                            and r.exchange.action.tool_name != CONTEXT_SUMMARY_TOOL
+                            for r in accepted.values()
+                        ):
+                            raise SessionConflictError(
+                                "preparation target is not an accepted original"
+                            )
+                    for address in request.summary_advice.sources if request.summary_advice else ():
+                        producer = accepted.get(address.artifact_id)
+                        if producer is None or producer.artifact is None:
+                            raise SessionConflictError("summary advice source was not accepted")
+                        if producer.exchange.action.tool_name == CONTEXT_SUMMARY_TOOL:
+                            if (
+                                address.pointer
+                                or address.start is not None
+                                or not any(
+                                    v.artifact == producer.artifact
+                                    and v.statements
+                                    and v.depth == 1
+                                    for v in request.summaries
+                                )
+                            ):
+                                raise SessionConflictError("summary advice parent was not visible")
+                        else:
+                            manifest = compilation.delivery_manifest if compilation else None
+                            delivered = (
+                                manifest.for_call(producer.artifact.call_id) if manifest else None
+                            )
+                            required = EvidenceDeliveryRange(
+                                pointer=address.pointer,
+                                kind="text" if address.start is not None else "value",
+                                start=address.start or 0,
+                                end=address.end or 0,
+                            )
+                            if delivered is None or not delivered.covers(required):
+                                raise SessionConflictError("summary advice range was not delivered")
+                    for summary in request.summaries:
+                        producer = accepted.get(summary.artifact.artifact_id)
+                        if (
+                            producer is None
+                            or producer.artifact != summary.artifact
+                            or producer.exchange.action.tool_name != CONTEXT_SUMMARY_TOOL
+                            or hashlib.sha256(
+                                producer.exchange.action.model_dump_json().encode()
+                            ).hexdigest()
+                            != summary.action_sha256
+                        ):
+                            raise SessionConflictError(
+                                "summary does not bind its accepted producer"
+                            )
+                        for source in summary.sources:
+                            original = accepted.get(source.artifact.artifact_id)
+                            if (
+                                original is None
+                                or original.artifact != source.artifact
+                                or original.exchange.action.tool_name == CONTEXT_SUMMARY_TOOL
+                            ):
+                                raise SessionConflictError(
+                                    "summary leaf is not an accepted original"
+                                )
                 preceding = conn.execute(
                     "SELECT data FROM run_events WHERE run_id=? AND sequence=?",
                     (run_id, state.sequence - 1),

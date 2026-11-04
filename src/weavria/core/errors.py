@@ -3,7 +3,7 @@
 from enum import StrEnum
 from typing import Literal, Self
 
-from pydantic import model_validator
+from pydantic import Field, SerializerFunctionWrapHandler, model_serializer, model_validator
 
 from ._schema import ContractModel, NonBlankString
 
@@ -17,6 +17,7 @@ class ErrorCategory(StrEnum):
     INVALID_TOOL_ARGUMENTS = "invalid_tool_arguments"
     INVALID_TOOL_OUTPUT = "invalid_tool_output"
     TOOL_FAILURE = "tool_failure"
+    SOURCE_UNAVAILABLE = "source_unavailable"
     TIMEOUT = "timeout"
     POLICY_DENIED = "policy_denied"
     RUNTIME_INVARIANT_VIOLATION = "runtime_invariant_violation"
@@ -126,6 +127,76 @@ class ModelRequestDiagnostic(ContractModel):
         return self
 
 
+class CoverageIssueDiagnostic(ContractModel):
+    """Content-free reference to a blocking finding in an audited candidate."""
+
+    obligation_index: int = Field(ge=0, lt=12)
+    information_need_indices: tuple[int, ...] = Field(max_length=8)
+    reason_codes: tuple[
+        Literal[
+            "missing_need",
+            "missing_completion",
+            "missing_selector",
+            "unsupported_source",
+            "optional_need_for_required_obligation",
+            "unselected_surface_producer",
+            "surface_not_grounded",
+            "missing_explicit_producer",
+            "missing_surface_binding",
+        ],
+        ...,
+    ] = Field(min_length=1, max_length=5)
+
+    @model_validator(mode="after")
+    def validate_indices(self) -> Self:
+        if any(not 0 <= index < 8 for index in self.information_need_indices):
+            raise ValueError("coverage diagnostic need index is outside the candidate bound")
+        return self
+
+
+class CoverageAttemptDiagnostic(ContractModel):
+    """Bounded record of a rejected candidate and any subsequent repair action."""
+
+    specification_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    issues: tuple[CoverageIssueDiagnostic, ...] = Field(min_length=1, max_length=12)
+    repair: Literal["none", "model", "host_required_need", "scope_correction"] = "none"
+    promoted_need_indices: tuple[int, ...] = Field(default=(), max_length=8)
+    scope_corrections: tuple[tuple[int, Literal["supplementary", "unbound_history"]], ...] = Field(
+        default=(), max_length=12
+    )
+    revised_specification_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    disputed_assessment_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+
+    @model_serializer(mode="wrap")
+    def preserve_legacy_wire(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        data = handler(self)
+        if not self.scope_corrections:
+            data.pop("scope_corrections", None)
+            data.pop("disputed_assessment_sha256", None)
+        return data
+
+    @model_validator(mode="after")
+    def validate_repair(self) -> Self:
+        if (self.repair == "host_required_need") != bool(self.promoted_need_indices):
+            raise ValueError("only host need repair can record promoted indices")
+        if (self.repair == "none") != (self.revised_specification_sha256 is None):
+            raise ValueError("a completed repair must identify the revised specification")
+        if (self.repair == "scope_correction") != bool(self.scope_corrections):
+            raise ValueError("scope correction requires recorded obligation decisions")
+        if (self.repair == "scope_correction") != (self.disputed_assessment_sha256 is not None):
+            raise ValueError("scope correction requires a bound assessment identity")
+        if self.scope_corrections:
+            indices = tuple(index for index, _ in self.scope_corrections)
+            if (
+                indices != tuple(issue.obligation_index for issue in self.issues)
+                or self.revised_specification_sha256 != self.specification_sha256
+            ):
+                raise ValueError("scope correction must address blockers without changing the plan")
+        if any(not 0 <= index < 8 for index in self.promoted_need_indices):
+            raise ValueError("promoted need index is outside the candidate bound")
+        return self
+
+
 class TaskPreparationAttemptDiagnostic(ContractModel):
     """Safe failure evidence for one bounded task-preparation model attempt."""
 
@@ -134,11 +205,21 @@ class TaskPreparationAttemptDiagnostic(ContractModel):
     error: RunError
     request: ModelRequestDiagnostic | None = None
     output: ModelOutputDiagnostic | None = None
+    coverage: CoverageAttemptDiagnostic | None = None
+
+    @model_serializer(mode="wrap")
+    def preserve_legacy_wire(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        data = handler(self)
+        if self.coverage is None:
+            data.pop("coverage", None)
+        return data
 
     @model_validator(mode="after")
     def validate_attempt(self) -> Self:
         if self.attempt < 1:
             raise ValueError("task preparation attempt must be positive")
+        if self.coverage is not None and self.stage != "coverage_validation":
+            raise ValueError("coverage diagnostics require a coverage validation attempt")
         if (
             self.output is not None
             and self.error.category is not ErrorCategory.INVALID_MODEL_RESPONSE

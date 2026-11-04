@@ -33,6 +33,7 @@ from weavria.context import (
     validate_recovery_view,
 )
 from weavria.core import (
+    CONTROL_FEEDBACK_BYTES,
     ActionInterventionChecked,
     ActionValueContext,
     ActionValueScope,
@@ -83,6 +84,7 @@ from weavria.core import (
     RecoveryNotice,
     RecoveryRange,
     RecoveryResolved,
+    ReplanPrior,
     RunEnded,
     RunError,
     RunReport,
@@ -96,8 +98,10 @@ from weavria.core import (
     TaskUpdate,
     ToolBatch,
     ToolCallAction,
+    ToolFailedObservation,
     ToolRecord,
     ToolRecorded,
+    ToolReplan,
     ToolStarted,
     TurnDecided,
     TurnRequest,
@@ -141,6 +145,7 @@ from .completion import (
 from .controller import (
     FinalizationPreparer,
     ProgressAssessor,
+    ProgressReplanAdvisor,
     TurnPreparation,
     TurnPreparer,
     TurnSettler,
@@ -166,7 +171,7 @@ from .journal import (
     RunJournal,
     settle_mutation,
 )
-from .progress import ProgressPolicy, SemanticProgressPolicy
+from .progress import ProgressCheck, ProgressPolicy, SemanticProgressPolicy
 from .scheduling import ToolScheduling, dispatch_batch
 from .state import (
     EventAcceptanceError,
@@ -335,10 +340,11 @@ def _instructions_for(instructions: str, tools: ToolRegistry, journal_version: i
         )
     if journal_version >= 3:
         assembled += (
-            "\nRejected calls did not run. For feedback_budget retry the advised page alone "
-            "within page_maximum. For artifact_page_retry use its cursor and set length "
-            "to page_maximum or less. Otherwise obey recommended_max_calls. If page_maximum=0 or "
-            "no_progress, change operation or source. Correct completion gaps."
+            "\nRejected calls did not run. capability_view: omit unavailable_calls; "
+            "use Available tools. "
+            "no_progress: use replan (zero-based), reuse prior evidence or change operation. "
+            "feedback_budget: retry advised page alone with its cursor and page_maximum. "
+            "Obey recommended_max_calls. If page_maximum=0 change source. Correct completion gaps."
         )
     if journal_version == 4:
         assembled += (
@@ -414,6 +420,7 @@ class _AgentKernel:
         self._semantic_snapshot: SemanticSnapshot | None = None
         self._journal_failed = False
         self._commit_lock = asyncio.Lock()
+        self._poll_revision_changed = asyncio.Event()
         self._clock = clock if clock is not None else SystemClock()
         self._decide = decide
         self._journal_version = journal_version
@@ -574,9 +581,59 @@ class _AgentKernel:
                 while self.state.phase is not Phase.TERMINAL:
                     if self._remaining(deadline) <= 0:
                         return await self._end(RunStatus.BUDGET_EXHAUSTED, "deadline")
+                    progress = self.state.progress_assessment
+                    if (
+                        progress is not None
+                        and progress.task_revision == self.state.task.revision
+                        and "sources_exhausted_without_evidence"
+                        in progress.continuation.reason_codes
+                    ):
+                        result = AgentResult(
+                            run_id=self._run_id,
+                            status=RunStatus.FAILED,
+                            error=RunError(
+                                category=ErrorCategory.SOURCE_UNAVAILABLE,
+                                message="Required data sources are unavailable after retry",
+                                retryable=True,
+                            ),
+                        )
+                        if await self._accept(
+                            RunEnded(result=result, reason="source_unavailable"),
+                            expected_revision=progress.task_revision,
+                        ):
+                            return result
+                        continue
                     if self.state.model_calls >= self._limits.max_model_calls:
                         return await self._end(RunStatus.BUDGET_EXHAUSTED, "model_calls")
                     task = self.state.task
+                    poll = self.state.pending_poll
+                    if poll is not None:
+                        # 等待期间不写入下一轮事件, 保留上一轮已提交的 SQLite 恢复点。
+                        delay = (poll.not_before - self._clock.now()).total_seconds()
+                        if (
+                            self.state.tool_calls >= self._limits.max_tool_calls
+                            or self._limits.max_model_calls - self.state.model_calls
+                            <= max(1, self._limits.finalization_model_calls)
+                            or max(0, delay)
+                            >= self._remaining(deadline) - self._finalization_reserve
+                        ):
+                            result = AgentResult(
+                                run_id=self._run_id, status=RunStatus.BUDGET_EXHAUSTED
+                            )
+                            if await self._accept(
+                                RunEnded(result=result, reason="poll_budget"),
+                                expected_revision=task.revision,
+                            ):
+                                return result
+                            continue
+                        if delay > 0:
+                            self._poll_revision_changed.clear()
+                            try:
+                                async with asyncio.timeout(delay):
+                                    await self._poll_revision_changed.wait()
+                            except TimeoutError:
+                                pass
+                            continue
                     try:
                         plan = await self._prepare_decision_context(task, deadline)
                         if plan is None:
@@ -687,6 +744,29 @@ class _AgentKernel:
                         if isinstance(response, ModelResponse)
                         else response.decision
                     )
+                    if self.state.pending_poll is not None and not (
+                        isinstance(decision, ToolBatch)
+                        and self._matches_pending_poll(
+                            tuple(
+                                self._tool_ceiling.action_identity(call) for call in decision.calls
+                            )
+                        )
+                    ):
+                        result = AgentResult(
+                            run_id=self._run_id,
+                            status=RunStatus.FAILED,
+                            error=RunError(
+                                category=ErrorCategory.INVALID_MODEL_RESPONSE,
+                                message="Pending external job requires the same status lookup",
+                            ),
+                        )
+                        if await self._accept(
+                            RunEnded(result=result, reason="pending_poll_abandoned"),
+                            expected_revision=task.revision,
+                        ):
+                            return result
+                        await self._accept(DecisionDiscarded())
+                        continue
                     if self.state.finalization is not None and not isinstance(
                         decision, FinishAction
                     ):
@@ -864,7 +944,7 @@ class _AgentKernel:
                 category = (
                     ErrorCategory.CONTEXT_BUDGET_EXCEEDED
                     if exc.reason == "feedback_budget"
-                    else ErrorCategory.POLICY_DENIED
+                    else ErrorCategory.INVALID_MODEL_RESPONSE
                     if exc.reason == "capability_view"
                     else ErrorCategory.NO_PROGRESS
                 )
@@ -981,7 +1061,7 @@ class _AgentKernel:
     async def _prepare_finalization_context(
         self, task: TaskInput, deadline: float
     ) -> EvidencePlan | TurnEvidencePlan | ControlEvidencePlan | None:
-        if task.revision != self.state.task.revision:
+        if task.revision != self.state.task.revision or self.state.pending_poll is not None:
             return None
         if isinstance(self._preparation, FinalizationPreparer):
             prepared = self._preparation.prepare_finalization(task)
@@ -1017,6 +1097,9 @@ class _AgentKernel:
     ) -> EvidencePlan | TurnEvidencePlan | ControlEvidencePlan | None:
         if not self._limits.finalization_model_calls:
             return await self._build_context(task)
+        if self.state.pending_poll is not None:
+            # 轮询完成前只编译常规上下文, 避免把运行状态交给只允许 Finish 的阶段。
+            return None if force_reserve else await self._build_context(task)
         assert self._finalization_policy is not None
         existing = self.state.finalization
         before = await self._assess_finalization(task)
@@ -1451,6 +1534,7 @@ class _AgentKernel:
             and not progress.material_progress
             else None
         )
+        visible_names = {descriptor.name for descriptor in self._visible_tools.descriptors}
         context = ActionInterventionContext(
             task=self.state.task,
             proposal=batch,
@@ -1458,6 +1542,8 @@ class _AgentKernel:
             remaining_model_calls=max(0, self._limits.max_model_calls - self.state.model_calls),
             remaining_tool_calls=max(0, self._limits.max_tool_calls - self.state.tool_calls),
             evidence_access_proof=evidence_access_proof,
+            has_visible_call=self._capability_epoch == 0
+            or any(call.tool_name in visible_names for call in batch.calls),
             action_value_context=value_context,
             action_value_profiles=self.state.action_value_profiles,
         )
@@ -1792,6 +1878,77 @@ class _AgentKernel:
         # 防止转义后的路径挤占已预留的控制反馈通道。
         return retry if len(retry.model_dump_json().encode()) <= 256 else None
 
+    def _with_progress_replan(
+        self, notice: AdmissionNotice, batch: ToolBatch, progress: ProgressCheck
+    ) -> AdmissionNotice:
+        index = progress.blocked_call_index
+        if index is None:
+            return notice
+        blocked = batch.calls[index]
+        identity = progress.action_identities[index]
+        duplicate = next(
+            (
+                offset
+                for offset, earlier in enumerate(progress.action_identities[:index])
+                if earlier.canonical_action_sha256 == identity.canonical_action_sha256
+            ),
+            None,
+        )
+        details = ToolReplan(call_index=index, duplicate_of_index=duplicate)
+        notice = notice.model_copy(update={"schema_version": 6, "replan": details})
+
+        def fits(candidate: ToolReplan) -> bool:
+            encoded = notice.model_copy(update={"replan": candidate}).model_dump_json().encode()
+            return len(encoded) <= CONTROL_FEEDBACK_BYTES
+
+        if duplicate is None:
+            for record in reversed(self.state.records):
+                prior_action = record.exchange.action
+                if prior_action.tool_name != blocked.tool_name:
+                    continue
+                prior_identity = self._tool_ceiling.action_identity(prior_action)
+                matches = (
+                    prior_identity.canonical_action_sha256 == identity.canonical_action_sha256
+                    if progress.reason == "repeated_action"
+                    else prior_identity.action_family_sha256 == identity.action_family_sha256
+                )
+                if not matches or len(prior_action.call_id) > 128:
+                    continue
+                outcome = record.exchange.observation
+                prior = ReplanPrior(
+                    call_id=prior_action.call_id,
+                    source_sha256=record.artifact.sha256 if record.artifact else None,
+                    failure_category=(
+                        outcome.error.category
+                        if isinstance(outcome, ToolFailedObservation)
+                        else None
+                    ),
+                )
+                candidate = details.model_copy(update={"prior": prior})
+                if fits(candidate):
+                    details = candidate
+                break
+        snapshot = self._semantic_snapshot
+        if (
+            snapshot is not None
+            and snapshot.version.task_revision == self.state.task.revision
+            and isinstance(self._preparation, ProgressReplanAdvisor)
+        ):
+            for need in self._preparation.replan_needs(snapshot, blocked.tool_name)[:3]:
+                # 路径可能很长。预算优先保证缺口身份,字段可退回已编译任务视图查看。
+                candidate = details.model_copy(update={"open_needs": (*details.open_needs, need)})
+                if not fits(candidate):
+                    need = need.model_copy(update={"missing_fields": ()})
+                    candidate = details.model_copy(
+                        update={"open_needs": (*details.open_needs, need)}
+                    )
+                if fits(candidate):
+                    details = candidate
+        candidate = details.model_copy(update={"tool_name": blocked.tool_name[:64]})
+        if fits(candidate):
+            details = candidate
+        return AdmissionNotice.model_validate(notice.model_copy(update={"replan": details}))
+
     async def _admit_batch(
         self,
         batch: ToolBatch,
@@ -1828,13 +1985,14 @@ class _AgentKernel:
         )
         remaining = max(0, self._limits.max_tool_calls - self.state.tool_calls)
         visible = {descriptor.name for descriptor in self._visible_tools.descriptors}
+        unavailable = tuple(
+            (index, call.tool_name)
+            for index, call in enumerate(batch.calls)
+            if call.tool_name not in visible
+        )
         reason = (
             "capability_view"
-            if capability_epoch > 0
-            and (
-                capability_epoch != self._capability_epoch
-                or any(call.tool_name not in visible for call in batch.calls)
-            )
+            if capability_epoch > 0 and (capability_epoch != self._capability_epoch or unavailable)
             else "tool_budget"
             if len(batch.calls) > remaining
             else "feedback_budget"
@@ -1842,7 +2000,8 @@ class _AgentKernel:
             else None
         )
         progress = None
-        if reason is None:
+        polling = self._matches_pending_poll(checked_identities)
+        if reason is None and not polling:
             intervention = self.state.intervention
             estimate = intervention.decision.value_estimate if intervention is not None else None
             # A persisted value judgement or delivery-gap proof can authorize bounded
@@ -1935,13 +2094,7 @@ class _AgentKernel:
                     rejection_state = {
                         "reason": reason,
                         "capability_epoch": capability_epoch,
-                        "invalid_tools": sorted(
-                            {
-                                call.tool_name
-                                for call in batch.calls
-                                if call.tool_name not in visible
-                            }
-                        ),
+                        "invalid_tools": sorted({name for _, name in unavailable}),
                     }
                 rejection_frontier = hashlib.sha256(
                     json.dumps(
@@ -1959,64 +2112,90 @@ class _AgentKernel:
                     self._rejection_repetitions > self._limits.max_no_progress_rejections
                 )
                 replan_exhausted = self._admission_replans > self._limits.max_admission_replans
-                await self._accept_locked(
-                    BatchRejected(
-                        notice=AdmissionNotice(
-                            schema_version=3 if page_retry else 2 if page_advice else 1,
-                            artifact_page_retry=page_retry,
-                            page_call_index=page_advice[0] if page_advice else None,
-                            page_parameter=page_advice[1] if page_advice else None,
-                            page_maximum=page_advice[2] if page_advice else None,
-                            reason=reason,
-                            proposal_sha256=hashlib.sha256(
-                                batch.model_dump_json().encode()
-                            ).hexdigest(),
+                notice = AdmissionNotice(
+                    schema_version=(
+                        5
+                        if reason == "capability_view"
+                        else 3
+                        if page_retry
+                        else 2
+                        if page_advice
+                        else 1
+                    ),
+                    unavailable_calls=(
+                        tuple((index, None) for index, _ in unavailable)
+                        if reason == "capability_view"
+                        else ()
+                    ),
+                    capability_epoch_changed=(
+                        capability_epoch != self._capability_epoch
+                        if reason == "capability_view"
+                        else None
+                    ),
+                    artifact_page_retry=page_retry,
+                    page_call_index=page_advice[0] if page_advice else None,
+                    page_parameter=page_advice[1] if page_advice else None,
+                    page_maximum=page_advice[2] if page_advice else None,
+                    reason=reason,
+                    proposal_sha256=hashlib.sha256(batch.model_dump_json().encode()).hexdigest(),
+                    proposed_calls=len(batch.calls),
+                    required_bytes=reservation.required_bytes,
+                    budget_bytes=reservation.budget_bytes,
+                    remaining_tool_calls=remaining,
+                    recommended_max_calls=(
+                        _recommended_feedback_batch_width(
                             proposed_calls=len(batch.calls),
                             required_bytes=reservation.required_bytes,
                             budget_bytes=reservation.budget_bytes,
-                            remaining_tool_calls=remaining,
-                            recommended_max_calls=(
-                                _recommended_feedback_batch_width(
-                                    proposed_calls=len(batch.calls),
-                                    required_bytes=reservation.required_bytes,
-                                    budget_bytes=reservation.budget_bytes,
-                                )
-                                if reason == "feedback_budget"
-                                else remaining
-                                if reason == "tool_budget"
-                                else None
-                            ),
-                            progress_fingerprint_sha256=(
-                                progress.fingerprint_sha256
-                                if reason == "no_progress" and progress is not None
-                                else None
-                            ),
-                            canonical_tool_key_sha256=(
-                                progress.canonical_tool_key_sha256
-                                if reason == "no_progress" and progress is not None
-                                else None
-                            ),
-                            progress_reason=(
-                                progress.reason
-                                if reason == "no_progress"
-                                and progress is not None
-                                and progress.reason != "novel_action"
-                                else None
-                            ),
-                            action_family_sha256=(
-                                progress.action_family_sha256
-                                if reason == "no_progress" and progress is not None
-                                else None
-                            ),
-                            prior_family_attempts=(
-                                progress.prior_family_attempts
-                                if reason == "no_progress" and progress is not None
-                                else None
-                            ),
                         )
+                        if reason == "feedback_budget"
+                        else remaining
+                        if reason == "tool_budget"
+                        else None
                     ),
-                    expected_revision=revision,
+                    progress_fingerprint_sha256=(
+                        progress.fingerprint_sha256
+                        if reason == "no_progress" and progress is not None
+                        else None
+                    ),
+                    canonical_tool_key_sha256=(
+                        progress.canonical_tool_key_sha256
+                        if reason == "no_progress" and progress is not None
+                        else None
+                    ),
+                    progress_reason=(
+                        progress.reason
+                        if reason == "no_progress"
+                        and progress is not None
+                        and progress.reason != "novel_action"
+                        else None
+                    ),
+                    action_family_sha256=(
+                        progress.action_family_sha256
+                        if reason == "no_progress" and progress is not None
+                        else None
+                    ),
+                    prior_family_attempts=(
+                        progress.prior_family_attempts
+                        if reason == "no_progress" and progress is not None
+                        else None
+                    ),
                 )
+                if reason == "capability_view":
+                    # 先为所有调用位置留空间,再按实际 JSON 大小填入可容纳的工具名。
+                    details = dict(notice.unavailable_calls)
+                    for index, name in unavailable:
+                        candidate = notice.model_copy(
+                            update={
+                                "unavailable_calls": tuple({**details, index: name[:64]}.items())
+                            }
+                        )
+                        if len(candidate.model_dump_json().encode()) <= CONTROL_FEEDBACK_BYTES:
+                            notice = candidate
+                            details[index] = name[:64]
+                if reason == "no_progress" and progress is not None:
+                    notice = self._with_progress_replan(notice, batch, progress)
+                await self._accept_locked(BatchRejected(notice=notice), expected_revision=revision)
                 if frontier_exhausted or replan_exhausted:
                     if reason == "no_progress":
                         raise _NoProgressExhausted
@@ -2036,15 +2215,24 @@ class _AgentKernel:
             expected_revision=revision,
         )
         if accepted:
-            assert progress is not None
             self._feedback_reserve_floor = 0
             self._feedback_reserve_revision = None
             self._rejection_frontier = None
             self._rejection_repetitions = 0
             self._rejection_task_revision = None
             self._admission_replans = 0
-            self._progress.record_admission(progress)
-        return accepted, progress.action_identities if progress is not None else ()
+            if progress is not None:
+                self._progress.record_admission(progress)
+        return accepted, checked_identities
+
+    def _matches_pending_poll(self, identities: tuple[ToolActionIdentity, ...]) -> bool:
+        poll = self.state.pending_poll
+        return (
+            poll is not None
+            and len(identities) == 1
+            and identities[0].normalization == "validated"
+            and identities[0].canonical_action_sha256 == poll.action_sha256
+        )
 
     def _completion_context(
         self,
@@ -2140,7 +2328,11 @@ class _AgentKernel:
             return None
         if isinstance(self._preparation, TurnSettler):
             await self._preparation.settle_turn(self.state.task)
-        if self._progress_assessor is None or revision != self.state.task.revision:
+        if (
+            self._progress_assessor is None
+            or revision != self.state.task.revision
+            or self.state.pending_poll is not None
+        ):
             return None
         feedback = self.state.feedback
         if feedback is None or feedback.task_revision != revision:
@@ -2198,6 +2390,7 @@ class _AgentKernel:
                 expected_revision=revision,
                 expected_identity=identities.get(call.call_id),
                 feedback_envelope=envelopes.get(call.call_id),
+                allow_polling=self._journal_version >= 3 and len(calls) == 1,
             )
 
         async def skip(call: ToolCallAction) -> None:
@@ -2230,6 +2423,7 @@ class _AgentKernel:
         expected_revision: int | None = None,
         expected_identity: ToolActionIdentity | None = None,
         feedback_envelope: FeedbackEnvelopeBound | None = None,
+        allow_polling: bool = False,
     ) -> None:
         remaining = self._remaining(deadline)
         if remaining <= 0:
@@ -2250,6 +2444,7 @@ class _AgentKernel:
             task_view=self._feedback_template.task_model_view
             if self._feedback_template is not None
             else None,
+            allow_polling=allow_polling,
         )
         self._check_cancel(owner, cancellations)
         await self._accept(ToolRecorded(record=record))
@@ -2305,6 +2500,8 @@ class _AgentKernel:
         encoded = event.model_dump_json()
         self._state = reduce_event(self._state, decode_event(encoded))
         self._events_json.append(encoded)
+        if isinstance(data, TaskRevised):
+            self._poll_revision_changed.set()
 
     async def _accept(
         self, data: ExecutionData | LoopData | ControlData, *, expected_revision: int | None = None
@@ -2331,6 +2528,8 @@ class _AgentKernel:
         cancelled = await self._persist(event, update)
         self._events_json.append(encoded)
         self._state = next_state
+        if isinstance(data, TaskRevised):
+            self._poll_revision_changed.set()
         if cancelled:
             raise asyncio.CancelledError
         return True

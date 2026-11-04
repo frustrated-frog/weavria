@@ -2,6 +2,7 @@
 
 import hashlib
 from dataclasses import dataclass, replace
+from datetime import datetime, timedelta
 from enum import StrEnum
 from typing import Literal, cast
 
@@ -90,6 +91,14 @@ class Phase(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class PendingPoll:
+    """从已接受结果归约出的查询边界, 可通过原事件重建。"""
+
+    action_sha256: str
+    not_before: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class RunState:
     """Immutable projection: nested payloads are independent serialized snapshots."""
 
@@ -103,6 +112,7 @@ class RunState:
     model_revision: int | None = None
     pending_json: str | None = None
     records_json: tuple[str, ...] = ()
+    pending_poll: PendingPoll | None = None
     result_json: str | None = None
     journal_version: int = 1
     turn_json: str | None = None
@@ -303,6 +313,7 @@ def reduce_event(state: RunState | None, event: JournalEvent) -> RunState:
             recovery_ranges_json=(),
             recovery_seen_json=(),
             recovery_attempts=(),
+            pending_poll=None,
         )
         if state.phase in (Phase.FINISH, Phase.ACCEPTED) or (
             state.phase is Phase.ACTION and state.journal_version == 1
@@ -464,7 +475,7 @@ def reduce_event(state: RunState | None, event: JournalEvent) -> RunState:
     if isinstance(event, (LoopEvent, ControlEvent)) and isinstance(
         data, (TurnDecided, ToolStarted, ToolRecorded, CallSkipped, TurnSettled)
     ):
-        return _reduce_turn(state, next_state, data)
+        return _reduce_turn(state, next_state, data, event.occurred_at)
     if isinstance(data, ToolStarted):
         pending = state.pending
         _require(
@@ -495,6 +506,7 @@ def reduce_event(state: RunState | None, event: JournalEvent) -> RunState:
     if isinstance(data, RunEnded):
         _require(data.result.run_id == state.run_id, "terminal result belongs to another run")
         if data.result.status is RunStatus.COMPLETED:
+            _require(state.pending_poll is None, "a pending external job cannot complete the run")
             pending = state.pending
             _require(
                 state.phase is (Phase.ACCEPTED if state.journal_version >= 3 else Phase.FINISH)
@@ -526,6 +538,7 @@ def _reduce_turn(
     state: RunState,
     next_state: RunState,
     data: TurnDecided | ToolStarted | ToolRecorded | CallSkipped | TurnSettled,
+    occurred_at: datetime,
 ) -> RunState:
     if isinstance(data, TurnDecided):
         _require(
@@ -600,6 +613,16 @@ def _reduce_turn(
     calls = {c.call_id: c for c in turn.decision.calls}
     settled = set(state.settled_call_ids) | set(state.skipped_call_ids)
     if isinstance(data, ToolStarted):
+        if state.pending_poll is not None:
+            admission = state.admission
+            _require(
+                admission is not None
+                and len(admission.feedback_envelopes) == 1
+                and admission.feedback_envelopes[0].action_sha256
+                == state.pending_poll.action_sha256
+                and occurred_at >= state.pending_poll.not_before,
+                "pending status lookup must retain its identity and wait until eligible",
+            )
         _require(
             state.journal_version < 3
             or (
@@ -637,6 +660,10 @@ def _reduce_turn(
         prior = {r.exchange.action.call_id for r in state.records} - calls.keys()
         _require(set(data.record.dependencies) <= prior, "tool reads an unaccepted turn result")
         artifact = data.record.artifact
+        poll = next_state.pending_poll
+        if state.model_revision == state.task.revision:
+            # 当前查询返回完成或失败时关闭等待。旧任务版本的结果只能保留为历史。
+            poll = None
         if state.journal_version >= 3:
             admission = state.admission
             _require(admission is not None, "tool feedback requires admission")
@@ -671,12 +698,22 @@ def _reduce_turn(
                         and authorization.tool_version == envelope.tool_version,
                         "successful tool feedback changed its admitted contract",
                     )
+                if (
+                    data.record.poll_after_seconds is not None
+                    and state.model_revision == state.task.revision
+                ):
+                    _require(len(calls) == 1, "a polling tool must run alone")
+                    poll = PendingPoll(
+                        envelope.action_sha256,
+                        occurred_at + timedelta(seconds=data.record.poll_after_seconds),
+                    )
         _require(
             artifact is None or artifact.run_id == state.run_id, "artifact belongs to another run"
         )
         return replace(
             next_state,
             records_json=(*state.records_json, data.record.model_dump_json()),
+            pending_poll=poll,
             active_call_ids=tuple(c for c in state.active_call_ids if c != call_id),
             settled_call_ids=(*state.settled_call_ids, call_id),
         )
@@ -702,7 +739,12 @@ def _reduce_turn(
         not state.active_call_ids and settled == calls.keys(),
         "turn cannot settle before all proposed calls have feedback",
     )
+    # 同一轮中的工具可以并行完成, 但下一次模型决策只能看到一个完整的结算边界。
+    # 每个提议调用都必须留下成功、失败或跳过事实; 少一个兄弟结果就进入下一轮,
+    # 会让模型基于局部状态继续行动, 也会破坏 call_id 与反馈的一一对应关系。
     records = {r.exchange.action.call_id: r for r in state.records}
+    # 执行完成顺序由调度决定且不稳定, 反馈仍按模型原始提议顺序重排。
+    # 这样并行只影响延迟, 不会让同一批结果因竞态产生不同的下一轮上下文。
     ordered = tuple(c for c in calls if c in state.settled_call_ids)
     assert state.model_revision is not None
     feedback = TurnFeedback(
@@ -1161,6 +1203,46 @@ def _reduce_control(
             or notice.reason in ("capability_view", "no_progress"),
             "rejection contradicts its budget",
         )
+        _require(
+            all(
+                name is None or turn.decision.calls[index].tool_name[:64] == name
+                for index, name in notice.unavailable_calls
+            ),
+            "capability diagnostics must match rejected calls",
+        )
+        replan = notice.replan
+        if replan is not None:
+            tool_name = turn.decision.calls[replan.call_index].tool_name
+            _require(
+                replan.tool_name is None or replan.tool_name == tool_name[:64],
+                "replan diagnostic does not match the rejected tool",
+            )
+            sibling = replan.duplicate_of_index
+            _require(
+                sibling is None or turn.decision.calls[sibling].tool_name == tool_name,
+                "replan duplicate does not match its sibling",
+            )
+            prior = replan.prior
+            if prior is not None:
+                _require(
+                    any(
+                        record.exchange.action.call_id == prior.call_id
+                        and record.exchange.action.tool_name == tool_name
+                        and (
+                            (
+                                record.artifact is not None
+                                and record.artifact.sha256 == prior.source_sha256
+                            )
+                            or (
+                                isinstance(record.exchange.observation, ToolFailedObservation)
+                                and record.exchange.observation.error.category
+                                == prior.failure_category
+                            )
+                        )
+                        for record in state.records
+                    ),
+                    "replan prior does not match an accepted tool outcome",
+                )
         cursor = notice.artifact_page_retry
         if cursor is not None:
             assert notice.page_call_index is not None

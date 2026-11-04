@@ -64,7 +64,7 @@ class CandidateAnswerVerifier(Protocol):
 class TaskCompletionEvaluator:
     """Evaluate declared obligations without trusting model claims of completion."""
 
-    version = "task-obligations/10"
+    version = "task-obligations/11"
 
     def __init__(
         self,
@@ -213,7 +213,7 @@ class TaskCompletionEvaluator:
             )
             # 模型可以主动提交无法核实的有限回答;这不等于宿主认定 Need 已经穷尽,
             # 也不能反向触发提前收尾。继续调用工具时,仍由进度策略和资源边界管理。
-            if limited_finalization or observed_paths_blocked:
+            if limited_finalization or ledger.sources_exhausted or observed_paths_blocked:
                 if (
                     self._answer is not None
                     and await self._answer.verify_answer(context, frame, ledger) == "reject"
@@ -232,7 +232,9 @@ class TaskCompletionEvaluator:
                     verdicts=verdicts,
                     outcome="unverifiable",
                     reason_code=(
-                        "finalization_incomplete_evidence"
+                        "required_sources_unavailable"
+                        if ledger.sources_exhausted
+                        else "finalization_incomplete_evidence"
                         if limited_finalization
                         else "attempted_paths_contract_gap"
                         if any(item.acquisition_status == "contract_gap" for item in incomplete)

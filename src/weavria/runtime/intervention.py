@@ -113,6 +113,7 @@ class ActionInterventionContext:
 
     __slots__ = (
         "_evidence_access_proof_json",
+        "_has_visible_call",
         "_navigation_proof_json",
         "_progress_assessment_json",
         "_proposal_json",
@@ -135,6 +136,7 @@ class ActionInterventionContext:
         evidence_access_proof: EvidenceAccessProof | None = None,
         action_value_context: ActionValueContext | None = None,
         action_value_profiles: tuple[ActionValueProfile, ...] = (),
+        has_visible_call: bool = True,
     ) -> None:
         if type(remaining_model_calls) is not int or remaining_model_calls < 0:
             raise ValueError("remaining model calls must be a nonnegative integer")
@@ -176,6 +178,7 @@ class ActionInterventionContext:
             if progress_assessment is not None
             else None
         )
+        self._has_visible_call = has_visible_call
         self._remaining_model_calls = remaining_model_calls
         self._remaining_tool_calls = remaining_tool_calls
         self._navigation_proof_json = (
@@ -193,6 +196,10 @@ class ActionInterventionContext:
             item.model_dump_json()
             for item in sorted(action_value_profiles, key=lambda value: value.value_key_sha256)
         )
+
+    @property
+    def has_visible_call(self) -> bool:
+        return self._has_visible_call
 
     @property
     def task(self) -> TaskInput:
@@ -312,7 +319,7 @@ class ProgressActionInterventionPolicy:
     @property
     def version(self) -> str:
         return (
-            "progress-action-intervention/7["
+            "progress-action-intervention/8["
             f"min_observations={self._minimum_observations};"
             f"min_expected_yield={self._minimum_yield:g};"
             f"max_pessimistic_regression={self._maximum_regression:g};"
@@ -330,13 +337,16 @@ class ProgressActionInterventionPolicy:
         recommendation = assessment.continuation.recommended_action
         if recommendation == "verify":
             access_proof = context.evidence_access_proof
-            if assessment.material_progress:
+            # 只有当前视图中仍有候选动作,才允许用本轮进展开启一次额外核验。
+            if context.has_visible_call and assessment.material_progress:
                 return InterventionDecision(
                     disposition="allow",
                     trigger="verification_advisory",
                     reason_codes=assessment.continuation.reason_codes,
                 )
-            if context.navigation_proof is not None or access_proof is not None:
+            if context.has_visible_call and (
+                context.navigation_proof is not None or access_proof is not None
+            ):
                 evidence_reason = (
                     "evidence_navigation_continuation"
                     if access_proof is None or access_proof.continuation_only

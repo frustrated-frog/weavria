@@ -22,7 +22,7 @@ from .understanding import TaskFrame
 class NeedProgressEvaluator:
     """Compare accepted Need projections without pretending unknown sources are independent."""
 
-    version = "need-progress-assessment/3"
+    version = "need-progress-assessment/4"
 
     def assess(
         self,
@@ -323,6 +323,22 @@ def _continuation(
     cost: ActionCostSignal,
     capability_expanded: bool,
 ) -> ContinuationSignal:
+    if after.sources_exhausted:
+        usable = any(
+            binding.relation in {"supports", "partially_supports"} and binding.freshness != "stale"
+            for binding in after.bindings
+        )
+        if usable:
+            return ContinuationSignal(
+                feasibility="ready",
+                recommended_action="verify",
+                reason_codes=("required_sources_unavailable",),
+            )
+        return ContinuationSignal(
+            feasibility="blocked",
+            recommended_action="stop",
+            reason_codes=("sources_exhausted_without_evidence",),
+        )
     regressed = bool(
         obligations.reopened_ids
         or coverage.lost_coverage_units

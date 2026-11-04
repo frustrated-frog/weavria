@@ -56,7 +56,7 @@ async def test_workspace_client_dispatches_only_fixed_get_routes() -> None:
         (422, ErrorCategory.INVALID_TOOL_ARGUMENTS, False),
         (404, ErrorCategory.TOOL_FAILURE, False),
         (429, ErrorCategory.TOOL_FAILURE, True),
-        (503, ErrorCategory.TOOL_FAILURE, True),
+        (503, ErrorCategory.SOURCE_UNAVAILABLE, True),
     ),
 )
 async def test_http_failures_preserve_status_and_argument_vs_source_semantics(
@@ -337,6 +337,35 @@ def test_workspace_evidence_profiles_cover_each_registered_private_tool() -> Non
         surface.parameter_constraints[0].input_pointer == "/scope"
         for surface in search_profile.surfaces
     )
+
+
+async def test_stock_price_performance_surface_reads_daily_bars_by_stock_code() -> None:
+    resource_profile = next(
+        profile
+        for profile in finscope_workspace_evidence_profiles()
+        if profile.capability_name == "read_finscope_resource"
+    )
+    surface = next(
+        surface
+        for surface in resource_profile.surfaces
+        if surface.surface_id == "workspace.resource.stock_price_performance"
+    )
+    assert surface.demand_policy == "broad_or_explicit"
+    (selector,) = surface.parameter_constraints
+    assert selector.input_pointer == "/kind"
+    assert selector.allowed_values == ("watchlist_daily_bars",)
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/watchlist/600519/daily-bars"
+        assert request.url.params.get("refresh") == "false"
+        return httpx.Response(200, json={"success": True, "data": [{"close": 100.0}]})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as http:
+        client = FinScopeWorkspaceClient("http://finscope.test", client=http)
+        result = await client.read_resource(
+            FinScopeResourceInput(kind="watchlist_daily_bars", identifier="600519")
+        )
+    assert result.data == [{"close": 100.0}]
 
 
 async def test_reaction_search_id_uses_its_own_resource_namespace() -> None:

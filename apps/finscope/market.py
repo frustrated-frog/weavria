@@ -61,13 +61,17 @@ class MarketPulseClient:
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
             raise ToolFault(
-                ErrorCategory.TOOL_FAILURE,
+                ErrorCategory.SOURCE_UNAVAILABLE
+                if status in (502, 503, 504)
+                else ErrorCategory.TOOL_FAILURE,
                 "FinScope market data is unavailable",
                 retryable=status == 429 or status >= 500,
             ) from exc
         except (httpx.TimeoutException, httpx.TransportError) as exc:
             raise ToolFault(
-                ErrorCategory.TOOL_FAILURE,
+                ErrorCategory.SOURCE_UNAVAILABLE
+                if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout))
+                else ErrorCategory.TOOL_FAILURE,
                 "FinScope market data is unavailable",
                 retryable=True,
             ) from exc
@@ -124,6 +128,7 @@ def market_pulse_tool(client: MarketPulseClient) -> TypedTool[MarketPulseInput, 
         output_type=MarketPulseOutput,
         execute=execute,
         behavior="read_only",
+        source_group="finscope-api",
         idempotency="replay_safe",
         risk="low",
         approval_required=False,

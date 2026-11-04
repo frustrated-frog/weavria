@@ -23,6 +23,7 @@ from .execution import (
     TypedTool,
 )
 from .schema_view import model_schema_view
+from .summarize import context_summary_tool
 
 __all__ = [
     "ArtifactReadInput",
@@ -40,6 +41,7 @@ __all__ = [
     "ToolRegistry",
     "TypedTool",
     "artifact_read_tool",
+    "context_summary_tool",
     "model_schema_view",
     "project_artifact_page",
     "resolve_pointer",

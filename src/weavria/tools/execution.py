@@ -56,7 +56,7 @@ class ToolDescriptor(BaseModel):
         validate_default=True,
         revalidate_instances="always",
     )
-    schema_version: Literal[2, 3, 4, 5] = 2
+    schema_version: Literal[2, 3, 4, 5, 6, 7] = 2
     name: str = Field(min_length=1, pattern=r"^[a-zA-Z][a-zA-Z0-9_]*$")
     version: str = Field(min_length=1)
     description: str = Field(min_length=1)
@@ -76,6 +76,9 @@ class ToolDescriptor(BaseModel):
 
     # 声明一个单调的页容量参数: 缩小它不能增加反馈上界,也不能改变读取位置。
     feedback_page_parameter: str | None = Field(default=None, min_length=1, max_length=64)
+    # 应用声明共同故障边界,只为安全只读工具使用。不得填写实际地址或凭据。
+    source_group: str | None = Field(default=None, max_length=64, pattern=r"^[a-z][a-z0-9_-]*$")
+    poll_interval_seconds: float | None = Field(default=None, ge=0.001, le=86400)
 
     @field_validator("schema_version", "max_attempts", mode="before")
     @classmethod
@@ -87,6 +90,10 @@ class ToolDescriptor(BaseModel):
     @model_serializer(mode="wrap")
     def preserve_legacy_wire(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
         data = handler(self)
+        if self.schema_version < 7:
+            data.pop("poll_interval_seconds", None)
+        if self.schema_version < 6:
+            data.pop("source_group", None)
         if self.schema_version < 5:
             data.pop("feedback_page_parameter", None)
         if self.schema_version == 2:
@@ -101,8 +108,31 @@ class ToolDescriptor(BaseModel):
             raise ValueError("complete feedback delivery requires descriptor schema version 3")
         if self.schema_version < 4 and self.feedback_bound_version is not None:
             raise ValueError("feedback bound metadata requires descriptor schema version 4")
-        if self.schema_version >= 4 and (
-            self.feedback_delivery != "complete" or self.feedback_bound_version is None
+        if (self.schema_version == 6 and self.source_group is None) or (
+            self.source_group is not None
+            and (
+                self.schema_version < 6
+                or self.behavior != "read_only"
+                or self.idempotency != "replay_safe"
+            )
+        ):
+            raise ValueError("source grouping requires descriptor v6 and replay-safe reads")
+        if (self.schema_version == 7) != (self.poll_interval_seconds is not None) or (
+            self.poll_interval_seconds is not None
+            and (
+                self.behavior != "read_only"
+                or self.idempotency != "replay_safe"
+                or self.approval_required
+                or self.feedback_delivery != "complete"
+            )
+        ):
+            raise ValueError(
+                "v7 polling requires a replay-safe read with bounded complete feedback"
+            )
+        if (self.schema_version in {4, 5} and self.feedback_delivery != "complete") or (
+            self.schema_version >= 4
+            and self.feedback_delivery == "complete"
+            and self.feedback_bound_version is None
         ):
             raise ValueError("descriptor schema version 4 requires a complete feedback bound")
         if self.feedback_delivery == "adaptive" and self.feedback_bound_version is not None:
@@ -114,7 +144,7 @@ class ToolDescriptor(BaseModel):
                 if isinstance(properties, dict)
                 else None
             )
-            if self.schema_version != 5 or self.feedback_delivery != "complete":
+            if self.schema_version < 5 or self.feedback_delivery != "complete":
                 raise ValueError("page advice requires a versioned complete feedback bound")
             if (
                 not isinstance(field, dict)
@@ -262,6 +292,8 @@ class TypedTool[Input: BaseModel, Output: BaseModel]:
         feedback_bound_version: str | None = None,
         feedback_data_bound: Callable[[Input, FeedbackBounds], int] | None = None,
         feedback_page_parameter: str | None = None,
+        source_group: str | None = None,
+        poll_interval_seconds: float | None = None,
     ) -> None:
         if isinstance(timeout_seconds, bool) or not math.isfinite(timeout_seconds):
             raise ValueError("tool timeout must be finite")
@@ -274,14 +306,24 @@ class TypedTool[Input: BaseModel, Output: BaseModel]:
             raise ValueError("adaptive feedback cannot declare a complete-data bound")
         adapter = TypeAdapter[dict[str, JsonValue]](dict[str, JsonValue])
         descriptor = ToolDescriptor(
-            schema_version=5
+            schema_version=7
+            if poll_interval_seconds is not None
+            else 6
+            if source_group is not None
+            else 5
             if feedback_page_parameter
             else 4
             if feedback_delivery != "adaptive"
             else 2,
             name=name,
             version=version,
-            description=description,
+            description=(
+                description
+                if poll_interval_seconds is None
+                else description
+                + " Call this lookup alone. If status is running, the runtime waits."
+                + " After that wait, call the same lookup with the same arguments and a fresh ID."
+            ),
             intent_signals=intent_signals,
             input_schema=adapter.validate_python(input_type.model_json_schema()),
             output_schema=adapter.validate_python(output_type.model_json_schema()),
@@ -295,6 +337,8 @@ class TypedTool[Input: BaseModel, Output: BaseModel]:
             feedback_delivery=feedback_delivery,
             feedback_bound_version=feedback_bound_version,
             feedback_page_parameter=feedback_page_parameter,
+            source_group=source_group,
+            poll_interval_seconds=poll_interval_seconds,
         )
         self._descriptor_json = descriptor.model_dump_json()
         self._input_type = input_type
@@ -523,6 +567,7 @@ class ToolExecutor:
         expected_identity: ToolActionIdentity | None = None,
         feedback_envelope: FeedbackEnvelopeBound | None = None,
         task_view: TaskModelView | None = None,
+        allow_polling: bool = False,
     ) -> ToolRecord:
         """Return a classified exchange; external cancellation always propagates."""
         if isinstance(max_duration, bool) or not math.isfinite(max_duration) or max_duration <= 0:
@@ -557,6 +602,15 @@ class ToolExecutor:
         try:
             tool = self._registry.get(action.tool_name)
             descriptor = tool.descriptor
+            if descriptor.poll_interval_seconds is not None and (
+                not allow_polling
+                or feedback_envelope is None
+                or feedback_envelope.delivery != "complete"
+            ):
+                raise ToolFault(
+                    ErrorCategory.INVALID_TOOL_ARGUMENTS,
+                    "A status poll requires a single-call control turn",
+                )
             if (
                 expected_identity is not None
                 and descriptor.version != expected_identity.tool_version
@@ -615,6 +669,18 @@ class ToolExecutor:
                 if not decision.allowed:
                     raise ToolFault(ErrorCategory.POLICY_DENIED, "Tool execution denied by policy")
                 value = await tool.invoke(arguments, context)
+                poll_after_seconds = None
+                if descriptor.poll_interval_seconds is not None:
+                    status = value.get("status") if isinstance(value, dict) else None
+                    if status == "running":
+                        poll_after_seconds = descriptor.poll_interval_seconds
+                    elif status == "failed":
+                        raise ToolFault(ErrorCategory.TOOL_FAILURE, "External job failed")
+                    elif status != "completed":
+                        raise ToolFault(
+                            ErrorCategory.INVALID_TOOL_OUTPUT,
+                            "Status poll returned an unsupported status",
+                        )
                 if owner is not None and owner.cancelling() > cancellations:
                     raise asyncio.CancelledError
                 if attempt_expired():
@@ -657,7 +723,11 @@ class ToolExecutor:
                 "policy_version": decision.policy_version,
             }
             record = ToolRecord(
-                schema_version=2 if descriptor.feedback_delivery != "adaptive" else 1,
+                schema_version=3
+                if poll_after_seconds is not None
+                else 2
+                if descriptor.feedback_delivery != "adaptive"
+                else 1,
                 exchange=ToolExchange(
                     action=action,
                     observation=ToolSucceededObservation(
@@ -671,6 +741,7 @@ class ToolExecutor:
                 authorization=authorization,
                 context_paths=descriptor.context_paths,
                 feedback_delivery=descriptor.feedback_delivery,
+                poll_after_seconds=poll_after_seconds,
             )
             if feedback_envelope is not None:
                 projected = (

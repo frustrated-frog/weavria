@@ -46,7 +46,7 @@ from weavria.evaluation import (
     RecordingHTTPTransport,
     summarize_samples,
 )
-from weavria.harness import TaskModelViewProjector, load_need_ledger, load_task_frame
+from weavria.harness import load_need_ledger, load_task_frame
 from weavria.models import (
     ModelCapabilities,
     ModelProvider,
@@ -391,7 +391,7 @@ async def evaluate(
                 market_client=MarketPulseClient("http://finscope.test", client=market_http),
                 requirement_coverage=coverage == "model",
                 evidence_guidance=coverage != "off",
-                task_model_projector=TaskModelViewProjector() if projected else None,
+                project_task_view=projected,
             )
             async with app.router.lifespan_context(app):
                 async with httpx.AsyncClient(

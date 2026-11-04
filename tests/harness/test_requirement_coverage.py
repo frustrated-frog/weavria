@@ -8,6 +8,8 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 from weavria.core import (
     ApplicationObservation,
     ErrorCategory,
+    Message,
+    MessageRole,
     ModelOutputDiagnostic,
     ModelRequest,
     ModelResponse,
@@ -25,9 +27,12 @@ from weavria.harness import (
     ModelRequirementCoverageValidator,
     ModelTaskInterpreter,
     ObligationCoverage,
+    ObligationSource,
     RequirementCoverageAssessment,
     RequirementCoverageError,
     RequirementCoverageReport,
+    ScopeDecision,
+    ScopeReview,
     SemanticObligation,
     TaskSpecification,
     TaskUnderstandingEngine,
@@ -347,11 +352,353 @@ async def test_engine_bounds_repeated_semantic_coverage_failure() -> None:
     assert raised.value.error.category is ErrorCategory.INVALID_MODEL_RESPONSE
     assert "omitted required semantic obligations" in raised.value.error.message
     assert "missing_selector=2" in raised.value.error.message
-    assert len(raised.value.attempts) == 1
-    assert raised.value.attempts[0].stage == "coverage_validation"
-    assert raised.value.attempts[0].attempt == 2
+    first, final = raised.value.attempts
+    assert first.coverage is not None and final.coverage is not None
+    assert first.coverage.repair == "model"
+    assert first.coverage.revised_specification_sha256 == final.coverage.specification_sha256
+    assert final.stage == "coverage_validation"
+    assert final.attempt == 2
     assert validator.calls == 2
     assert len(repairer.reports) == 1
+
+
+@pytest.mark.parametrize(
+    ("normalize", "source", "use_host"),
+    (
+        (True, ObligationSource(start=5, end=11), True),
+        (False, ObligationSource(start=5, end=11), False),
+        (True, None, False),
+    ),
+)
+async def test_required_need_repair_matches_model_baseline(
+    normalize: bool, source: ObligationSource | None, use_host: bool
+) -> None:
+    task = TaskInput(goal="概述报告并解释详细发现")
+    spec = _repaired_specification()
+    summary, details = spec.information_needs
+    candidate = spec.model_copy(
+        update={"information_needs": (summary, details.model_copy(update={"required": False}))}
+    )
+    assessment = _assessment(covered=True)
+    summary_goal, details_goal, answer = assessment.obligations
+    assessment = assessment.model_copy(
+        update={
+            "obligations": (
+                summary_goal,
+                details_goal.model_copy(update={"source": source}),
+                answer,
+            )
+        }
+    )
+    provider = FakeModelProvider(
+        (
+            ModelResponse(
+                action=ToolCallAction(
+                    call_id="candidate",
+                    tool_name="declare_task_specification",
+                    arguments=candidate.model_dump(mode="json"),
+                )
+            ),
+        )
+    )
+    validator = _SequenceValidator((assessment, assessment))
+    repairer = _Repairer()
+    engine = TaskUnderstandingEngine(
+        ModelTaskInterpreter(provider),
+        coverage_validator=validator,
+        coverage_repairer=repairer,
+        evidence_profiles=(_profile(),),
+        normalize_required_needs=normalize,
+        max_duration=1,
+    )
+
+    prepared = await engine.prepare(
+        input_id="anchored-required-need", task=task, history=(), tools=_tools()
+    )
+
+    frame = prepared.record.frame
+    assert frame.specification == spec
+    assert frame.requirement_coverage is not None
+    report = frame.requirement_coverage
+    assert report.verdict == "sufficient"
+    assert validator.obligation_inputs == [None, assessment.obligations]
+    assert len(repairer.reports) == (0 if use_host else 1)
+    (attempt,) = report.repair_history
+    assert attempt.repair == ("host_required_need" if use_host else "model")
+    assert attempt.promoted_need_indices == ((1,) if use_host else ())
+    assert attempt.issues[0].reason_codes == ("optional_need_for_required_obligation",)
+    assert attempt.revised_specification_sha256 == report.specification_sha256
+    assert RequirementCoverageReport.model_validate_json(report.model_dump_json()) == report
+
+
+@pytest.mark.parametrize(
+    ("goal", "decision", "stale", "undercovered"),
+    (
+        ("Summarize the report", "unbound_history", False, False),
+        ("Summarize the report", "supplementary", False, False),
+        ("Summarize the report and explain the findings too", "required", False, False),
+        ("Do the same for the next report", "required", False, False),
+        ("Summarize and explain the report", "uncertain", False, False),
+        ("Summarize the report", "unbound_history", True, False),
+        ("Summarize the report and explain the findings too", "supplementary", False, True),
+    ),
+)
+async def test_scope_correction_preserves_explicit_and_continued_requirements(
+    goal: str,
+    decision: Literal["supplementary", "unbound_history", "required", "uncertain"],
+    stale: bool,
+    undercovered: bool,
+) -> None:
+    spec = _repaired_specification()
+    summary, details = spec.information_needs
+    candidate = spec.model_copy(
+        update={"information_needs": (summary, details.model_copy(update={"required": False}))}
+    )
+    assessment = _assessment(covered=True)
+    summary_goal, details_goal, answer = assessment.obligations
+    if goal == "Summarize the report":
+        read_report, response = candidate.completion_criteria
+        candidate = candidate.model_copy(
+            update={
+                "goal": "Return the report summary",
+                "completion_criteria": (
+                    read_report,
+                    response.model_copy(update={"description": "Deliver a summary"}),
+                ),
+            }
+        )
+        answer = answer.model_copy(update={"description": "Deliver the summary"})
+    assessment = assessment.model_copy(
+        update={
+            "obligations": (
+                summary_goal,
+                details_goal.model_copy(update={"origin": "conversation"}),
+                answer,
+            )
+        }
+    )
+    corrected = (
+        summary_goal,
+        assessment.obligations[1].model_copy(update={"required": False}),
+        answer,
+    )
+    accepted = assessment.model_copy(
+        update={
+            "obligations": corrected
+            if decision in ("unbound_history", "supplementary")
+            else assessment.obligations,
+            "scope_undercovered": undercovered,
+        }
+    )
+    history = (
+        Message(
+            role=MessageRole.USER, content="Summarize the previous report and explain findings"
+        ),
+    )
+
+    class ScopeValidator(_SequenceValidator):
+        async def review_scope(
+            self,
+            request: TaskUnderstandingInput,
+            report: RequirementCoverageReport,
+            *,
+            obligation_ids: tuple[str, ...],
+            max_duration: float,
+        ) -> ScopeReview:
+            assert request.task.goal == goal
+            assert request.history == history
+            assert obligation_ids == ("details",)
+            assert max_duration > 0
+            return ScopeReview(
+                specification_sha256="0" * 64 if stale else report.specification_sha256,
+                assessment_sha256=report.assessment_sha256,
+                decisions=(ScopeDecision(obligation_id="details", decision=decision),),
+            )
+
+    provider = FakeModelProvider(
+        (
+            ModelResponse(
+                action=ToolCallAction(
+                    call_id="candidate",
+                    tool_name="declare_task_specification",
+                    arguments=candidate.model_dump(mode="json"),
+                )
+            ),
+        )
+    )
+    validator = ScopeValidator((assessment, accepted))
+    repairer = _Repairer()
+    engine = TaskUnderstandingEngine(
+        ModelTaskInterpreter(provider),
+        coverage_validator=validator,
+        coverage_repairer=repairer,
+        evidence_profiles=(_profile(),),
+        max_duration=1,
+    )
+
+    async def prepare():
+        return await engine.prepare(
+            input_id="scope-correction", task=TaskInput(goal=goal), history=history, tools=_tools()
+        )
+
+    if stale or undercovered:
+        with pytest.raises(TaskUnderstandingError) as raised:
+            await prepare()
+        assert raised.value.error.cause_type == (
+            "InvalidScopeReview" if stale else "TaskScopeUndercovered"
+        )
+        assert not repairer.reports
+        return
+
+    frame = (await prepare()).record.frame
+    assert frame.requirement_coverage is not None
+    report = frame.requirement_coverage
+    (attempt,) = report.repair_history
+    if decision in ("unbound_history", "supplementary"):
+        assert frame.specification == candidate
+        assert report.obligations == corrected
+        assert not repairer.reports
+        assert attempt.repair == "scope_correction"
+        assert attempt.scope_corrections == ((1, decision),)
+        assert attempt.disputed_assessment_sha256 is not None
+    else:
+        assert frame.specification == spec
+        assert report.obligations == assessment.obligations
+        assert len(repairer.reports) == 1
+        assert attempt.repair == "model"
+    assert RequirementCoverageReport.model_validate_json(report.model_dump_json()) == report
+
+
+async def test_coverage_stops_when_repair_repeats_the_same_candidate_and_blockers() -> None:
+    class UnchangedRepairer(_Repairer):
+        async def repair(
+            self,
+            request: TaskUnderstandingInput,
+            specification: TaskSpecification,
+            report: RequirementCoverageReport,
+            *,
+            max_duration: float,
+        ) -> TaskSpecification:
+            self.reports.append(report)
+            return specification
+
+    rejected = _assessment(covered=False)
+    validator = _SequenceValidator((rejected, rejected))
+    repairer = UnchangedRepairer()
+    engine = TaskUnderstandingEngine(
+        _Interpreter(),
+        coverage_validator=validator,
+        coverage_repairer=repairer,
+        evidence_profiles=(_profile(),),
+        max_coverage_repairs=2,
+        max_duration=1,
+    )
+
+    with pytest.raises(TaskUnderstandingError) as raised:
+        await engine.prepare(
+            input_id="repeated-coverage-conflict",
+            task=TaskInput(goal="Summarize the report and explain its detailed findings"),
+            history=(),
+            tools=_tools(),
+        )
+
+    assert raised.value.error.cause_type == "CoverageNoProgress:missing_selector=2"
+    assert len(raised.value.attempts) == 2
+    assert len(repairer.reports) == 1
+
+
+async def test_coverage_rejects_an_anchor_into_generated_constraints() -> None:
+    assessment = _assessment(covered=True)
+    first, *rest = assessment.obligations
+    invalid = assessment.model_copy(
+        update={
+            "obligations": (
+                first.model_copy(
+                    update={
+                        "origin": "task_constraint",
+                        "source": ObligationSource(start=0, end=3, constraint_index=0),
+                    }
+                ),
+                *rest,
+            )
+        }
+    )
+    provider = FakeModelProvider(
+        tuple(
+            ModelResponse(
+                action=ToolCallAction(
+                    call_id=f"audit-{index}",
+                    tool_name="declare_requirement_coverage",
+                    arguments=result.model_dump(mode="json"),
+                )
+            )
+            for index, result in enumerate((invalid, assessment))
+        )
+    )
+    accepted = await ModelRequirementCoverageValidator(provider).assess(
+        TaskUnderstandingInput(
+            task=TaskInput(goal="Summarize the report and explain its detailed findings"),
+            capabilities=(_capability_view(),),
+        ),
+        _repaired_specification(),
+        max_duration=1,
+    )
+
+    # 审计请求中虽有生成的约束条目, 锚点只按原始任务的约束范围校验。
+    assert provider.requests[0].task.constraints
+    assert "invalid_obligation_source" in provider.requests[1].instructions
+    assert accepted == assessment
+
+
+async def test_model_reaudit_only_returns_findings_for_host_frozen_obligations() -> None:
+    assessment = _assessment(covered=True)
+    provider = FakeModelProvider(
+        (
+            ModelResponse(
+                action=ToolCallAction(
+                    call_id="re-audit",
+                    tool_name="declare_requirement_coverage",
+                    arguments=assessment.model_dump(mode="json", include={"findings"}),
+                )
+            ),
+        )
+    )
+    accepted = await ModelRequirementCoverageValidator(provider).assess(
+        TaskUnderstandingInput(
+            task=TaskInput(goal="Summarize the report and explain its detailed findings"),
+            capabilities=(_capability_view(),),
+        ),
+        _repaired_specification(),
+        obligations=assessment.obligations,
+        max_duration=1,
+    )
+
+    assert accepted == assessment
+    assert "do not return an obligations field" in provider.requests[0].instructions
+
+
+async def test_scope_expansion_blocks_preparation_even_when_audit_finds_no_omissions() -> None:
+    assessment = _assessment(covered=True).model_copy(update={"scope_expanded": True})
+    validator = _SequenceValidator((assessment,))
+    repairer = _Repairer()
+    engine = TaskUnderstandingEngine(
+        _Interpreter(),
+        coverage_validator=validator,
+        coverage_repairer=repairer,
+        evidence_profiles=(_profile(),),
+    )
+
+    with pytest.raises(TaskUnderstandingError) as raised:
+        await engine.prepare(
+            input_id="new-scope",
+            task=TaskInput(goal="Summarize the report only"),
+            history=(),
+            tools=_tools(),
+        )
+
+    assert raised.value.error.cause_type == "TaskScopeExpanded"
+    assert validator.calls == 1
+    assert repairer.reports == []
 
 
 def test_host_downgrades_a_false_covered_claim_without_surface_fields() -> None:
@@ -380,6 +727,43 @@ def test_host_downgrades_a_false_covered_claim_without_surface_fields() -> None:
     assert all("surface_not_grounded" in item.reason_codes for item in report.host_adjustments)
     assert report.source_assessment_sha256 != report.assessment_sha256
     assert RequirementCoverageReport.model_validate_json(report.model_dump_json()) == report
+
+
+@pytest.mark.parametrize("details_required", (False, True))
+def test_optional_enrichment_blocks_coverage_only_when_the_user_needs_it(
+    details_required: bool,
+) -> None:
+    spec = _repaired_specification()
+    summary, details = spec.information_needs
+    spec = spec.model_copy(
+        update={"information_needs": (summary, details.model_copy(update={"required": False}))}
+    )
+    assessment = _assessment(covered=True)
+    summary_goal, details_goal, deliverable = assessment.obligations
+    assessment = assessment.model_copy(
+        update={
+            "obligations": (
+                summary_goal,
+                details_goal.model_copy(update={"required": details_required}),
+                deliverable,
+            )
+        }
+    )
+    report = compile_requirement_coverage(
+        assessment,
+        specification=spec,
+        capabilities=(_capability_view(),),
+        validator_version="report-validator/1",
+        repair_count=0,
+    )
+
+    assert report.verdict == ("insufficient" if details_required else "sufficient")
+    assert tuple(finding.obligation_id for finding in report.blocking_findings) == (
+        ("details",) if details_required else ()
+    )
+    assert tuple(adjustment.reason_codes for adjustment in report.host_adjustments) == (
+        (("optional_need_for_required_obligation",),) if details_required else ()
+    )
 
 
 async def test_semantic_repair_receives_exact_host_reasons_and_surface_bindings() -> None:
