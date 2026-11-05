@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from weavria.core import ToolFailedObservation, ToolRecord
-from weavria.tools import ToolRegistry
+from weavria.tools import ToolRegistry, model_tool_bytes
 
 from .capabilities import CapabilityQuery, CapabilityResolver
 from .context import need_priority_weights
@@ -64,7 +64,7 @@ class AdaptiveCapabilityPolicy:
 
     @property
     def version(self) -> str:
-        return f"adaptive-capabilities/3:tools={self.max_tools}:bytes={self.max_descriptor_bytes}"
+        return f"adaptive-capabilities/4:tools={self.max_tools}:bytes={self.max_descriptor_bytes}"
 
     def select(
         self,
@@ -171,8 +171,20 @@ class AdaptiveCapabilityPolicy:
                 candidates.add(name)
                 coverage.setdefault(name, {})[target] = 1.0
 
+        # 隔离计算是任务内可重复使用的能力:一次成功可能只生成中间成果,
+        # 甚至只返回代码错误的诊断。不能用 ToolSucceeded 推断整个计算目的完成。
+        # 仅当前 Frame 显式声明的计算获得目标,未声明发现/旧视图均不能激活它。
+        if frame.specification.route == "execute":
+            for capability in frame.specification.capability_needs:
+                descriptor = descriptors.get(capability.name)
+                if descriptor is None or descriptor.behavior != "isolated_compute":
+                    continue
+                target = f"compute:{capability.name}"
+                weights[target] = 2.0 if capability.necessity == "required" else 0.5
+                coverage.setdefault(capability.name, {})[target] = 1.0
+
         costs = {
-            name: len(descriptors[name].model_dump_json().encode())
+            name: model_tool_bytes(descriptors[name])
             for name in candidates
             if name in descriptors
             and name in coverage

@@ -41,7 +41,7 @@ from weavria.harness import (
 from weavria.harness.context import need_priority_weights
 from weavria.models import FakeSessionProvider, OpenAICompatibleTokenCounter
 from weavria.sessions import SessionEngine
-from weavria.tools import ToolContext, ToolFault, ToolRegistry, TypedTool
+from weavria.tools import ToolContext, ToolFault, ToolRegistry, TypedTool, model_tool_bytes
 
 
 class Input(BaseModel):
@@ -234,8 +234,10 @@ def test_failure_discount_is_local_and_single_failed_path_remains_selectable() -
 
 def test_descriptor_budget_reports_uncovered_targets_without_overflow() -> None:
     frame, ledger = problem((need("alpha", "large"), need("beta", "small")))
-    registry = ToolRegistry((tool("large", description="source " * 400), tool("small")))
-    cost = len(registry.get("small").descriptor.model_dump_json().encode())
+    registry = ToolRegistry(
+        (tool("large", description="source " * 400), tool("small", description="source " * 30))
+    )
+    cost = model_tool_bytes(registry.get("small").descriptor)
     selected = AdaptiveCapabilityPolicy(max_descriptor_bytes=cost).select(
         frame=frame,
         ledger=ledger,
@@ -248,6 +250,41 @@ def test_descriptor_budget_reports_uncovered_targets_without_overflow() -> None:
     assert selected.names == ("small",)
     assert selected.descriptor_bytes == cost
     assert selected.uncovered_targets == ("need:alpha",)
+
+
+def test_large_host_output_contract_does_not_consume_model_menu_budget() -> None:
+    from pydantic import Field
+
+    class LargeOutput(BaseModel):
+        value: str = Field(description="Host-only output documentation. " * 1000)
+
+    async def read(value: Input, context: ToolContext) -> LargeOutput:
+        return LargeOutput(value=value.key)
+
+    tools = ToolRegistry(
+        (
+            TypedTool(
+                name="read",
+                version="1",
+                description="Read a value",
+                input_type=Input,
+                output_type=LargeOutput,
+                execute=read,
+            ),
+        )
+    )
+    frame, ledger = problem((need("alpha", "read"),))
+    assert len(tools.get("read").descriptor.model_dump_json().encode()) > 16000
+    selected = AdaptiveCapabilityPolicy(max_descriptor_bytes=512).select(
+        frame=frame,
+        ledger=ledger,
+        tools=tools,
+        resolver=CapabilityResolver(),
+        previous=(),
+        records=(),
+        discover=False,
+    )
+    assert selected.names == ("read",) and selected.descriptor_bytes <= 512
 
 
 def test_dependency_frontier_priorities_are_shared_and_cycle_is_rejected() -> None:
@@ -574,7 +611,7 @@ def test_selection_experiment_compares_fixed_budget_and_unbounded_baselines() ->
 def test_best_single_tool_can_replace_density_greedy_prefix() -> None:
     frame, ledger = problem((need("alpha", "small", "large"), need("beta", "large")))
     registry = ToolRegistry((tool("small"), tool("large", description="x" * 1400)))
-    budget = len(registry.get("large").descriptor.model_dump_json().encode())
+    budget = model_tool_bytes(registry.get("large").descriptor)
     selected = AdaptiveCapabilityPolicy(max_tools=2, max_descriptor_bytes=budget).select(
         frame=frame,
         ledger=ledger,
@@ -678,6 +715,99 @@ async def test_discovery_uses_read_only_candidates_and_success_clears_old_failur
         discover=True,
     )
     assert selected.names == ("a_source",)
+
+
+@pytest.mark.parametrize("computed", (False, True))
+def test_completed_call_does_not_retire_declared_compute_but_effect_is_once(computed: bool) -> None:
+    from weavria.core import ArtifactRef, ToolAuthorization, ToolSucceededObservation
+    from weavria.harness import CompletionObligation
+
+    frame, ledger = problem((need("alpha", "perform"),))
+    frame = canonicalize_task_frame(
+        frame.model_copy(
+            update={
+                "requirements": (),
+                "obligations": (
+                    CompletionObligation(
+                        obligation_id="produce", kind="capability_result", capability_name="perform"
+                    ),
+                ),
+            }
+        )
+    )
+    ledger = ledger.model_copy(update={"states": ()})
+    registered = TypedTool(
+        name="perform",
+        version="1",
+        description="Transform accepted files. " * 10,
+        input_type=Input,
+        output_type=Output,
+        execute=execute,
+        behavior="isolated_compute" if computed else "side_effect",
+    )
+    tools = ToolRegistry((registered,))
+    record = ToolRecord(
+        authorization=ToolAuthorization(
+            tool_version="1",
+            policy_version="test/1",
+            allowed=True,
+            reason="allowed",
+            normalized_arguments={"key": "part"},
+        ),
+        artifact=ArtifactRef(
+            artifact_id="source", run_id="run", call_id="first", sha256="0" * 64, size_bytes=1
+        ),
+        exchange=ToolExchange(
+            action=ToolCallAction(call_id="first", tool_name="perform", arguments={"key": "part"}),
+            observation=ToolSucceededObservation(
+                call_id="first",
+                tool_name="perform",
+                output={
+                    "artifact_id": "source",
+                    "sha256": "0" * 64,
+                    "size_bytes": 1,
+                    "policy_version": "test/1",
+                },
+            ),
+        ),
+    )
+
+    def select(current: TaskFrame, budget: int = 16000):
+        return AdaptiveCapabilityPolicy(max_descriptor_bytes=budget).select(
+            frame=current,
+            ledger=ledger,
+            tools=tools,
+            resolver=CapabilityResolver(),
+            previous=("perform",),
+            records=(record,),
+            discover=False,
+        )
+
+    selected = select(frame)
+    assert selected.names == (("perform",) if computed else ())
+    # 计算也必须服从预算,不能为了支持续算偷偷扩大工具集。
+    assert model_tool_bytes(registered.descriptor) > 256
+    limited = select(frame, 256)
+    assert limited.names == ()
+    assert limited.uncovered_targets == (("compute:perform",) if computed else ())
+    # 新任务不再声明该能力时,上轮可见和上轮成功都不能使其继续常驻。
+    cleared = canonicalize_task_frame(
+        frame.model_copy(
+            update={
+                "specification": frame.specification.model_copy(
+                    update={
+                        "route": "direct",
+                        "capability_needs": (),
+                        "completion_criteria": (
+                            CompletionCriterion(kind="response", description="Answer"),
+                        ),
+                    }
+                ),
+                "obligations": (),
+            }
+        )
+    )
+    assert select(cleared).names == ()
 
 
 def test_action_without_information_need_keeps_its_unresolved_obligation() -> None:

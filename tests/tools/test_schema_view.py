@@ -44,3 +44,39 @@ def test_model_schema_keeps_constraints_and_business_keys_without_mutating_regis
     assert view["required"] == original["required"]
     assert view["additionalProperties"] is False
     assert view["$defs"] == {"title": {"type": "string", "maxLength": 16}}
+
+
+def test_catalogue_cost_counts_the_actual_entry_and_keeps_path_guidance() -> None:
+    import json
+
+    from weavria.tools import (
+        PythonExecutionInput,
+        ToolDescriptor,
+        model_tool_bytes,
+        model_tool_view,
+    )
+
+    descriptor = ToolDescriptor(
+        name="compute",
+        version="1",
+        description="计算并检查文件",
+        input_schema=PythonExecutionInput.model_json_schema(),
+        output_schema={"type": "string", "description": "large unused output contract" * 2000},
+    )
+    view = model_tool_view(descriptor)
+    serialized = json.dumps(view, ensure_ascii=False, separators=(",", ":"))
+    assert model_tool_bytes(descriptor) == len(serialized.encode())
+    assert "large unused output contract" not in serialized
+    assert "Relative virtual path" in serialized
+    assert "minLength" in serialized and "maxLength" in serialized
+    assert model_tool_view(descriptor, compact=False) == {
+        "name": descriptor.name,
+        "version": descriptor.version,
+        "description": descriptor.description,
+        "input_schema": descriptor.input_schema,
+    }
+    # 公共展示对象可由调用方修改,但不能改变注册契约或下一次展示。
+    schema = view["input_schema"]
+    assert isinstance(schema, dict)
+    schema.clear()
+    assert model_tool_bytes(descriptor) == len(serialized.encode())

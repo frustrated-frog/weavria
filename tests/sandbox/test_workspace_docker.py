@@ -9,9 +9,11 @@ import pytest
 
 from examples.sandbox_execution import run_task
 from weavria.artifacts import read_owned_attachment
-from weavria.context import SessionTokenCounter
 from weavria.core import (
+    CompletionNotice,
     FinishAction,
+    InterventionNotice,
+    ModelResponse,
     ModelTurn,
     SessionRequest,
     SessionRunEvent,
@@ -20,7 +22,8 @@ from weavria.core import (
     ToolExchange,
     ToolRecorded,
 )
-from weavria.models import ModelCapabilities
+from weavria.harness import CapabilityNeed, CompletionCriterion, TaskSpecification
+from weavria.models import FakeModelProvider, ModelCapabilities, OpenAICompatibleTokenCounter
 from weavria.sandbox import DockerPythonSandbox, SandboxRequest
 from weavria.sessions import SQLiteSessionStore
 from weavria.tools import WorkspaceExecutionOutput
@@ -55,11 +58,12 @@ Path('/workspace/outputs/report.txt').write_text(report)
 """
 
 
-@pytest.mark.parametrize("manifest", (False, True))
+@pytest.mark.parametrize(("manifest", "adaptive"), ((False, False), (True, False), (True, True)))
 async def test_workspace_failure_correction_and_sqlite_reopen(
     tmp_path: Path,
-    session_counter: SessionTokenCounter,
+    session_counter: OpenAICompatibleTokenCounter,
     manifest: bool,
+    adaptive: bool,
 ) -> None:
     backend = DockerPythonSandbox(image=os.environ["WEAVRIA_TEST_DOCKER_IMAGE"])
 
@@ -69,9 +73,25 @@ async def test_workspace_failure_correction_and_sqlite_reopen(
 
         async def generate_session(self, request: SessionRequest) -> ModelTurn:
             self.calls += 1
-            if self.calls == 1:
+            phase = self.calls - 1 if adaptive and self.calls > 3 else self.calls
+            if isinstance(request.current.control, InterventionNotice):
+                # 义务只证明工具用过,先服从建议进入验收,由独立验收指出成果仍不完整。
+                return ModelTurn(decision=FinishAction(output="Check whether the files are ready."))
+            if isinstance(request.current.control, CompletionNotice):
+                assert "workspace_incomplete" in request.current.control.decision.issue_codes
+                phase = 4
+            # 断言真实执行请求的目录,而非仅检查选择器返回了一个名称集合。
+            assert request.current.instructions.count("Available tools:") == 1
+            if adaptive:
+                assert '"name":"merge_workspace"' not in request.current.instructions
+                assert '"name":"execute_workspace_python"' in request.current.instructions
+                if self.calls > 1:
+                    assert '"name":"read_source_bundle"' not in request.current.instructions
+                if self.calls > 3:
+                    assert '"name":"read_workspace_file"' not in request.current.instructions
+            if phase == 1:
                 call = ToolCallAction(call_id="read", tool_name="read_source_bundle", arguments={})
-            elif self.calls == 2:
+            elif phase == 2:
                 read = next(
                     h
                     for h in request.current.history
@@ -94,20 +114,39 @@ async def test_workspace_failure_correction_and_sqlite_reopen(
                         ],
                     },
                 )
-            elif self.calls in (3, 4):
+            elif phase in (3, 4):
                 initial = next(
                     h
                     for h in request.current.history
                     if isinstance(h, ToolExchange) and h.action.call_id == "initial"
                 )
                 feedback = json.loads(initial.model_dump_json())["observation"]["output"]
-                if self.calls == 4:
+                if adaptive and self.calls == 3:
+                    return ModelTurn(
+                        decision=ToolBatch(
+                            calls=(
+                                ToolCallAction(
+                                    call_id="inspect",
+                                    tool_name="read_workspace_file",
+                                    arguments={
+                                        "base": {
+                                            "artifact_id": feedback["artifact_id"],
+                                            "revision": feedback["data"]["workspace"]["revision"],
+                                        },
+                                        "path": "statistics.json",
+                                        "length": 1000,
+                                    },
+                                ),
+                            )
+                        )
+                    )
+                if phase == 4:
                     assert "NameError" in request.model_dump_json()
                 call = ToolCallAction(
                     call_id=f"report{self.calls}",
                     tool_name="execute_workspace_python",
                     arguments={
-                        "code": "missing_variable" if self.calls == 3 else REPORT,
+                        "code": "missing_variable" if phase == 3 else REPORT,
                         "base": {
                             "artifact_id": feedback["artifact_id"],
                             "revision": feedback["data"]["workspace"]["revision"],
@@ -121,6 +160,34 @@ async def test_workspace_failure_correction_and_sqlite_reopen(
 
     path = tmp_path / "workspace.sqlite"
     model = Model()
+    # 固定解释只用来验证多阶段能力生命周期,不作为模型选对工具的实验证据。
+    names = ("read_source_bundle", "execute_workspace_python", "read_workspace_file")
+    specification = TaskSpecification(
+        route="execute",
+        intent="Compute and inspect files",
+        goal="Produce both workspace files",
+        capability_needs=tuple(
+            CapabilityNeed(name=n, purpose="Complete the file task", necessity="required")
+            for n in names
+        ),
+        completion_criteria=tuple(
+            CompletionCriterion(
+                kind="capability_result", capability=n, description="Use the capability"
+            )
+            for n in names
+        ),
+    )
+    reasoning = FakeModelProvider(
+        (
+            ModelResponse(
+                action=ToolCallAction(
+                    call_id="declare",
+                    tool_name="declare_task_specification",
+                    arguments=specification.model_dump(mode="json"),
+                )
+            ),
+        )
+    )
     result = await run_task(
         path,
         backend=backend,
@@ -128,8 +195,15 @@ async def test_workspace_failure_correction_and_sqlite_reopen(
         counter=session_counter,
         workspace=True,
         manifest=manifest,
+        capabilities="adaptive" if adaptive else "static",
+        reasoning_model=reasoning if adaptive else None,
+        reasoning_counter=session_counter if adaptive else None,
     )
-    assert result["status"] == "completed" and model.calls == 5, result
+    assert result["status"] == "completed" and model.calls == (8 if adaptive else 5), (
+        model.calls,
+        result["diagnostics"],
+        result["capability_views"],
+    )
     attempts = cast(list[dict[str, object]], result["code_attempts"])
     assert [a["status"] for a in attempts] == ["completed", "code_error", "completed"]
     assert attempts[1]["workspace_revision"] is None

@@ -71,7 +71,14 @@ def _manifest_tool[I: BaseModel, O: BaseModel](
 class WorkspaceFileReadInput(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
     base: WorkspaceRef
-    path: str = Field(min_length=1, max_length=192)
+    path: str = Field(
+        min_length=1,
+        max_length=192,
+        description=(
+            "Relative virtual path copied from the file manifest, "
+            "without /workspace/inputs or any absolute prefix."
+        ),
+    )
     start: int = Field(default=0, ge=0, le=65536)
     length: int = Field(default=1000, ge=1, le=4000)
     _path = field_validator("path")(validate_path)

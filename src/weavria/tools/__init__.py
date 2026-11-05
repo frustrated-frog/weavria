@@ -8,6 +8,7 @@ from .artifact_read import (
     resolve_pointer,
     task_artifact_read_tool,
 )
+from .catalogue_view import model_tool_bytes, model_tool_view
 from .execution import (
     PolicyDecision,
     ReadOnlyPolicy,
@@ -88,6 +89,8 @@ __all__ = [
     "load_workspace_artifact",
     "load_workspace_state",
     "model_schema_view",
+    "model_tool_bytes",
+    "model_tool_view",
     "project_artifact_page",
     "python_execution_tool",
     "resolve_pointer",

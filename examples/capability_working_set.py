@@ -21,7 +21,7 @@ from weavria.harness import (
     TaskSpecification,
     canonicalize_task_frame,
 )
-from weavria.tools import ToolContext, ToolRegistry, TypedTool
+from weavria.tools import ToolContext, ToolRegistry, TypedTool, model_tool_bytes
 
 
 class SelectionStep(TypedDict):
@@ -110,7 +110,7 @@ def experiment() -> dict[str, object]:
         )
     )
     policy = AdaptiveCapabilityPolicy(max_tools=2, max_descriptor_bytes=16000)
-    costs = {d.name: len(d.model_dump_json().encode()) for d in tools.descriptors}
+    costs = {d.name: model_tool_bytes(d) for d in tools.descriptors}
     rows: list[SelectionStep] = []
     previous: tuple[str, ...] = ()
     for completed in range(5):

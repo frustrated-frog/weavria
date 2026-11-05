@@ -54,7 +54,14 @@ class _Contract(BaseModel):
 class ArtifactFile(_Contract):
     artifact_id: str = Field(min_length=1, max_length=128)
     pointer: str = Field(default="", max_length=1024, pattern=r"^(?:|/(?:[^~]|~[01])*)$")
-    path: str = Field(min_length=1, max_length=192)
+    path: str = Field(
+        min_length=1,
+        max_length=192,
+        description=(
+            "Relative virtual path, e.g. sources.json. The host mounts it under "
+            "/workspace/inputs; never include that absolute prefix here."
+        ),
+    )
     format: Literal["text", "json"] = "text"
 
     _path = field_validator("path")(validate_path)
