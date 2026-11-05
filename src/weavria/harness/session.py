@@ -32,6 +32,7 @@ from .clarification import BlockingAmbiguityPolicy, ClarificationPolicy
 from .completion import TaskCompletionEvaluator, TaskObligationCompletionPolicy
 from .context import project_context_focus
 from .finalization import NeedFinalizationPolicy
+from .outcomes import CapabilityOutcomeResolver
 from .progress import NeedProgressEvaluator
 from .requirements import (
     EvidenceResolver,
@@ -70,7 +71,9 @@ class TaskAwareSessionPreparer:
         clarification: ClarificationPolicy | None = None,
         working_set: CapabilityWorkingSetPolicy | None = None,
         working_records: bool = False,
+        outcomes: CapabilityOutcomeResolver | None = None,
     ) -> None:
+        self._outcomes = outcomes
         self._working_records = working_records
         self._working_set = working_set
         self._understanding = understanding
@@ -99,7 +102,8 @@ class TaskAwareSessionPreparer:
     @property
     def version(self) -> str:
         return (
-            f"task-aware-session/13[work={self._working_records};"
+            f"task-aware-session/14[work={self._working_records};"
+            f"{self._outcomes.version if self._outcomes else 'no-outcomes'};"
             f"{self._understanding.version};{self._evidence.version};"
             f"{self._capabilities.version};{self._clarification.version};"
             f"{self._working_set.version if self._working_set else 'monotonic-view/1'}]"
@@ -241,6 +245,12 @@ class TaskAwareSessionPreparer:
             previous=previous,
         )
         frame = preparation.record.frame
+        if self._outcomes is not None:
+            pending = self._outcomes.pending(frame, context.tools)
+            if pending:
+                ledger = ledger.model_copy(
+                    update={"schema_version": 7, "capability_outcomes": pending}
+                )
         transition_patch = None
         transition_kind = "initial"
         transition_cause = context.cause
@@ -390,6 +400,21 @@ class TaskAwareSessionPreparer:
             read_artifact=context.read_artifact,
             previous=previous,
         )
+        if self._outcomes is not None:
+            outcomes = await self._outcomes.resolve(
+                task=context.task,
+                frame=base,
+                tools=context.tools,
+                records=context.records,
+                read_artifact=context.read_artifact,
+            )
+            if outcomes:
+                ledger = ledger.model_copy(
+                    update={
+                        "schema_version": 7,
+                        "capability_outcomes": outcomes,
+                    }
+                )
         descriptors = context.tools.descriptors
         groups = {item.name: item.source_group for item in descriptors if item.source_group}
         failure_rounds = dict(previous.source_failure_rounds)
@@ -529,7 +554,9 @@ class TaskAwareSessionPreparer:
                 }
             )
         if failure_rounds or previous.source_failure_rounds:
-            schema_version: Literal[5, 6] = 6 if failure_rounds else 5
+            schema_version: Literal[5, 6, 7] = (
+                7 if ledger.capability_outcomes else 6 if failure_rounds else 5
+            )
             ledger = ledger.model_copy(
                 update={
                     "schema_version": schema_version,
@@ -537,13 +564,13 @@ class TaskAwareSessionPreparer:
                     "sources_exhausted": sources_exhausted,
                 }
             )
-            same_facts = (
-                ledger.model_copy(update={"evidence_revision": previous.evidence_revision})
-                == previous
-            )
-            ledger = ledger.model_copy(
-                update={"evidence_revision": previous.evidence_revision + int(not same_facts)}
-            )
+        # 所有投影归约完成后统一比较,避免独立验收字段使资料 Resolver 每轮虚增版本。
+        same_facts = (
+            ledger.model_copy(update={"evidence_revision": previous.evidence_revision}) == previous
+        )
+        ledger = ledger.model_copy(
+            update={"evidence_revision": previous.evidence_revision + int(not same_facts)}
+        )
         capability_changed = visible != existing
         ledger_changed = ledger.evidence_revision != previous.evidence_revision
         frame_revision = base.revision + int(capability_changed or ledger_changed)

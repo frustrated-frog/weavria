@@ -48,6 +48,7 @@ from .memory_formation import MemoryExtractor, MemoryFormationEngine, MemoryRevi
 from .memory_generation import MemoryGenerationPolicy
 from .memory_models import ModelMemoryExtractor, ModelMemoryReviewer
 from .memory_session import SessionMemoryBinding, SessionMemoryIngestor
+from .outcomes import CapabilityOutcomeResolver, CapabilityOutcomeVerifier
 from .requirements import EvidenceExtractor, EvidenceResolver
 from .session import TaskAwareSessionPreparer
 from .task_continuation import TaskContinuation
@@ -65,6 +66,7 @@ class HarnessEvidence:
     extractors: tuple[EvidenceExtractor, ...] = ()
     discovery_policy: CapabilityDiscoveryPolicy | None = None
     audit_requirements: bool = False
+    outcome_verifiers: tuple[CapabilityOutcomeVerifier, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -318,6 +320,7 @@ class AgentHarness:
             memory_catchup_fraction=config.memory_catchup_fraction,
             understanding=understanding,
             evidence_extractors=evidence.extractors if evidence is not None else (),
+            outcome_verifiers=evidence.outcome_verifiers if evidence is not None else (),
             discovery_policy=evidence.discovery_policy if evidence is not None else None,
             working_records=config.working_records,
             adaptive_capabilities=config.adaptive_capabilities,
@@ -356,6 +359,7 @@ class AgentHarness:
         completion: CompletionPolicy | None = None,
         understanding: TaskUnderstandingEngine | None = None,
         evidence_extractors: tuple[EvidenceExtractor, ...] = (),
+        outcome_verifiers: tuple[CapabilityOutcomeVerifier, ...] = (),
         discovery_policy: CapabilityDiscoveryPolicy | None = None,
         working_records: bool = False,
         working_set: CapabilityWorkingSetPolicy | None = None,
@@ -371,6 +375,8 @@ class AgentHarness:
     ) -> None:
         if context.semantic_compaction and context_recovery is None:
             raise ValueError("semantic compaction requires context recovery")
+        if outcome_verifiers and (understanding is None or not adaptive_capabilities):
+            raise ValueError("outcome verifiers require understanding and adaptive capabilities")
         if working_records and understanding is None:
             raise ValueError("working records require task understanding")
         if working_records:
@@ -438,6 +444,9 @@ class AgentHarness:
                 if adaptive_capabilities
                 else None,
                 working_records=working_records,
+                outcomes=CapabilityOutcomeResolver(outcome_verifiers)
+                if outcome_verifiers
+                else None,
             )
             if understanding
             else None,

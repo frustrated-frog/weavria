@@ -60,13 +60,13 @@ def _continuation_observation(
 class TaskModelViewProjector:
     """Project accepted state without authorizing actions or manufacturing evidence."""
 
-    version = "task-model-view/4"
+    version = "task-model-view/6"
     working_records_version = 1
 
     def __init__(self, *, compact_work_summary: bool = False) -> None:
         self._compact_work_summary = compact_work_summary
         if compact_work_summary:
-            self.version = "task-model-view/5"
+            self.version = "task-model-view/7"
 
     def project(
         self,
@@ -250,6 +250,23 @@ class TaskModelViewProjector:
             ),
         }
         progress_payload: dict[str, JsonValue] = {"needs": progress}
+        outcome_progress: list[JsonValue] = [
+            {
+                "capability": item.capability_name,
+                "status": item.status,
+                "reason_code": item.reason_code,
+            }
+            for item in ledger.capability_outcomes
+        ]
+        if outcome_progress:
+            progress_payload["capability_outcomes"] = outcome_progress
+        # 上界在任务创建时固定,不能等首份验收结论出现后再扩容。Preparer 初始登记
+        # 实际配置的验收槽位(最多 16 个),后续名字固定,状态/原因使用契约最大长度。
+        # 未配置验收的任务不承担新功能的预算开销,尤其不能挤占紧窗口的原文空间。
+        maximum_outcomes: list[JsonValue] = [
+            {"capability": item.capability_name, "status": "unverifiable", "reason_code": "x" * 128}
+            for item in ledger.capability_outcomes
+        ]
         if work is not None:
             if work.task_revision != task.revision:
                 raise ValueError("working projection belongs to another task revision")
@@ -274,6 +291,17 @@ class TaskModelViewProjector:
             progress=progress_payload,
             max_progress_bytes=len(
                 json.dumps({"needs": maximum}, ensure_ascii=False, separators=(",", ":")).encode()
+            )
+            + (
+                len(
+                    json.dumps(
+                        {"capability_outcomes": maximum_outcomes},
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ).encode()
+                )
+                if maximum_outcomes
+                else 0
             )
             + (MAX_WORK_BYTES + 32 if work is not None else 0),
             max_instruction_bytes=max_instruction_bytes,

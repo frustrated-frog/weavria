@@ -8,6 +8,7 @@ from weavria.tools import ToolRegistry, model_tool_bytes
 
 from .capabilities import CapabilityQuery, CapabilityResolver
 from .context import need_priority_weights
+from .outcomes import outcome_is_current
 from .requirements import NeedLedger, NeedStatus
 from .understanding import TaskFrame
 from .work import WorkingState, work_need_weights
@@ -64,7 +65,7 @@ class AdaptiveCapabilityPolicy:
 
     @property
     def version(self) -> str:
-        return f"adaptive-capabilities/4:tools={self.max_tools}:bytes={self.max_descriptor_bytes}"
+        return f"adaptive-capabilities/5:tools={self.max_tools}:bytes={self.max_descriptor_bytes}"
 
     def select(
         self,
@@ -78,7 +79,11 @@ class AdaptiveCapabilityPolicy:
         discover: bool,
         working_state: WorkingState | None = None,
     ) -> CapabilityWorkingSet:
-        if frame.work_id != ledger.work_id or frame.revision != ledger.frame_revision:
+        if (
+            frame.work_id != ledger.work_id
+            or frame.revision != ledger.frame_revision
+            or frame.request_anchor.task_revision != ledger.task_revision
+        ):
             raise ValueError("working set requires the current task frame and ledger")
         if (
             working_state is not None
@@ -88,6 +93,29 @@ class AdaptiveCapabilityPolicy:
         descriptors = {d.name: d for d in tools.descriptors}
         declared = {n.name for n in frame.specification.capability_needs}
         candidates = set(previous) | declared
+        # 信息满足不等于成果完成。只有宿主独立验收的完整范围证明可释放计算,
+        # 且证明依赖的精确接受结果仍须存在;导入其他 Run 的结论不会生效。
+        retired: set[str] = set()
+        for outcome in ledger.capability_outcomes:
+            descriptor = descriptors.get(outcome.capability_name)
+            if (
+                outcome.status != "verified"
+                or not outcome_is_current(outcome, frame, records)
+                or descriptor is None
+                or descriptor.behavior != "isolated_compute"
+                or descriptor.version != outcome.capability_version
+                or outcome.capability_name not in declared
+            ):
+                continue
+            # 缺资料、反证或过期时仍保留取证/修复入口;ACQUIRED 不会升级为 SATISFIED。
+            if any(
+                need.required
+                and outcome.capability_name in need.capability_names
+                and not ledger.state_for(need.need_id).acquisition_complete
+                for need in frame.requirements
+            ):
+                continue
+            retired.add(outcome.capability_name)
         priorities = need_priority_weights(frame.requirements, ledger)
         for need_id, boost in work_need_weights(working_state, ledger).items():
             if need_id in priorities:
@@ -115,11 +143,19 @@ class AdaptiveCapabilityPolicy:
         coverage: dict[str, dict[str, float]] = {}
         for need in frame.requirements:
             state = ledger.state_for(need.need_id)
-            if state.status is NeedStatus.SATISFIED or need.source != "external":
+            if (
+                state.status is NeedStatus.SATISFIED
+                or need.source != "external"
+                or (need.capability_names and set(need.capability_names) <= retired)
+            ):
                 continue
             target = f"need:{need.need_id}"
             weights[target] = priorities[need.need_id]
-            matches = {name: 1.0 for name in need.capability_names if name in candidates}
+            matches = {
+                name: 1.0
+                for name in need.capability_names
+                if name in candidates and name not in retired
+            }
             penalties: dict[str, float] = {}
             for failure in state.failures:
                 if positions.get(failure.call_id, -1) > last_success.get(
@@ -143,7 +179,7 @@ class AdaptiveCapabilityPolicy:
                     trigger="partial_need",
                 )
                 for choice in choices:
-                    if choice.decision == "select":
+                    if choice.decision == "select" and choice.name not in retired:
                         candidates.add(choice.name)
                         # 声明映射比词法/Schema 猜测更强,但均不替代实际输出核验。
                         matches[choice.name] = (
@@ -157,7 +193,7 @@ class AdaptiveCapabilityPolicy:
         # 有些动作没有信息需求,但有独立完成义务。它们不能被空 Need 集误删。
         for obligation in frame.obligations:
             name = obligation.capability_name
-            if not obligation.required or name is None or obligation.need_ids:
+            if not obligation.required or name is None or obligation.need_ids or name in retired:
                 continue
             if any(
                 r.exchange.action.tool_name == name
@@ -177,7 +213,11 @@ class AdaptiveCapabilityPolicy:
         if frame.specification.route == "execute":
             for capability in frame.specification.capability_needs:
                 descriptor = descriptors.get(capability.name)
-                if descriptor is None or descriptor.behavior != "isolated_compute":
+                if (
+                    descriptor is None
+                    or descriptor.behavior != "isolated_compute"
+                    or capability.name in retired
+                ):
                     continue
                 target = f"compute:{capability.name}"
                 weights[target] = 2.0 if capability.necessity == "required" else 0.5

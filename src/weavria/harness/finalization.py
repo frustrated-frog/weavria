@@ -14,6 +14,7 @@ from weavria.core import (
 from weavria.runtime import CompletionContext, FinalizationAssessment, artifact_page_source_ranges
 from weavria.tools import ArtifactReadOutput, resolve_pointer
 
+from .outcomes import outcome_is_current
 from .requirements import (
     EvidenceBinding,
     EvidenceResolver,
@@ -24,7 +25,7 @@ from .understanding import load_task_frame
 
 
 class NeedFinalizationPolicy:
-    version = "need-finalization/5"
+    version = "need-finalization/6"
 
     def __init__(self, evidence: EvidenceResolver | None = None) -> None:
         self._evidence = evidence or EvidenceResolver()
@@ -76,6 +77,17 @@ class NeedFinalizationPolicy:
                 for record in context.records
             )
             for obligation in frame.obligations
+        ):
+            return FinalizationAssessment(False, "unavailable")
+        required_capabilities = {
+            item.capability_name
+            for item in frame.obligations
+            if item.required and item.kind == "capability_result"
+        }
+        if any(
+            item.capability_name in required_capabilities
+            and (item.status != "verified" or not outcome_is_current(item, frame, context.records))
+            for item in ledger.capability_outcomes
         ):
             return FinalizationAssessment(False, "unavailable")
         required = tuple(

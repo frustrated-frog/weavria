@@ -98,6 +98,8 @@ from .memory_generation import MemoryGenerationPolicy
 from .memory_interpretation import ModelMemoryRepairingExtractor
 from .memory_models import ModelMemoryExtractor, ModelMemoryReviewer
 from .memory_session import AcceptedMemoryEvents, SessionMemoryBinding, SessionMemoryIngestor
+from .outcome_contracts import CapabilityOutcome, CapabilityOutcomeDecision
+from .outcomes import CapabilityOutcomeContext, CapabilityOutcomeResolver, CapabilityOutcomeVerifier
 from .progress import NeedProgressEvaluator
 from .requirements import (
     CompletionObligation,
@@ -173,6 +175,11 @@ __all__ = [
     "CapabilityEpochView",
     "CapabilityEvidenceProfile",
     "CapabilityNeed",
+    "CapabilityOutcome",
+    "CapabilityOutcomeContext",
+    "CapabilityOutcomeDecision",
+    "CapabilityOutcomeResolver",
+    "CapabilityOutcomeVerifier",
     "CapabilityQuery",
     "CapabilityResolver",
     "CapabilityRetriever",

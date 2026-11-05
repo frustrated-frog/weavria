@@ -58,12 +58,16 @@ Path('/workspace/outputs/report.txt').write_text(report)
 """
 
 
-@pytest.mark.parametrize(("manifest", "adaptive"), ((False, False), (True, False), (True, True)))
+@pytest.mark.parametrize(
+    ("manifest", "adaptive", "verified"),
+    ((False, False, False), (True, False, False), (True, True, False), (True, True, True)),
+)
 async def test_workspace_failure_correction_and_sqlite_reopen(
     tmp_path: Path,
     session_counter: OpenAICompatibleTokenCounter,
     manifest: bool,
     adaptive: bool,
+    verified: bool,
 ) -> None:
     backend = DockerPythonSandbox(image=os.environ["WEAVRIA_TEST_DOCKER_IMAGE"])
 
@@ -84,7 +88,9 @@ async def test_workspace_failure_correction_and_sqlite_reopen(
             assert request.current.instructions.count("Available tools:") == 1
             if adaptive:
                 assert '"name":"merge_workspace"' not in request.current.instructions
-                assert '"name":"execute_workspace_python"' in request.current.instructions
+                assert ('"name":"execute_workspace_python"' in request.current.instructions) == (
+                    not verified or self.calls < 6
+                )
                 if self.calls > 1:
                     assert '"name":"read_source_bundle"' not in request.current.instructions
                 if self.calls > 3:
@@ -195,11 +201,13 @@ async def test_workspace_failure_correction_and_sqlite_reopen(
         counter=session_counter,
         workspace=True,
         manifest=manifest,
-        capabilities="adaptive" if adaptive else "static",
+        capabilities="verified" if verified else "adaptive" if adaptive else "static",
         reasoning_model=reasoning if adaptive else None,
         reasoning_counter=session_counter if adaptive else None,
     )
-    assert result["status"] == "completed" and model.calls == (8 if adaptive else 5), (
+    if result["status"] != "completed":
+        pytest.fail(json.dumps(result["diagnostics"], ensure_ascii=False))
+    assert model.calls == (6 if verified else 8 if adaptive else 5), (
         model.calls,
         result["diagnostics"],
         result["capability_views"],
@@ -209,6 +217,24 @@ async def test_workspace_failure_correction_and_sqlite_reopen(
     assert attempts[1]["workspace_revision"] is None
     async with SQLiteSessionStore(path) as store:
         events = await store.events("source-statistics", limit=256)
+        if verified:
+            from weavria.core import SessionSemanticCommitted
+            from weavria.harness import load_need_ledger
+
+            heads = [
+                event.data.snapshot
+                for event in events
+                if isinstance(event.data, SessionSemanticCommitted)
+            ]
+            last = heads[-1]
+            outcomes = load_need_ledger(last.need_ledger).capability_outcomes
+            assert outcomes[0].status == "verified"
+            assert "execute_workspace_python" not in last.visible_tool_names
+            assert any(
+                load_need_ledger(head.need_ledger).capability_outcomes[0].status == "repair"
+                for head in heads
+                if load_need_ledger(head.need_ledger).capability_outcomes
+            )
         versions: list[WorkspaceExecutionOutput] = []
         for event in events:
             if not isinstance(event.data, SessionRunEvent) or not isinstance(

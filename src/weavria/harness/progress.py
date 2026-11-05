@@ -15,6 +15,7 @@ from weavria.core import (
     TurnFeedback,
 )
 
+from .outcomes import outcome_is_current
 from .requirements import EvidenceBinding, InformationRequirement, NeedLedger, NeedStatus
 from .understanding import TaskFrame
 
@@ -22,7 +23,7 @@ from .understanding import TaskFrame
 class NeedProgressEvaluator:
     """Compare accepted Need projections without pretending unknown sources are independent."""
 
-    version = "need-progress-assessment/4"
+    version = "need-progress-assessment/5"
 
     def assess(
         self,
@@ -141,12 +142,12 @@ def _obligation_progress(
     before_satisfied = {
         item.obligation_id
         for item in observable
-        if _obligation_satisfied(item.need_ids, item.capability_name, before, before_records)
+        if _obligation_satisfied(item.need_ids, item.capability_name, before, before_records, frame)
     }
     after_satisfied = {
         item.obligation_id
         for item in observable
-        if _obligation_satisfied(item.need_ids, item.capability_name, after, after_records)
+        if _obligation_satisfied(item.need_ids, item.capability_name, after, after_records, frame)
     }
     all_ids = {item.obligation_id for item in observable}
     before_open = all_ids - before_satisfied
@@ -166,7 +167,14 @@ def _obligation_satisfied(
     capability_name: str | None,
     ledger: NeedLedger,
     records: tuple[ToolRecord, ...],
+    frame: TaskFrame,
 ) -> bool:
+    # 一旦宿主提供成果验收,工具用过/资料齐全不能覆盖 repair 或 unverifiable。
+    outcome = next(
+        (o for o in ledger.capability_outcomes if o.capability_name == capability_name), None
+    )
+    if outcome is not None:
+        return outcome.status == "verified" and outcome_is_current(outcome, frame, records)
     if need_ids:
         return all(ledger.state_for(need_id).status is NeedStatus.SATISFIED for need_id in need_ids)
     if capability_name is None:

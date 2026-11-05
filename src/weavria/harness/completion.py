@@ -14,6 +14,7 @@ from weavria.core import (
 )
 from weavria.runtime import CompletionContext
 
+from .outcomes import capability_outcome_scope, outcome_is_current
 from .requirements import EvidenceResolver, NeedLedger, NeedStatus, load_need_ledger
 from .understanding import TaskFrame, load_task_frame
 
@@ -64,7 +65,7 @@ class CandidateAnswerVerifier(Protocol):
 class TaskCompletionEvaluator:
     """Evaluate declared obligations without trusting model claims of completion."""
 
-    version = "task-obligations/11"
+    version = "task-obligations/12"
 
     def __init__(
         self,
@@ -185,7 +186,14 @@ class TaskCompletionEvaluator:
         if any(
             obligation.required
             and obligation.kind == "capability_result"
-            and not obligation.need_ids
+            and (
+                not obligation.need_ids
+                or any(
+                    v.obligation_id == obligation.obligation_id
+                    and v.reason_code == "capability_outcome_repair"
+                    for v in verdicts
+                )
+            )
             and any(
                 verdict.obligation_id == obligation.obligation_id
                 and verdict.result == "unsatisfied"
@@ -333,6 +341,34 @@ def _verdicts(
                     obligation_id=obligation.obligation_id,
                     result="satisfied",
                     reason_code="answer_delivered",
+                )
+            )
+            continue
+        outcome = next(
+            (
+                item
+                for item in ledger.capability_outcomes
+                if item.capability_name == obligation.capability_name
+            ),
+            None,
+        )
+        if outcome is not None and obligation.kind == "capability_result":
+            current = outcome.scope_sha256 == capability_outcome_scope(frame)
+            verified = (
+                current
+                and outcome.status == "verified"
+                and outcome_is_current(outcome, frame, records)
+            )
+            repair = current and outcome.status == "repair"
+            verdicts.append(
+                ObligationVerdict(
+                    obligation_id=obligation.obligation_id,
+                    result="satisfied" if verified else "unsatisfied" if repair else "unknown",
+                    reason_code="capability_outcome_verified"
+                    if verified
+                    else "capability_outcome_repair"
+                    if repair
+                    else "capability_outcome_unverifiable",
                 )
             )
             continue

@@ -27,7 +27,14 @@ from weavria.core import (
     ToolRecorded,
 )
 from weavria.evaluation import RecordingHTTPTransport, summarize_samples
-from weavria.harness import AgentHarness, CapabilityDescriptor, HarnessConfig, HarnessEvidence
+from weavria.harness import (
+    AgentHarness,
+    CapabilityDescriptor,
+    CapabilityOutcomeContext,
+    CapabilityOutcomeDecision,
+    HarnessConfig,
+    HarnessEvidence,
+)
 from weavria.models import (
     ModelProvider,
     OpenAICompatibleConfig,
@@ -142,6 +149,15 @@ class VerifyWorkspace:
         )
 
     async def verify(self, context: CompletionContext) -> CompletionDecision:
+        if await self.is_complete(context):
+            return CompletionAccept(outcome="verified")
+        return CompletionRepair(
+            issue_codes=("workspace_incomplete",),
+            guidance="Create statistics.json first; from its exact workspace base add report.txt.",
+        )
+
+    async def is_complete(self, context: CompletionContext | CapabilityOutcomeContext) -> bool:
+        """反馈验收与最终交付使用同一内容/父版本判断,避免两处标准逐渐分歧。"""
         accepted: dict[str, WorkspaceExecutionOutput] = {}
         for record in context.records:
             if (
@@ -170,10 +186,27 @@ class VerifyWorkspace:
             except ValueError:
                 valid = False
             if valid:
-                return CompletionAccept(outcome="verified")
-        return CompletionRepair(
-            issue_codes=("workspace_incomplete",),
-            guidance="Create statistics.json first; from its exact workspace base add report.txt.",
+                return True
+        return False
+
+
+class VerifyWorkspaceOutcome:
+    """固定任务的独立 oracle,不尝试验证任意自然语言任务或预编排执行步骤。"""
+
+    key = "source-workspace-outcome"
+    version = "1"
+    capability_name = "execute_workspace_python"
+
+    def __init__(self, bundle: SourceBundle) -> None:
+        self._check = VerifyWorkspace(bundle)
+
+    async def verify(self, context: CapabilityOutcomeContext) -> CapabilityOutcomeDecision:
+        if context.task.goal != WORKSPACE_TASK or context.task.constraints:
+            return CapabilityOutcomeDecision(status="unverifiable", reason_code="unsupported_task")
+        valid = await self._check.is_complete(context)
+        return CapabilityOutcomeDecision(
+            status="verified" if valid else "repair",
+            reason_code="workspace_verified" if valid else "workspace_incomplete",
         )
 
 
@@ -202,7 +235,7 @@ async def run_task(
     counter: SessionTokenCounter,
     workspace: bool = False,
     manifest: bool = True,
-    capabilities: Literal["static", "adaptive"] = "static",
+    capabilities: Literal["static", "adaptive", "verified"] = "static",
     reasoning_model: ModelProvider | None = None,
     reasoning_counter: ModelRequestTokenCounter | None = None,
 ) -> dict[str, object]:
@@ -246,7 +279,9 @@ async def run_task(
         "Input is an accepted Artifact; pass pointer /files with format json to create "
         "/workspace/inputs/sources.json. Export statistics.json. "
     )
-    adaptive = capabilities == "adaptive"
+    adaptive = capabilities != "static"
+    if capabilities == "verified" and not workspace:
+        raise ValueError("verified capability example requires workspace mode")
     config = HarnessConfig(
         configuration_id=f"sandbox-source-statistics/2:{capabilities}",
         task_understanding=adaptive,
@@ -269,7 +304,10 @@ async def run_task(
         evidence=HarnessEvidence(
             discovery_policy=RegisteredDiscovery(
                 tuple((d.name, d.version) for d in registry.descriptors)
-            )
+            ),
+            outcome_verifiers=(VerifyWorkspaceOutcome(bundle),)
+            if capabilities == "verified"
+            else (),
         )
         if adaptive
         else None,
@@ -291,6 +329,9 @@ async def run_task(
                 "epoch": event.data.snapshot.version.capability_epoch,
                 "names": event.data.snapshot.visible_tool_names,
                 "frame": event.data.snapshot.observation.payload,
+                "capability_outcomes": event.data.snapshot.need_ledger.get(
+                    "capability_outcomes", []
+                ),
             }
             for event in events
             if isinstance(event.data, SessionSemanticCommitted)
@@ -346,7 +387,7 @@ async def run_task(
                         }
                     )
         return {
-            "schema_version": 3,
+            "schema_version": 4,
             "capabilities": capabilities,
             "capability_views": views,
             "request_catalogue_costs": measured_model.samples,
@@ -369,7 +410,9 @@ async def main() -> None:
     parser.add_argument("--env-file", type=Path)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--workspace", action="store_true", help="Run the two-stage workspace task")
-    parser.add_argument("--capabilities", choices=("static", "adaptive"), default="static")
+    parser.add_argument(
+        "--capabilities", choices=("static", "adaptive", "verified"), default="static"
+    )
     args = parser.parse_args()
     bundle = dataset()
     print(f"Frozen Python files: {len(bundle.files)}")

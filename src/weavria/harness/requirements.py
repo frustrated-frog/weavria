@@ -21,6 +21,7 @@ from weavria.artifacts import ArtifactSnapshot
 from weavria.core import ErrorCategory, ToolFailedObservation, ToolRecord
 from weavria.tools import resolve_pointer
 
+from .outcome_contracts import CapabilityOutcome
 from .targets import EvidenceTargetBinding, TargetedContract, same_target_value
 
 _Identifier = Annotated[
@@ -262,7 +263,7 @@ class NeedState(BaseModel):
 
 class NeedLedger(BaseModel):
     model_config = _SemanticContract.model_config
-    schema_version: Literal[5, 6] = 5
+    schema_version: Literal[5, 6, 7] = 5
     work_id: _Identifier
     task_revision: int = Field(ge=1)
     frame_revision: int = Field(ge=1)
@@ -270,6 +271,7 @@ class NeedLedger(BaseModel):
     states: tuple[NeedState, ...]
     bindings: tuple[EvidenceBinding, ...] = ()
     probes: tuple["EvidenceProbe", ...] = ()
+    capability_outcomes: tuple[CapabilityOutcome, ...] = Field(default=(), max_length=16)
 
     source_failure_rounds: dict[_Identifier, Literal[1, 2]] = Field(default_factory=dict)
     sources_exhausted: bool = False
@@ -282,12 +284,21 @@ class NeedLedger(BaseModel):
         if self.schema_version == 5:
             data.pop("source_failure_rounds", None)
             data.pop("sources_exhausted", None)
+        if self.schema_version < 7:
+            data.pop("capability_outcomes", None)
         return data
 
     @model_validator(mode="after")
     def validate_ledger(self) -> Self:
-        if (self.schema_version == 6) != bool(self.source_failure_rounds):
+        if self.schema_version < 7 and (self.schema_version == 6) != bool(
+            self.source_failure_rounds
+        ):
             raise ValueError("source failure tracking requires a nonempty v6 ledger")
+        if (self.schema_version == 7) != bool(self.capability_outcomes):
+            raise ValueError("capability outcomes require a nonempty v7 ledger")
+        names = [item.capability_name for item in self.capability_outcomes]
+        if len(names) != len(set(names)):
+            raise ValueError("capability outcome names must be unique")
         if self.sources_exhausted and 2 not in self.source_failure_rounds.values():
             raise ValueError("source exhaustion requires a closed group")
         need_ids = [state.need_id for state in self.states]
@@ -406,6 +417,25 @@ class NeedLedger(BaseModel):
                 {
                     "source_failure_rounds": self.source_failure_rounds,
                     "sources_exhausted": self.sources_exhausted,
+                }
+            )
+        if self.capability_outcomes:
+            # 内容相同的新调用不制造成果进展;不可变证据身份仍保留在完整投影中。
+            payload.append(
+                {
+                    "capability_outcomes": [
+                        {
+                            "capability_name": item.capability_name,
+                            "capability_version": item.capability_version,
+                            "scope_sha256": item.scope_sha256,
+                            "status": item.status,
+                            "reason_code": item.reason_code,
+                            "verifier_key": item.verifier_key,
+                            "verifier_version": item.verifier_version,
+                            "evidence_sha256": sorted({ref.sha256 for ref in item.evidence}),
+                        }
+                        for item in self.capability_outcomes
+                    ]
                 }
             )
         return hashlib.sha256(
