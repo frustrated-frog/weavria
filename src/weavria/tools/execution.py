@@ -22,7 +22,12 @@ from pydantic import (
 )
 from pydantic_core import PydanticSerializationError
 
-from weavria.artifacts import ArtifactSnapshot, ArtifactStore
+from weavria.artifacts import (
+    ArtifactAccessError,
+    ArtifactSnapshot,
+    ArtifactStore,
+    read_owned_attachment,
+)
 from weavria.core import (
     ArtifactRef,
     ErrorCategory,
@@ -203,13 +208,20 @@ class ToolContext:
         *,
         call_id: str | None = None,
         task_view: TaskModelView | None = None,
+        attachment_limit: int = 4_000_000,
     ) -> None:
+        if type(attachment_limit) is not int or not 1 <= attachment_limit <= 4_000_000:
+            raise ValueError("attachment_limit must be in 1..4000000")
+        self._attachment_limit = attachment_limit
         self._task_view_json = task_view.model_dump_json() if task_view else None
         self._call_id = call_id
         self._run_id = run_id
         self._store = store
         self._reads: list[str] = []
         self._active = True
+        self._attachment_reads: dict[str, ArtifactRef] = {}
+        self._attachment_bytes = 0
+        self._attachment_count = 0
         self._accepted = (
             None
             if accepted_artifacts is None
@@ -241,7 +253,10 @@ class ToolContext:
         """Read within the owning run and record the producing call."""
         if not self._active:
             raise RuntimeError("tool invocation context is closed")
-        if self._accepted is not None and artifact_id not in self._accepted:
+        allowed = self._attachment_reads.get(artifact_id)
+        if allowed is None and self._accepted is not None:
+            allowed = self._accepted.get(artifact_id)
+        if self._accepted is not None and allowed is None:
             raise ToolFault(
                 ErrorCategory.POLICY_DENIED, "Artifact is outside the accepted turn view"
             )
@@ -250,9 +265,50 @@ class ToolContext:
             raise RuntimeError("tool invocation context is closed")
         if snapshot.reference.run_id != self._run_id:
             raise ToolExecutionError("artifact store returned another run's result")
-        if self._accepted is not None and snapshot.reference != self._accepted[artifact_id]:
+        if allowed is not None and snapshot.reference != allowed:
             raise ToolExecutionError("artifact store changed an accepted source identity")
         self._reads.append(snapshot.reference.call_id)
+        return snapshot
+
+    async def stage_attachment(self, value: JsonValue) -> ArtifactRef:
+        """Stage bounded data under this call; only an accepted parent can grant later reads."""
+        if not self._active or self._call_id is None:
+            raise RuntimeError("attachment staging requires an active owned call")
+        size = len(TypeAdapter[JsonValue](JsonValue).dump_json(value))
+        # 同一调用的所有附件共享上限;不是每个附件分别获得无限存储额度。
+        if self._attachment_count >= 32 or self._attachment_bytes + size > self._attachment_limit:
+            raise ToolFault(ErrorCategory.INVALID_TOOL_OUTPUT, "Attachment capacity exceeded")
+        self._attachment_count += 1
+        self._attachment_bytes += size
+        snapshot = await self._store.put(self._run_id, self._call_id, value)
+        if not self._active:
+            raise RuntimeError("tool invocation context is closed")
+        reference = snapshot.reference
+        if reference.run_id != self._run_id or reference.call_id != self._call_id:
+            raise ToolExecutionError("attachment store violated execution identity")
+        self._attachment_bytes += max(0, reference.size_bytes - size)
+        if (
+            self._attachment_bytes > self._attachment_limit
+            or len(reference.model_dump_json().encode()) > 1024
+        ):
+            raise ToolFault(
+                ErrorCategory.INVALID_TOOL_OUTPUT, "Attachment metadata or capacity exceeded"
+            )
+        return reference
+
+    async def read_attachment(self, parent_id: str, pointer: str) -> ArtifactSnapshot:
+        """Resolve an attachment through an authorized parent and bind its exact identity."""
+        parent = await self.read_artifact(parent_id)
+        try:
+            snapshot = await read_owned_attachment(parent, pointer, self._store.get)
+        except ArtifactAccessError as exc:
+            raise ToolFault(ErrorCategory.POLICY_DENIED, str(exc)) from exc
+        if not self._active:
+            raise RuntimeError("tool invocation context is closed")
+        reference = snapshot.reference
+        # 授权只存在于本次调用,使内部计算可沿现有 Artifact 输入端口读取。
+        # 后续模型动作仍需重新验证父结果,不能直接复用这里的临时授权。
+        self._attachment_reads[reference.artifact_id] = reference
         return snapshot
 
     def close(self) -> None:
@@ -595,6 +651,9 @@ class ToolExecutor:
             accepted_artifacts,
             call_id=action.call_id,
             task_view=task_view,
+            attachment_limit=min(4_000_000, self._bounds.max_result_bytes)
+            if self._bounds
+            else 4_000_000,
         )
         authorization: ToolAuthorization | None = None
         retryable = False

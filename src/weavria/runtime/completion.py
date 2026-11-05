@@ -7,7 +7,12 @@ from typing import Protocol, runtime_checkable
 
 from pydantic import JsonValue, TypeAdapter
 
-from weavria.artifacts import ArtifactAccessError, ArtifactSnapshot, ArtifactStore
+from weavria.artifacts import (
+    ArtifactAccessError,
+    ArtifactSnapshot,
+    ArtifactStore,
+    read_owned_attachment,
+)
 from weavria.core import (
     CompletionAccept,
     CompletionAssessment,
@@ -141,6 +146,14 @@ class CompletionContext:
             raise ArtifactAccessError("completion artifact disagrees with accepted execution")
         if reference.call_id not in self._reads:
             self._reads.append(reference.call_id)
+        return snapshot
+
+    async def read_attachment(self, parent_id: str, pointer: str) -> ArtifactSnapshot:
+        """Read a child only through accepted completion evidence, retaining parent provenance."""
+        parent = await self.read_artifact(parent_id)
+        snapshot = await read_owned_attachment(parent, pointer, self._store.get)
+        if not self._open:
+            raise ArtifactAccessError("completion context is closed")
         return snapshot
 
     def close(self) -> None:

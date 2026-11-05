@@ -40,6 +40,19 @@ from .workspace import (
     workspace_execution_tool,
     workspace_merge_tool,
 )
+from .workspace_manifest import (
+    WorkspaceFileReadInput,
+    WorkspaceFileReadOutput,
+    workspace_file_read_tool,
+    workspace_manifest_tools,
+)
+from .workspace_storage import (
+    WorkspaceFileEntry,
+    WorkspaceManifest,
+    WorkspaceManifestOutput,
+    load_workspace_artifact,
+    load_workspace_state,
+)
 
 __all__ = [
     "ArtifactFile",
@@ -62,16 +75,25 @@ __all__ = [
     "TypedTool",
     "WorkspaceExecutionInput",
     "WorkspaceExecutionOutput",
+    "WorkspaceFileEntry",
+    "WorkspaceFileReadInput",
+    "WorkspaceFileReadOutput",
+    "WorkspaceManifest",
+    "WorkspaceManifestOutput",
     "WorkspaceMergeInput",
     "WorkspaceMergeOutput",
     "WorkspaceRef",
     "artifact_read_tool",
     "context_summary_tool",
+    "load_workspace_artifact",
+    "load_workspace_state",
     "model_schema_view",
     "project_artifact_page",
     "python_execution_tool",
     "resolve_pointer",
     "task_artifact_read_tool",
     "workspace_execution_tool",
+    "workspace_file_read_tool",
+    "workspace_manifest_tools",
     "workspace_merge_tool",
 ]

@@ -30,6 +30,7 @@ from .python_execution import (
     PythonExecutionOutput,
     python_execution_tool,
 )
+from .workspace_storage import load_workspace_state
 
 
 class _Contract(BaseModel):
@@ -113,17 +114,8 @@ class _JSONTool[I: BaseModel, O: BaseModel](TypedTool[I, O]):
 
 
 async def _read(reference: WorkspaceRef, context: ToolContext) -> WorkspaceSnapshot:
-    snapshot = await context.read_artifact(reference.artifact_id)
-    value = snapshot.value
-    try:
-        if not isinstance(value, dict) or not isinstance(value.get("workspace"), dict):
-            raise ValueError("artifact has no published workspace")
-        workspace = WorkspaceSnapshot.model_validate_json(json.dumps(value["workspace"]))
-        if workspace.revision != reference.revision:
-            raise ValueError("workspace revision differs from the selected base")
-        return workspace
-    except ValueError as exc:
-        raise ToolFault(ErrorCategory.INVALID_TOOL_ARGUMENTS, str(exc)[:256]) from exc
+    _, workspace = await load_workspace_state(reference.artifact_id, reference.revision, context)
+    return workspace
 
 
 def _capacity(value: int) -> None:
@@ -144,17 +136,21 @@ def workspace_execution_tool(
     async def execute(
         value: WorkspaceExecutionInput, context: ToolContext
     ) -> WorkspaceExecutionOutput:
-        base = await _read(value.base, context) if value.base else None
+        source, base = (
+            await load_workspace_state(value.base.artifact_id, value.base.revision, context)
+            if value.base
+            else (None, None)
+        )
         inherited = (
             tuple(
                 ArtifactFile(
-                    artifact_id=value.base.artifact_id,
+                    artifact_id=source.reference.artifact_id,
                     pointer=f"/workspace/files/{i}/text",
                     path=file.path,
                 )
                 for i, file in enumerate(base.files)
             )
-            if base is not None and value.base is not None
+            if base is not None and source is not None
             else ()
         )
         inherited_paths = {item.path for item in inherited}

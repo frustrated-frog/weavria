@@ -8,6 +8,7 @@ from typing import cast
 import pytest
 
 from examples.sandbox_execution import run_task
+from weavria.artifacts import read_owned_attachment
 from weavria.context import SessionTokenCounter
 from weavria.core import (
     FinishAction,
@@ -54,9 +55,11 @@ Path('/workspace/outputs/report.txt').write_text(report)
 """
 
 
+@pytest.mark.parametrize("manifest", (False, True))
 async def test_workspace_failure_correction_and_sqlite_reopen(
     tmp_path: Path,
     session_counter: SessionTokenCounter,
+    manifest: bool,
 ) -> None:
     backend = DockerPythonSandbox(image=os.environ["WEAVRIA_TEST_DOCKER_IMAGE"])
 
@@ -119,7 +122,12 @@ async def test_workspace_failure_correction_and_sqlite_reopen(
     path = tmp_path / "workspace.sqlite"
     model = Model()
     result = await run_task(
-        path, backend=backend, model=model, counter=session_counter, workspace=True
+        path,
+        backend=backend,
+        model=model,
+        counter=session_counter,
+        workspace=True,
+        manifest=manifest,
     )
     assert result["status"] == "completed" and model.calls == 5, result
     attempts = cast(list[dict[str, object]], result["code_attempts"])
@@ -140,6 +148,8 @@ async def test_workspace_failure_correction_and_sqlite_reopen(
             ):
                 continue
             snapshot = await store.get(record.artifact.run_id, record.artifact.artifact_id)
+            if manifest:
+                snapshot = await read_owned_attachment(snapshot, "/state", store.get)
             versions.append(WorkspaceExecutionOutput.model_validate_json(snapshot.content_json))
         first, failed, final = versions
         assert first.workspace and final.workspace and not failed.workspace

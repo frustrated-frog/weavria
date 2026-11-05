@@ -18,6 +18,8 @@ Weavria 是一套实验性的 Python Agent Harness 与 Runtime，重点是让模
 
 多步文件计算可使用 `execute_workspace_python` 显式选择已接受的工作区版本、保留未改文件并生成子版本；`merge_workspace` 支持直接兄弟版本的三方合并与冲突反馈。机制、容量及恢复边界见[工作区版本复用与冲突处理](docs/工作区版本复用与冲突处理.md)。
 
+`workspace_manifest_tools` 将工作区正文留在受控 Artifact 附件，模型收到文件清单并通过 `read_workspace_file` 按需分页，后续计算从已接受的父结果恢复原文件。大文件反馈明显缩小；小型真实任务因额外工具定义等开销未节省总 Token。流程、兼容与实验见[工作区清单与按需正文恢复](docs/工作区清单与按需正文恢复.md)。
+
 ## 开发环境
 
 需要 Python 3.12+ 与 uv：
