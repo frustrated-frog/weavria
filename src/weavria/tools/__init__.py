@@ -31,6 +31,15 @@ from .python_execution import (
 )
 from .schema_view import model_schema_view
 from .summarize import context_summary_tool
+from .workspace import (
+    WorkspaceExecutionInput,
+    WorkspaceExecutionOutput,
+    WorkspaceMergeInput,
+    WorkspaceMergeOutput,
+    WorkspaceRef,
+    workspace_execution_tool,
+    workspace_merge_tool,
+)
 
 __all__ = [
     "ArtifactFile",
@@ -51,6 +60,11 @@ __all__ = [
     "ToolPolicy",
     "ToolRegistry",
     "TypedTool",
+    "WorkspaceExecutionInput",
+    "WorkspaceExecutionOutput",
+    "WorkspaceMergeInput",
+    "WorkspaceMergeOutput",
+    "WorkspaceRef",
     "artifact_read_tool",
     "context_summary_tool",
     "model_schema_view",
@@ -58,4 +72,6 @@ __all__ = [
     "python_execution_tool",
     "resolve_pointer",
     "task_artifact_read_tool",
+    "workspace_execution_tool",
+    "workspace_merge_tool",
 ]

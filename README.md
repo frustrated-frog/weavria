@@ -16,6 +16,8 @@ Weavria 是一套实验性的 Python Agent Harness 与 Runtime，重点是让模
 
 可显式注册 `execute_python`，在一次性 Docker 工作区中运行 Python、消费已接受的 Artifact 并导出 UTF-8 结果文件。默认只读策略不授权计算；宿主须提供固定镜像和工具版本授权。隔离、错误反馈、资源与清理边界见[隔离代码执行的生命周期与验证](docs/隔离代码执行的生命周期与验证.md)。
 
+多步文件计算可使用 `execute_workspace_python` 显式选择已接受的工作区版本、保留未改文件并生成子版本；`merge_workspace` 支持直接兄弟版本的三方合并与冲突反馈。机制、容量及恢复边界见[工作区版本复用与冲突处理](docs/工作区版本复用与冲突处理.md)。
+
 ## 开发环境
 
 需要 Python 3.12+ 与 uv：

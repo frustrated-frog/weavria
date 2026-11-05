@@ -13,6 +13,7 @@ from .contracts import (
     validate_paths,
 )
 from .docker import DockerPythonSandbox
+from .workspace import WorkspaceMerge, WorkspaceSnapshot, advance_workspace, merge_workspaces
 
 __all__ = [
     "DockerPythonSandbox",
@@ -24,6 +25,10 @@ __all__ = [
     "SandboxRequest",
     "SandboxResult",
     "TextFile",
+    "WorkspaceMerge",
+    "WorkspaceSnapshot",
+    "advance_workspace",
+    "merge_workspaces",
     "validate_path",
     "validate_paths",
 ]
