@@ -27,6 +27,11 @@ finscope = [
   "tiktoken>=0.9,<1",
   "uvicorn>=0.34,<1",
 ]
+local-memory = [
+  "numpy>=2,<3",
+  "onnxruntime>=1.20,<2",
+  "tokenizers>=0.21,<1",
+]
 
 [dependency-groups]
 dev = [

@@ -390,6 +390,17 @@ class SessionContextCompiler:
                         else (),
                     )
             units = tuple(replacements)
+        # 只消费宿主报告里的相关度,不读取模型可编辑正文中的分数字段。
+        # 同一需求的语义特征共享键,防止重复记忆刷覆盖;完整事实组仍不可拆分。
+        relevance_features: dict[str, list[tuple[str, float]]] = {}
+        weights = {d.demand_id: d.weight for d in demands}
+        if supply is not None:
+            for hint in supply.report.relevance:
+                if hint.demand_id not in weights:
+                    raise ContextBuildError("source relevance belongs to an unknown demand")
+                relevance_features.setdefault(hint.bundle_id, []).append(
+                    (f"d:{hint.demand_id}:retrieved", weights[hint.demand_id] * hint.score)
+                )
         # bundle 的唯一可选表示是整组 raw:片段索引用来评分,不生成模型可见摘录。
         # 与历史/工具竞争同一预算时可以整体落选,不能只留下规则值而丢掉条件。
         units += tuple(
@@ -397,7 +408,13 @@ class SessionContextCompiler:
                 f"bundle:{bundle.bundle_id}",
                 digest(bundle.model_dump_json()),
                 "bundle",
-                (Representation("raw", bundle.model_dump_json(), scorer.features(parts)),),
+                (
+                    Representation(
+                        "raw",
+                        bundle.model_dump_json(),
+                        (*scorer.features(parts), *relevance_features.get(bundle.bundle_id, ())),
+                    ),
+                ),
             )
             for bundle, parts in zip(bundles, indexed_bundles, strict=True)
         )
@@ -480,6 +497,8 @@ class SessionContextCompiler:
             if policy_version == 3
             else "context-compiler/2",
         )
+        # ConversationView 的版本描述历史视图协议。可选来源的相关度策略
+        # 单独记录在供给报告与编译报告中,不能写入旧视图的封闭版本枚举。
         template = SessionRequest.model_construct(
             schema_version=10
             if self.config.summary_preparation
@@ -940,7 +959,12 @@ class SessionContextCompiler:
         )
         report = ContextCompilation(
             schema_version=report_version,
-            policy_version=f"context-compiler/{report_version}[{self.config.policy}]",
+            policy_version=f"context-compiler/{report_version}[{self.config.policy}]"
+            + (
+                "+source-relevance/1"
+                if supply is not None and supply.report.schema_version == 2
+                else ""
+            ),
             compaction_status=compaction_status,
             summaries=summaries.report(request.summaries) if summaries is not None else None,
             summary_advice=advice,

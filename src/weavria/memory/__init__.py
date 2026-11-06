@@ -65,7 +65,18 @@ from .formation import (
 from .generation import MemoryGenerationAttempt, MemoryGenerationReason, MemoryGenerationReport
 from .groups import MemoryGroup, MemoryGroupRecall
 from .interpretation_selection import InterpretationOption, select_interpretation
+from .onnx_encoder import OnnxE5MemoryEncoder
+from .snapshot import MemoryRetrievalSnapshot
 from .store import SQLiteMemoryStore
+from .task_retrieval import (
+    MemoryDemand,
+    MemoryEncoder,
+    MemoryEncodingError,
+    MemoryMatch,
+    MemoryRetrievalPolicy,
+    TaskMemoryRecall,
+    TaskMemoryRetriever,
+)
 
 __all__ = [
     "InterpretationOption",
@@ -86,7 +97,10 @@ __all__ = [
     "MemoryConditionResult",
     "MemoryConflictError",
     "MemoryCursor",
+    "MemoryDemand",
     "MemoryDocument",
+    "MemoryEncoder",
+    "MemoryEncodingError",
     "MemoryError",
     "MemoryEvent",
     "MemoryExtraction",
@@ -107,6 +121,7 @@ __all__ = [
     "MemoryInterpretationRound",
     "MemoryInterpretationSearch",
     "MemoryJudgment",
+    "MemoryMatch",
     "MemoryMeaningAssessment",
     "MemoryMeaningUnit",
     "MemoryModel",
@@ -117,6 +132,8 @@ __all__ = [
     "MemoryReceipt",
     "MemoryReconciliation",
     "MemoryResolution",
+    "MemoryRetrievalPolicy",
+    "MemoryRetrievalSnapshot",
     "MemoryReview",
     "MemoryScope",
     "MemorySetFragment",
@@ -125,7 +142,10 @@ __all__ = [
     "MemorySource",
     "MemoryStorageError",
     "MemoryVersion",
+    "OnnxE5MemoryEncoder",
     "SQLiteMemoryStore",
+    "TaskMemoryRecall",
+    "TaskMemoryRetriever",
     "compare_memory_conditions",
     "fact_key",
     "rewrite_fact_set",

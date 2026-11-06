@@ -18,7 +18,13 @@ from weavria.context import (
     SessionTokenCounter,
 )
 from weavria.core import ApplicationObservation, RecoveryLimits, SessionResult, TaskUpdate
-from weavria.memory import MemoryAccess, MemoryError, MemoryScope, SQLiteMemoryStore
+from weavria.memory import (
+    MemoryAccess,
+    MemoryError,
+    MemoryScope,
+    SQLiteMemoryStore,
+    TaskMemoryRetriever,
+)
 from weavria.models import ModelCallError, ModelProvider, SessionModelProvider
 from weavria.runtime import (
     CompletionPolicy,
@@ -90,6 +96,7 @@ class HarnessMemory:
     admission: ConservativeMemoryAdmission | None = None
     # 显式选择当前已知但生效起点未知的事实;不改变其时间字段或权威等级。
     include_unknown_time: bool = False
+    retrieval: TaskMemoryRetriever | None = None
 
     @classmethod
     def from_model(
@@ -108,6 +115,7 @@ class HarnessMemory:
         max_events: int = 512,
         max_recall_bytes: int = 8192,
         include_unknown_time: bool = False,
+        retrieval: TaskMemoryRetriever | None = None,
     ) -> Self:
         """一份配置成套构造提取、审阅、准入;增强语义与修复调用均显式选择。"""
         if profile not in {"basic", "fact_sets", "conditions"}:
@@ -142,6 +150,7 @@ class HarnessMemory:
             max_events=max_events,
             max_recall_bytes=max_recall_bytes,
             include_unknown_time=include_unknown_time,
+            retrieval=retrieval,
         )
 
     def __post_init__(self) -> None:
@@ -307,6 +316,7 @@ class AgentHarness:
                 max_events=memory.max_events,
                 max_recall_bytes=memory.max_recall_bytes,
                 include_unknown_time=memory.include_unknown_time,
+                retrieval=memory.retrieval,
             )
         return cls(
             path,
@@ -420,6 +430,7 @@ class AgentHarness:
                 scope=memory.scope,
                 max_bytes=memory.max_recall_bytes,
                 include_unknown_time=memory.include_unknown_time,
+                retriever=memory.retrieval,
             )
             if memory is not None and self._memory_store is not None
             else None

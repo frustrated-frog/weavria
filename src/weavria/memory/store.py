@@ -38,6 +38,7 @@ from .formation_storage import append_job, current_job
 from .groups import MemoryGroupRecall, pack_groups
 from .reducer import reduce_mutations
 from .retrieval import pack_recall, rank_versions
+from .snapshot import MemoryRetrievalSnapshot
 
 
 def _fingerprint(batch: MemoryBatch) -> str:
@@ -507,6 +508,16 @@ class SQLiteMemoryStore:
         assert isinstance(result, MemoryGroupRecall)
         return result
 
+    async def retrieval_snapshot(
+        self, access: MemoryAccess, query: MemoryQuery, *, deadline: datetime | None = None
+    ) -> MemoryRetrievalSnapshot:
+        """先完整过滤并固定候选;排序器在事务外工作,不持有数据库锁调用模型。"""
+        if not query.include_contested:
+            raise ValueError("retrieval snapshot cannot exclude contested facts")
+        result = await self._recall(access, query, grouped=True, deadline=deadline, snapshot=True)
+        assert isinstance(result, MemoryRetrievalSnapshot)
+        return result
+
     async def _recall(
         self,
         access: MemoryAccess,
@@ -514,12 +525,13 @@ class SQLiteMemoryStore:
         *,
         grouped: bool,
         deadline: datetime | None,
-    ) -> MemoryRecall | MemoryGroupRecall:
+        snapshot: bool = False,
+    ) -> MemoryRecall | MemoryGroupRecall | MemoryRetrievalSnapshot:
         query = MemoryQuery.model_validate_json(MemoryQuery.model_validate(query).model_dump_json())
         _grant(access, query.scope)
         scope = _scope_key(query.scope)
 
-        def recall() -> MemoryRecall | MemoryGroupRecall:
+        def recall() -> MemoryRecall | MemoryGroupRecall | MemoryRetrievalSnapshot:
             with self._transaction(write=False, deadline=deadline) as conn:
                 current_head = self._head(scope)
                 head = current_head if query.at_head is None else query.at_head
@@ -580,6 +592,13 @@ class SQLiteMemoryStore:
                     {s for hit in hits for s in hit.version.assertion.source_ids}
                 ):
                     raise MemoryStorageError("memory projection has missing evidence sources")
+                if snapshot:
+                    return MemoryRetrievalSnapshot(
+                        query=query,
+                        head=head,
+                        versions=tuple(sorted(versions, key=lambda v: v.assertion.memory_id)),
+                        sources=tuple(sources[key] for key in sorted(sources)),
+                    )
                 if grouped:
                     # 授权、时间过滤、来源加载与组闭包共享同一个读事务。
                     # 不在分页或逐条 top-k 后拼“完整组”,否则无法证明例外没有遗漏。

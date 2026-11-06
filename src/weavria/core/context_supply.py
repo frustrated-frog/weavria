@@ -1,8 +1,16 @@
 """Atomic low-trust context bundles and content-free source supply diagnostics."""
 
-from typing import Self
+from typing import Literal, Self
 
-from pydantic import Field, JsonValue, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    JsonValue,
+    SerializerFunctionWrapHandler,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 from ._schema import ContractModel, NonBlankString
 
@@ -14,8 +22,49 @@ class ContextBundle(ContractModel):
     content: dict[str, JsonValue]
 
 
-class ContextSupplyReport(ContractModel):
+class ContextRelevance(ContractModel):
+    """宿主来源提供的需求相关度,只能影响软分配,不能证明内容为真。"""
+
+    bundle_id: str = Field(min_length=1, max_length=256)
+    demand_id: str = Field(min_length=1, max_length=256)
+    score: float = Field(gt=0, le=1)
+
+
+class RetrievalDiagnostics(ContractModel):
+    mode: Literal["lexical", "dense", "hybrid", "lexical_fallback"]
+    fallback_reason: Literal["encoding_failure", "encoding_capacity"] | None = None
+    encoded_chunks: int = Field(ge=0)
+    cache_hits: int = Field(ge=0)
+    selection_steps: int = Field(ge=0)
+    search_exhausted: bool = False
+
+    @model_validator(mode="after")
+    def valid_fallback(self) -> Self:
+        if (self.mode == "lexical_fallback") != (self.fallback_reason is not None):
+            raise ValueError("retrieval fallback must carry its reason")
+        return self
+
+
+class ContextSupplyReport(BaseModel):
     """Bind a provider's bounded selection to task demands and its read snapshot."""
+
+    model_config = ContractModel.model_config
+    schema_version: Literal[1, 2] = 1
+    relevance: tuple[ContextRelevance, ...] = Field(default=(), max_length=3200)
+    retrieval: RetrievalDiagnostics | None = None
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def version_type(cls, value: object) -> object:
+        return ContractModel.validate_version_type(value)
+
+    @model_serializer(mode="wrap")
+    def legacy_wire(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        data = handler(self)
+        if self.schema_version == 1:
+            data.pop("relevance", None)
+            data.pop("retrieval", None)
+        return data
 
     provider_version: NonBlankString
     task_revision: int = Field(ge=1)
@@ -29,6 +78,13 @@ class ContextSupplyReport(ContractModel):
 
     @model_validator(mode="after")
     def validate_counts(self) -> Self:
+        if self.schema_version == 1 and (self.relevance or self.retrieval is not None):
+            raise ValueError("retrieval relevance requires source report v2")
+        if self.schema_version == 2 and self.retrieval is None:
+            raise ValueError("source report v2 requires retrieval diagnostics")
+        keys = [(r.bundle_id, r.demand_id) for r in self.relevance]
+        if len(keys) != len(set(keys)):
+            raise ValueError("source report repeats a relevance binding")
         if self.matched_groups != (
             self.supplied_groups + self.limit_omitted_groups + self.budget_omitted_groups
         ):
@@ -51,6 +107,10 @@ class ContextSupply(ContractModel):
             raise ValueError("source bundle identities must be unique")
         if self.report.supplied_groups != len(self.bundles):
             raise ValueError("source supply count differs from its bundles")
+        if any(
+            r.bundle_id not in {b.bundle_id for b in self.bundles} for r in self.report.relevance
+        ):
+            raise ValueError("source relevance refers to an absent bundle")
         wire = json.dumps([b.model_dump(mode="json") for b in self.bundles], sort_keys=True)
         if hashlib.sha256(wire.encode()).hexdigest() != self.report.supplied_sha256:
             raise ValueError("source supply digest differs from its bundles")

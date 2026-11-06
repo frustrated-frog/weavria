@@ -3,7 +3,13 @@
 from .actions import AgentAction, FinishAction, ToolCallAction, parse_action
 from .compaction import CompactedExcerpt, ContextCompaction
 from .context import ContextChoice, ContextCompilation, SessionContextCompiled
-from .context_supply import ContextBundle, ContextSupply, ContextSupplyReport
+from .context_supply import (
+    ContextBundle,
+    ContextRelevance,
+    ContextSupply,
+    ContextSupplyReport,
+    RetrievalDiagnostics,
+)
 from .control import (
     COMPLETION_GUIDANCE_JSON_BYTES,
     CONTROL_FEEDBACK_BYTES,
@@ -234,6 +240,7 @@ __all__ = [
     "ContextChoice",
     "ContextCompaction",
     "ContextCompilation",
+    "ContextRelevance",
     "ContextSelected",
     "ContextSummaryNode",
     "ContextSummaryView",
@@ -311,6 +318,7 @@ __all__ = [
     "RecoveryStatus",
     "ReplanNeed",
     "ReplanPrior",
+    "RetrievalDiagnostics",
     "RetrievedHistoryCandidate",
     "RunEnded",
     "RunError",
