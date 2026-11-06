@@ -201,7 +201,7 @@ async def test_recommended_entry_steering_invalidates_old_work_and_model_answer(
             assert view is not None
             payload = view.progress["working_state"]
             assert isinstance(payload, dict)
-            if payload.get("schema_version") == 2:
+            if payload.get("schema_version") == 3:
                 assert compact
                 assert payload["task_revision"] == 1 and payload["revision"] == 1
                 assert payload["notes"] == [

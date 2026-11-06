@@ -17,6 +17,7 @@ from weavria.runtime import CompletionContext
 from .outcomes import capability_outcome_scope, outcome_is_current
 from .requirements import EvidenceResolver, NeedLedger, NeedStatus, load_need_ledger
 from .understanding import TaskFrame, load_task_frame
+from .work import load_work
 
 _Identifier = Annotated[
     str,
@@ -65,7 +66,7 @@ class CandidateAnswerVerifier(Protocol):
 class TaskCompletionEvaluator:
     """Evaluate declared obligations without trusting model claims of completion."""
 
-    version = "task-obligations/12"
+    version = "task-obligations/13"
 
     def __init__(
         self,
@@ -120,6 +121,31 @@ class TaskCompletionEvaluator:
                 outcome="unverifiable",
                 reason_code="waiting_for_clarification",
             )
+        snapshot = context.semantic_snapshot
+        if snapshot is not None and snapshot.working_state is not None:
+            work = load_work(snapshot.working_state)
+            if work.task_revision != context.task.revision:
+                return CompletionEvaluation(
+                    disposition="cannot_proceed",
+                    verdicts=(),
+                    outcome="unverifiable",
+                    reason_code="working_state_stale",
+                )
+            # 只阻止活跃工作集里仍失效的结果,不把普通计划/假设强制变成完成义务。
+            # 模型可重验后重新绑定,也可明确退休不再使用的结果;二者都不是语义证明。
+            if work.has_stale_results:
+                return CompletionEvaluation(
+                    disposition="repair",
+                    verdicts=(),
+                    outcome="unverifiable",
+                    next_required_actions=(
+                        "Working results have stale dependencies. "
+                        "See working_state.dependency_issues; "
+                        "recheck parents before descendants and bind current note revisions, "
+                        "or retire obsolete results with propose_work. Keep independent notes.",
+                    ),
+                    reason_code="work_dependency_stale",
+                )
         if frame.specification.route == "direct":
             return CompletionEvaluation(
                 disposition="accept",
@@ -324,7 +350,11 @@ class TaskObligationCompletionPolicy:
             guidance = evaluation.next_required_actions[0]
             # 复用当前已提交诊断,不再次执行验收或向模型授权工具。完整条目在 Task
             # Model View 中保留,CompletionRepair 仍服从 Runtime 原有短反馈上限。
-            if context.semantic_state is not None and context.task_observation is not None:
+            if (
+                evaluation.reason_code != "work_dependency_stale"
+                and context.semantic_state is not None
+                and context.task_observation is not None
+            ):
                 ledger = load_need_ledger(context.semantic_state)
                 frame = load_task_frame(context.task_observation.payload)
                 required = {o.capability_name for o in frame.obligations if o.required}

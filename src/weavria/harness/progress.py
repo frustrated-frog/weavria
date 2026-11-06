@@ -18,12 +18,13 @@ from weavria.core import (
 from .outcomes import outcome_is_current
 from .requirements import EvidenceBinding, InformationRequirement, NeedLedger, NeedStatus
 from .understanding import TaskFrame
+from .work import WorkingState
 
 
 class NeedProgressEvaluator:
     """Compare accepted Need projections without pretending unknown sources are independent."""
 
-    version = "need-progress-assessment/5"
+    version = "need-progress-assessment/6"
 
     def assess(
         self,
@@ -37,8 +38,11 @@ class NeedProgressEvaluator:
         remaining_model_calls: int,
         remaining_tool_calls: int,
         capability_expanded: bool,
+        working_state: WorkingState | None = None,
     ) -> ProgressAssessment:
         self._validate_inputs(task_revision, frame, before, after, feedback)
+        if working_state is not None and working_state.task_revision != task_revision:
+            raise ValueError("working progress belongs to another task revision")
         feedback_ids = tuple(item.call_id for item in feedback.calls)
         batch_ids = set(feedback_ids)
         prior_records = tuple(
@@ -68,6 +72,7 @@ class NeedProgressEvaluator:
             information=information_signal,
             cost=cost_signal,
             capability_expanded=capability_expanded,
+            working_state=working_state,
         )
         positive = bool(
             obligation_signal.newly_satisfied_ids
@@ -330,7 +335,22 @@ def _continuation(
     information: InformationGainSignal,
     cost: ActionCostSignal,
     capability_expanded: bool,
+    working_state: WorkingState | None,
 ) -> ContinuationSignal:
+    # 资料齐全不能催促仍含失效结论的工作集收尾。此信号只改变下一步建议,
+    # 不增加 material_progress、不改写证据摘要,防止反复改笔记逃避停滞预算。
+    if working_state is not None and working_state.has_stale_results:
+        if cost.remaining_model_calls == 0 or cost.remaining_tool_calls == 0:
+            return ContinuationSignal(
+                feasibility="blocked",
+                recommended_action="stop",
+                reason_codes=("continuation_budget_exhausted",),
+            )
+        return ContinuationSignal(
+            feasibility="constrained",
+            recommended_action="replan",
+            reason_codes=("working_dependencies_stale",),
+        )
     if after.sources_exhausted:
         usable = any(
             binding.relation in {"supports", "partially_supports"} and binding.freshness != "stale"

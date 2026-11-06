@@ -61,13 +61,13 @@ def _continuation_observation(
 class TaskModelViewProjector:
     """Project accepted state without authorizing actions or manufacturing evidence."""
 
-    version = "task-model-view/10"
+    version = "task-model-view/12"
     working_records_version = 1
 
     def __init__(self, *, compact_work_summary: bool = False) -> None:
         self._compact_work_summary = compact_work_summary
         if compact_work_summary:
-            self.version = "task-model-view/11"
+            self.version = "task-model-view/13"
 
     def project(
         self,

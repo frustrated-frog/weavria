@@ -29,16 +29,40 @@ Text = Annotated[str, StringConstraints(min_length=1, max_length=240, pattern=r"
 Identity = Annotated[str, StringConstraints(min_length=1, max_length=128, pattern=r"\S")]
 
 
-class WorkContract(BaseModel):
+class _WorkBase(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True, validate_default=True)
-    schema_version: Literal[1] = 1
 
-    @field_validator("schema_version", mode="before")
+    @field_validator("schema_version", mode="before", check_fields=False)
     @classmethod
     def version_type(cls, value: object) -> object:
         if type(value) is not int:
             raise ValueError("work schema version must be an integer")
         return value
+
+
+class WorkContract(_WorkBase):
+    schema_version: Literal[1] = 1
+
+
+class _VersionedWork(_WorkBase):
+    # v1 文档继续按原协议读取;带依赖或版本元数据的记录必须显式写为 v2。
+    schema_version: Literal[1, 2] = 2
+
+
+class WorkDependency(WorkContract):
+    """绑定一次已接受的结论版本;不授予来源访问权,也不代表语义证明。"""
+
+    note_id: Identity
+    revision: int = Field(ge=0)
+
+
+class WorkDependencyIssue(WorkContract):
+    """每条直接边只归入一种原因;blocked_by 表示必须先重验的上游。"""
+
+    note_id: Identity
+    changed: tuple[Identity, ...] = Field(default=(), max_length=5)
+    missing: tuple[Identity, ...] = Field(default=(), max_length=5)
+    blocked_by: tuple[Identity, ...] = Field(default=(), max_length=5)
 
 
 class WorkReference(WorkContract):
@@ -56,15 +80,27 @@ class WorkReference(WorkContract):
         return self
 
 
-class WorkNote(WorkContract):
+class WorkNote(_VersionedWork):
     note_id: Identity
     kind: Literal["plan", "hypothesis", "result", "rejected", "issue"]
     summary: Text
     need_ids: tuple[Identity, ...] = Field(default=(), max_length=4)
     sources: tuple[WorkReference, ...] = Field(default=(), max_length=2)
+    depends_on: tuple[WorkDependency, ...] = Field(
+        default=(), max_length=5, exclude_if=lambda value: not value
+    )
+
+    @model_validator(mode="after")
+    def dependency_contract(self) -> Self:
+        parents = tuple(edge.note_id for edge in self.depends_on)
+        if len(set(parents)) != len(parents) or self.note_id in parents:
+            raise ValueError("work dependencies must be unique and cannot reference self")
+        if self.schema_version == 1 and self.depends_on:
+            raise ValueError("work dependencies require schema v2")
+        return self
 
 
-class WorkUpdate(WorkContract):
+class WorkUpdate(_VersionedWork):
     """全量替换有界工作集;原始工具事件保留全部旧版本,不靠无限追加维持状态。"""
 
     task_revision: int = Field(ge=1)
@@ -77,6 +113,11 @@ class WorkUpdate(WorkContract):
     def bounded(self) -> Self:
         if len({n.note_id for n in self.notes}) != len(self.notes):
             raise ValueError("work note IDs must be unique")
+        _dependency_order(self.notes)
+        if any(edge.revision > self.base_revision + 1 for n in self.notes for edge in n.depends_on):
+            raise ValueError("work dependencies cannot bind future revisions")
+        if self.schema_version == 1 and any(n.depends_on for n in self.notes):
+            raise ValueError("work dependencies require schema v2")
         if len(self.model_dump_json().encode()) > 4000:
             raise ValueError("work update exceeds 4000 UTF-8 bytes")
         return self
@@ -88,12 +129,18 @@ class WorkSource(WorkContract):
     source_label: str | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
-class WorkProposal(WorkContract):
+class WorkProposal(_VersionedWork):
     update: WorkUpdate
     sources: tuple[WorkSource, ...]
 
+    @model_validator(mode="after")
+    def version_contract(self) -> Self:
+        if self.schema_version == 1 and any(n.depends_on for n in self.update.notes):
+            raise ValueError("work dependencies require schema v2")
+        return self
 
-class WorkingState(WorkContract):
+
+class WorkingState(_VersionedWork):
     """可重建的工作投影。游标防止重复应用,CAS 防止同批更新相互覆盖。"""
 
     trust: Literal["model_inference"] = "model_inference"
@@ -105,13 +152,146 @@ class WorkingState(WorkContract):
     next_need_ids: tuple[Identity, ...] = Field(default=(), max_length=4)
     next_query: str = Field(default="", max_length=240)
     invalidated_note_ids: tuple[Identity, ...] = Field(default=(), max_length=6)
-    last_notice: Literal["empty", "accepted", "stale_revision", "unknown_need", "revised"] = "empty"
+    last_notice: Literal[
+        "empty", "accepted", "stale_revision", "unknown_need", "invalid_dependency", "revised"
+    ] = "empty"
+    note_revisions: dict[Identity, Annotated[int, Field(ge=0)]] = Field(
+        default_factory=dict, max_length=6, exclude_if=lambda value: not value
+    )
+    dependency_issues: tuple[WorkDependencyIssue, ...] = Field(
+        default=(), max_length=6, exclude_if=lambda value: not value
+    )
 
     @model_validator(mode="after")
     def bounded(self) -> Self:
+        _dependency_order(self.notes)
+        if self.schema_version == 1:
+            if (
+                self.note_revisions
+                or self.dependency_issues
+                or any(n.depends_on for n in self.notes)
+            ):
+                raise ValueError("working dependency state requires schema v2")
+        else:
+            # 旧的无依赖构造调用和 v1 迁移都可从工作集修订号建立初始版本。
+            # 含依赖的状态不能猜测版本,必须提供归约器计算的完整映射。
+            if not self.note_revisions and not any(n.depends_on for n in self.notes):
+                object.__setattr__(
+                    self, "note_revisions", {n.note_id: self.revision for n in self.notes}
+                )
+            if set(self.note_revisions) != {n.note_id for n in self.notes} or any(
+                version > self.revision for version in self.note_revisions.values()
+            ):
+                raise ValueError("working note revisions must cover exactly the current notes")
+            if any(
+                edge.revision > self.revision
+                or (
+                    edge.note_id in self.note_revisions
+                    and edge.revision > self.note_revisions[edge.note_id]
+                )
+                for note in self.notes
+                for edge in note.depends_on
+            ):
+                raise ValueError("work dependencies cannot bind future revisions")
+            if self.dependency_issues != _dependency_issues(self.notes, self.note_revisions):
+                raise ValueError("working dependency issues must match the versioned graph")
         if len(self.model_dump_json().encode()) > MAX_WORK_BYTES:
             raise ValueError("working state exceeds its fixed byte budget")
         return self
+
+    @property
+    def stale_note_ids(self) -> tuple[str, ...]:
+        return tuple(issue.note_id for issue in self.dependency_issues)
+
+    @property
+    def has_stale_results(self) -> bool:
+        """收尾和进度策略共享同一判断,计划或假设本身不增加交付义务。"""
+        stale = set(self.stale_note_ids)
+        return any(note.kind == "result" and note.note_id in stale for note in self.notes)
+
+    @property
+    def recheck_note_ids(self) -> tuple[str, ...]:
+        """只有上游存在且当前有效的失效笔记才能直接重验,不把后继自动恢复。"""
+        return tuple(
+            issue.note_id
+            for issue in self.dependency_issues
+            if not issue.missing and not issue.blocked_by
+        )
+
+
+def _dependency_order(notes: tuple[WorkNote, ...]) -> tuple[str, ...]:
+    """有界 DAG 的拓扑顺序;缺失父节点留给失效诊断,环则是非法提案。"""
+    by_id = {note.note_id: note for note in notes}
+    if len(by_id) != len(notes):
+        raise ValueError("work note IDs must be unique")
+    order: list[str] = []
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(identity: str) -> None:
+        if identity in visiting:
+            raise ValueError("work dependencies must be acyclic")
+        if identity in visited:
+            return
+        visiting.add(identity)
+        for edge in by_id[identity].depends_on:
+            if edge.note_id in by_id:
+                visit(edge.note_id)
+        visiting.remove(identity)
+        visited.add(identity)
+        order.append(identity)
+
+    for identity in by_id:
+        visit(identity)
+    return tuple(order)
+
+
+def _dependency_issues(
+    notes: tuple[WorkNote, ...], versions: dict[str, int]
+) -> tuple[WorkDependencyIssue, ...]:
+    by_id = {note.note_id: note for note in notes}
+    issues: dict[str, WorkDependencyIssue] = {}
+    for identity in _dependency_order(notes):
+        changed: list[str] = []
+        missing: list[str] = []
+        blocked: list[str] = []
+        for edge in by_id[identity].depends_on:
+            if edge.note_id not in by_id:
+                missing.append(edge.note_id)
+            elif edge.note_id in issues:
+                blocked.append(edge.note_id)
+            elif edge.revision != versions[edge.note_id]:
+                changed.append(edge.note_id)
+        if changed or missing or blocked:
+            issues[identity] = WorkDependencyIssue(
+                note_id=identity,
+                changed=tuple(changed),
+                missing=tuple(missing),
+                blocked_by=tuple(blocked),
+            )
+    # 序列化顺序由提交顺序决定,避免字典/遍历顺序影响快照与回放。
+    return tuple(issues[n.note_id] for n in notes if n.note_id in issues)
+
+
+def _note_content(note: WorkNote) -> dict[str, JsonValue]:
+    return note.model_dump(mode="json", exclude={"schema_version"})
+
+
+def _note_versions(state: WorkingState) -> dict[str, int]:
+    return state.note_revisions or {n.note_id: state.revision for n in state.notes}
+
+
+def _next_note_versions(state: WorkingState, notes: tuple[WorkNote, ...]) -> dict[str, int]:
+    previous = {n.note_id: n for n in state.notes}
+    versions = _note_versions(state)
+    # 整个笔记内容(含来源和依赖版本)不变才保留版本。删除再加入使用新版本,
+    # 因此 A→B→A 也不会让仍绑定第一次 A 的下游悄悄复活。
+    return {
+        n.note_id: versions[n.note_id]
+        if n.note_id in previous and _note_content(n) == _note_content(previous[n.note_id])
+        else state.revision + 1
+        for n in notes
+    }
 
 
 def compact_work(state: WorkingState) -> dict[str, JsonValue]:
@@ -130,8 +310,8 @@ def compact_work(state: WorkingState) -> dict[str, JsonValue]:
     labels = {source.reference: source.source_label for source in state.sources}
     compact: dict[str, JsonValue] = {
         **full,
-        "schema_version": 2,
-        "strategy": "stage-summary/1",
+        "schema_version": 3,
+        "strategy": "stage-summary/2",
         "state_sha256": hashlib.sha256(raw).hexdigest(),
         "notes": [
             {
@@ -161,7 +341,7 @@ def compact_work(state: WorkingState) -> dict[str, JsonValue]:
     return compact if len(encoded) + 64 <= len(raw) else full
 
 
-class WorkDraftNote(WorkContract):
+class WorkDraftNote(_VersionedWork):
     """模型负责内容与关联;省略编号时由内容摘要确定稳定编号。"""
 
     note_id: Identity | None = None
@@ -169,9 +349,21 @@ class WorkDraftNote(WorkContract):
     summary: Text
     need_ids: tuple[Identity, ...] = Field(default=(), max_length=4)
     sources: tuple[WorkReference, ...] = Field(default=(), max_length=2)
+    depends_on: tuple[WorkDependency, ...] = Field(
+        default=(), max_length=5, exclude_if=lambda value: not value
+    )
+
+    @model_validator(mode="after")
+    def dependency_contract(self) -> Self:
+        parents = tuple(edge.note_id for edge in self.depends_on)
+        if len(set(parents)) != len(parents) or self.note_id in parents:
+            raise ValueError("work dependencies must be unique and cannot reference self")
+        if self.schema_version == 1 and self.depends_on:
+            raise ValueError("work dependencies require schema v2")
+        return self
 
 
-class WorkDraft(WorkContract):
+class WorkDraft(_VersionedWork):
     """简化的输入协议;接受后仍持久化带明确版本的 WorkUpdate。"""
 
     task_revision: int | None = Field(default=None, ge=1)
@@ -198,6 +390,8 @@ def _bind_draft(draft: WorkDraft, context: ToolContext) -> WorkUpdate:
             ErrorCategory.INVALID_TOOL_ARGUMENTS,
             "Work revision requires a bound task view or explicit revisions",
         )
+    if draft.schema_version == 1 and any(n.depends_on for n in draft.notes):
+        raise ValueError("work dependencies require schema v2")
     notes = tuple(
         WorkNote(
             note_id=n.note_id
@@ -207,6 +401,7 @@ def _bind_draft(draft: WorkDraft, context: ToolContext) -> WorkUpdate:
             summary=n.summary,
             need_ids=n.need_ids,
             sources=n.sources,
+            depends_on=n.depends_on,
         )
         for n in draft.notes
     )
@@ -290,26 +485,39 @@ def work_tool() -> TypedTool[WorkDraft, WorkProposal]:
         # 这里只生成提议 Artifact,不写隐藏状态。Runtime 接受结果后才做归约;
         # 同批业务工具的新结果尚未接受,不能被工作提议提前引用。
         proposal = WorkProposal(update=update, sources=tuple(sources))
-        if len(proposal.model_dump_json().encode()) > MAX_WORK_BYTES - 512:
+        # 归约后的诊断有额外开销。按每条边的最长诊断键预留空间,确保工具
+        # 接受的提案不会在后续无 I/O 的状态归约阶段才撞上持久化字节上限。
+        overhead = {
+            "note_revisions": {n.note_id: update.base_revision + 1 for n in update.notes},
+            "dependency_issues": [
+                WorkDependencyIssue(
+                    note_id=n.note_id, blocked_by=tuple(e.note_id for e in n.depends_on)
+                ).model_dump(mode="json")
+                for n in update.notes
+                if n.depends_on
+            ],
+        }
+        reserve = len(json.dumps(overhead, ensure_ascii=False, separators=(",", ":")).encode())
+        if len(proposal.model_dump_json().encode()) + reserve > MAX_WORK_BYTES - 512:
             raise ToolFault(ErrorCategory.INVALID_TOOL_ARGUMENTS, "Work proposal is too large")
         return proposal
 
     return _WorkTool(
         name=WORK_TOOL,
-        version="4",
+        version="5",
         input_type=WorkDraft,
         output_type=WorkProposal,
         description=(
-            "Keep bounded multi-step notes: results with accepted artifact IDs/pointers, "
-            "open issues, plans, hypotheses or rejected attempts. Supply notes with kind, summary, "
-            "need_ids and sources (artifact_id/pointer; copy start/end from the exact text span "
-            "for a source label; omit the observation wrapper). The host binds omitted "
-            "revisions and note_id to the current proposal. "
-            "Replace the whole set; retain useful notes. Sourced results lower acquired needs' "
-            "exploration priority; issues and next_need_ids raise it. "
-            "Check working_state.last_notice "
-            "after this proposal. Notes are fallible summaries, never proof or private reasoning. "
-            "Skip unchanged notes. Honor requested working notes even for a short final answer."
+            "Replace up to six fallible working notes; retain useful notes. Sources use accepted "
+            "artifact_id/pointer without observation wrapper; copy exact start/end for text spans. "
+            "Omitted task/base revisions and note_id are host-bound. Stable note_id plus "
+            "depends_on [{note_id,revision}] binds conclusions to working_state.note_revisions. "
+            "New/changed notes get base_revision+1. Recheck conclusions before rebinding versions. "
+            "dependency_issues reports changed/missing parents and blocked_by stale parents; "
+            "recheck upstream first or retire obsolete notes. Stale results block final delivery. "
+            "Sourced results lower exploration priority; issues/next_need_ids raise it. "
+            "Check working_state.last_notice for acceptance. Notes are not proof or private "
+            "reasoning. Honor requested working notes even for short answers."
         ),
         execute=propose,
     )
@@ -327,6 +535,9 @@ def revise_work(state: WorkingState, before: TaskFrame, after: TaskFrame) -> Wor
             break
         unchanged = valid
     notes = tuple(n for n in state.notes if n.need_ids and set(n.need_ids) <= unchanged)
+    # 需求修订仍退休原来不适用的笔记;跨需求的结论边则保留并标记缺失依赖,
+    # 让模型知道为何需要局部重验,而不是把幸存的后继误当作独立结论。
+    versions = {n.note_id: _note_versions(state)[n.note_id] for n in notes}
     refs = {ref.model_dump_json() for n in notes for ref in n.sources}
     # 下一步意图是当前整体目标下的决定,即使局部笔记保留也必须重新提出。
     return WorkingState(
@@ -334,6 +545,8 @@ def revise_work(state: WorkingState, before: TaskFrame, after: TaskFrame) -> Wor
         revision=state.revision + 1,
         processed_records=state.processed_records,
         notes=notes,
+        note_revisions=versions,
+        dependency_issues=_dependency_issues(notes, versions),
         sources=tuple(s for s in state.sources if s.reference.model_dump_json() in refs),
         invalidated_note_ids=tuple(n.note_id for n in state.notes if n not in notes),
         last_notice="revised",
@@ -370,11 +583,23 @@ async def reduce_work(
         if not mentioned <= need_ids:
             state = state.model_copy(update={"last_notice": "unknown_need"})
             continue
+        versions = _next_note_versions(state, update.notes)
+        if any(
+            edge.note_id in versions and edge.revision > versions[edge.note_id]
+            for note in update.notes
+            for edge in note.depends_on
+        ):
+            # 不能预订尚未发生的父版本,否则未来更新可能让旧结论自动复活。
+            # 与 CAS 一样只拒绝该提案,保留先前提交的完整状态并推进处理游标。
+            state = state.model_copy(update={"last_notice": "invalid_dependency"})
+            continue
         state = WorkingState(
             task_revision=state.task_revision,
             revision=state.revision + 1,
             processed_records=state.processed_records,
             notes=update.notes,
+            note_revisions=versions,
+            dependency_issues=_dependency_issues(update.notes, versions),
             sources=proposal.sources,
             next_need_ids=update.next_need_ids,
             next_query=update.next_query,
@@ -418,7 +643,10 @@ def work_analysis_status(
             for address in binding.addresses
         ]
         notes = [note for note in state.notes if need.need_id in note.need_ids]
-        if any(note.kind in {"issue", "rejected"} for note in notes):
+        if any(
+            note.kind in {"issue", "rejected"} or note.note_id in state.stale_note_ids
+            for note in notes
+        ):
             result[need.need_id] = "open_question"
         elif any(
             note.kind == "result"
@@ -454,6 +682,9 @@ def work_need_weights(
             elif analysis == "open_question":
                 weights[need_id] = 2.0
     if state is not None:
+        for note in state.notes:
+            if note.note_id in state.stale_note_ids:
+                weights.update(dict.fromkeys(note.need_ids, 2.0))
         weights.update(dict.fromkeys(state.next_need_ids, 2.0))
     return weights
 

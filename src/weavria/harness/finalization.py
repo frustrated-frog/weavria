@@ -22,10 +22,11 @@ from .requirements import (
     load_need_ledger,
 )
 from .understanding import load_task_frame
+from .work import load_work
 
 
 class NeedFinalizationPolicy:
-    version = "need-finalization/6"
+    version = "need-finalization/7"
 
     def __init__(self, evidence: EvidenceResolver | None = None) -> None:
         self._evidence = evidence or EvidenceResolver()
@@ -37,6 +38,11 @@ class NeedFinalizationPolicy:
         request: ControlRequest | None,
         manifest: EvidenceDeliveryManifest | None,
     ) -> FinalizationAssessment:
+        snapshot = context.semantic_snapshot
+        if snapshot is not None and snapshot.working_state is not None:
+            work = load_work(snapshot.working_state)
+            if work.task_revision != context.task.revision or work.has_stale_results:
+                return FinalizationAssessment(False, "unavailable")
         observation = context.task_observation
         if observation is None:
             return FinalizationAssessment(False, "unavailable")

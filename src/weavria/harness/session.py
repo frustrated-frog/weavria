@@ -102,7 +102,7 @@ class TaskAwareSessionPreparer:
     @property
     def version(self) -> str:
         return (
-            f"task-aware-session/14[work={self._working_records};"
+            f"task-aware-session/15[work={self._working_records};"
             f"{self._outcomes.version if self._outcomes else 'no-outcomes'};"
             f"{self._understanding.version};{self._evidence.version};"
             f"{self._capabilities.version};{self._clarification.version};"
@@ -156,6 +156,11 @@ class TaskAwareSessionPreparer:
             remaining_tool_calls=context.remaining_tool_calls,
             capability_expanded=bool(
                 set(context.after.visible_tool_names) - set(context.before.visible_tool_names)
+            ),
+            working_state=(
+                load_work(context.after.working_state)
+                if context.after.working_state is not None
+                else None
             ),
         )
 

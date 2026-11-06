@@ -163,7 +163,14 @@ from .understanding import (
     load_task_frame_patch,
     reduce_frame_patch,
 )
-from .work import WorkingState, WorkNote, WorkReference, WorkUpdate
+from .work import (
+    WorkDependency,
+    WorkDependencyIssue,
+    WorkingState,
+    WorkNote,
+    WorkReference,
+    WorkUpdate,
+)
 from .working_set import AdaptiveCapabilityPolicy, CapabilityWorkingSet, CapabilityWorkingSetPolicy
 
 __all__ = [
@@ -305,6 +312,8 @@ __all__ = [
     "TaskUnderstandingInputAdmission",
     "TaskUnderstandingRecord",
     "TaskVersion",
+    "WorkDependency",
+    "WorkDependencyIssue",
     "WorkNote",
     "WorkReference",
     "WorkUpdate",

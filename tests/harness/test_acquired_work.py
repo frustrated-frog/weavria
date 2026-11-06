@@ -137,7 +137,7 @@ async def test_findings_and_open_questions_jointly_reallocate_tools_and_context(
     assert selected(state) == ("read_beta",)
     assert work_analysis_status(ledger, state)["beta"] == "analysis_pending"
     compressed = compact_work(state)
-    assert compressed["schema_version"] == 2
+    assert compressed["schema_version"] == 3
     assert compressed["sources"] == {
         source.artifact_id: {"call_id": source.call_id, "source_sha256": source.sha256}
     }
@@ -147,7 +147,7 @@ async def test_findings_and_open_questions_jointly_reallocate_tools_and_context(
         and note["sources"] == [{"artifact_id": source.artifact_id, "pointer": "/value"}]
         for note in compressed["notes"]
     )
-    assert compact_work(WorkingState(task_revision=1))["schema_version"] == 1
+    assert compact_work(WorkingState(task_revision=1))["schema_version"] == 2
 
     issue = WorkNote(
         note_id="alpha-gap",

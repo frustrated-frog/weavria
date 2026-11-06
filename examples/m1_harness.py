@@ -216,14 +216,14 @@ class LongTaskDelivery:
 
     def __init__(self, output: JsonOutputContract) -> None:
         self._output = output
-        self.version = f"long-task-delivery/3:{output.version}"
+        self.version = f"long-task-delivery/4:{output.version}"
 
     def can_finalize_committed(self, context: CompletionContext) -> bool:
         snapshot = context.semantic_snapshot
         if snapshot is None or snapshot.working_state is None:
             return False
         work = WorkingState.model_validate_json(json.dumps(snapshot.working_state))
-        if work.task_revision != context.task.revision:
+        if work.task_revision != context.task.revision or work.has_stale_results:
             return False
         # 归约后的 notes 与 sources 属于同一次更新; 被拒的工具提案不参与判定。
         resolved = tuple(source.reference for source in work.sources)

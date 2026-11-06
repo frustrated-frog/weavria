@@ -55,12 +55,46 @@ def project_context_focus(snapshot: SemanticSnapshot) -> ContextFocus:
                             note.summary
                             for note in (working.notes if working else ())
                             if requirement.need_id in note.need_ids
-                            and note.kind in {"issue", "rejected"}
+                            and (
+                                note.kind in {"issue", "rejected"}
+                                or (working is not None and note.note_id in working.stale_note_ids)
+                            )
                         ),
                     )
                 ),
                 weight=weight,
                 anchors=anchors,
+            )
+        )
+    if working is not None and working.dependency_issues and len(demands) < 128:
+        # 优先回取可直接重验的结论及其父节点资料。多层后继仍在工作视图中可见,
+        # 但不要求模型同时重算整条链;依赖边本身从不扩大 Artifact 访问权限。
+        ready = set(working.recheck_note_ids)
+        targets = ready | {
+            edge.note_id
+            for note in working.notes
+            if note.note_id in ready
+            for edge in note.depends_on
+        }
+        references = tuple(
+            ref for note in working.notes if note.note_id in targets for ref in note.sources
+        )
+        demands.append(
+            ContextDemand(
+                "working:recheck",
+                "Recheck revised conclusion dependencies: "
+                + " ".join(note.summary for note in working.notes if note.note_id in targets),
+                weight=4.0,
+                anchors=tuple(
+                    EvidenceAnchor(
+                        s.artifact.run_id,
+                        s.artifact.call_id,
+                        s.artifact.sha256,
+                        s.reference.pointer,
+                    )
+                    for s in working.sources
+                    if s.reference in references
+                ),
             )
         )
     if working is not None and working.next_query:
