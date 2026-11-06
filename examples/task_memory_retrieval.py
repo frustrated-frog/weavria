@@ -15,7 +15,7 @@ from typing import Literal, Self
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from weavria.context import ContextDemand
-from weavria.core import TaskInput
+from weavria.core import ContextRerankReport, TaskInput
 from weavria.harness import MemoryContextSource
 from weavria.memory import (
     MemoryAccess,
@@ -23,6 +23,7 @@ from weavria.memory import (
     MemoryBatch,
     MemoryGroup,
     MemoryMutation,
+    MemoryReranker,
     MemoryRetrievalPolicy,
     MemoryScope,
     MemorySource,
@@ -82,6 +83,7 @@ class Row(BaseModel):
     elapsed_ms: float
     encoded_chunks: int
     selection_steps: int
+    reranking: ContextRerankReport | None = None
 
 
 async def evaluate(
@@ -92,6 +94,7 @@ async def evaluate(
     encoder: OnnxE5MemoryEncoder,
     now: datetime,
     mode: Literal["legacy", "lexical", "dense", "hybrid"],
+    reranker: MemoryReranker | None = None,
 ) -> dict[str, object]:
     rows: list[Row] = []
     max_bytes = 16000
@@ -104,6 +107,7 @@ async def evaluate(
             else TaskMemoryRetriever(
                 encoder=encoder if mode != "lexical" else None,
                 policy=MemoryRetrievalPolicy(mode=mode, failure="raise"),
+                reranker=reranker,
             )
         )
         source = MemoryContextSource(
@@ -147,6 +151,7 @@ async def evaluate(
                 elapsed_ms=round(elapsed, 3),
                 encoded_chunks=diagnostics.encoded_chunks if diagnostics else 0,
                 selection_steps=diagnostics.selection_steps if diagnostics else 0,
+                reranking=supplied.report.reranking,
             )
         )
     return {
@@ -155,9 +160,13 @@ async def evaluate(
         if mode == "legacy"
         else repr(MemoryRetrievalPolicy(mode=mode, failure="raise")),
         "max_bytes": max_bytes,
-        "fact_recall": sum(r.recalled_count for r in rows) / sum(r.expected_count for r in rows),
+        "fact_recall": sum(r.recalled_count for r in rows) / sum(r.expected_count for r in rows)
+        if any(r.expected_count for r in rows)
+        else None,
         "demand_coverage": sum(r.covered_demands for r in rows)
-        / sum(r.positive_demands for r in rows),
+        / sum(r.positive_demands for r in rows)
+        if any(r.positive_demands for r in rows)
+        else None,
         "unrelated_facts": sum(r.unrelated_count for r in rows),
         "negative_abstentions": sum(r.negative and not r.selected for r in rows),
         "negative_cases": sum(r.negative for r in rows),

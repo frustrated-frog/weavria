@@ -13,6 +13,7 @@ from pydantic import (
 )
 
 from ._schema import ContractModel, NonBlankString
+from .context_rerank import ContextRerankReport
 
 
 class ContextBundle(ContractModel):
@@ -49,9 +50,10 @@ class ContextSupplyReport(BaseModel):
     """Bind a provider's bounded selection to task demands and its read snapshot."""
 
     model_config = ContractModel.model_config
-    schema_version: Literal[1, 2] = 1
+    schema_version: Literal[1, 2, 3] = 1
     relevance: tuple[ContextRelevance, ...] = Field(default=(), max_length=3200)
     retrieval: RetrievalDiagnostics | None = None
+    reranking: ContextRerankReport | None = None
 
     @field_validator("schema_version", mode="before")
     @classmethod
@@ -64,6 +66,8 @@ class ContextSupplyReport(BaseModel):
         if self.schema_version == 1:
             data.pop("relevance", None)
             data.pop("retrieval", None)
+        if self.schema_version < 3:
+            data.pop("reranking", None)
         return data
 
     provider_version: NonBlankString
@@ -80,13 +84,25 @@ class ContextSupplyReport(BaseModel):
     def validate_counts(self) -> Self:
         if self.schema_version == 1 and (self.relevance or self.retrieval is not None):
             raise ValueError("retrieval relevance requires source report v2")
-        if self.schema_version == 2 and self.retrieval is None:
+        if self.schema_version >= 2 and self.retrieval is None:
             raise ValueError("source report v2 requires retrieval diagnostics")
+        if (self.schema_version == 3) != (self.reranking is not None):
+            raise ValueError("reranking diagnostics require source report v3")
         keys = [(r.bundle_id, r.demand_id) for r in self.relevance]
         if len(keys) != len(set(keys)):
             raise ValueError("source report repeats a relevance binding")
+        rejected = 0
+        if self.reranking is not None:
+            r = self.reranking
+            rejected = r.rejected_groups + r.unassessed_groups
+            if self.matched_groups != r.candidate_groups:
+                raise ValueError("reranking candidates differ from source accounting")
+            by_demand = {d.demand_id: d.accepted for d in r.demands}
+            for did in {h.demand_id for h in self.relevance}:
+                if sum(h.demand_id == did for h in self.relevance) > by_demand.get(did, 0):
+                    raise ValueError("source relevance exceeds accepted rerank candidates")
         if self.matched_groups != (
-            self.supplied_groups + self.limit_omitted_groups + self.budget_omitted_groups
+            self.supplied_groups + self.limit_omitted_groups + self.budget_omitted_groups + rejected
         ):
             raise ValueError("source supply accounting is incomplete")
         return self

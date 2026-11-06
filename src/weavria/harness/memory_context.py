@@ -17,6 +17,7 @@ from weavria.memory import (
     MemoryEncodingError,
     MemoryGroupRecall,
     MemoryQuery,
+    MemoryRerankError,
     MemoryScope,
     MemoryStorageError,
     TaskMemoryRetriever,
@@ -103,7 +104,12 @@ class MemoryContextSource:
                 raise ContextSourceError("capacity") from exc
             except MemoryConflictError as exc:
                 raise ContextSourceError("invalid_snapshot") from exc
-            except (MemoryStorageError, MemoryEncodingError, TimeoutError) as exc:
+            except (
+                MemoryStorageError,
+                MemoryEncodingError,
+                MemoryRerankError,
+                TimeoutError,
+            ) as exc:
                 raise ContextSourceError("unavailable") from exc
         if not demands:
             raise ValueError("memory retrieval requires current task demands")

@@ -1,6 +1,7 @@
 """同一授权、双时间边界内的完整候选快照;不是 top-k 搜索结果。"""
 
 import hashlib
+import json
 from typing import Self
 
 from pydantic import Field, model_validator
@@ -47,3 +48,24 @@ class MemoryRetrievalSnapshot(MemoryModel):
 
     def digest(self) -> str:
         return hashlib.sha256(self.model_dump_json().encode()).hexdigest()
+
+    def population_digest(self) -> str:
+        """固定可见语料而非查询时钟;事实、来源、权限作用域变化均使校准失效。"""
+        return hashlib.sha256(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "scope": self.query.scope.model_dump(mode="json"),
+                    "versions": [
+                        v.model_dump(mode="json")
+                        for v in sorted(self.versions, key=lambda v: v.assertion.memory_id)
+                    ],
+                    "sources": [
+                        s.model_dump(mode="json")
+                        for s in sorted(self.sources, key=lambda s: s.source_id)
+                    ],
+                },
+                sort_keys=True,
+                ensure_ascii=False,
+            ).encode()
+        ).hexdigest()

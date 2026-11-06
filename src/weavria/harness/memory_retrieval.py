@@ -3,12 +3,14 @@
 import hashlib
 import json
 from collections.abc import Sequence
+from dataclasses import asdict
 from typing import Protocol, runtime_checkable
 
 from weavria.context import ContextDemand, history_query_digest
 from weavria.core import (
     ContextBundle,
     ContextRelevance,
+    ContextRerankReport,
     ContextSupply,
     ContextSupplyReport,
     RetrievalDiagnostics,
@@ -20,6 +22,7 @@ from weavria.memory import (
     MemoryGroup,
     MemoryMatch,
     MemoryQuery,
+    MemoryRerankAssessment,
     MemoryRetrievalSnapshot,
     TaskMemoryRetriever,
 )
@@ -77,13 +80,14 @@ async def retrieve_task_memory(
         omitted: int,
         budget: int,
         diagnostics: RetrievalDiagnostics,
+        reranking: MemoryRerankAssessment | None = None,
     ) -> ContextSupply:
         bundles = _bundles(snapshot, groups)
         wire = json.dumps([b.model_dump(mode="json") for b in bundles], sort_keys=True)
         return ContextSupply(
             bundles=bundles,
             report=ContextSupplyReport(
-                schema_version=2,
+                schema_version=3 if reranking is not None else 2,
                 provider_version=provider_version,
                 task_revision=task.revision,
                 demand_sha256=demand_digest,
@@ -100,6 +104,9 @@ async def retrieve_task_memory(
                     for m in matches
                 ),
                 retrieval=diagnostics,
+                reranking=ContextRerankReport.model_validate_json(json.dumps(asdict(reranking)))
+                if reranking is not None
+                else None,
             ),
         )
 
@@ -129,12 +136,35 @@ async def retrieve_task_memory(
             .encode()
         )
 
+    def measure_reranked(
+        groups: tuple[MemoryGroup, ...],
+        matches: tuple[MemoryMatch, ...],
+        report: MemoryRerankAssessment,
+    ) -> int:
+        # 评估在选择前完成,因此直接计入真实报告。两个省略计数平分剩余数,
+        # 获得十进制位数之和的上界,保持计数守恒而不低估最终诊断字节。
+        remaining = report.eligible_groups - len(groups)
+        return len(
+            supply(
+                groups,
+                matches,
+                matched=report.candidate_groups,
+                omitted=remaining // 2,
+                budget=remaining - remaining // 2,
+                diagnostics=reserve,
+                reranking=report,
+            )
+            .model_dump_json()
+            .encode()
+        )
+
     recalled = await retriever.retrieve(
         snapshot,
         tuple(MemoryDemand(d.demand_id, d.query, d.weight) for d in demands),
         limit=query.limit,
         max_bytes=query.max_bytes,
         measure=measure,
+        measure_reranked=measure_reranked,
     )
     result = supply(
         recalled.groups,
@@ -150,6 +180,7 @@ async def retrieve_task_memory(
             selection_steps=recalled.selection_steps,
             search_exhausted=recalled.search_exhausted,
         ),
+        reranking=recalled.reranking,
     )
     if len(result.model_dump_json().encode()) > query.max_bytes:
         raise ValueError("memory selection exceeded its complete supply measurement")

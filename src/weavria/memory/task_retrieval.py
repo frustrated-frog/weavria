@@ -11,6 +11,7 @@ from typing import Literal, Protocol
 
 from .contracts import MemoryCapacityError, MemoryError, MemoryHit
 from .groups import MemoryGroup, group_identity
+from .reranking import MemoryRerankAssessment, MemoryReranker, RerankCandidate
 from .retrieval import rank_versions
 from .snapshot import MemoryRetrievalSnapshot
 
@@ -117,6 +118,7 @@ class TaskMemoryRecall:
     cache_hits: int
     selection_steps: int
     search_exhausted: bool
+    reranking: MemoryRerankAssessment | None = None
 
 
 def _normalize(vectors: tuple[tuple[float, ...], ...], count: int) -> tuple[tuple[float, ...], ...]:
@@ -160,7 +162,11 @@ class TaskMemoryRetriever:
     """宿主拥有编码器生命周期;缓存有界且只加速重算,不承载授权或事实。"""
 
     def __init__(
-        self, *, encoder: MemoryEncoder | None = None, policy: MemoryRetrievalPolicy | None = None
+        self,
+        *,
+        encoder: MemoryEncoder | None = None,
+        policy: MemoryRetrievalPolicy | None = None,
+        reranker: MemoryReranker | None = None,
     ) -> None:
         self.policy = policy or MemoryRetrievalPolicy()
         if self.policy.mode != "lexical" and encoder is None:
@@ -169,7 +175,11 @@ class TaskMemoryRetriever:
         self._encoder_version = encoder.version if encoder else None
         self._lock = asyncio.Lock()
         self._cache: OrderedDict[tuple[str, str, str], tuple[float, ...]] = OrderedDict()
-        self.version = self.policy.version() + ":" + (encoder.version if encoder else "none")
+        self.candidate_version = (
+            self.policy.version() + ":" + (encoder.version if encoder else "none")
+        )
+        self.reranker = reranker
+        self.version = self.candidate_version + (":" + reranker.version if reranker else "")
 
     async def retrieve(
         self,
@@ -179,6 +189,10 @@ class TaskMemoryRetriever:
         limit: int,
         max_bytes: int,
         measure: Callable[[tuple[MemoryGroup, ...], tuple[MemoryMatch, ...]], int],
+        measure_reranked: Callable[
+            [tuple[MemoryGroup, ...], tuple[MemoryMatch, ...], MemoryRerankAssessment], int
+        ]
+        | None = None,
     ) -> TaskMemoryRecall:
         """measure 计量完整交付表示;排名不授权,失败不会发布部分候选。"""
         if not 1 <= len(demands) <= self.policy.max_demands or len(
@@ -187,11 +201,15 @@ class TaskMemoryRetriever:
             raise MemoryCapacityError("memory demand count or identities exceed contract")
         if not 1 <= limit <= 100 or max_bytes < 256:
             raise ValueError("invalid memory selection capacity")
+        if self.reranker is not None and measure_reranked is None:
+            raise ValueError("reranked retrieval requires complete assessment-aware measurement")
         # 在端口处重新验证,隔离外部可变模型对象。所有编码发生在此检查之后。
         snapshot = MemoryRetrievalSnapshot.model_validate_json(snapshot.model_dump_json())
         async with asyncio.timeout(self.policy.max_duration):
             async with self._lock:
-                return await self._retrieve(snapshot, demands, limit, max_bytes, measure)
+                return await self._retrieve(
+                    snapshot, demands, limit, max_bytes, measure, measure_reranked
+                )
 
     async def _retrieve(
         self,
@@ -200,6 +218,10 @@ class TaskMemoryRetriever:
         limit: int,
         max_bytes: int,
         measure: Callable[[tuple[MemoryGroup, ...], tuple[MemoryMatch, ...]], int],
+        measure_reranked: Callable[
+            [tuple[MemoryGroup, ...], tuple[MemoryMatch, ...], MemoryRerankAssessment], int
+        ]
+        | None,
     ) -> TaskMemoryRecall:
         policy = self.policy
         families: dict[str, list[MemoryHit]] = defaultdict(list)
@@ -271,6 +293,45 @@ class TaskMemoryRetriever:
         candidates = {m.group_id for m in matches}
         if len(candidates) > policy.max_candidates:
             raise MemoryCapacityError("memory candidate union exceeds capacity")
+        raw_count = len(candidates)
+        reranking = None
+        if self.reranker is not None:
+            assert measure_reranked is not None
+            queries = {d.demand_id: d.query for d in demands}
+            assessment = await self.reranker.assess(
+                groups,
+                tuple(
+                    RerankCandidate(m.group_id, m.demand_id, queries[m.demand_id], m.score)
+                    for m in matches
+                ),
+                demand_ids=tuple(queries),
+                # 词法回退改变了候选分布,不能继续套用原 Hybrid 的校准。
+                candidate_version=self.candidate_version
+                + ":actual="
+                + ("lexical_fallback" if fallback else mode)
+                + ":corpus="
+                + snapshot.population_digest(),
+            )
+            reranking = assessment.report
+            previous = {(m.demand_id, m.group_id): m for m in matches}
+            matches = []
+            for demand in demands:
+                ranked = sorted(
+                    (item for item in assessment.accepted if item[0] == demand.demand_id),
+                    key=lambda item: (-item[2], item[1]),
+                )
+                for rank, (did, gid, _) in enumerate(ranked, 1):
+                    old = previous[did, gid]
+                    matches.append(
+                        MemoryMatch(gid, did, 1 / rank, old.lexical_rank, old.dense_rank)
+                    )
+            candidates = {m.group_id for m in matches}
+            assessment_measure = measure_reranked
+
+            def measured(g: tuple[MemoryGroup, ...], m: tuple[MemoryMatch, ...]) -> int:
+                return assessment_measure(g, m, assessment.report)
+
+            measure = measured
         result = await self._select(groups, tuple(matches), demands, limit, max_bytes, measure)
         selected, steps, exhausted = result
         chosen = tuple(groups[gid] for gid in selected)
@@ -293,7 +354,7 @@ class TaskMemoryRetriever:
         return TaskMemoryRecall(
             chosen,
             chosen_matches,
-            len(candidates),
+            raw_count,
             len(remaining) - budget_omitted,
             budget_omitted,
             "lexical_fallback" if fallback else mode,
@@ -302,6 +363,7 @@ class TaskMemoryRetriever:
             hits,
             steps,
             exhausted,
+            reranking,
         )
 
     def _ranks(self, scores: dict[str, float]) -> dict[str, int]:

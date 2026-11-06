@@ -66,6 +66,15 @@ from .generation import MemoryGenerationAttempt, MemoryGenerationReason, MemoryG
 from .groups import MemoryGroup, MemoryGroupRecall
 from .interpretation_selection import InterpretationOption, select_interpretation
 from .onnx_encoder import OnnxE5MemoryEncoder
+from .onnx_reranker import OnnxMemoryPairScorer
+from .reranking import (
+    MemoryPairScorer,
+    MemoryRerankAssessment,
+    MemoryReranker,
+    MemoryRerankError,
+    MemoryRerankPolicy,
+    NullScoreCalibration,
+)
 from .snapshot import MemoryRetrievalSnapshot
 from .store import SQLiteMemoryStore
 from .task_retrieval import (
@@ -126,11 +135,16 @@ __all__ = [
     "MemoryMeaningUnit",
     "MemoryModel",
     "MemoryMutation",
+    "MemoryPairScorer",
     "MemoryProposition",
     "MemoryQuery",
     "MemoryRecall",
     "MemoryReceipt",
     "MemoryReconciliation",
+    "MemoryRerankAssessment",
+    "MemoryRerankError",
+    "MemoryRerankPolicy",
+    "MemoryReranker",
     "MemoryResolution",
     "MemoryRetrievalPolicy",
     "MemoryRetrievalSnapshot",
@@ -142,7 +156,9 @@ __all__ = [
     "MemorySource",
     "MemoryStorageError",
     "MemoryVersion",
+    "NullScoreCalibration",
     "OnnxE5MemoryEncoder",
+    "OnnxMemoryPairScorer",
     "SQLiteMemoryStore",
     "TaskMemoryRecall",
     "TaskMemoryRetriever",

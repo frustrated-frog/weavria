@@ -962,7 +962,7 @@ class SessionContextCompiler:
             policy_version=f"context-compiler/{report_version}[{self.config.policy}]"
             + (
                 "+source-relevance/1"
-                if supply is not None and supply.report.schema_version == 2
+                if supply is not None and supply.report.schema_version >= 2
                 else ""
             ),
             compaction_status=compaction_status,

@@ -9,7 +9,7 @@ from typing import Literal
 
 import pytest
 
-from weavria.memory import MemoryEncodingError, OnnxE5MemoryEncoder
+from weavria.memory import MemoryEncodingError, OnnxE5MemoryEncoder, OnnxMemoryPairScorer
 
 
 class Backend:
@@ -18,10 +18,12 @@ class Backend:
         self.entered, self.release, self.finished = (threading.Event() for _ in range(3))
         self.block = False
         self.long = False
+        self.scalar = False
 
-    def encode(self, text: str) -> SimpleNamespace:
-        self.texts.append(text)
-        return SimpleNamespace(ids=list(range(513)) if self.long else [0, 5, 2])
+    def encode(self, text: str, pair: str | None = None) -> SimpleNamespace:
+        self.texts.append(text if pair is None else text + "|" + pair)
+        ids = list(range(513)) if self.long else [0, 5, 2]
+        return SimpleNamespace(ids=ids, type_ids=[0] * len(ids))
 
     def run(self, output_names: object, input_feed: dict[str, list[list[int]]]) -> list[object]:
         self.entered.set()
@@ -29,6 +31,9 @@ class Backend:
             if self.block and not self.release.wait(5):
                 raise TimeoutError("fixture worker was not released")
             # 每 token 两维,掩码均值结果固定,便于检查 query/passage 协议。
+            if self.scalar:
+                scores = [[2.0] for _ in input_feed["input_ids"]]
+                return [SimpleNamespace(tolist=lambda: scores)]
             values = [[[1.0, 3.0] for _ in row] for row in input_feed["input_ids"]]
             return [SimpleNamespace(tolist=lambda: values)]
         finally:
@@ -77,8 +82,22 @@ def local_backend(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Back
     def load(name: str, package: str | None = None) -> object:
         return modules[name] if name in modules else original(name, package)
 
-    monkeypatch.setattr("weavria.memory.onnx_encoder.importlib.import_module", load)
+    monkeypatch.setattr("weavria.memory._local_onnx.importlib.import_module", load)
     return backend, model, tokenizer
+
+
+async def test_cross_encoder_uses_tokenizer_pair_and_withholds_overlong_group(
+    local_backend: tuple[Backend, Path, Path],
+) -> None:
+    backend, model, tokenizer = local_backend
+    backend.scalar = True
+    async with OnnxMemoryPairScorer(model, tokenizer) as scorer:
+        assert await scorer.score((("question", "all facts and exceptions"),)) == (2.0,)
+        assert backend.texts == ["question|all facts and exceptions"]
+        backend.long = True
+        backend.entered.clear()
+        assert await scorer.score((("question", "too many tokens"),)) == (None,)
+        assert not backend.entered.is_set()
 
 
 @pytest.mark.parametrize("role", ["query", "passage"])
