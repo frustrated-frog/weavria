@@ -104,8 +104,10 @@ from .outcomes import (
     CapabilityOutcomeResolver,
     CapabilityOutcomeVerifier,
     OutcomeRepairFeedbackProvider,
+    OutcomeRepairStrategyProvider,
 )
 from .progress import NeedProgressEvaluator
+from .repair_selection import RepairSelection, select_repair_issues
 from .requirements import (
     CompletionObligation,
     EvidenceAddress,
@@ -262,8 +264,10 @@ __all__ = [
     "OriginalRequestAnchor",
     "OutcomeRepairFeedbackProvider",
     "OutcomeRepairIssue",
+    "OutcomeRepairStrategyProvider",
     "ProposedTaskAction",
     "PublicCapabilityPolicy",
+    "RepairSelection",
     "RequirementCoverageAssessment",
     "RequirementCoverageError",
     "RequirementCoverageReport",
@@ -317,5 +321,6 @@ __all__ = [
     "load_task_frame",
     "load_task_frame_patch",
     "reduce_frame_patch",
+    "select_repair_issues",
     "task_specification_sha256",
 ]

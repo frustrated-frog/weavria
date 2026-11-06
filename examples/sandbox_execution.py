@@ -140,7 +140,7 @@ class VerifyStatistics:
 
 
 class VerifyWorkspace:
-    version = "source-workspace/1"
+    version = "source-workspace/2"
 
     def __init__(self, bundle: SourceBundle) -> None:
         self.expected = reference(bundle)
@@ -226,8 +226,9 @@ class VerifyWorkspace:
             statistics_ok = json.loads(current.get("statistics.json", "null")) == self.expected
         except ValueError:
             statistics_ok = False
+        issues: list[OutcomeRepairIssue] = []
         if not statistics_ok:
-            return (
+            issues.append(
                 issue(
                     "statistics_content",
                     "Statistics match the frozen sources",
@@ -236,10 +237,10 @@ class VerifyWorkspace:
                     "Recompute counts from frozen source text; "
                     "inspect AST node types and output ordering.",
                     "statistics.json",
-                ),
+                )
             )
         if not output.base:
-            return (
+            issues.append(
                 issue(
                     "report_stage",
                     "Report is added in a second workspace stage",
@@ -248,10 +249,10 @@ class VerifyWorkspace:
                     "Use this artifact and workspace revision as base to add report.txt; "
                     "base files are already mounted.",
                     "report.txt",
-                ),
+                )
             )
-        if not base or not base.workspace or output.base.revision != base.workspace.revision:
-            return (
+        elif not base or not base.workspace or output.base.revision != base.workspace.revision:
+            issues.append(
                 issue(
                     "workspace_parent",
                     "Parent version is an accepted workspace",
@@ -259,22 +260,24 @@ class VerifyWorkspace:
                     "Parent not found or revision mismatch",
                     "Inspect accepted workspace manifests and choose an existing matching parent.",
                     "base",
-                ),
-            )
-        prior = {f.path: f.text for f in base.workspace.files}
-        issues: list[OutcomeRepairIssue] = []
-        if "report.txt" in prior or current.get("statistics.json") != prior.get("statistics.json"):
-            issues.append(
-                issue(
-                    "statistics_preservation",
-                    "Second stage preserves the first stage",
-                    "Parent has statistics.json only; child retains identical statistics bytes",
-                    "Statistics rewritten or parent already contains report.txt",
-                    "Branch from the statistics-only version and export report.txt "
-                    "without rewriting statistics.json.",
-                    "statistics.json",
                 )
             )
+        else:
+            prior = {f.path: f.text for f in base.workspace.files}
+            if "report.txt" in prior or current.get("statistics.json") != prior.get(
+                "statistics.json"
+            ):
+                issues.append(
+                    issue(
+                        "statistics_preservation",
+                        "Second stage preserves the first stage",
+                        "Parent has statistics.json only; child retains identical statistics bytes",
+                        "Statistics rewritten or parent already contains report.txt",
+                        "Branch from the statistics-only version and export report.txt "
+                        "without rewriting statistics.json.",
+                        "statistics.json",
+                    )
+                )
         if current.get("report.txt") != self.report:
             issues.append(
                 issue(
@@ -287,7 +290,19 @@ class VerifyWorkspace:
                     "report.txt",
                 )
             )
-        return tuple(issues)
+        # 每次都从真实文件重新求未满足条件,不把上轮依赖图当成事实。统计正确是
+        # 建立报告阶段的前提;报告内容修复还应等父版本与保留约束恢复。这里给出
+        # 条件的逻辑依赖,不替模型生成代码、选择工具参数或宣布下游已经通过。
+        codes = {item.code for item in issues}
+        dependent: list[OutcomeRepairIssue] = []
+        for item in issues:
+            parents: set[str] = set()
+            if item.code == "report_content":
+                parents = codes - {item.code}
+            elif item.code != "statistics_content":
+                parents = codes & {"statistics_content"}
+            dependent.append(item.model_copy(update={"depends_on": tuple(sorted(parents))}))
+        return tuple(dependent)
 
 
 class VerifyWorkspaceOutcome:
@@ -313,13 +328,25 @@ class VerifyWorkspaceOutcome:
 class VerifyWorkspaceRepair(VerifyWorkspaceOutcome):
     """详细诊断策略与粗粒度基线共享同一验收谓词,只改变失败反馈。"""
 
-    version = "2-repair"
+    version = "3-repair"
     repair_feedback_bytes = 2048
+
+    def __init__(
+        self,
+        bundle: SourceBundle,
+        *,
+        repair_strategy: Literal["prefix", "dependency_frontier"] = "prefix",
+    ) -> None:
+        super().__init__(bundle)
+        self.repair_strategy = repair_strategy
 
     async def verify(self, context: CapabilityOutcomeContext) -> CapabilityOutcomeDecision:
         if context.task.goal != WORKSPACE_TASK or context.task.constraints:
             return CapabilityOutcomeDecision(status="unverifiable", reason_code="unsupported_task")
         issues = await self._check.diagnose(context)
+        # 两组使用相同的失败条件与验收谓词,只对比反馈选择机制。
+        if self.repair_strategy == "prefix":
+            issues = tuple(item.model_copy(update={"depends_on": ()}) for item in issues)
         return CapabilityOutcomeDecision(
             status="repair" if issues else "verified",
             reason_code="workspace_incomplete" if issues else "workspace_verified",
@@ -353,6 +380,7 @@ async def run_task(
     workspace: bool = False,
     manifest: bool = True,
     capabilities: Literal["static", "adaptive", "verified", "repair"] = "static",
+    repair_strategy: Literal["prefix", "dependency_frontier"] = "prefix",
     reasoning_model: ModelProvider | None = None,
     reasoning_counter: ModelRequestTokenCounter | None = None,
 ) -> dict[str, object]:
@@ -399,8 +427,10 @@ async def run_task(
     adaptive = capabilities != "static"
     if capabilities in {"verified", "repair"} and not workspace:
         raise ValueError("verified capability example requires workspace mode")
+    if repair_strategy != "prefix" and capabilities != "repair":
+        raise ValueError("dependency repair selection requires repair capability mode")
     config = HarnessConfig(
-        configuration_id=f"sandbox-source-statistics/2:{capabilities}",
+        configuration_id=f"sandbox-source-statistics/3:{capabilities}:{repair_strategy}",
         task_understanding=adaptive,
         context=ContextCompilerConfig(window_tokens=131072, output_tokens=counter.output_tokens),
         limits=RunLimits(
@@ -422,7 +452,7 @@ async def run_task(
             discovery_policy=RegisteredDiscovery(
                 tuple((d.name, d.version) for d in registry.descriptors)
             ),
-            outcome_verifiers=(VerifyWorkspaceRepair(bundle),)
+            outcome_verifiers=(VerifyWorkspaceRepair(bundle, repair_strategy=repair_strategy),)
             if capabilities == "repair"
             else (VerifyWorkspaceOutcome(bundle),)
             if capabilities == "verified"
@@ -506,8 +536,9 @@ async def run_task(
                         }
                     )
         return {
-            "schema_version": 4,
+            "schema_version": 5,
             "capabilities": capabilities,
+            "repair_strategy": repair_strategy,
             "capability_views": views,
             "request_catalogue_costs": measured_model.samples,
             "dataset_sha256": hashlib.sha256(bundle.model_dump_json().encode()).hexdigest(),
@@ -531,6 +562,9 @@ async def main() -> None:
     parser.add_argument("--workspace", action="store_true", help="Run the two-stage workspace task")
     parser.add_argument(
         "--capabilities", choices=("static", "adaptive", "verified", "repair"), default="static"
+    )
+    parser.add_argument(
+        "--repair-strategy", choices=("prefix", "dependency_frontier"), default="prefix"
     )
     args = parser.parse_args()
     bundle = dataset()
@@ -565,6 +599,7 @@ async def main() -> None:
                 workspace=args.workspace,
                 manifest=not args.full_workspace,
                 capabilities=args.capabilities,
+                repair_strategy=args.repair_strategy,
                 reasoning_model=OpenAICompatibleProvider(cfg, transport=transport),
                 reasoning_counter=model.token_counter(encoding="cl100k_base"),
             )

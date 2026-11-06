@@ -59,14 +59,15 @@ Path('/workspace/outputs/report.txt').write_text(report)
 
 
 @pytest.mark.parametrize(
-    ("manifest", "adaptive", "verified", "repair", "content_error"),
+    ("manifest", "adaptive", "verified", "repair", "content_error", "dependency"),
     (
-        (False, False, False, False, False),
-        (True, False, False, False, False),
-        (True, True, False, False, False),
-        (True, True, True, False, False),
-        (True, True, True, True, False),
-        (True, True, True, True, True),
+        (False, False, False, False, False, False),
+        (True, False, False, False, False, False),
+        (True, True, False, False, False, False),
+        (True, True, True, False, False, False),
+        (True, True, True, True, False, False),
+        (True, True, True, True, True, False),
+        (True, True, True, True, True, True),
     ),
 )
 async def test_workspace_failure_correction_and_sqlite_reopen(
@@ -77,6 +78,7 @@ async def test_workspace_failure_correction_and_sqlite_reopen(
     verified: bool,
     repair: bool,
     content_error: bool,
+    dependency: bool,
 ) -> None:
     backend = DockerPythonSandbox(image=os.environ["WEAVRIA_TEST_DOCKER_IMAGE"])
 
@@ -86,14 +88,28 @@ async def test_workspace_failure_correction_and_sqlite_reopen(
 
         async def generate_session(self, request: SessionRequest) -> ModelTurn:
             self.calls += 1
-            phase = self.calls - 1 if adaptive and self.calls > 3 else self.calls
+            # 依赖模式额外先生成一份错误统计,其后恢复相同的正常阶段。
+            # 这些程序是故障注入,只能证明反馈链路,不能证明模型自主纠错能力。
+            turn = self.calls - 1 if dependency and self.calls >= 3 else self.calls
+            if dependency and self.calls == 3:
+                view = request.current.task_model_view
+                assert view is not None
+                rows = view.progress["capability_outcomes"]
+                assert isinstance(rows, list) and isinstance(rows[0], dict)
+                feedback = rows[0]["feedback"]
+                assert isinstance(feedback, dict)
+                assert feedback["deferred_issues"] == 2
+                issues = feedback["issues"]
+                assert isinstance(issues, list) and len(issues) == 1
+                assert isinstance(issues[0], dict) and issues[0]["code"] == "statistics_content"
+            phase = turn - 1 if adaptive and turn > 3 else turn
             if isinstance(request.current.control, InterventionNotice):
                 # 义务只证明工具用过,先服从建议进入验收,由独立验收指出成果仍不完整。
                 return ModelTurn(decision=FinishAction(output="Check whether the files are ready."))
             if isinstance(request.current.control, CompletionNotice):
                 assert "workspace_incomplete" in request.current.control.decision.issue_codes
                 phase = 4
-            if repair and self.calls == 5:
+            if repair and turn == 5:
                 view = request.current.task_model_view
                 assert view is not None
                 assert ("report_content" if content_error else "execution_failed") in json.dumps(
@@ -107,11 +123,11 @@ async def test_workspace_failure_correction_and_sqlite_reopen(
             if adaptive:
                 assert '"name":"merge_workspace"' not in request.current.instructions
                 assert ('"name":"execute_workspace_python"' in request.current.instructions) == (
-                    not verified or self.calls < 6
+                    not verified or turn < 6
                 )
-                if self.calls > 1:
+                if turn > 1:
                     assert '"name":"read_source_bundle"' not in request.current.instructions
-                if self.calls > 3:
+                if turn > 3:
                     assert '"name":"read_workspace_file"' not in request.current.instructions
             if phase == 1:
                 call = ToolCallAction(call_id="read", tool_name="read_source_bundle", arguments={})
@@ -123,10 +139,14 @@ async def test_workspace_failure_correction_and_sqlite_reopen(
                 )
                 feedback = json.loads(read.model_dump_json())["observation"]["output"]
                 call = ToolCallAction(
-                    call_id="initial",
+                    call_id="initial_bad" if dependency and self.calls == 2 else "initial",
                     tool_name="execute_workspace_python",
                     arguments={
-                        "code": STATISTICS,
+                        "code": STATISTICS.replace(
+                            "sum(isinstance(n,ast.FunctionDef) for n in nodes)", "999"
+                        )
+                        if dependency and self.calls == 2
+                        else STATISTICS,
                         "outputs": ["statistics.json"],
                         "inputs": [
                             {
@@ -139,13 +159,27 @@ async def test_workspace_failure_correction_and_sqlite_reopen(
                     },
                 )
             elif phase in (3, 4):
-                initial = next(
-                    h
-                    for h in request.current.history
-                    if isinstance(h, ToolExchange) and h.action.call_id == "initial"
-                )
-                feedback = json.loads(initial.model_dump_json())["observation"]["output"]
-                if adaptive and self.calls == 3:
+                if adaptive and turn > 3:
+                    # 历史输出可以被折叠,已接受的读取调用仍含准确 base。测试不能
+                    # 假定较早的完整 manifest 永远驻留在模型上下文中。
+                    inspected = next(
+                        h
+                        for h in request.current.history
+                        if isinstance(h, ToolExchange) and h.action.call_id == "inspect"
+                    )
+                    base_ref = inspected.action.arguments["base"]
+                else:
+                    initial = next(
+                        h
+                        for h in request.current.history
+                        if isinstance(h, ToolExchange) and h.action.call_id == "initial"
+                    )
+                    feedback = json.loads(initial.model_dump_json())["observation"]["output"]
+                    base_ref = {
+                        "artifact_id": feedback["artifact_id"],
+                        "revision": feedback["data"]["workspace"]["revision"],
+                    }
+                if adaptive and turn == 3:
                     return ModelTurn(
                         decision=ToolBatch(
                             calls=(
@@ -153,10 +187,7 @@ async def test_workspace_failure_correction_and_sqlite_reopen(
                                     call_id="inspect",
                                     tool_name="read_workspace_file",
                                     arguments={
-                                        "base": {
-                                            "artifact_id": feedback["artifact_id"],
-                                            "revision": feedback["data"]["workspace"]["revision"],
-                                        },
+                                        "base": base_ref,
                                         "path": "statistics.json",
                                         "length": 1000,
                                     },
@@ -167,7 +198,7 @@ async def test_workspace_failure_correction_and_sqlite_reopen(
                 if phase == 4 and not content_error:
                     assert "NameError" in request.model_dump_json()
                 call = ToolCallAction(
-                    call_id=f"report{self.calls}",
+                    call_id=f"report{turn}",
                     tool_name="execute_workspace_python",
                     arguments={
                         "code": (
@@ -177,10 +208,7 @@ async def test_workspace_failure_correction_and_sqlite_reopen(
                         )
                         if phase == 3
                         else REPORT,
-                        "base": {
-                            "artifact_id": feedback["artifact_id"],
-                            "revision": feedback["data"]["workspace"]["revision"],
-                        },
+                        "base": base_ref,
                         "outputs": ["report.txt"],
                     },
                 )
@@ -225,6 +253,7 @@ async def test_workspace_failure_correction_and_sqlite_reopen(
         counter=session_counter,
         workspace=True,
         manifest=manifest,
+        repair_strategy="dependency_frontier" if dependency else "prefix",
         capabilities="repair"
         if repair
         else "verified"
@@ -237,18 +266,18 @@ async def test_workspace_failure_correction_and_sqlite_reopen(
     )
     if result["status"] != "completed":
         pytest.fail(json.dumps(result["diagnostics"], ensure_ascii=False))
-    assert model.calls == (6 if verified else 8 if adaptive else 5), (
+    assert model.calls == (6 if verified else 8 if adaptive else 5) + int(dependency), (
         model.calls,
         result["diagnostics"],
         result["capability_views"],
     )
     attempts = cast(list[dict[str, object]], result["code_attempts"])
-    assert [a["status"] for a in attempts] == [
+    assert [a["status"] for a in attempts] == (["completed"] if dependency else []) + [
         "completed",
         "completed" if content_error else "code_error",
         "completed",
     ]
-    assert (attempts[1]["workspace_revision"] is not None) == content_error
+    assert (attempts[1 + int(dependency)]["workspace_revision"] is not None) == content_error
     async with SQLiteSessionStore(path) as store:
         events = await store.events("source-statistics", limit=256)
         if verified:
@@ -269,6 +298,22 @@ async def test_workspace_failure_correction_and_sqlite_reopen(
                 for head in heads
                 if load_need_ledger(head.need_ledger).capability_outcomes
             )
+            if dependency:
+                # 持久化保留未显示的下游拓扑;最终验收后必须清空,不能只隐藏反馈。
+                repairs = [
+                    load_need_ledger(head.need_ledger).capability_outcomes[0]
+                    for head in heads
+                    if load_need_ledger(head.need_ledger).capability_outcomes
+                    and load_need_ledger(head.need_ledger).capability_outcomes[0].status == "repair"
+                ]
+                assert any(
+                    r.dependencies.get("report_content") == ("report_stage", "statistics_content")
+                    and [i.code for i in r.issues] == ["statistics_content"]
+                    for r in repairs
+                )
+                assert any([i.code for i in r.issues] == ["report_stage"] for r in repairs)
+                assert any([i.code for i in r.issues] == ["report_content"] for r in repairs)
+                assert outcomes[0].schema_version == 3 and not outcomes[0].dependencies
         versions: list[WorkspaceExecutionOutput] = []
         for event in events:
             if not isinstance(event.data, SessionRunEvent) or not isinstance(
@@ -285,6 +330,8 @@ async def test_workspace_failure_correction_and_sqlite_reopen(
             if manifest:
                 snapshot = await read_owned_attachment(snapshot, "/state", store.get)
             versions.append(WorkspaceExecutionOutput.model_validate_json(snapshot.content_json))
+        if dependency:
+            versions = versions[1:]
         first, failed, final = versions
         assert first.workspace and final.workspace
         assert (failed.workspace is not None) == content_error

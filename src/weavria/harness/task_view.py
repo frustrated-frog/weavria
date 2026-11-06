@@ -61,13 +61,13 @@ def _continuation_observation(
 class TaskModelViewProjector:
     """Project accepted state without authorizing actions or manufacturing evidence."""
 
-    version = "task-model-view/8"
+    version = "task-model-view/10"
     working_records_version = 1
 
     def __init__(self, *, compact_work_summary: bool = False) -> None:
         self._compact_work_summary = compact_work_summary
         if compact_work_summary:
-            self.version = "task-model-view/9"
+            self.version = "task-model-view/11"
 
     def project(
         self,
@@ -268,6 +268,14 @@ class TaskModelViewProjector:
                 "Locations identify inspected results; they do not grant access. "
                 "Choose a changed action from currently available tools; authorization and retry "
                 "limits still apply. Omitted issues remain unresolved."
+            )
+        if any(item.schema_version == 3 for item in ledger.capability_outcomes):
+            definition["repair_dependency_contract"] = (
+                "Dependency-aware feedback shows currently actionable unmet conditions. "
+                "deferred_issues counts conditions waiting on unmet prerequisites; "
+                "ready_issues includes actionable conditions omitted for budget. "
+                "Repairing a prerequisite requires revalidation; "
+                "it does not prove descendants solved."
             )
         if outcome_progress:
             progress_payload["capability_outcomes"] = outcome_progress

@@ -5,13 +5,14 @@ import hashlib
 import json
 import math
 from collections.abc import Awaitable, Callable
-from typing import Protocol, runtime_checkable
+from typing import Literal, Protocol, runtime_checkable
 
 from weavria.artifacts import ArtifactAccessError, ArtifactSnapshot, read_owned_attachment
 from weavria.core import ArtifactRef, TaskInput, ToolRecord, ToolSucceededObservation
 from weavria.tools import ToolRegistry
 
 from .outcome_contracts import CapabilityOutcome, CapabilityOutcomeDecision, OutcomeRepairIssue
+from .repair_selection import select_repair_issues
 from .understanding import TaskFrame
 
 
@@ -157,6 +158,14 @@ class OutcomeRepairFeedbackProvider(Protocol):
     def repair_feedback_bytes(self) -> int: ...
 
 
+@runtime_checkable
+class OutcomeRepairStrategyProvider(Protocol):
+    """可选的条件依赖选择;默认验收器继续使用有序前缀。"""
+
+    @property
+    def repair_strategy(self) -> Literal["prefix", "dependency_frontier"]: ...
+
+
 def _feedback_budget(verifier: CapabilityOutcomeVerifier) -> int:
     if not isinstance(verifier, OutcomeRepairFeedbackProvider):
         return 0
@@ -202,6 +211,18 @@ class CapabilityOutcomeResolver:
         self._verifiers = verifiers
         # 容量属于配置,不能随每轮验收动态改变,否则会破坏模型视图的预算承诺。
         self._feedback_budgets = {v.capability_name: _feedback_budget(v) for v in verifiers}
+        self._strategies = {
+            v.capability_name: v.repair_strategy
+            if isinstance(v, OutcomeRepairStrategyProvider)
+            else "prefix"
+            for v in verifiers
+        }
+        if any(
+            strategy not in {"prefix", "dependency_frontier"}
+            or (strategy == "dependency_frontier" and not self._feedback_budgets[name])
+            for name, strategy in self._strategies.items()
+        ):
+            raise ValueError("repair strategy requires a supported mode and declared capacity")
         self._duration = max_duration
         self._bytes = max_read_bytes
 
@@ -209,8 +230,8 @@ class CapabilityOutcomeResolver:
     def version(self) -> str:
         strategies = ",".join(f"{v.capability_name}:{v.key}@{v.version}" for v in self._verifiers)
         return (
-            f"capability-outcomes/2:{self._duration}:{self._bytes}[{strategies};"
-            f"feedback={self._feedback_budgets}]"
+            f"capability-outcomes/3:{self._duration}:{self._bytes}[{strategies};"
+            f"feedback={self._feedback_budgets};selection={self._strategies}]"
         )
 
     def pending(self, frame: TaskFrame, tools: ToolRegistry) -> tuple[CapabilityOutcome, ...]:
@@ -219,7 +240,11 @@ class CapabilityOutcomeResolver:
         descriptors = {item.name: item for item in tools.descriptors}
         return tuple(
             CapabilityOutcome(
-                schema_version=2 if self._feedback_budgets[verifier.capability_name] else 1,
+                schema_version=3
+                if self._strategies[verifier.capability_name] == "dependency_frontier"
+                else 2
+                if self._feedback_budgets[verifier.capability_name]
+                else 1,
                 repair_feedback_bytes=self._feedback_budgets[verifier.capability_name],
                 status="unverifiable",
                 reason_code="outcome_not_checked",
@@ -312,11 +337,21 @@ class CapabilityOutcomeResolver:
                 decision = CapabilityOutcomeDecision(
                     status="unverifiable", reason_code="outcome_feedback_unbound"
                 )
-            issues, omitted = _fit_issues(decision.issues, budget)
+            dependencies: dict[str, tuple[str, ...]] = {}
+            graph_mode = self._strategies[verifier.capability_name] == "dependency_frontier"
+            if graph_mode:
+                selection = select_repair_issues(decision.issues, budget)
+                issues, omitted = selection.issues, selection.omitted_issues
+                dependencies = selection.dependencies
+            else:
+                if any(issue.depends_on for issue in decision.issues):
+                    raise ValueError("verifier dependencies require dependency_frontier strategy")
+                issues, omitted = _fit_issues(decision.issues, budget)
             outcomes.append(
                 CapabilityOutcome(
                     **decision.model_dump(exclude={"issues"}),
-                    schema_version=2 if budget else 1,
+                    schema_version=3 if graph_mode else 2 if budget else 1,
+                    dependencies=dependencies,
                     repair_feedback_bytes=budget,
                     issues=issues,
                     omitted_issues=omitted,

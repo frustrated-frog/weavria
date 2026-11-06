@@ -427,10 +427,14 @@ async def test_owned_attachment_does_not_grant_direct_or_cross_producer_reads(
     assert outcomes[0].evidence == (parent.reference,)
 
 
-@pytest.mark.parametrize("detailed", (False, True))
+@pytest.mark.parametrize("detailed,dependency", ((False, False), (True, False), (True, True)))
 async def test_feedback_projection_reopens_on_steering_without_version_churn(
     detailed: bool,
+    dependency: bool,
 ) -> None:
+    class Dependencies(DetailedVerifier):
+        repair_strategy: Literal["dependency_frontier"] = "dependency_frontier"
+
     class Interpreter:
         version = "test/1"
 
@@ -442,7 +446,9 @@ async def test_feedback_projection_reopens_on_steering_without_version_churn(
     preparer = TaskAwareSessionPreparer(
         TaskUnderstandingEngine(Interpreter()),
         working_set=AdaptiveCapabilityPolicy(),
-        outcomes=CapabilityOutcomeResolver((DetailedVerifier() if detailed else Verifier(),)),
+        outcomes=CapabilityOutcomeResolver(
+            (Dependencies() if dependency else DetailedVerifier() if detailed else Verifier(),)
+        ),
     )
     prepared = await preparer.prepare(
         SessionTaskContext(
@@ -591,6 +597,7 @@ async def test_feedback_projection_reopens_on_steering_without_version_churn(
     pending = load_need_ledger(changed.need_ledger).capability_outcomes
     assert len(pending) == 1 and pending[0].reason_code == "outcome_not_checked"
     assert pending[0].status == "unverifiable" and not pending[0].evidence
+    assert not pending[0].dependencies
 
 
 @pytest.mark.parametrize("version", (5, 6))
@@ -749,3 +756,74 @@ def test_verified_outcome_cannot_carry_unresolved_issues() -> None:
                 ),
             ),
         )
+
+
+@pytest.mark.parametrize("unbound_child", (False, True))
+async def test_hidden_dependency_is_validated_and_verification_context_closed(
+    unbound_child: bool,
+) -> None:
+    store = InMemoryArtifactStore()
+    first = await recorded(store, 1, "first")
+    second = await recorded(store, 1, "second")
+    assert first.artifact and second.artifact
+
+    class Graph(DetailedVerifier):
+        repair_strategy: Literal["dependency_frontier"] = "dependency_frontier"
+
+        async def verify(self, context: CapabilityOutcomeContext) -> CapabilityOutcomeDecision:
+            assert first.artifact and second.artifact
+            self.contexts.append(context)
+            await context.read_artifact(first.artifact.artifact_id)
+            root = OutcomeRepairIssue(
+                code="root",
+                condition="Root",
+                expected="valid",
+                observed="invalid",
+                suggestion="Inspect root",
+                artifact_id=first.artifact.artifact_id,
+            )
+            return CapabilityOutcomeDecision(
+                status="repair",
+                reason_code="incomplete",
+                issues=(
+                    root,
+                    root.model_copy(
+                        update={
+                            "code": "child",
+                            "depends_on": ("root",) if unbound_child else ("missing",),
+                            "artifact_id": second.artifact.artifact_id
+                            if unbound_child
+                            else first.artifact.artifact_id,
+                        }
+                    ),
+                ),
+            )
+
+    async def read(identity: str) -> ArtifactSnapshot:
+        return await store.get("run", identity)
+
+    verifier = Graph()
+    resolver = CapabilityOutcomeResolver((verifier,))
+    pending = resolver.pending(frame(), registry())[0]
+    assert pending.schema_version == 3 and not pending.dependencies
+    call = resolver.resolve(
+        task=TASK, frame=frame(), tools=registry(), records=(first, second), read_artifact=read
+    )
+    if unbound_child:
+        # 子条件不进模型反馈也必须检查引用,不能用拓扑隐藏未经检查的来源。
+        result = (await call)[0]
+        assert result.status == "unverifiable" and result.reason_code == "outcome_feedback_unbound"
+        assert not result.issues and not result.dependencies
+    else:
+        with pytest.raises(ValueError, match="missing condition"):
+            await call
+    with pytest.raises(ArtifactAccessError, match="closed"):
+        await verifier.contexts[-1].read_artifact(first.artifact.artifact_id)
+
+
+def test_dependency_strategy_requires_capacity_at_construction() -> None:
+    class MissingCapacity(Verifier):
+        repair_strategy: Literal["dependency_frontier"] = "dependency_frontier"
+
+    with pytest.raises(ValueError, match="declared capacity"):
+        CapabilityOutcomeResolver((MissingCapacity(),))
