@@ -316,14 +316,38 @@ class TaskObligationCompletionPolicy:
 
     @property
     def version(self) -> str:
-        return f"task-obligation-completion/6[{self._evaluator.version}]"
+        return f"task-obligation-completion/7[{self._evaluator.version}]"
 
     async def verify(self, context: CompletionContext) -> CompletionDecision:
         evaluation = await self._evaluator.evaluate(context)
         if evaluation.disposition == "repair":
+            guidance = evaluation.next_required_actions[0]
+            # 复用当前已提交诊断,不再次执行验收或向模型授权工具。完整条目在 Task
+            # Model View 中保留,CompletionRepair 仍服从 Runtime 原有短反馈上限。
+            if context.semantic_state is not None and context.task_observation is not None:
+                ledger = load_need_ledger(context.semantic_state)
+                frame = load_task_frame(context.task_observation.payload)
+                required = {o.capability_name for o in frame.obligations if o.required}
+                for outcome in ledger.capability_outcomes:
+                    if (
+                        outcome.status == "repair"
+                        and outcome.capability_name in required
+                        and outcome.scope_sha256 == capability_outcome_scope(frame)
+                        and (
+                            not outcome.evidence
+                            or outcome_is_current(outcome, frame, context.records)
+                        )
+                        and outcome.issues
+                    ):
+                        issue = outcome.issues[0]
+                        guidance = (
+                            f"Condition {issue.code}: {issue.suggestion} "
+                            "See capability_outcomes.feedback for checked evidence and details."
+                        )
+                        break
             return CompletionRepair(
                 issue_codes=(evaluation.reason_code,),
-                guidance=fit_completion_guidance(evaluation.next_required_actions[0]),
+                guidance=fit_completion_guidance(guidance),
             )
         if evaluation.outcome == "unverifiable":
             return CompletionUnverifiable(reason=evaluation.reason_code)

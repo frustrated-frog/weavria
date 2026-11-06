@@ -34,6 +34,7 @@ from weavria.harness import (
     CapabilityOutcomeDecision,
     HarnessConfig,
     HarnessEvidence,
+    OutcomeRepairIssue,
 )
 from weavria.models import (
     ModelProvider,
@@ -158,7 +159,22 @@ class VerifyWorkspace:
 
     async def is_complete(self, context: CompletionContext | CapabilityOutcomeContext) -> bool:
         """反馈验收与最终交付使用同一内容/父版本判断,避免两处标准逐渐分歧。"""
+        return not await self.diagnose(context)
+
+    async def diagnose(
+        self, context: CompletionContext | CapabilityOutcomeContext
+    ) -> tuple[OutcomeRepairIssue, ...]:
+        """从真实内容检查条件,返回最近候选的缺口;任一有效不可变交付仍可通过。"""
         accepted: dict[str, WorkspaceExecutionOutput] = {}
+        issues = (
+            OutcomeRepairIssue(
+                code="workspace_missing",
+                condition="A workspace result exists",
+                expected="Accepted execution with exported statistics.json",
+                observed="No workspace result",
+                suggestion="Read the source bundle and compute the statistics in a workspace.",
+            ),
+        )
         for record in context.records:
             if (
                 record.exchange.action.tool_name != "execute_workspace_python"
@@ -168,26 +184,110 @@ class VerifyWorkspace:
             snapshot = await load_workspace_artifact(record.artifact.artifact_id, context)
             output = WorkspaceExecutionOutput.model_validate_json(snapshot.content_json)
             accepted[record.artifact.artifact_id] = output
-            if not output.workspace or not output.base:
-                continue
-            base = accepted.get(output.base.artifact_id)
-            if not base or not base.workspace:
-                continue
-            prior = {f.path: f.text for f in base.workspace.files}
-            current = {f.path: f.text for f in output.workspace.files}
-            try:
-                valid = (
-                    output.base.revision == base.workspace.revision
-                    and "report.txt" not in prior
-                    and current.get("statistics.json") == prior.get("statistics.json")
-                    and json.loads(current.get("statistics.json", "null")) == self.expected
-                    and current.get("report.txt") == self.report
+            base = accepted.get(output.base.artifact_id) if output.base else None
+            issues = self._conditions(output, base, record.artifact.artifact_id)
+            if not issues:
+                return ()
+        return issues
+
+    def _conditions(
+        self,
+        output: WorkspaceExecutionOutput,
+        base: WorkspaceExecutionOutput | None,
+        artifact_id: str,
+    ) -> tuple[OutcomeRepairIssue, ...]:
+        def issue(
+            code: str, condition: str, expected: str, observed: str, suggestion: str, location: str
+        ) -> OutcomeRepairIssue:
+            return OutcomeRepairIssue(
+                code=code,
+                condition=condition,
+                expected=expected,
+                observed=observed,
+                suggestion=suggestion,
+                artifact_id=artifact_id,
+                location=location,
+            )
+
+        if not output.workspace:
+            return (
+                issue(
+                    "execution_failed",
+                    "Execution publishes a workspace",
+                    "completed",
+                    output.computation.execution.status,
+                    "Inspect the execution error and correct the code; "
+                    "reuse the last valid workspace base.",
+                    "execution",
+                ),
+            )
+        current = {f.path: f.text for f in output.workspace.files}
+        try:
+            statistics_ok = json.loads(current.get("statistics.json", "null")) == self.expected
+        except ValueError:
+            statistics_ok = False
+        if not statistics_ok:
+            return (
+                issue(
+                    "statistics_content",
+                    "Statistics match the frozen sources",
+                    "Sorted per-file AST counts, including nested definitions and methods",
+                    "Missing, invalid JSON, or counts differ from independent AST computation",
+                    "Recompute counts from frozen source text; "
+                    "inspect AST node types and output ordering.",
+                    "statistics.json",
+                ),
+            )
+        if not output.base:
+            return (
+                issue(
+                    "report_stage",
+                    "Report is added in a second workspace stage",
+                    "A child workspace based on the statistics version",
+                    "No workspace base",
+                    "Use this artifact and workspace revision as base to add report.txt; "
+                    "base files are already mounted.",
+                    "report.txt",
+                ),
+            )
+        if not base or not base.workspace or output.base.revision != base.workspace.revision:
+            return (
+                issue(
+                    "workspace_parent",
+                    "Parent version is an accepted workspace",
+                    "Exact parent artifact_id and revision",
+                    "Parent not found or revision mismatch",
+                    "Inspect accepted workspace manifests and choose an existing matching parent.",
+                    "base",
+                ),
+            )
+        prior = {f.path: f.text for f in base.workspace.files}
+        issues: list[OutcomeRepairIssue] = []
+        if "report.txt" in prior or current.get("statistics.json") != prior.get("statistics.json"):
+            issues.append(
+                issue(
+                    "statistics_preservation",
+                    "Second stage preserves the first stage",
+                    "Parent has statistics.json only; child retains identical statistics bytes",
+                    "Statistics rewritten or parent already contains report.txt",
+                    "Branch from the statistics-only version and export report.txt "
+                    "without rewriting statistics.json.",
+                    "statistics.json",
                 )
-            except ValueError:
-                valid = False
-            if valid:
-                return True
-        return False
+            )
+        if current.get("report.txt") != self.report:
+            issues.append(
+                issue(
+                    "report_content",
+                    "Report matches statistics",
+                    "Three ordered newline-terminated totals: functions, async_functions, classes",
+                    "report.txt missing or differs from the statistics sums/format",
+                    "Read statistics.json from the base, sum each requested column, "
+                    "and write exactly three lines.",
+                    "report.txt",
+                )
+            )
+        return tuple(issues)
 
 
 class VerifyWorkspaceOutcome:
@@ -207,6 +307,23 @@ class VerifyWorkspaceOutcome:
         return CapabilityOutcomeDecision(
             status="verified" if valid else "repair",
             reason_code="workspace_verified" if valid else "workspace_incomplete",
+        )
+
+
+class VerifyWorkspaceRepair(VerifyWorkspaceOutcome):
+    """详细诊断策略与粗粒度基线共享同一验收谓词,只改变失败反馈。"""
+
+    version = "2-repair"
+    repair_feedback_bytes = 2048
+
+    async def verify(self, context: CapabilityOutcomeContext) -> CapabilityOutcomeDecision:
+        if context.task.goal != WORKSPACE_TASK or context.task.constraints:
+            return CapabilityOutcomeDecision(status="unverifiable", reason_code="unsupported_task")
+        issues = await self._check.diagnose(context)
+        return CapabilityOutcomeDecision(
+            status="repair" if issues else "verified",
+            reason_code="workspace_incomplete" if issues else "workspace_verified",
+            issues=issues,
         )
 
 
@@ -235,7 +352,7 @@ async def run_task(
     counter: SessionTokenCounter,
     workspace: bool = False,
     manifest: bool = True,
-    capabilities: Literal["static", "adaptive", "verified"] = "static",
+    capabilities: Literal["static", "adaptive", "verified", "repair"] = "static",
     reasoning_model: ModelProvider | None = None,
     reasoning_counter: ModelRequestTokenCounter | None = None,
 ) -> dict[str, object]:
@@ -280,7 +397,7 @@ async def run_task(
         "/workspace/inputs/sources.json. Export statistics.json. "
     )
     adaptive = capabilities != "static"
-    if capabilities == "verified" and not workspace:
+    if capabilities in {"verified", "repair"} and not workspace:
         raise ValueError("verified capability example requires workspace mode")
     config = HarnessConfig(
         configuration_id=f"sandbox-source-statistics/2:{capabilities}",
@@ -305,7 +422,9 @@ async def run_task(
             discovery_policy=RegisteredDiscovery(
                 tuple((d.name, d.version) for d in registry.descriptors)
             ),
-            outcome_verifiers=(VerifyWorkspaceOutcome(bundle),)
+            outcome_verifiers=(VerifyWorkspaceRepair(bundle),)
+            if capabilities == "repair"
+            else (VerifyWorkspaceOutcome(bundle),)
             if capabilities == "verified"
             else (),
         )
@@ -411,7 +530,7 @@ async def main() -> None:
     parser.add_argument("--output", type=Path)
     parser.add_argument("--workspace", action="store_true", help="Run the two-stage workspace task")
     parser.add_argument(
-        "--capabilities", choices=("static", "adaptive", "verified"), default="static"
+        "--capabilities", choices=("static", "adaptive", "verified", "repair"), default="static"
     )
     args = parser.parse_args()
     bundle = dataset()

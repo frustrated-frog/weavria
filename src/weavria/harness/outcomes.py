@@ -5,13 +5,13 @@ import hashlib
 import json
 import math
 from collections.abc import Awaitable, Callable
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from weavria.artifacts import ArtifactAccessError, ArtifactSnapshot, read_owned_attachment
 from weavria.core import ArtifactRef, TaskInput, ToolRecord, ToolSucceededObservation
 from weavria.tools import ToolRegistry
 
-from .outcome_contracts import CapabilityOutcome, CapabilityOutcomeDecision
+from .outcome_contracts import CapabilityOutcome, CapabilityOutcomeDecision, OutcomeRepairIssue
 from .understanding import TaskFrame
 
 
@@ -149,6 +149,39 @@ class CapabilityOutcomeVerifier(Protocol):
     async def verify(self, context: CapabilityOutcomeContext) -> CapabilityOutcomeDecision: ...
 
 
+@runtime_checkable
+class OutcomeRepairFeedbackProvider(Protocol):
+    """可选扩展:在任务开始前声明详细诊断容量,旧验收器不承担该开销。"""
+
+    @property
+    def repair_feedback_bytes(self) -> int: ...
+
+
+def _feedback_budget(verifier: CapabilityOutcomeVerifier) -> int:
+    if not isinstance(verifier, OutcomeRepairFeedbackProvider):
+        return 0
+    budget = verifier.repair_feedback_bytes
+    if type(budget) is not int or not 256 <= budget <= 8192:
+        raise ValueError("repair feedback capacity must be in [256, 8192]")
+    return budget
+
+
+def _fit_issues(
+    issues: tuple[OutcomeRepairIssue, ...], budget: int
+) -> tuple[tuple[OutcomeRepairIssue, ...], int]:
+    """保持验收器的优先次序和条目完整性;超预算不改变 repair 的语义。"""
+    retained: list[OutcomeRepairIssue] = []
+    for issue in issues:
+        payload = {
+            "issues": [item.model_dump(mode="json") for item in (*retained, issue)],
+            "omitted_issues": len(issues) - len(retained) - 1,
+        }
+        if len(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()) > budget:
+            break
+        retained.append(issue)
+    return tuple(retained), len(issues) - len(retained)
+
+
 class CapabilityOutcomeResolver:
     """顺序、限时重新验收;不缓存旧 verified,取消继续传播给父 Run。"""
 
@@ -167,13 +200,18 @@ class CapabilityOutcomeResolver:
         if type(max_read_bytes) is not int or max_read_bytes < 1:
             raise ValueError("outcome byte budget must be positive")
         self._verifiers = verifiers
+        # 容量属于配置,不能随每轮验收动态改变,否则会破坏模型视图的预算承诺。
+        self._feedback_budgets = {v.capability_name: _feedback_budget(v) for v in verifiers}
         self._duration = max_duration
         self._bytes = max_read_bytes
 
     @property
     def version(self) -> str:
         strategies = ",".join(f"{v.capability_name}:{v.key}@{v.version}" for v in self._verifiers)
-        return f"capability-outcomes/1:{self._duration}:{self._bytes}[{strategies}]"
+        return (
+            f"capability-outcomes/2:{self._duration}:{self._bytes}[{strategies};"
+            f"feedback={self._feedback_budgets}]"
+        )
 
     def pending(self, frame: TaskFrame, tools: ToolRegistry) -> tuple[CapabilityOutcome, ...]:
         """任务开始就声明有界验收槽位;未读取成果,不得继承旧任务的 verified。"""
@@ -181,6 +219,8 @@ class CapabilityOutcomeResolver:
         descriptors = {item.name: item for item in tools.descriptors}
         return tuple(
             CapabilityOutcome(
+                schema_version=2 if self._feedback_budgets[verifier.capability_name] else 1,
+                repair_feedback_bytes=self._feedback_budgets[verifier.capability_name],
                 status="unverifiable",
                 reason_code="outcome_not_checked",
                 capability_name=descriptor.name,
@@ -261,9 +301,25 @@ class CapabilityOutcomeResolver:
                 )
             finally:
                 context.close()
+            budget = self._feedback_budgets[verifier.capability_name]
+            if decision.issues and not budget:
+                raise ValueError("verifier returned issues without declaring feedback capacity")
+            if any(
+                issue.artifact_id is not None
+                and issue.artifact_id not in {ref.artifact_id for ref in context.evidence}
+                for issue in decision.issues
+            ):
+                decision = CapabilityOutcomeDecision(
+                    status="unverifiable", reason_code="outcome_feedback_unbound"
+                )
+            issues, omitted = _fit_issues(decision.issues, budget)
             outcomes.append(
                 CapabilityOutcome(
-                    **decision.model_dump(),
+                    **decision.model_dump(exclude={"issues"}),
+                    schema_version=2 if budget else 1,
+                    repair_feedback_bytes=budget,
+                    issues=issues,
+                    omitted_issues=omitted,
                     capability_name=descriptor.name,
                     capability_version=descriptor.version,
                     scope_sha256=capability_outcome_scope(frame),

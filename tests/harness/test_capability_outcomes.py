@@ -23,6 +23,7 @@ from weavria.core import (
 from weavria.harness import (
     AdaptiveCapabilityPolicy,
     CapabilityNeed,
+    CapabilityOutcome,
     CapabilityOutcomeContext,
     CapabilityOutcomeDecision,
     CapabilityOutcomeResolver,
@@ -36,11 +37,13 @@ from weavria.harness import (
     NeedState,
     NeedStatus,
     OriginalRequestAnchor,
+    OutcomeRepairIssue,
     StructuralEvidenceExtractor,
     TaskAwareSessionPreparer,
     TaskCompletionEvaluator,
     TaskFrame,
     TaskModelViewProjector,
+    TaskObligationCompletionPolicy,
     TaskSpecification,
     TaskUnderstandingEngine,
     TaskUnderstandingInput,
@@ -192,6 +195,29 @@ class Verifier:
                         status="verified", reason_code="value_verified"
                     )
         return CapabilityOutcomeDecision(status="repair", reason_code="second_stage_missing")
+
+
+class DetailedVerifier(Verifier):
+    repair_feedback_bytes = 1024
+
+    async def verify(self, context: CapabilityOutcomeContext) -> CapabilityOutcomeDecision:
+        decision = await super().verify(context)
+        if decision.status != "repair":
+            return decision
+        return decision.model_copy(
+            update={
+                "issues": (
+                    OutcomeRepairIssue(
+                        code="second_stage",
+                        condition="Second stage value",
+                        expected="2",
+                        observed="1",
+                        suggestion="Compute the second stage using the existing value.",
+                        artifact_id=context.evidence[0].artifact_id if context.evidence else None,
+                    ),
+                )
+            }
+        )
 
 
 @pytest.mark.parametrize("state", (NeedStatus.ACQUIRED, NeedStatus.SATISFIED))
@@ -401,7 +427,10 @@ async def test_owned_attachment_does_not_grant_direct_or_cross_producer_reads(
     assert outcomes[0].evidence == (parent.reference,)
 
 
-async def test_feedback_projection_reopens_on_steering_without_version_churn() -> None:
+@pytest.mark.parametrize("detailed", (False, True))
+async def test_feedback_projection_reopens_on_steering_without_version_churn(
+    detailed: bool,
+) -> None:
     class Interpreter:
         version = "test/1"
 
@@ -413,7 +442,7 @@ async def test_feedback_projection_reopens_on_steering_without_version_churn() -
     preparer = TaskAwareSessionPreparer(
         TaskUnderstandingEngine(Interpreter()),
         working_set=AdaptiveCapabilityPolicy(),
-        outcomes=CapabilityOutcomeResolver((Verifier(),)),
+        outcomes=CapabilityOutcomeResolver((DetailedVerifier() if detailed else Verifier(),)),
     )
     prepared = await preparer.prepare(
         SessionTaskContext(
@@ -490,6 +519,12 @@ async def test_feedback_projection_reopens_on_steering_without_version_churn() -
                     check, request=None, manifest=None
                 )
                 assert not finalization.eligible
+                if detailed:
+                    decision = await TaskObligationCompletionPolicy().verify(check)
+                    from weavria.core import CompletionRepair
+
+                    assert isinstance(decision, CompletionRepair)
+                    assert "second_stage" in decision.guidance
         finally:
             check.close()
     loaded = SemanticSnapshot.model_validate_json(snapshot(complete, 3).model_dump_json())
@@ -500,11 +535,29 @@ async def test_feedback_projection_reopens_on_steering_without_version_churn() -
         for i, value in enumerate((prepared, partial, complete), 1)
     ]
     assert len({view.max_progress_bytes for view in views}) == 1
+    if detailed:
+        for view, value in zip(views, (prepared, partial, complete), strict=True):
+            rows = view.progress["capability_outcomes"]
+            assert isinstance(rows, list) and isinstance(rows[0], dict)
+            feedback = rows[0]["feedback"]
+            outcome = load_need_ledger(value.need_ledger).capability_outcomes[0]
+            assert feedback == outcome.repair_feedback()
+        assert load_need_ledger(partial.need_ledger).capability_outcomes[0].issues
+        assert not load_need_ledger(complete.need_ledger).capability_outcomes[0].issues
     assert views[0].progress["capability_outcomes"] == [
         {
             "capability": "compute",
             "status": "unverifiable",
             "reason_code": "outcome_not_checked",
+            **(
+                {
+                    "feedback": load_need_ledger(prepared.need_ledger)
+                    .capability_outcomes[0]
+                    .repair_feedback()
+                }
+                if detailed
+                else {}
+            ),
         }
     ]
     assert views[-1].progress["capability_outcomes"] == [
@@ -512,6 +565,15 @@ async def test_feedback_projection_reopens_on_steering_without_version_churn() -
             "capability": "compute",
             "status": "verified",
             "reason_code": "value_verified",
+            **(
+                {
+                    "feedback": load_need_ledger(complete.need_ledger)
+                    .capability_outcomes[0]
+                    .repair_feedback()
+                }
+                if detailed
+                else {}
+            ),
         }
     ]
     context = replace(context, base_semantic=loaded, records=(first, second))
@@ -548,4 +610,142 @@ def test_old_ledger_wire_stays_unchanged(version: Literal[5, 6]) -> None:
     with pytest.raises(ValidationError):
         NeedLedger.model_validate_json(
             wire.replace(f'"schema_version":{version}', '"schema_version":7')
+        )
+
+
+@pytest.mark.parametrize("budget", (256, 2048))
+async def test_repair_budget_preserves_whole_unicode_issues_and_v1_wire(budget: int) -> None:
+    import json
+
+    store = InMemoryArtifactStore()
+    record = await recorded(store, 1, "first")
+    assert record.artifact
+
+    class Many(DetailedVerifier):
+        repair_feedback_bytes = budget
+
+        async def verify(self, context: CapabilityOutcomeContext) -> CapabilityOutcomeDecision:
+            await super().verify(context)
+            return CapabilityOutcomeDecision(
+                status="repair",
+                reason_code="incomplete",
+                issues=tuple(
+                    OutcomeRepairIssue(
+                        code=f"condition_{i}",
+                        condition="统计条件",
+                        expected="正确计数",
+                        observed="没有满足",
+                        suggestion="重新计算并检查输出" * 8,
+                        artifact_id=record.artifact.artifact_id if record.artifact else None,
+                        location="统计.json",
+                    )
+                    for i in range(8)
+                ),
+            )
+
+    async def read(identity: str) -> ArtifactSnapshot:
+        return await store.get("run", identity)
+
+    resolver = CapabilityOutcomeResolver((Many(),))
+    pending = resolver.pending(frame(), registry())[0]
+    result = (
+        await resolver.resolve(
+            task=TASK, frame=frame(), tools=registry(), records=(record,), read_artifact=read
+        )
+    )[0]
+    assert pending.schema_version == result.schema_version == 2
+    assert pending.repair_feedback_bytes == result.repair_feedback_bytes == budget
+    assert result.status == "repair" and result.omitted_issues > 0
+    assert len(result.issues) + result.omitted_issues == 8
+    assert (
+        len(
+            json.dumps(result.repair_feedback(), ensure_ascii=False, separators=(",", ":")).encode()
+        )
+        <= budget
+    )
+    assert all(issue.code == f"condition_{i}" for i, issue in enumerate(result.issues))
+    ledger = NeedLedger(
+        schema_version=7,
+        work_id="work",
+        task_revision=1,
+        frame_revision=1,
+        evidence_revision=1,
+        states=(),
+        capability_outcomes=(result,),
+    )
+    assert load_need_ledger(ledger.model_dump_json()) == ledger
+    # 改诊断措辞不等于成果进展,不能靠换反馈文本逃离无进展保护。
+    if result.issues:
+        invalid = result.model_copy(update={"omitted_issues": 8})
+        with pytest.raises(ValidationError, match="issue count limit"):
+            CapabilityOutcome.model_validate_json(invalid.model_dump_json())
+        changed = result.model_copy(
+            update={"issues": (result.issues[0].model_copy(update={"observed": "仍未满足"}),)}
+        )
+        assert (
+            ledger.progress_sha256()
+            == ledger.model_copy(update={"capability_outcomes": (changed,)}).progress_sha256()
+        )
+    legacy = CapabilityOutcomeResolver((Verifier(),)).pending(frame(), registry())[0]
+    assert (
+        "issues" not in legacy.model_dump_json()
+        and "repair_feedback_bytes" not in legacy.model_dump_json()
+    )
+
+
+async def test_issue_cannot_reference_an_accepted_but_uninspected_artifact() -> None:
+    store = InMemoryArtifactStore()
+    first = await recorded(store, 1, "first")
+    second = await recorded(store, 1, "second")
+    assert first.artifact and second.artifact
+
+    class Unbound(DetailedVerifier):
+        async def verify(self, context: CapabilityOutcomeContext) -> CapabilityOutcomeDecision:
+            assert first.artifact and second.artifact
+            await context.read_artifact(first.artifact.artifact_id)
+            return CapabilityOutcomeDecision(
+                status="repair",
+                reason_code="incomplete",
+                issues=(
+                    OutcomeRepairIssue(
+                        code="wrong_source",
+                        condition="Checked source",
+                        expected="valid",
+                        observed="invalid",
+                        suggestion="Inspect source",
+                        artifact_id=second.artifact.artifact_id,
+                    ),
+                ),
+            )
+
+    async def read(identity: str) -> ArtifactSnapshot:
+        return await store.get("run", identity)
+
+    outcome = (
+        await CapabilityOutcomeResolver((Unbound(),)).resolve(
+            task=TASK,
+            frame=frame(),
+            tools=registry(),
+            records=(first, second),
+            read_artifact=read,
+        )
+    )[0]
+    assert outcome.status == "unverifiable" and outcome.reason_code == "outcome_feedback_unbound"
+    assert not outcome.issues
+
+
+def test_verified_outcome_cannot_carry_unresolved_issues() -> None:
+    with pytest.raises(ValidationError, match="only repair"):
+        CapabilityOutcomeDecision(
+            status="verified",
+            reason_code="done",
+            issues=(
+                OutcomeRepairIssue(
+                    code="incomplete",
+                    condition="Result",
+                    expected="complete",
+                    observed="incomplete",
+                    suggestion="Inspect",
+                ),
+            ),
         )

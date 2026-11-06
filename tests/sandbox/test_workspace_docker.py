@@ -59,8 +59,15 @@ Path('/workspace/outputs/report.txt').write_text(report)
 
 
 @pytest.mark.parametrize(
-    ("manifest", "adaptive", "verified"),
-    ((False, False, False), (True, False, False), (True, True, False), (True, True, True)),
+    ("manifest", "adaptive", "verified", "repair", "content_error"),
+    (
+        (False, False, False, False, False),
+        (True, False, False, False, False),
+        (True, True, False, False, False),
+        (True, True, True, False, False),
+        (True, True, True, True, False),
+        (True, True, True, True, True),
+    ),
 )
 async def test_workspace_failure_correction_and_sqlite_reopen(
     tmp_path: Path,
@@ -68,6 +75,8 @@ async def test_workspace_failure_correction_and_sqlite_reopen(
     manifest: bool,
     adaptive: bool,
     verified: bool,
+    repair: bool,
+    content_error: bool,
 ) -> None:
     backend = DockerPythonSandbox(image=os.environ["WEAVRIA_TEST_DOCKER_IMAGE"])
 
@@ -84,6 +93,15 @@ async def test_workspace_failure_correction_and_sqlite_reopen(
             if isinstance(request.current.control, CompletionNotice):
                 assert "workspace_incomplete" in request.current.control.decision.issue_codes
                 phase = 4
+            if repair and self.calls == 5:
+                view = request.current.task_model_view
+                assert view is not None
+                assert ("report_content" if content_error else "execution_failed") in json.dumps(
+                    view.progress
+                )
+                assert (
+                    "sum each requested column" if content_error else "Inspect the execution error"
+                ) in json.dumps(view.progress)
             # 断言真实执行请求的目录,而非仅检查选择器返回了一个名称集合。
             assert request.current.instructions.count("Available tools:") == 1
             if adaptive:
@@ -146,13 +164,19 @@ async def test_workspace_failure_correction_and_sqlite_reopen(
                             )
                         )
                     )
-                if phase == 4:
+                if phase == 4 and not content_error:
                     assert "NameError" in request.model_dump_json()
                 call = ToolCallAction(
                     call_id=f"report{self.calls}",
                     tool_name="execute_workspace_python",
                     arguments={
-                        "code": "missing_variable" if phase == 3 else REPORT,
+                        "code": (
+                            REPORT.replace("sum(r[key] for r in rows)", "999")
+                            if content_error
+                            else "missing_variable"
+                        )
+                        if phase == 3
+                        else REPORT,
                         "base": {
                             "artifact_id": feedback["artifact_id"],
                             "revision": feedback["data"]["workspace"]["revision"],
@@ -201,7 +225,13 @@ async def test_workspace_failure_correction_and_sqlite_reopen(
         counter=session_counter,
         workspace=True,
         manifest=manifest,
-        capabilities="verified" if verified else "adaptive" if adaptive else "static",
+        capabilities="repair"
+        if repair
+        else "verified"
+        if verified
+        else "adaptive"
+        if adaptive
+        else "static",
         reasoning_model=reasoning if adaptive else None,
         reasoning_counter=session_counter if adaptive else None,
     )
@@ -213,8 +243,12 @@ async def test_workspace_failure_correction_and_sqlite_reopen(
         result["capability_views"],
     )
     attempts = cast(list[dict[str, object]], result["code_attempts"])
-    assert [a["status"] for a in attempts] == ["completed", "code_error", "completed"]
-    assert attempts[1]["workspace_revision"] is None
+    assert [a["status"] for a in attempts] == [
+        "completed",
+        "completed" if content_error else "code_error",
+        "completed",
+    ]
+    assert (attempts[1]["workspace_revision"] is not None) == content_error
     async with SQLiteSessionStore(path) as store:
         events = await store.events("source-statistics", limit=256)
         if verified:
@@ -252,7 +286,8 @@ async def test_workspace_failure_correction_and_sqlite_reopen(
                 snapshot = await read_owned_attachment(snapshot, "/state", store.get)
             versions.append(WorkspaceExecutionOutput.model_validate_json(snapshot.content_json))
         first, failed, final = versions
-        assert first.workspace and final.workspace and not failed.workspace
+        assert first.workspace and final.workspace
+        assert (failed.workspace is not None) == content_error
         assert final.workspace.parents == (first.workspace.revision,)
         assert (
             next(f for f in final.workspace.files if f.path == "statistics.json")
