@@ -28,6 +28,8 @@ Weavria 是一套实验性的 Python Agent Harness 与 Runtime，重点是让模
 
 加上 `--repair-strategy dependency_frontier` 可按未满足条件的依赖关系选择当前可修复问题，在固定字节预算内精确选择诊断组合。每轮重新验收后推进，不把修复上游当成下游已经通过。默认仍使用前缀策略，见[条件依赖与局部修复选择](docs/条件依赖与局部修复选择.md)。
 
+`uv run python -m examples.repair_feedback` 检查四类固定错误工作区；显式加 `--run` 可在相同任务解释和初始成果下对照两种策略，区分初始化成本与模型自主修复。运行方式及当前证据限制见[固定起点的成对修复实验](docs/固定起点的成对修复实验.md)。
+
 ## 开发环境
 
 需要 Python 3.12+ 与 uv：

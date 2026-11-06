@@ -64,6 +64,13 @@ from .progress_signals import (
     ProgressSignalExperiment,
     evaluate_progress_signals,
 )
+from .repair_feedback import (
+    RepairPair,
+    RepairStep,
+    RepairStrategy,
+    RepairTrial,
+    compare_repair_trials,
+)
 from .summary_fidelity import (
     FidelityCase,
     FidelityComparison,
@@ -114,9 +121,14 @@ __all__ = [
     "ProgressStrategySummary",
     "ProviderFinishReason",
     "RecordingHTTPTransport",
+    "RepairPair",
+    "RepairStep",
+    "RepairStrategy",
+    "RepairTrial",
     "TokenUsage",
     "build_live_progress_experiment",
     "compare_fidelity",
+    "compare_repair_trials",
     "evaluate_action_interventions",
     "evaluate_action_value_policy",
     "evaluate_capability_discovery",

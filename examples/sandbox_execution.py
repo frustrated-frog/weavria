@@ -44,7 +44,7 @@ from weavria.models import (
     SessionModelProvider,
 )
 from weavria.runtime import CompletionContext, RunLimits
-from weavria.sandbox import DockerPythonSandbox
+from weavria.sandbox import DockerPythonSandbox, SandboxBackend
 from weavria.tools import (
     PythonExecutionOutput,
     SandboxToolPolicy,
@@ -374,7 +374,7 @@ WORKSPACE_TASK = TASK + (
 async def run_task(
     path: Path,
     *,
-    backend: DockerPythonSandbox,
+    backend: SandboxBackend,
     model: SessionModelProvider,
     counter: SessionTokenCounter,
     workspace: bool = False,
