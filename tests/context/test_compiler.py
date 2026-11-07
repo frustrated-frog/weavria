@@ -246,16 +246,18 @@ async def test_joint_selection_recovers_exact_old_tail_and_current_evidence(
 async def test_feedback_reservation_counts_stable_instructions_exactly(
     session_counter: OpenAICompatibleTokenCounter,
 ) -> None:
-    config = ContextCompilerConfig(
-        window_tokens=24_000,
-        output_tokens=256,
-        safety_tokens=64,
-        policy="full",
-    )
     instructions = "the trusted instruction " * 650
     request_base = ControlRequest(
         instructions=instructions,
         task=TaskInput(goal="explain current market state"),
+    )
+    # 为新增的正文编码协议留出 128 Token。下方仍要求旧字节上界拒绝、
+    # 精确 BPE 方案接受, 保持本用例对固定指令预算的回归判别力。
+    config = ContextCompilerConfig(
+        window_tokens=24_128,
+        output_tokens=256,
+        safety_tokens=64,
+        policy="full",
     )
     turns = tuple(
         ConversationTurn(

@@ -562,6 +562,8 @@ async def test_structured_artifact_page_exposes_pointer_for_one_oversized_child(
 
 async def test_text_artifact_page_uses_encoded_bytes_and_preserves_character_cursor() -> None:
     store = InMemoryArtifactStore()
+    # 中文, 引号和换行的 JSON 编码字节数都不能用 len(text) 直接推断.
+    # 这组数据专门验证分页依据真实传输字节, 同时游标仍停在完整字符边界.
     text = '中文"换行\n' * 20
     source = await store.put("run", "source", {"text": text})
     executor = ToolExecutor("run", ToolRegistry((artifact_read_tool(),)), store, ReadOnlyPolicy())
@@ -584,9 +586,13 @@ async def test_text_artifact_page_uses_encoded_bytes_and_preserves_character_cur
     output = ArtifactReadOutput.model_validate_json(
         json.dumps((await store.get("run", record.artifact.artifact_id)).value)
     )
+    # 第一页必须真实前进但不能吞掉全部内容, 才能覆盖需要续读的场景.
     assert 0 < output.end < len(text)
+    # 返回值必须严格等于原文的连续前缀, 禁止为了省预算静默改写或跳字.
     assert output.value == text[: output.end]
+    # page_bytes 统计的是实际 JSON payload, 不能超过调用方声明的 31 字节.
     assert output.page_bytes <= 31
+    # 原文尚未读完时必须显式暴露 has_more, 让 Agent 可以按游标恢复原始证据.
     assert output.has_more is True
 
 

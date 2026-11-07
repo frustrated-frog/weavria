@@ -1,5 +1,6 @@
 import json
-from typing import Any
+from hashlib import sha256
+from typing import Any, Literal
 
 import pytest
 from pydantic import JsonValue, TypeAdapter
@@ -12,10 +13,14 @@ from weavria.core import (
     Message,
     MessageRole,
     ModelRequest,
+    SemanticVersion,
     SessionRequest,
     TaskInput,
+    TaskModelView,
+    TaskModelViewSource,
     ToolBatch,
     ToolCallAction,
+    task_view_digest,
 )
 from weavria.models import (
     ModelCallError,
@@ -241,6 +246,71 @@ def _session_request(*, sequence: int = 0) -> SessionRequest:
             task=TaskInput(goal="question"),
         ),
     )
+
+
+@pytest.mark.parametrize("mode", ("action", "session", "synthesis"))
+@pytest.mark.parametrize(
+    "output",
+    (
+        "已读取报告。\n\n## 详细发现\n观察结果。",
+        '{"answer":"用户明确要求的 JSON","example":"\\n"}',
+    ),
+)
+async def test_finish_protocol_distinguishes_visible_content_from_transport_json(
+    mode: Literal["action", "session", "synthesis"], output: str
+) -> None:
+    envelope_key = "action" if mode == "action" else "decision"
+    transport = Transport(
+        _response(json.dumps({envelope_key: {"kind": "finish", "output": output}}))
+    )
+    config = OpenAICompatibleConfig(model="test", json_mode=True)
+    if mode == "action":
+        response = await OpenAICompatibleProvider(config, transport=transport).generate(_request())
+        candidate = response.action
+    else:
+        request = _session_request()
+        if mode == "synthesis":
+            view = TaskModelView(
+                projector_version="test/1",
+                phase="synthesis",
+                source=TaskModelViewSource(
+                    work_id="work",
+                    version=SemanticVersion(
+                        task_revision=1,
+                        frame_revision=1,
+                        capability_epoch=1,
+                        evidence_revision=1,
+                        semantic_sequence=1,
+                    ),
+                    task_sha256=sha256(request.current.task.model_dump_json().encode()).hexdigest(),
+                    observation_sha256="0" * 64,
+                    ledger_sha256="0" * 64,
+                    visible_tools_sha256="0" * 64,
+                ),
+                definition={},
+                definition_sha256=task_view_digest({}),
+                progress={},
+                max_progress_bytes=1024,
+                max_instruction_bytes=4096,
+            )
+            request = request.model_copy(
+                update={
+                    "current": request.current.model_copy(
+                        update={"schema_version": 5, "task_model_view": view}
+                    )
+                }
+            )
+        response = await OpenAICompatibleSessionProvider(
+            config, transport=transport
+        ).generate_session(request)
+        candidate = response.decision
+    assert isinstance(candidate, FinishAction) and candidate.output == output
+    system = transport.requests[0]["messages"][0]["content"]
+    assert "final user-visible content" in system
+    assert "Only if the task requests JSON" in system
+    assert "real newlines" in system
+    # 正文允许是用户要求的 JSON 或转义示例, 适配器不能靠字段名擅自拆包。
+    assert transport.requests[0]["response_format"] == {"type": "json_object"}
 
 
 async def test_session_provider_encodes_observations_and_parses_json_turn() -> None:

@@ -205,9 +205,13 @@ def _text_page(value: str, *, start: int, budget: int) -> tuple[str, int, int]:
         raise ToolFault(
             ErrorCategory.INVALID_TOOL_ARGUMENTS, "Artifact range is outside the source"
         )
+    # budget 约束的是最终 JSON 编码后的字节数, 不能直接按 Python 字符数切片.
+    # 否则中文, 引号和换行等内容经过编码后可能超出模型反馈预算.
     low, high = start, len(value)
     accepted_end: int | None = None
     accepted_bytes = 0
+    # 在字符边界上二分查找, 找到当前预算能容纳的最长连续区间.
+    # end 仍是原文字符游标, 后续页可以从该位置继续, 不会拆坏 Unicode 字符.
     while low <= high:
         middle = (low + high) // 2
         encoded_bytes = len(_JSON.dump_json(value[start:middle]))
@@ -217,6 +221,8 @@ def _text_page(value: str, *, start: int, budget: int) -> tuple[str, int, int]:
             low = middle + 1
         else:
             high = middle - 1
+    # 连一个完整字符都放不下时直接失败, 让调用方缩小请求或提高预算.
+    # 这里不能返回空页, 否则 next cursor 不前进, Agent 会在同一位置反复读取.
     if accepted_end is None or (accepted_end == start and start < len(value)):
         raise ToolFault(
             ErrorCategory.INVALID_TOOL_ARGUMENTS,
