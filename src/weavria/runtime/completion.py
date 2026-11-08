@@ -225,12 +225,15 @@ class LayeredCompletionPolicy:
 
     async def verify(self, context: CompletionContext) -> CompletionDecision:
         adapter = TypeAdapter[CompletionDecision](CompletionDecision)
+        # 先检查任务本身是否完成. Finish 只是模型提交的候选答案,
+        # 不能绕过必需结果, 已接受执行证据和当前任务版本的核验.
         required = adapter.validate_python(await self._required.verify(context))
-        # A repair rejects the candidate, so no publication can occur on this attempt.
-        # Unverifiable is different: the candidate may still be published and therefore
-        # must pass every extension constraint such as redaction and source markers.
+        # Repair 会直接否决本次候选, 此时继续做发布检查既浪费预算,
+        # 也可能让后续通过结果掩盖任务缺口, 所以必须立即返回修复要求.
         if isinstance(required, CompletionRepair):
             return required
+        # 无法独立验证不等于可以跳过发布约束. 候选仍可能以低置信结果交付,
+        # 因此脱敏, 来源标记等扩展规则仍要逐层检查.
         extension = adapter.validate_python(await self._extension.verify(context))
         if isinstance(extension, CompletionRepair):
             return extension
@@ -238,6 +241,8 @@ class LayeredCompletionPolicy:
             return required
         if isinstance(extension, CompletionUnverifiable):
             return extension
+        # 两层都接受时保留更弱结论. 只有每一层都给出 verified,
+        # 宿主才允许把最终结果标记成已验证, 避免单层成功抬高整体可信度.
         outcome = (
             "verified"
             if required.outcome == "verified" and extension.outcome == "verified"

@@ -21,6 +21,7 @@ class _Policy:
 
 
 async def test_required_completion_policy_cannot_be_bypassed_by_extension() -> None:
+    # 必需结果仍有缺口时, 即使发布层愿意接受也不能把候选答案放行.
     required = _Policy(
         "required/1",
         CompletionRepair(issue_codes=("required_output_mismatch",), guidance="修正输出"),
@@ -31,10 +32,12 @@ async def test_required_completion_policy_cannot_be_bypassed_by_extension() -> N
     decision = await policy.verify(cast(CompletionContext, object()))
 
     assert isinstance(decision, CompletionRepair)
+    # 第一层已经否决后应立即停止, 避免额外检查覆盖原始修复原因.
     assert extension.calls == 0
 
 
 async def test_layered_completion_acceptance_keeps_the_weaker_outcome() -> None:
+    # 一层只能确认可交付但未验证时, 整体结果也不能升级成 verified.
     required = _Policy("required/1", CompletionAccept(outcome="verified"))
     extension = _Policy("extension/1", CompletionAccept(outcome="unverified"))
 
