@@ -54,7 +54,7 @@ from .memory_formation import MemoryExtractor, MemoryFormationEngine, MemoryRevi
 from .memory_generation import MemoryGenerationPolicy
 from .memory_models import ModelMemoryExtractor, ModelMemoryReviewer
 from .memory_session import SessionMemoryBinding, SessionMemoryIngestor
-from .memory_sufficiency import ModelMemoryEvidenceAssessor
+from .memory_sufficiency import MemoryEvidenceAssessor
 from .outcomes import CapabilityOutcomeResolver, CapabilityOutcomeVerifier
 from .requirements import EvidenceExtractor, EvidenceResolver
 from .session import TaskAwareSessionPreparer
@@ -98,7 +98,7 @@ class HarnessMemory:
     # 显式选择当前已知但生效起点未知的事实;不改变其时间字段或权威等级。
     include_unknown_time: bool = False
     retrieval: TaskMemoryRetriever | None = None
-    evidence_assessor: ModelMemoryEvidenceAssessor | None = None
+    evidence_assessor: MemoryEvidenceAssessor | None = None
 
     @classmethod
     def from_model(

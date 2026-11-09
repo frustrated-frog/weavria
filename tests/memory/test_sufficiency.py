@@ -22,7 +22,13 @@ from weavria.core import (
     TaskInput,
     ToolCallAction,
 )
-from weavria.harness import MemoryContextSource, MemoryEvidencePolicy, ModelMemoryEvidenceAssessor
+from weavria.harness import (
+    JointMemoryEvidenceAssessor,
+    MemoryContextSource,
+    MemoryEvidenceAssessor,
+    MemoryEvidencePolicy,
+    ModelMemoryEvidenceAssessor,
+)
 from weavria.memory import (
     MemoryAccess,
     MemoryAssertion,
@@ -179,6 +185,49 @@ def model(plan: dict[str, JsonValue], checked: dict[str, JsonValue]) -> FakeMode
             )
         )
     )
+
+
+def assessor(variant: str) -> MemoryEvidenceAssessor:
+    if variant == "reviewed":
+        return ModelMemoryEvidenceAssessor(model(proposal(), review()), configuration_id="test")
+    wire: dict[str, JsonValue] = {
+        "demands": [
+            {
+                "demand_id": "current_task",
+                "parts": [
+                    {"text": "For internal reports, ", "slot": None},
+                    {"text": "what language", "slot": 0},
+                    {"text": " and ", "slot": None},
+                    {"text": "completion date should I use?", "slot": 1},
+                ],
+                "slots": [
+                    {
+                        "roles": ["direct"],
+                        "citations": [
+                            {
+                                "member": 0,
+                                "quote": "Use English for internal reports.",
+                            }
+                        ],
+                        "conditions": [],
+                    },
+                    {"roles": ["background"], "citations": [], "conditions": []},
+                ],
+            }
+        ]
+    }
+    provider = FakeModelProvider(
+        (
+            ModelResponse(
+                action=ToolCallAction(
+                    call_id="joint",
+                    tool_name="assess_memory_evidence_jointly",
+                    arguments=wire,
+                )
+            ),
+        )
+    )
+    return JointMemoryEvidenceAssessor(provider, configuration_id="test")
 
 
 @pytest.mark.parametrize(
@@ -371,17 +420,17 @@ async def test_timeout_and_cancel_join_provider(
 
 
 @pytest.mark.parametrize("padding", [0, 12000])
+@pytest.mark.parametrize("variant", ["reviewed", "joint"])
 async def test_compilation_downgrades_evicted_evidence_and_persists_source_report(
     tmp_path: Path,
     assertion: MemoryAssertion,
     source: MemorySource,
     session_counter: OpenAICompatibleTokenCounter,
     padding: int,
+    variant: str,
 ) -> None:
     supply = make_supply(assertion, source, padding=padding)
-    assessment = await ModelMemoryEvidenceAssessor(
-        model(proposal(), review()), configuration_id="test"
-    ).assess(supply, DEMANDS)
+    assessment = await assessor(variant).assess(supply, DEMANDS)
     assert assessment.failure is None
     assessed = ContextSupply(
         bundles=supply.bundles,
@@ -439,11 +488,13 @@ def test_legacy_supply_wire_unchanged(assertion: MemoryAssertion, source: Memory
     assert ContextSupply.model_validate_json(supply.model_dump_json()) == supply
 
 
+@pytest.mark.parametrize("variant", ["reviewed", "joint"])
 async def test_public_memory_source_applies_assessment_without_changing_store(
     tmp_path: Path,
     access: MemoryAccess,
     assertion: MemoryAssertion,
     source: MemorySource,
+    variant: str,
 ) -> None:
     original = assertion.model_copy(update={"text": "Use English for internal reports."})
     async with SQLiteMemoryStore(tmp_path / "memory.db") as store:
@@ -462,9 +513,7 @@ async def test_public_memory_source_applies_assessment_without_changing_store(
             access=access,
             scope=assertion.scope,
             valid_at=lambda: source.observed_at,
-            evidence=ModelMemoryEvidenceAssessor(
-                model(proposal(), review()), configuration_id="test"
-            ),
+            evidence=assessor(variant),
             max_bytes=12000,
         )
         supply = await context.retrieve(

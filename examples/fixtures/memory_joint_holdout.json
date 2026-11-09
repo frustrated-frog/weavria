@@ -1,0 +1,25 @@
+{
+  "version": "memory-joint-holdout/1",
+  "description": "联合判断策略冻结后首次执行的新事实集；标签只供评分，不参与生成。",
+  "facts": [
+    {"id":"test-backup","predicate":"backup_frequency","text":"实验环境的数据每天备份一次。","conditions":{"environment":"test"}},
+    {"id":"prod-backup","predicate":"backup_frequency","text":"正式环境的数据每小时备份一次。","conditions":{"environment":"production"}},
+    {"id":"end-time-rule","predicate":"backup_log","text":"备份任务完成后，必须将结束时刻写入日志。"},
+    {"id":"retry","predicate":"retry_count","text":"失败请求最多重试三次。"},
+    {"id":"redaction","predicate":"log_redaction","text":"日志中不得包含访问令牌。"},
+    {"id":"timeout-a","predicate":"runtime_timeout","text":"运行超时设置为二十秒。","contested":true},
+    {"id":"timeout-b","predicate":"runtime_timeout","text":"运行超时设置为三十秒。","contested":true}
+  ],
+  "cases": [
+    {"id":"prod-frequency","query":"How often should data in the production environment be backed up?","expected":"supported"},
+    {"id":"test-frequency","query":"实验环境需要多久备份一次？","expected":"supported"},
+    {"id":"both-scenarios","query":"实验环境的备份频率是多少？正式环境的备份频率是多少？","expected":"supported"},
+    {"id":"unknown-environment","query":"我不知道当前用的是哪种环境，应该多久备份一次？","expected":"conditional"},
+    {"id":"undecided-environment","query":"可能迁到正式环境，但还没定，现在应该采用哪个备份频率？","expected":"conditional"},
+    {"id":"actual-end","query":"最近那次备份究竟是几点完成的？","expected":"missing"},
+    {"id":"rule-and-value","query":"备份结束后必须记录什么？最近那次备份的实际结束时刻是什么？","expected":"partial"},
+    {"id":"retry","query":"失败请求最多允许重试几次？","expected":"supported"},
+    {"id":"negative-rule","query":"Is it allowed to put access tokens in logs?","expected":"supported"},
+    {"id":"contested","query":"运行超过多少秒就会超时？","expected":"conflict"}
+  ]
+}

@@ -26,7 +26,11 @@ from weavria.core import (
     TaskInput,
     ToolCallAction,
 )
-from weavria.harness import MemoryEvidencePolicy, ModelMemoryEvidenceAssessor
+from weavria.harness import (
+    JointMemoryEvidenceAssessor,
+    MemoryEvidencePolicy,
+    ModelMemoryEvidenceAssessor,
+)
 from weavria.memory import (
     MemoryAccess,
     MemoryAssertion,
@@ -39,6 +43,7 @@ from weavria.memory import (
 )
 from weavria.models import (
     ModelCapabilities,
+    ModelOutputError,
     ModelProvider,
     OpenAICompatibleConfig,
     OpenAICompatibleProvider,
@@ -83,13 +88,19 @@ class CapturedProvider:
     def __init__(self, provider: ModelProvider) -> None:
         self.provider = provider
         self.actions: list[dict[str, object]] = []
+        self.errors: list[dict[str, str]] = []
 
     @property
     def capabilities(self) -> ModelCapabilities:
         return self.provider.capabilities
 
     async def generate(self, request: ModelRequest) -> ModelResponse:
-        response = await self.provider.generate(request)
+        try:
+            response = await self.provider.generate(request)
+        except ModelOutputError as exc:
+            # 只记录框架枚举,不保存供应商原始错误或内容,也不将错误当成正常拒答。
+            self.errors.append({"kind": "model_output", "code": exc.diagnostic.code})
+            raise
         self.actions.append(response.action.model_dump(mode="json"))
         return response
 
@@ -257,8 +268,19 @@ async def experiment(args: argparse.Namespace) -> None:
         configuration_id=config_id,
         policy=MemoryEvidencePolicy(max_duration=120),
     )
+    joint = JointMemoryEvidenceAssessor(
+        provider,
+        configuration_id=config_id,
+        policy=MemoryEvidencePolicy(max_duration=120),
+    )
     rows: list[dict[str, object]] = []
-    variants = ("single", "reviewed") if args.variant == "both" else (str(args.variant),)
+    variants = (
+        ("single", "reviewed", "joint")
+        if args.variant == "all"
+        else ("single", "reviewed")
+        if args.variant == "both"
+        else (str(args.variant),)
+    )
     try:
         with tempfile.TemporaryDirectory(prefix="weavria-sufficiency-") as directory:
             async with SQLiteMemoryStore(Path(directory) / "memory.db") as store:
@@ -268,11 +290,13 @@ async def experiment(args: argparse.Namespace) -> None:
                 for variant in variants:
                     started, before = time.monotonic(), transport.calls
                     action_start = len(provider.actions)
+                    error_start = len(provider.errors)
                     detail = None
                     if variant == "single":
                         status = await baseline(provider, supply, case.query)
                     else:
-                        result = await assessor.assess(
+                        selected = joint if variant == "joint" else assessor
+                        result = await selected.assess(
                             supply, (ContextDemand("current_task", case.query),)
                         )
                         status = summarize([n.status for d in result.demands for n in d.needs])
@@ -287,6 +311,7 @@ async def experiment(args: argparse.Namespace) -> None:
                         "latency_ms": round((time.monotonic() - started) * 1000),
                         "assessment": detail,
                         "actions": provider.actions[action_start:],
+                        "errors": provider.errors[error_start:],
                     }
                     rows.append(row)
                     print(
@@ -310,6 +335,7 @@ async def experiment(args: argparse.Namespace) -> None:
                     "dataset_sha256": hashlib.sha256(raw_dataset).hexdigest(),
                     "configuration_id": config_id,
                     "assessor_version": assessor.version,
+                    "joint_assessor_version": joint.version,
                     "rows": rows,
                     "correct": {v: counts[v, True] for v in variants},
                     "transport": transport.observations,
@@ -325,5 +351,7 @@ if __name__ == "__main__":
     parser.add_argument("--dataset", default="examples/fixtures/memory_sufficiency.json")
     parser.add_argument("--output", required=True, help="模型结果写到仓库外")
     parser.add_argument("--limit", type=int, default=13)
-    parser.add_argument("--variant", choices=("single", "reviewed", "both"), default="both")
+    parser.add_argument(
+        "--variant", choices=("single", "reviewed", "joint", "both", "all"), default="both"
+    )
     asyncio.run(experiment(parser.parse_args()))

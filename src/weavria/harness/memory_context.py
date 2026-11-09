@@ -24,7 +24,7 @@ from weavria.memory import (
 )
 
 from .memory_retrieval import MemorySnapshotReader, retrieve_task_memory
-from .memory_sufficiency import ModelMemoryEvidenceAssessor
+from .memory_sufficiency import MemoryEvidenceAssessor
 
 
 class MemoryGroupReader(Protocol):
@@ -56,7 +56,7 @@ class MemoryContextSource:
         max_groups: int = 32,
         max_bytes: int = 262144,
         retriever: TaskMemoryRetriever | None = None,
-        evidence: ModelMemoryEvidenceAssessor | None = None,
+        evidence: MemoryEvidenceAssessor | None = None,
     ) -> None:
         # 身份、精确作用域与时间策略由宿主绑定,模型只能影响候选查询词。
         # 复制授权契约避免外部可变对象在一次请求中静默扩大访问范围。

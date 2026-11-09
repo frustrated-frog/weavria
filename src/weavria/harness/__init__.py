@@ -96,9 +96,14 @@ from .memory_features import MemoryReviewFeatureProvider, MemoryReviewFeatures
 from .memory_formation import MemoryExtractor, MemoryFormationEngine, MemoryReviewer
 from .memory_generation import MemoryGenerationPolicy
 from .memory_interpretation import ModelMemoryRepairingExtractor
+from .memory_joint_evidence import JointMemoryEvidenceAssessor
 from .memory_models import ModelMemoryExtractor, ModelMemoryReviewer
 from .memory_session import AcceptedMemoryEvents, SessionMemoryBinding, SessionMemoryIngestor
-from .memory_sufficiency import MemoryEvidencePolicy, ModelMemoryEvidenceAssessor
+from .memory_sufficiency import (
+    MemoryEvidenceAssessor,
+    MemoryEvidencePolicy,
+    ModelMemoryEvidenceAssessor,
+)
 from .outcome_contracts import CapabilityOutcome, CapabilityOutcomeDecision, OutcomeRepairIssue
 from .outcomes import (
     CapabilityOutcomeContext,
@@ -244,8 +249,10 @@ __all__ = [
     "IntentDecisionPolicy",
     "IntentHypothesis",
     "IntentUncertainty",
+    "JointMemoryEvidenceAssessor",
     "LiteralTargetResolver",
     "MemoryContextSource",
+    "MemoryEvidenceAssessor",
     "MemoryEvidencePolicy",
     "MemoryExtractor",
     "MemoryFormationEngine",
