@@ -98,6 +98,7 @@ from .memory_generation import MemoryGenerationPolicy
 from .memory_interpretation import ModelMemoryRepairingExtractor
 from .memory_models import ModelMemoryExtractor, ModelMemoryReviewer
 from .memory_session import AcceptedMemoryEvents, SessionMemoryBinding, SessionMemoryIngestor
+from .memory_sufficiency import MemoryEvidencePolicy, ModelMemoryEvidenceAssessor
 from .outcome_contracts import CapabilityOutcome, CapabilityOutcomeDecision, OutcomeRepairIssue
 from .outcomes import (
     CapabilityOutcomeContext,
@@ -245,6 +246,7 @@ __all__ = [
     "IntentUncertainty",
     "LiteralTargetResolver",
     "MemoryContextSource",
+    "MemoryEvidencePolicy",
     "MemoryExtractor",
     "MemoryFormationEngine",
     "MemoryFormationError",
@@ -254,6 +256,7 @@ __all__ = [
     "MemoryReviewFeatures",
     "MemoryReviewer",
     "MemoryUpdateReport",
+    "ModelMemoryEvidenceAssessor",
     "ModelMemoryExtractor",
     "ModelMemoryRepairingExtractor",
     "ModelMemoryReviewer",

@@ -15,6 +15,7 @@ from pydantic import (
 from ._schema import ContractModel, NonBlankString
 from .compaction import ContextCompaction
 from .context import SessionContextCompiled
+from .context_evidence import ContextEvidenceAssessment
 from .context_supply import ContextBundle
 from .control import ControlEvent, ControlRequest, RunReport
 from .errors import ErrorCategory, TaskPreparationAttemptDiagnostic
@@ -265,10 +266,11 @@ class ConversationView(BaseModel):
 
 
 class SessionRequest(BaseModel):
-    """版本化上下文。v8 增加与执行历史分离的派生摘要视图。"""
+    """版本化上下文。v8 增加派生摘要;v11 独立增加所选证据的充分性投影。"""
 
     model_config = ContractModel.model_config
-    schema_version: Literal[5, 6, 7, 8, 9, 10] = 5
+    schema_version: Literal[5, 6, 7, 8, 9, 10, 11] = 5
+    evidence: ContextEvidenceAssessment | None = None
     bundles: tuple[ContextBundle, ...] = Field(default=(), max_length=100)
     conversation: ConversationView
     compaction: ContextCompaction | None = None
@@ -292,10 +294,20 @@ class SessionRequest(BaseModel):
             data.pop("summaries", None)
         if self.schema_version < 9:
             data.pop("summary_advice", None)
+        if self.schema_version < 11:
+            data.pop("evidence", None)
         return data
 
     @model_validator(mode="after")
     def validate_bundles(self) -> Self:
+        if (self.schema_version == 11) != (self.evidence is not None):
+            raise ValueError("evidence view requires session request v11")
+        if self.evidence is not None:
+            if self.evidence.task_revision != self.current.task.revision:
+                raise ValueError("evidence belongs to another task revision")
+            retained = frozenset(b.bundle_id for b in self.bundles)
+            if self.evidence.project(retained) != self.evidence:
+                raise ValueError("evidence sufficiency outlives its bundle dependencies")
         if self.bundles and self.schema_version < 6:
             raise ValueError("context bundles require session request v6 or later")
         if len({b.bundle_id for b in self.bundles}) != len(self.bundles):

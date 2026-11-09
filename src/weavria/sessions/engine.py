@@ -36,6 +36,7 @@ from weavria.core import (
     ContextBundle,
     ContextCompaction,
     ContextCompilation,
+    ContextEvidenceAssessment,
     ContextSummaryView,
     ContextSupply,
     ControlEvent,
@@ -255,6 +256,7 @@ class _SessionAdapter:
         self._context_source = context_source
         self._support_tools = support_tools
         self._bundles: tuple[ContextBundle, ...] = ()
+        self._evidence: ContextEvidenceAssessment | None = None
         self._compaction: ContextCompaction | None = None
         self._summaries: tuple[ContextSummaryView, ...] = ()
         self._summary_advice: SummaryAdvice | None = None
@@ -269,7 +271,9 @@ class _SessionAdapter:
     def _outer_request(self, request: ControlRequest) -> SessionRequest:
         # 发送与持久化必须重建相同包络, 否则请求摘要无法证明模型实际收到的内容。
         return SessionRequest(
-            schema_version=10
+            schema_version=11
+            if self._evidence is not None
+            else 10
             if self._summary_preparation
             else 9
             if self._summary_guidance
@@ -281,6 +285,7 @@ class _SessionAdapter:
             if self._context_source is not None
             else 5,
             bundles=self._bundles,
+            evidence=self._evidence,
             conversation=self._prepared[request.task.revision],
             compaction=self._compaction,
             summaries=self._summaries,
@@ -397,6 +402,7 @@ class _SessionAdapter:
         # Only one attempt is active; discard obsolete prepared views after the
         # previous model call/verification has joined, retaining bounded state.
         self._bundles = ()
+        self._evidence = None
         self._compaction = None
         self._summaries = ()
         self._summary_advice = None
@@ -574,6 +580,7 @@ class _SessionAdapter:
 
     def _install_control_context(self, outer: SessionRequest, report: ContextCompilation) -> None:
         self._bundles = outer.bundles
+        self._evidence = outer.evidence
         self._compaction = outer.compaction
         self._summaries = outer.summaries
         self._summary_advice = outer.summary_advice

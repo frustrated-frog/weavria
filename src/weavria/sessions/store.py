@@ -1773,7 +1773,22 @@ class SQLiteSessionStore:
             raise SessionConflictError("compaction delivery disagrees with its request")
         if request.summary_advice != (compilation.summary_advice if compilation else None):
             raise SessionConflictError("summary advice disagrees with compilation")
-        if request.schema_version >= 8:
+        source_evidence = (
+            compilation.supply.evidence if compilation and compilation.supply else None
+        )
+        if request.evidence != (
+            source_evidence.project(frozenset(b.bundle_id for b in request.bundles))
+            if source_evidence is not None
+            else None
+        ):
+            raise SessionConflictError("evidence delivery disagrees with its source assessment")
+        # v11 独立增加证据审查,不隐式开启语义摘要。旧 v8-v10 的强制报告仍保留。
+        if 8 <= request.schema_version <= 10 or (
+            request.schema_version == 11
+            and (
+                request.summaries or (compilation is not None and compilation.summaries is not None)
+            )
+        ):
             if compilation is None or compilation.summaries is None:
                 raise SessionConflictError("summary request requires its compilation report")
             choices = {c.source_id: c for c in compilation.choices}

@@ -1,0 +1,24 @@
+{
+  "version": "memory-sufficiency-holdout/1",
+  "description": "修正场景条件协议后、运行前冻结；不同事实和问题，仅用于一次验证，不用标签配置模型。",
+  "facts": [
+    {"id":"offline","predicate":"document_format","text":"给离线读者的手册应导出为 PDF。","conditions":{"delivery":"offline"}},
+    {"id":"online","predicate":"document_format","text":"在线发布的文档应使用 HTML。","conditions":{"delivery":"online"}},
+    {"id":"version-rule","predicate":"release_log","text":"每次打包都必须将打包工具的版本号记录到发布日志中。"},
+    {"id":"build-date-rule","predicate":"footer","text":"文档页脚必须注明构建日期。"},
+    {"id":"logs","predicate":"log_retention","text":"运行日志保留七天，然后清除。"},
+    {"id":"compression-a","predicate":"compression","text":"导出文件应使用 gzip 压缩。","contested":true},
+    {"id":"compression-b","predicate":"compression","text":"导出文件应使用 zstd 压缩。","contested":true}
+  ],
+  "cases": [
+    {"id":"offline-format","query":"这份手册要发给没有网络的读者，应该导出成什么格式？","expected":"supported"},
+    {"id":"online-format","query":"Which format should the documentation use when published online?","expected":"supported"},
+    {"id":"unknown-delivery","query":"还没决定在线发布还是离线发送，现在文档应选择什么格式？","expected":"conditional"},
+    {"id":"version","query":"我们现在使用的打包工具具体版本号是什么？","expected":"missing"},
+    {"id":"date","query":"最近那版文档是哪天构建的？","expected":"missing"},
+    {"id":"logs","query":"How long are runtime logs retained?","expected":"supported"},
+    {"id":"footer","query":"文档页脚要求写什么信息？","expected":"supported"},
+    {"id":"partial","query":"在线发布的文档用什么格式？最近构建日期是哪天？","expected":"partial"},
+    {"id":"conflict","query":"导出文件到底应该选择哪种压缩算法？","expected":"conflict"}
+  ]
+}

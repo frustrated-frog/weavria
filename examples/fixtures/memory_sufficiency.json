@@ -1,0 +1,28 @@
+{
+  "version": "memory-sufficiency/1",
+  "description": "固定公共事实全集，隔离充分性判断；不以此测召回或最终答案质量。标签只供离线评分。",
+  "facts": [
+    {"id":"cache","predicate":"cache_identity","text":"向量缓存必须绑定模型版本、作用域及文本摘要；缓存命中不能跳过授权检查。"},
+    {"id":"archive","predicate":"archive_preference","text":"完成的研究报告按年份和主题归档，文件名中保留报告日期。"},
+    {"id":"internal","predicate":"report_language","text":"内部报告使用中文。","conditions":{"audience":"internal"}},
+    {"id":"external","predicate":"report_language","text":"面向外部读者的报告使用英文。","conditions":{"audience":"external"}},
+    {"id":"backup","predicate":"backup_retention","text":"每份备份保留十四天，到期删除。"},
+    {"id":"timeout-a","predicate":"approval_timeout","text":"审批请求等待三十秒后超时。","contested":true},
+    {"id":"timeout-b","predicate":"approval_timeout","text":"审批请求等待六十秒后超时。","contested":true}
+  ],
+  "cases": [
+    {"id":"no-database-version","query":"What exact PostgreSQL version is deployed?","expected":"missing"},
+    {"id":"no-last-report-date","query":"我最近完成的那份研究报告是哪天写完的？","expected":"missing"},
+    {"id":"cache-fields","query":"向量缓存的键应该包含哪些信息？","expected":"supported"},
+    {"id":"cache-authorization","query":"缓存命中以后还要检查权限吗？","expected":"supported"},
+    {"id":"archive-rule","query":"完成的研究报告应该如何分类归档和命名？","expected":"supported"},
+    {"id":"internal-language","query":"我要写一份内部报告，应该使用哪种语言？","expected":"supported"},
+    {"id":"external-language","query":"What language should a report for external readers use?","expected":"supported"},
+    {"id":"unknown-audience","query":"我要写一份报告，应该使用哪种语言？","expected":"conditional"},
+    {"id":"hypothetical-audience","query":"也许这份报告会对外发布，但受众还没确定，现在能决定使用哪种语言吗？","expected":"conditional"},
+    {"id":"retention","query":"备份多久后删除？","expected":"supported"},
+    {"id":"backup-date","query":"最近一份备份是在哪一天生成的？","expected":"missing"},
+    {"id":"partial-language-date","query":"内部报告用什么语言？我最近一份报告的完成日期是什么？","expected":"partial"},
+    {"id":"contested-timeout","query":"审批请求究竟等待多少秒才超时？","expected":"conflict"}
+  ]
+}

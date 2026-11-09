@@ -3,6 +3,12 @@
 from .actions import AgentAction, FinishAction, ToolCallAction, parse_action
 from .compaction import CompactedExcerpt, ContextCompaction
 from .context import ContextChoice, ContextCompilation, SessionContextCompiled
+from .context_evidence import (
+    ContextEvidenceAssessment,
+    ContextEvidenceCheck,
+    ContextEvidenceDemand,
+    ContextEvidenceNeed,
+)
 from .context_rerank import ContextRerankReport, RerankDemandReport
 from .context_supply import (
     ContextBundle,
@@ -241,6 +247,10 @@ __all__ = [
     "ContextChoice",
     "ContextCompaction",
     "ContextCompilation",
+    "ContextEvidenceAssessment",
+    "ContextEvidenceCheck",
+    "ContextEvidenceDemand",
+    "ContextEvidenceNeed",
     "ContextRelevance",
     "ContextRerankReport",
     "ContextSelected",

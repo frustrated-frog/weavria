@@ -1,4 +1,4 @@
-"""Atomic low-trust context bundles and content-free source supply diagnostics."""
+"""Atomic low-trust context bundles and versioned source supply diagnostics."""
 
 from typing import Literal, Self
 
@@ -13,6 +13,7 @@ from pydantic import (
 )
 
 from ._schema import ContractModel, NonBlankString
+from .context_evidence import ContextEvidenceAssessment
 from .context_rerank import ContextRerankReport
 
 
@@ -50,10 +51,11 @@ class ContextSupplyReport(BaseModel):
     """Bind a provider's bounded selection to task demands and its read snapshot."""
 
     model_config = ContractModel.model_config
-    schema_version: Literal[1, 2, 3] = 1
+    schema_version: Literal[1, 2, 3, 4] = 1
     relevance: tuple[ContextRelevance, ...] = Field(default=(), max_length=3200)
     retrieval: RetrievalDiagnostics | None = None
     reranking: ContextRerankReport | None = None
+    evidence: ContextEvidenceAssessment | None = None
 
     @field_validator("schema_version", mode="before")
     @classmethod
@@ -68,6 +70,8 @@ class ContextSupplyReport(BaseModel):
             data.pop("retrieval", None)
         if self.schema_version < 3:
             data.pop("reranking", None)
+        if self.schema_version < 4:
+            data.pop("evidence", None)
         return data
 
     provider_version: NonBlankString
@@ -84,10 +88,24 @@ class ContextSupplyReport(BaseModel):
     def validate_counts(self) -> Self:
         if self.schema_version == 1 and (self.relevance or self.retrieval is not None):
             raise ValueError("retrieval relevance requires source report v2")
-        if self.schema_version >= 2 and self.retrieval is None:
+        if self.schema_version in {2, 3} and self.retrieval is None:
             raise ValueError("source report v2 requires retrieval diagnostics")
-        if (self.schema_version == 3) != (self.reranking is not None):
+        if self.schema_version < 4 and (self.schema_version == 3) != (self.reranking is not None):
             raise ValueError("reranking diagnostics require source report v3")
+        if (self.schema_version == 4) != (self.evidence is not None):
+            raise ValueError("evidence assessment requires source report v4")
+        if (
+            self.schema_version == 4
+            and (self.relevance or self.reranking is not None)
+            and self.retrieval is None
+        ):
+            raise ValueError("retrieval features still require their diagnostics in source v4")
+        if self.evidence is not None and (
+            self.evidence.task_revision != self.task_revision
+            or self.evidence.demand_sha256 != self.demand_sha256
+            or self.evidence.supplied_sha256 != self.supplied_sha256
+        ):
+            raise ValueError("evidence assessment differs from its source binding")
         keys = [(r.bundle_id, r.demand_id) for r in self.relevance]
         if len(keys) != len(set(keys)):
             raise ValueError("source report repeats a relevance binding")
@@ -114,6 +132,25 @@ class ContextSupply(ContractModel):
     bundles: tuple[ContextBundle, ...] = Field(default=(), max_length=100)
     report: ContextSupplyReport
 
+    def evidence_view_json(self) -> str:
+        """任务理解阶段复用同一审查边界,不让被拒材料从另一模型入口漏回。"""
+        import json
+
+        evidence = self.report.evidence
+        if evidence is None:
+            return self.model_dump_json()
+        allowed = evidence.allowed_bundle_ids()
+        return json.dumps(
+            {
+                "bundles": [
+                    b.model_dump(mode="json") for b in self.bundles if b.bundle_id in allowed
+                ],
+                "evidence": evidence.model_dump(mode="json"),
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
     @model_validator(mode="after")
     def validate_binding(self) -> Self:
         import hashlib
@@ -123,6 +160,15 @@ class ContextSupply(ContractModel):
             raise ValueError("source bundle identities must be unique")
         if self.report.supplied_groups != len(self.bundles):
             raise ValueError("source supply count differs from its bundles")
+        if self.report.evidence is not None:
+            evidence = self.report.evidence
+            ids = {b.bundle_id for b in self.bundles}
+            if not evidence.allowed_bundle_ids() <= ids or any(
+                c.bundle_id not in ids for d in evidence.demands for n in d.needs for c in n.checks
+            ):
+                raise ValueError("evidence refers to an absent supplied bundle")
+            if any(n.status == "omitted" for d in evidence.demands for n in d.needs):
+                raise ValueError("omitted is a final context projection, not a source judgment")
         if any(
             r.bundle_id not in {b.bundle_id for b in self.bundles} for r in self.report.relevance
         ):

@@ -24,6 +24,7 @@ from weavria.memory import (
 )
 
 from .memory_retrieval import MemorySnapshotReader, retrieve_task_memory
+from .memory_sufficiency import ModelMemoryEvidenceAssessor
 
 
 class MemoryGroupReader(Protocol):
@@ -55,15 +56,19 @@ class MemoryContextSource:
         max_groups: int = 32,
         max_bytes: int = 262144,
         retriever: TaskMemoryRetriever | None = None,
+        evidence: ModelMemoryEvidenceAssessor | None = None,
     ) -> None:
         # 身份、精确作用域与时间策略由宿主绑定,模型只能影响候选查询词。
         # 复制授权契约避免外部可变对象在一次请求中静默扩大访问范围。
         self._reader = reader
         self._retriever = retriever
+        self._evidence = evidence
         if retriever is not None:
             if not isinstance(reader, MemorySnapshotReader):
                 raise ValueError("task memory retrieval requires a complete snapshot reader")
             self.version = "memory-context/2[" + retriever.version + "]"
+        if evidence is not None:
+            self.version += "+" + evidence.version
         self._access = MemoryAccess.model_validate_json(access.model_dump_json())
         self._query = MemoryQuery(
             scope=scope,
@@ -77,6 +82,33 @@ class MemoryContextSource:
         self._valid_at = valid_at or (lambda: datetime.now(UTC))
 
     async def retrieve(
+        self,
+        *,
+        session_id: str,
+        run_id: str,
+        task: TaskInput,
+        demands: tuple[ContextDemand, ...],
+    ) -> ContextSupply:
+        supply = await self._retrieve(
+            session_id=session_id, run_id=run_id, task=task, demands=demands
+        )
+        if self._evidence is None:
+            return supply
+        assessment = await self._evidence.assess(supply, demands)
+        report = ContextSupplyReport.model_validate(
+            {
+                **supply.report.model_dump(),
+                "schema_version": 4,
+                "evidence": assessment,
+            }
+        )
+        assessed = ContextSupply(bundles=supply.bundles, report=report)
+        # 诊断不能免费绕过源预算;完整表示装不下时显式失败,不裁掉缺口报告。
+        if len(assessed.model_dump_json().encode()) > self._query.max_bytes:
+            raise ContextSourceError("capacity")
+        return assessed
+
+    async def _retrieve(
         self,
         *,
         session_id: str,

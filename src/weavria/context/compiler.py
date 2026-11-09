@@ -218,7 +218,13 @@ class SessionContextCompiler:
             supply = ContextSupply.model_validate_json(supply.model_dump_json())
             if supply.report.task_revision != base.task.revision:
                 raise ContextBuildError("source supply belongs to another task revision")
+        evidence = supply.report.evidence if supply else None
         bundles = supply.bundles if supply else ()
+        if evidence is not None:
+            # 只背景相关、未完成审查的材料不能靠词法特征重新进入可选上下文。
+            # 条件未知/冲突仍带完整族,主模型可据此澄清或寻找其他证据。
+            allowed = evidence.allowed_bundle_ids()
+            bundles = tuple(b for b in bundles if b.bundle_id in allowed)
         if recovery_ranges and not base.recovery_enabled:
             raise ContextBuildError("recovery requires control request v4")
         if synthesis_range is not None and synthesis_range.value_bytes > MAX_SYNTHESIS_RANGE_BYTES:
@@ -309,6 +315,10 @@ class SessionContextCompiler:
             raise ContextBuildError("retrieval query differs from compiler demands")
         if supply is not None and supply.report.demand_sha256 != history_query_digest(demands):
             raise ContextBuildError("source supply query differs from compiler demands")
+        if evidence is not None and {d.demand_id for d in evidence.demands} != {
+            d.demand_id for d in demands
+        }:
+            raise ContextBuildError("evidence assessment omitted a current demand")
         indexed_bundles = tuple(
             [
                 await bounded_passages(
@@ -500,7 +510,9 @@ class SessionContextCompiler:
         # ConversationView 的版本描述历史视图协议。可选来源的相关度策略
         # 单独记录在供给报告与编译报告中,不能写入旧视图的封闭版本枚举。
         template = SessionRequest.model_construct(
-            schema_version=10
+            schema_version=11
+            if evidence is not None
+            else 10
             if self.config.summary_preparation
             else 9
             if self.config.summary_guidance
@@ -511,6 +523,7 @@ class SessionContextCompiler:
             else 5,
             conversation=empty,
             current=base,
+            evidence=evidence.project(frozenset()) if evidence else None,
         )
         wire = template.model_dump(mode="json")
         payloads = tuple(tuple(json.loads(v.payload_json) for v in unit.variants) for unit in units)
@@ -569,7 +582,9 @@ class SessionContextCompiler:
                 ),
                 **(
                     {
-                        "schema_version": 10
+                        "schema_version": 11
+                        if evidence is not None
+                        else 10
                         if self.config.summary_preparation
                         else 9
                         if self.config.summary_guidance
@@ -607,6 +622,19 @@ class SessionContextCompiler:
                         ]
                     }
                     if supply is not None
+                    else {}
+                ),
+                **(
+                    {
+                        "evidence": evidence.project(
+                            frozenset(
+                                units[i].identity.removeprefix("bundle:")
+                                for i in selected
+                                if units[i].channel == "bundle"
+                            )
+                        ).model_dump(mode="json")
+                    }
+                    if evidence is not None
                     else {}
                 ),
             }
@@ -962,7 +990,7 @@ class SessionContextCompiler:
             policy_version=f"context-compiler/{report_version}[{self.config.policy}]"
             + (
                 "+source-relevance/1"
-                if supply is not None and supply.report.schema_version >= 2
+                if supply is not None and supply.report.retrieval is not None
                 else ""
             ),
             compaction_status=compaction_status,
