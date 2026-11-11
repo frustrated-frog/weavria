@@ -119,7 +119,9 @@ async def experiment(args: argparse.Namespace) -> None:
                             max_groups=2 if variant == "wide" else 1,
                             max_bytes=65536,
                             retriever=TaskMemoryRetriever(
-                                policy=MemoryRetrievalPolicy(mode="lexical")
+                                policy=MemoryRetrievalPolicy(
+                                    mode="lexical", lexical_normalization=args.lexical_normalization
+                                )
                             ),
                             evidence=assessor,
                             refinement=MemoryRefinementPolicy(max_duration=120)
@@ -199,6 +201,7 @@ async def experiment(args: argparse.Namespace) -> None:
                     "configuration_id": config_id,
                     "model_config": asdict(config),
                     "options": options,
+                    "lexical_normalization": args.lexical_normalization,
                     "assessor_version": assessor.version,
                     "rows": rows,
                 },
@@ -212,6 +215,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", default="examples/fixtures/memory_refinement.json")
     parser.add_argument("--output", required=True)
+    parser.add_argument(
+        "--lexical-normalization", choices=("surface", "english_snowball"), default="surface"
+    )
     parser.add_argument(
         "--variants",
         nargs="+",

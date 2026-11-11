@@ -1,0 +1,323 @@
+{
+  "version": "cpython-v3.12.8-docs/1",
+  "documents": [
+    {
+      "name": "asyncio-task.rst",
+      "url": "https://raw.githubusercontent.com/python/cpython/v3.12.8/Doc/library/asyncio-task.rst",
+      "sha256": "ab191cfa513cd7f7251ce84c52c3470426395f65d1169dc165298bdeb0dcc5b0"
+    },
+    {
+      "name": "logging.rst",
+      "url": "https://raw.githubusercontent.com/python/cpython/v3.12.8/Doc/library/logging.rst",
+      "sha256": "70edcff05f815a8cb287e6011a75e22bfc86b1743e33feff0775409db750d532"
+    },
+    {
+      "name": "pathlib.rst",
+      "url": "https://raw.githubusercontent.com/python/cpython/v3.12.8/Doc/library/pathlib.rst",
+      "sha256": "1c4ba9aabc2e36321dcfdc3b86daebace41aa39969eaedb449e4a385d6011af1"
+    },
+    {
+      "name": "subprocess.rst",
+      "url": "https://raw.githubusercontent.com/python/cpython/v3.12.8/Doc/library/subprocess.rst",
+      "sha256": "4742471faba4e77a685fca0297fc7884d7fe1a7ff3fdb8a6858476fbc07a76db"
+    }
+  ],
+  "questions": [
+    {
+      "id": "a1",
+      "split": "development",
+      "category": "morphology",
+      "query": "How should a coroutine clean up after cancellation and then propagate the exception?",
+      "document": "asyncio-task.rst",
+      "lines": [
+        301,
+        305
+      ]
+    },
+    {
+      "id": "a2",
+      "split": "development",
+      "category": "paraphrase",
+      "query": "Why can a background coroutine disappear before finishing if I discard its task handle?",
+      "document": "asyncio-task.rst",
+      "lines": [
+        265,
+        268
+      ]
+    },
+    {
+      "id": "a3",
+      "split": "development",
+      "category": "literal",
+      "query": "When a TaskGroup child fails, what happens to the remaining tasks?",
+      "document": "asyncio-task.rst",
+      "lines": [
+        353,
+        356
+      ]
+    },
+    {
+      "id": "a4",
+      "split": "validation",
+      "category": "cross_language",
+      "query": "为什么异步任务不能吞掉取消异常，否则结构化并发会出问题？",
+      "document": "asyncio-task.rst",
+      "lines": [
+        307,
+        314
+      ]
+    },
+    {
+      "id": "a5",
+      "split": "validation",
+      "category": "paraphrase",
+      "query": "Can I protect an inner async operation from its caller being cancelled while the caller still receives an exception?",
+      "document": "asyncio-task.rst",
+      "lines": [
+        641,
+        645
+      ]
+    },
+    {
+      "id": "a6",
+      "split": "validation",
+      "category": "morphology",
+      "query": "How are failures collected and raised after a task group finishes?",
+      "document": "asyncio-task.rst",
+      "lines": [
+        363,
+        368
+      ]
+    },
+    {
+      "id": "s1",
+      "split": "development",
+      "category": "paraphrase",
+      "query": "My child program writes lots of output and waiting for it hangs. How can I avoid filling the pipe?",
+      "document": "subprocess.rst",
+      "lines": [
+        799,
+        802
+      ]
+    },
+    {
+      "id": "s2",
+      "split": "development",
+      "category": "morphology",
+      "query": "Does expiration of a communicate timeout kill the subprocess, and how should cleanup proceed?",
+      "document": "subprocess.rst",
+      "lines": [
+        836,
+        838
+      ]
+    },
+    {
+      "id": "s3",
+      "split": "development",
+      "category": "literal",
+      "query": "What does a negative Popen.returncode mean on POSIX?",
+      "document": "subprocess.rst",
+      "lines": [
+        945,
+        946
+      ]
+    },
+    {
+      "id": "s4",
+      "split": "validation",
+      "category": "cross_language",
+      "query": "子进程通信读取的数据量很大，为什么不适合用 communicate？",
+      "document": "subprocess.rst",
+      "lines": [
+        849,
+        850
+      ]
+    },
+    {
+      "id": "s5",
+      "split": "validation",
+      "category": "paraphrase",
+      "query": "Is it safe to resume reading a child process after communication times out without losing its output?",
+      "document": "subprocess.rst",
+      "lines": [
+        832,
+        834
+      ]
+    },
+    {
+      "id": "s6",
+      "split": "validation",
+      "category": "morphology",
+      "query": "How does terminating a process differ from killing it on POSIX and Windows?",
+      "document": "subprocess.rst",
+      "lines": [
+        869,
+        879
+      ]
+    },
+    {
+      "id": "p1",
+      "split": "development",
+      "category": "paraphrase",
+      "query": "Why can following directory links while walking a tree loop forever?",
+      "document": "pathlib.rst",
+      "lines": [
+        1292,
+        1294
+      ]
+    },
+    {
+      "id": "p2",
+      "split": "development",
+      "category": "morphology",
+      "query": "When creating directories recursively, are permissions applied to newly created parents?",
+      "document": "pathlib.rst",
+      "lines": [
+        1364,
+        1366
+      ]
+    },
+    {
+      "id": "p3",
+      "split": "development",
+      "category": "literal",
+      "query": "How does Path.walk handle os.scandir errors by default and with on_error?",
+      "document": "pathlib.rst",
+      "lines": [
+        1279,
+        1283
+      ]
+    },
+    {
+      "id": "p4",
+      "split": "validation",
+      "category": "cross_language",
+      "query": "Path.walk 默认会跟随符号链接吗？链接会放在哪个列表？",
+      "document": "pathlib.rst",
+      "lines": [
+        1285,
+        1288
+      ]
+    },
+    {
+      "id": "p5",
+      "split": "validation",
+      "category": "paraphrase",
+      "query": "Can touching an existing file update its modification time instead of failing?",
+      "document": "pathlib.rst",
+      "lines": [
+        1347,
+        1352
+      ]
+    },
+    {
+      "id": "p6",
+      "split": "validation",
+      "category": "morphology",
+      "query": "How can I override platform casing rules when globbing paths?",
+      "document": "pathlib.rst",
+      "lines": [
+        1197,
+        1200
+      ]
+    },
+    {
+      "id": "l1",
+      "split": "development",
+      "category": "paraphrase",
+      "query": "Why does one log entry get printed more than once when I attach handlers at several hierarchy levels?",
+      "document": "logging.rst",
+      "lines": [
+        164,
+        171
+      ]
+    },
+    {
+      "id": "l2",
+      "split": "development",
+      "category": "morphology",
+      "query": "How is concurrent logging synchronized between threads and handlers?",
+      "document": "logging.rst",
+      "lines": [
+        1128,
+        1131
+      ]
+    },
+    {
+      "id": "l3",
+      "split": "development",
+      "category": "literal",
+      "query": "Does Logger.propagate check ancestor logger levels and filters?",
+      "document": "logging.rst",
+      "lines": [
+        144,
+        148
+      ]
+    },
+    {
+      "id": "l4",
+      "split": "validation",
+      "category": "cross_language",
+      "query": "日志系统退出时如何保证缓冲内容写出并关闭处理器？",
+      "document": "logging.rst",
+      "lines": [
+        1438,
+        1440
+      ]
+    },
+    {
+      "id": "l5",
+      "split": "validation",
+      "category": "paraphrase",
+      "query": "Why might logging inside an asynchronous signal handler be unsafe even though normal threading is supported?",
+      "document": "logging.rst",
+      "lines": [
+        1133,
+        1136
+      ]
+    },
+    {
+      "id": "l6",
+      "split": "validation",
+      "category": "morphology",
+      "query": "At which ancestor does propagation of logged events stop?",
+      "document": "logging.rst",
+      "lines": [
+        153,
+        160
+      ]
+    },
+    {
+      "id": "n1",
+      "split": "development",
+      "category": "negative",
+      "query": "How do I rotate an AWS access key with boto3?",
+      "document": null,
+      "lines": null
+    },
+    {
+      "id": "n2",
+      "split": "development",
+      "category": "negative",
+      "query": "Which PostgreSQL isolation level prevents write skew?",
+      "document": null,
+      "lines": null
+    },
+    {
+      "id": "n3",
+      "split": "validation",
+      "category": "negative",
+      "query": "How does NumPy broadcasting combine incompatible array dimensions?",
+      "document": null,
+      "lines": null
+    },
+    {
+      "id": "n4",
+      "split": "validation",
+      "category": "negative",
+      "query": "What does HTTP 429 mean and how should Retry-After be parsed?",
+      "document": null,
+      "lines": null
+    }
+  ]
+}

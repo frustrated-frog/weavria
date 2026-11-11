@@ -894,6 +894,15 @@ wheels = [
 ]
 
 [[package]]
+name = "snowballstemmer"
+version = "3.0.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/75/a7/9810d872919697c9d01295633f5d574fb416d47e535f258272ca1f01f447/snowballstemmer-3.0.1.tar.gz", hash = "sha256:6d5eeeec8e9f84d4d56b847692bacf79bc2c8e90c7f80ca4444ff8b6f2e52895", size = 105575, upload-time = "2025-05-09T16:34:51.843Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c8/78/3565d011c61f5a43488987ee32b6f3f656e7f107ac2782dd57bdd7d91d9a/snowballstemmer-3.0.1-py3-none-any.whl", hash = "sha256:6cd7b3897da8d6c9ffb968a6781fa6532dce9c3618a4b127d920dab764a19064", size = 103274, upload-time = "2025-05-09T16:34:50.371Z" },
+]
+
+[[package]]
 name = "starlette"
 version = "1.8.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1073,6 +1082,9 @@ finscope = [
     { name = "tiktoken" },
     { name = "uvicorn" },
 ]
+lexical-memory = [
+    { name = "snowballstemmer" },
+]
 local-memory = [
     { name = "numpy" },
     { name = "onnxruntime" },
@@ -1093,6 +1105,7 @@ dev = [
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "ruff" },
+    { name = "snowballstemmer" },
     { name = "tiktoken" },
     { name = "uvicorn" },
 ]
@@ -1105,12 +1118,13 @@ requires-dist = [
     { name = "numpy", marker = "extra == 'local-memory'", specifier = ">=2,<3" },
     { name = "onnxruntime", marker = "extra == 'local-memory'", specifier = ">=1.20,<2" },
     { name = "pydantic", specifier = ">=2.10,<3" },
+    { name = "snowballstemmer", marker = "extra == 'lexical-memory'", specifier = "==3.0.1" },
     { name = "tiktoken", marker = "extra == 'finscope'", specifier = ">=0.9,<1" },
     { name = "tiktoken", marker = "extra == 'tokenization'", specifier = ">=0.9,<1" },
     { name = "tokenizers", marker = "extra == 'local-memory'", specifier = ">=0.21,<1" },
     { name = "uvicorn", marker = "extra == 'finscope'", specifier = ">=0.34,<1" },
 ]
-provides-extras = ["tokenization", "openai-compatible", "finscope", "local-memory"]
+provides-extras = ["tokenization", "openai-compatible", "finscope", "local-memory", "lexical-memory"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -1120,6 +1134,7 @@ dev = [
     { name = "pytest", specifier = ">=8.3" },
     { name = "pytest-asyncio", specifier = ">=0.24" },
     { name = "ruff", specifier = ">=0.9" },
+    { name = "snowballstemmer", specifier = "==3.0.1" },
     { name = "tiktoken", specifier = ">=0.9,<1" },
     { name = "uvicorn", specifier = ">=0.34,<1" },
 ]

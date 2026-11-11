@@ -99,8 +99,21 @@ def measure(groups: tuple[MemoryGroup, ...], matches: tuple[MemoryMatch, ...]) -
     return len(json.dumps([g.model_dump(mode="json") for g in groups]).encode())
 
 
+@pytest.mark.parametrize(
+    "policy",
+    [
+        MemoryRetrievalPolicy(),
+        MemoryRetrievalPolicy(
+            lexical_normalization="english_snowball", dense_view="contextual_windows"
+        ),
+    ],
+)
 async def test_semantic_recall_preserves_zero_match_exception_and_demand_diversity(
-    tmp_path: Path, access: MemoryAccess, assertion: MemoryAssertion, source: MemorySource
+    tmp_path: Path,
+    access: MemoryAccess,
+    assertion: MemoryAssertion,
+    source: MemorySource,
+    policy: MemoryRetrievalPolicy,
 ) -> None:
     async with SQLiteMemoryStore(tmp_path / "memory.db") as store:
         await seed(store, access, assertion, source)
@@ -110,7 +123,7 @@ async def test_semantic_recall_preserves_zero_match_exception_and_demand_diversi
         assert not (await store.recall_groups(access, query)).groups
         snapshot = await store.retrieval_snapshot(access, query)
         encoder = Encoder()
-        retriever = TaskMemoryRetriever(encoder=encoder)
+        retriever = TaskMemoryRetriever(encoder=encoder, policy=policy)
         demands = (MemoryDemand("first", "one"), MemoryDemand("second", "two"))
         recall = await retriever.retrieve(
             snapshot, demands, limit=2, max_bytes=10000, measure=measure

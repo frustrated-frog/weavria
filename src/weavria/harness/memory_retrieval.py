@@ -37,9 +37,10 @@ class MemorySnapshotReader(Protocol):
 
 @dataclass(frozen=True)
 class MemorySelectionDemand(ContextDemand):
-    """同一需求的两个排名视图;asdict 摘要同时绑定原查询与扩展词。"""
+    """同一需求的两个排名视图;摘要绑定原查询、别称与仅供去重的锚点。"""
 
     expansion: str = ""
+    expansion_anchors: str = ""
 
 
 def _bundles(
@@ -191,6 +192,9 @@ async def select_task_memory(
                 d.query,
                 d.weight,
                 expansion=d.expansion if isinstance(d, MemorySelectionDemand) else "",
+                expansion_anchors=d.expansion_anchors
+                if isinstance(d, MemorySelectionDemand)
+                else "",
             )
             for d in (selection or demands)
         ),

@@ -4,12 +4,13 @@ import math
 import re
 import unicodedata
 from collections import Counter, defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 
 from .contracts import MemoryCapacityError, MemoryHit, MemoryRecall, MemorySource, MemoryVersion
 
 
-def _terms(text: str) -> tuple[str, ...]:
+def surface_terms(text: str) -> tuple[str, ...]:
+    """共享的词面分词;NFKC/casefold,中文字符及相邻双字,不推断同义。"""
     normalized = unicodedata.normalize("NFKC", text).casefold()
     result: list[str] = []
     for part in re.findall(
@@ -26,21 +27,28 @@ def _terms(text: str) -> tuple[str, ...]:
 def residual_memory_query(query: str, backgrounds: Sequence[str]) -> str:
     """从查询词项减去已读背景的词项;只供排名,不得替换原任务或条件。
 
-    使用与 BM25 相同的归一化/中英文切词。保留原查询词序并去重,无残差时
+    使用基础 BM25 的词面归一化/中英文切词。保留原查询词序并去重,无残差时
     回退原查询。背景判断可能出错,所以这不是事实删除或否定证据。
     """
-    consumed = {term for text in backgrounds for term in _terms(text)}
-    remaining = tuple(dict.fromkeys(t for t in _terms(query) if t not in consumed))
+    consumed = {term for text in backgrounds for term in surface_terms(text)}
+    remaining = tuple(dict.fromkeys(t for t in surface_terms(query) if t not in consumed))
     return " ".join(remaining)[:2048] if remaining else query[:2048]
 
 
-def rank_versions(versions: Sequence[MemoryVersion], text: str) -> tuple[MemoryHit, ...]:
+def rank_versions(
+    versions: Sequence[MemoryVersion],
+    text: str,
+    *,
+    terms: Callable[[str], tuple[str, ...]] = surface_terms,
+    exclude_query_terms: frozenset[str] = frozenset(),
+) -> tuple[MemoryHit, ...]:
     """Rank exact-filter survivors; lexical relevance never confers factual authority.
 
     BM25 uses k1=1.2, b=.75 and positive Robertson IDF. Its corpus is only the
     visible snapshot: another tenant or a future version cannot affect ranking.
     """
-    query_terms = set(_terms(text))
+    # 只从查询扣除已在另一通道计分的锚点;文档长度和 IDF 语料不受影响。
+    query_terms = set(terms(text)) - exclude_query_terms
     if not text.strip():
         return tuple(
             MemoryHit(version=v, score=0.0)
@@ -52,10 +60,10 @@ def rank_versions(versions: Sequence[MemoryVersion], text: str) -> tuple[MemoryH
     lengths: list[int] = []
     for index, version in enumerate(versions):
         assertion = version.assertion
-        terms = Counter(_terms(f"{assertion.subject} {assertion.predicate} {assertion.text}"))
-        lengths.append(terms.total())
-        for term in query_terms & terms.keys():
-            postings[term].append((index, terms[term]))
+        counts = Counter(terms(f"{assertion.subject} {assertion.predicate} {assertion.text}"))
+        lengths.append(counts.total())
+        for term in query_terms & counts.keys():
+            postings[term].append((index, counts[term]))
     average = sum(lengths) / len(lengths) or 1.0
     scores: dict[int, float] = defaultdict(float)
     for term in sorted(postings):

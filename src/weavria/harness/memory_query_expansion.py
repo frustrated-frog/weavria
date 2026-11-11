@@ -79,7 +79,7 @@ class ModelMemoryQueryExpander:
         self._provider = provider
         self.policy = policy or MemoryQueryExpansionPolicy()
         self.version = (
-            "memory-query-expansion/2:"
+            "memory-query-expansion/3:"
             + hashlib.sha256(
                 (configuration_id + repr(self.policy) + _INSTRUCTIONS).encode()
             ).hexdigest()
@@ -161,6 +161,8 @@ class ModelMemoryQueryExpander:
                 aliases[did].extend(e.aliases)
             # 原残差与原文锚点留在主视图,别称进入独立排名通道。这样保留限制,
             # 又不让较长背景文本在 BM25 中压过新词。两路只共享候选,不共享真值。
+            # 另外传递已定位的锚点,由检索器按其词形策略从别称中去重;
+            # 不能在这里裁剪自然语言别称,否则词形差异仍会绕过去重。
             output = tuple(
                 MemorySelectionDemand(
                     d.demand_id,
@@ -168,10 +170,14 @@ class ModelMemoryQueryExpander:
                     d.weight,
                     d.anchors,
                     expansion=" ".join(dict.fromkeys(aliases[d.demand_id])),
+                    expansion_anchors=" ".join(dict.fromkeys(additions[d.demand_id])),
                 )
                 for d in selection
             )
-            if any(len(d.query) > 2048 or len(d.expansion) > 2048 for d in output):
+            if any(
+                len(d.query) > 2048 or len(d.expansion) > 2048 or len(d.expansion_anchors) > 2048
+                for d in output
+            ):
                 raise _Capacity
         except _Capacity:
             failure = "capacity"

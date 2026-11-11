@@ -11,8 +11,10 @@ from typing import Literal, Protocol
 
 from .contracts import MemoryCapacityError, MemoryError, MemoryHit
 from .groups import MemoryGroup, group_identity
+from .lexical_analysis import EnglishSnowballTerms
+from .passage_windows import contextual_windows
 from .reranking import MemoryRerankAssessment, MemoryReranker, RerankCandidate
-from .retrieval import rank_versions
+from .retrieval import rank_versions, surface_terms
 from .snapshot import MemoryRetrievalSnapshot
 
 
@@ -37,12 +39,15 @@ class MemoryDemand:
     query: str
     weight: float = 1.0
     expansion: str = ""
+    expansion_anchors: str = ""
 
     def __post_init__(self) -> None:
         if not self.demand_id.strip() or not self.query.strip() or len(self.query) > 2048:
             raise ValueError("memory demand requires an identity and a bounded nonempty query")
-        if type(self.expansion) is not str or len(self.expansion) > 2048:
-            raise ValueError("memory expansion must be a bounded string")
+        if any(
+            type(v) is not str or len(v) > 2048 for v in (self.expansion, self.expansion_anchors)
+        ):
+            raise ValueError("memory expansion and anchors must be bounded strings")
         if (
             isinstance(self.weight, bool)
             or not math.isfinite(self.weight)
@@ -64,8 +69,15 @@ class MemoryRetrievalPolicy:
     cache_entries: int = 1024
     failure: Literal["raise", "lexical"] = "lexical"
     max_duration: float = 20.0
+    lexical_normalization: Literal["surface", "english_snowball"] = "surface"
+    dense_view: Literal["json_bytes", "contextual_windows"] = "json_bytes"
 
     def __post_init__(self) -> None:
+        if self.lexical_normalization not in {
+            "surface",
+            "english_snowball",
+        } or self.dense_view not in {"json_bytes", "contextual_windows"}:
+            raise ValueError("unknown memory retrieval representation")
         for value, upper in (
             (self.rank_constant, 1000),
             (self.channel_limit, 100),
@@ -96,7 +108,7 @@ class MemoryRetrievalPolicy:
             raise ValueError("memory retrieval duration must be in (0,300]")
 
     def version(self) -> str:
-        return "task-memory/1:" + hashlib.sha256(repr(self).encode()).hexdigest()[:24]
+        return "task-memory/2:" + hashlib.sha256(repr(self).encode()).hexdigest()[:24]
 
 
 @dataclass(frozen=True)
@@ -175,11 +187,21 @@ class TaskMemoryRetriever:
         if self.policy.mode != "lexical" and encoder is None:
             raise ValueError("semantic memory retrieval requires an explicit encoder")
         self.encoder = encoder
+        # 配置时就验证可选依赖,不把安装错误伪装成普通的空召回。
+        self._lexical_version = (
+            EnglishSnowballTerms().version
+            if self.policy.lexical_normalization == "english_snowball"
+            else "surface/1"
+        )
         self._encoder_version = encoder.version if encoder else None
         self._lock = asyncio.Lock()
         self._cache: OrderedDict[tuple[str, str, str], tuple[float, ...]] = OrderedDict()
         self.candidate_version = (
-            self.policy.version() + ":" + (encoder.version if encoder else "none")
+            self.policy.version()
+            + ":"
+            + (encoder.version if encoder else "none")
+            + ":"
+            + self._lexical_version
         )
         self.reranker = reranker
         self.version = self.candidate_version + (":" + reranker.version if reranker else "")
@@ -251,15 +273,28 @@ class TaskMemoryRetriever:
         }
         lexical: dict[str, dict[str, int]] = {}
         expanded: dict[str, dict[str, int]] = {}
+        terms = (
+            EnglishSnowballTerms()
+            if policy.lexical_normalization == "english_snowball"
+            else surface_terms
+        )
         for demand in demands:
             scores: dict[str, float] = {}
-            for hit in rank_versions(snapshot.versions, demand.query):
+            for hit in rank_versions(snapshot.versions, demand.query, terms=terms):
                 gid = group_identity(hit.version)
                 scores[gid] = max(scores.get(gid, 0.0), hit.score)
             lexical[demand.demand_id] = self._ranks(scores)
             if demand.expansion:
                 extra: dict[str, float] = {}
-                for hit in rank_versions(snapshot.versions, demand.expansion):
+                # 主视图已经保留实体/背景锚点。别称只贡献锚点之外的词项,
+                # 防止 plan/planning 之类弱背景在两路重复得分。不能减去整个
+                # 主查询:其中可能包含需要再次强调的答案焦点(例如 beta code)。
+                for hit in rank_versions(
+                    snapshot.versions,
+                    demand.expansion,
+                    terms=terms,
+                    exclude_query_terms=frozenset(terms(demand.expansion_anchors)),
+                ):
                     gid = group_identity(hit.version)
                     extra[gid] = max(extra.get(gid, 0.0), hit.score)
                 expanded[demand.demand_id] = self._ranks(extra)
@@ -327,7 +362,7 @@ class TaskMemoryRetriever:
                 demand_ids=tuple(queries),
                 # 词法回退改变了候选分布,不能继续套用原 Hybrid 的校准。
                 candidate_version=self.candidate_version
-                + (":lexical-expansion/1" if expanded else "")
+                + (":lexical-expansion/2" if expanded else "")
                 + ":actual="
                 + ("lexical_fallback" if fallback else mode)
                 + ":corpus="
@@ -417,7 +452,12 @@ class TaskMemoryRetriever:
                 },
                 ensure_ascii=False,
             )
-            for chunk in _chunks(representation):
+            chunks = (
+                contextual_windows(a)
+                if self.policy.dense_view == "contextual_windows"
+                else _chunks(representation)
+            )
+            for chunk in chunks:
                 texts.append(chunk)
                 owners.append(group_identity(version))
                 if len(texts) > self.policy.max_chunks:

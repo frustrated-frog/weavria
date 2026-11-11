@@ -2,7 +2,7 @@
 
 import asyncio
 import json
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import pytest
@@ -103,6 +103,7 @@ async def test_append_only_grounded_expansion_preserves_original_input() -> None
         assessment(),
     )
     assert result[0].query == "who signs off Aster production"
+    assert asdict(result[0])["expansion_anchors"] == "Aster production"
     assert DEMANDS[0].query == QUESTION and SELECTION[0].query == "who signs off"
     assert result[0].demand_id == SELECTION[0].demand_id
     assert result[0].weight == SELECTION[0].weight and result[0].anchors == SELECTION[0].anchors
