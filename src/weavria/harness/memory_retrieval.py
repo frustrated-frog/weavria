@@ -3,7 +3,7 @@
 import hashlib
 import json
 from collections.abc import Sequence
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from typing import Protocol, runtime_checkable
 
 from weavria.context import ContextDemand, history_query_digest
@@ -33,6 +33,13 @@ class MemorySnapshotReader(Protocol):
     async def retrieval_snapshot(
         self, access: MemoryAccess, query: MemoryQuery
     ) -> MemoryRetrievalSnapshot: ...
+
+
+@dataclass(frozen=True)
+class MemorySelectionDemand(ContextDemand):
+    """同一需求的两个排名视图;asdict 摘要同时绑定原查询与扩展词。"""
+
+    expansion: str = ""
 
 
 def _bundles(
@@ -178,7 +185,15 @@ async def select_task_memory(
 
     recalled = await retriever.retrieve(
         snapshot,
-        tuple(MemoryDemand(d.demand_id, d.query, d.weight) for d in (selection or demands)),
+        tuple(
+            MemoryDemand(
+                d.demand_id,
+                d.query,
+                d.weight,
+                expansion=d.expansion if isinstance(d, MemorySelectionDemand) else "",
+            )
+            for d in (selection or demands)
+        ),
         limit=query.limit,
         max_bytes=query.max_bytes,
         measure=measure,

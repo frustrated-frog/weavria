@@ -53,6 +53,7 @@ from .memory_features import MemoryReviewFeatureProvider, MemoryReviewFeatures
 from .memory_formation import MemoryExtractor, MemoryFormationEngine, MemoryReviewer
 from .memory_generation import MemoryGenerationPolicy
 from .memory_models import ModelMemoryExtractor, ModelMemoryReviewer
+from .memory_query_expansion import ModelMemoryQueryExpander
 from .memory_refinement import MemoryRefinementPolicy
 from .memory_session import SessionMemoryBinding, SessionMemoryIngestor
 from .memory_sufficiency import MemoryEvidenceAssessor
@@ -101,6 +102,7 @@ class HarnessMemory:
     retrieval: TaskMemoryRetriever | None = None
     evidence_assessor: MemoryEvidenceAssessor | None = None
     refinement: MemoryRefinementPolicy | None = None
+    query_expander: ModelMemoryQueryExpander | None = None
 
     @classmethod
     def from_model(
@@ -437,6 +439,7 @@ class AgentHarness:
                 retriever=memory.retrieval,
                 evidence=memory.evidence_assessor,
                 refinement=memory.refinement,
+                query_expander=memory.query_expander,
             )
             if memory is not None and self._memory_store is not None
             else None

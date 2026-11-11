@@ -14,14 +14,16 @@ from pathlib import Path
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
 from examples.live_memory_formation import Transport
-from examples.memory_sufficiency import Dataset, Fact, seeded_supply
+from examples.memory_sufficiency import CapturedProvider, Dataset, Fact, seeded_supply
 from weavria.context import ContextDemand
 from weavria.core import TaskInput
 from weavria.harness import (
     JointMemoryEvidenceAssessor,
     MemoryContextSource,
     MemoryEvidencePolicy,
+    MemoryQueryExpansionPolicy,
     MemoryRefinementPolicy,
+    ModelMemoryQueryExpander,
 )
 from weavria.harness.structured_memory import call_structured_memory
 from weavria.memory import (
@@ -75,7 +77,7 @@ async def experiment(args: argparse.Namespace) -> None:
         120,
         options=options,
     )
-    provider = OpenAICompatibleProvider(config, transport=transport)
+    provider = CapturedProvider(OpenAICompatibleProvider(config, transport=transport))
     assessor = JointMemoryEvidenceAssessor(
         provider, configuration_id=config_id, policy=MemoryEvidencePolicy(max_duration=120)
     )
@@ -106,21 +108,29 @@ async def experiment(args: argparse.Namespace) -> None:
                         ),
                         store,
                     )
-                    for variant in ("single_pass", "refined"):
+                    for variant in args.variants:
                         start, before = time.monotonic(), transport.calls
+                        action_start = len(provider.actions)
                         source = MemoryContextSource(
                             store,
                             access=access,
                             scope=scope,
                             valid_at=lambda: now,
-                            max_groups=1,
+                            max_groups=2 if variant == "wide" else 1,
                             max_bytes=65536,
                             retriever=TaskMemoryRetriever(
                                 policy=MemoryRetrievalPolicy(mode="lexical")
                             ),
                             evidence=assessor,
                             refinement=MemoryRefinementPolicy(max_duration=120)
-                            if variant == "refined"
+                            if variant in {"refined", "expanded"}
+                            else None,
+                            query_expander=ModelMemoryQueryExpander(
+                                provider,
+                                configuration_id=config_id,
+                                policy=MemoryQueryExpansionPolicy(max_duration=60),
+                            )
+                            if variant == "expanded"
                             else None,
                         )
                         supply = await source.retrieve(
@@ -164,14 +174,18 @@ async def experiment(args: argparse.Namespace) -> None:
                             "answer": answer.model_dump(mode="json"),
                             "correct": answer.value == case.expected,
                             "grounded": grounded,
+                            "wrong_nonnull": answer.value is not None
+                            and answer.value != case.expected,
                             "calls": transport.calls - before,
                             "latency_ms": round((time.monotonic() - start) * 1000),
                             "report": supply.report.model_dump(mode="json"),
+                            "actions": provider.actions[action_start:],
                         }
                         rows.append(row)
                         print(
                             json.dumps(
-                                {k: v for k, v in row.items() if k != "report"}, ensure_ascii=False
+                                {k: v for k, v in row.items() if k not in {"report", "actions"}},
+                                ensure_ascii=False,
                             ),
                             flush=True,
                         )
@@ -198,4 +212,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", default="examples/fixtures/memory_refinement.json")
     parser.add_argument("--output", required=True)
+    parser.add_argument(
+        "--variants",
+        nargs="+",
+        choices=("single_pass", "refined", "expanded", "wide"),
+        default=["single_pass", "refined"],
+    )
     asyncio.run(experiment(parser.parse_args()))

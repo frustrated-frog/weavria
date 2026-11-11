@@ -1,0 +1,14 @@
+{
+  "version": "memory-query-expansion-validation/1",
+  "description": "原句锚定扩展v1实现后、首次运行前冻结。不同术语、实体、否定、条件未知与缺失事实。所有策略读相同完整语料。",
+  "cases": [
+    {"id":"owner", "query":"For the editorial newsletter production coordination checklist, who is in charge?", "expected":"Lena Ortiz", "facts":["The editorial newsletter production coordination checklist tracks weekly milestones.","Accountable owner: Lena Ortiz.","The archive location is shelf 4.","The meeting duration is 30 minutes."]},
+    {"id":"expiry", "query":"For the temporary credential issuance onboarding worksheet, when does it stop working?", "expected":"2027-02-01", "facts":["The temporary credential issuance onboarding worksheet documents delivery.","Credential expiration date: 2027-02-01.","Credential creation date: 2026-11-01.","The renewal reminder is sent in January."]},
+    {"id":"retention", "query":"For the audit evidence storage management handbook, how long must records be kept?", "expected":"18 months", "facts":["The audit evidence storage management handbook describes the archive workflow.","Mandatory retention period: 18 months.","Temporary cache lifetime: 3 days.","Encryption algorithm: AES-256."]},
+    {"id":"wrong_entity", "query":"For the Aster service release checklist, who signs off Aster?", "expected":"Nora Lin", "facts":["The Aster service release checklist tracks readiness and checks.","Aster approver: Nora Lin.","Birch approver: Owen Lee.","Cedar approver: Ada Wu."]},
+    {"id":"unavailable_entity", "query":"For the Aster service release checklist, who signs off Aster?", "expected":null, "facts":["The Aster service release checklist tracks readiness and checks.","Birch approver: Owen Lee.","Cedar approver: Ada Wu.","Aster approval will be recorded after the meeting."]},
+    {"id":"prohibition", "query":"For the telemetry data security compliance review, what information is forbidden to store?", "expected":"authentication secrets", "facts":["The telemetry data security compliance review covers persistence controls.","Prohibited content: authentication secrets.","Permitted content: request identifiers.","Archive retention: 90 days."]},
+    {"id":"unknown_condition", "query":"What is the maximum delay we can tolerate? The environment is undecided.", "expected":null, "facts":["The maximum delay review records service performance.","Test latency ceiling: 800 ms.","Production latency ceiling: 100 ms."], "conditions":[{}, {"environment":"test"}, {"environment":"production"}]},
+    {"id":"no_actual_value", "query":"For the laboratory instrument calibration review, how warm was the sample?", "expected":null, "facts":["The laboratory instrument calibration review is complete.","Record specimen temperature after each calibration.","Room temperature target: 22 C.","Calibration interval: 30 days."]}
+  ]
+}

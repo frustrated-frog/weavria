@@ -2,7 +2,15 @@
 
 from typing import Literal, Self
 
-from pydantic import Field, JsonValue, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    JsonValue,
+    SerializerFunctionWrapHandler,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 from ._schema import ContractModel
 
@@ -122,9 +130,39 @@ class ContextEvidenceAssessment(ContractModel):
         )
 
 
-class ContextRefinementReport(ContractModel):
+class ContextQueryExpansion(ContractModel):
+    """查询扩展只保留诊断摘要,不把生成词语持久化成已验证证据。"""
+
+    strategy_version: str = Field(min_length=1, max_length=128)
+    input_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    output_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    proposal_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    model_calls: int = Field(ge=0, le=1)
+    failure: Literal["capacity", "unavailable", "invalid_expansion"] | None = None
+
+    @model_validator(mode="after")
+    def binding(self) -> Self:
+        if self.failure is None and (
+            self.model_calls != 1 or self.output_sha256 is None or self.proposal_sha256 is None
+        ):
+            raise ValueError("successful query expansion requires a bound model result")
+        if self.failure is not None and self.output_sha256 is not None:
+            raise ValueError("failed query expansion cannot release an expanded query")
+        return self
+
+
+class ContextRefinementReport(BaseModel):
     """一次补证决策的诊断;旧判断仅供审计,不能作为最终可见证据。"""
 
+    model_config = ContractModel.model_config
+    schema_version: Literal[1, 2] = 1
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def version_type(cls, value: object) -> object:
+        return ContractModel.validate_version_type(value)
+
+    expansion: ContextQueryExpansion | None = None
     policy_version: str = Field(min_length=1, max_length=128)
     initial: ContextEvidenceAssessment
     candidate: ContextEvidenceAssessment | None = None
@@ -144,6 +182,15 @@ class ContextRefinementReport(ContractModel):
 
     @model_validator(mode="after")
     def binding(self) -> Self:
+        if (self.schema_version == 2) != (self.expansion is not None):
+            raise ValueError("query expansion requires refinement report v2")
+        if self.expansion is not None and (
+            self.retrievals != 2
+            or (
+                self.expansion.failure is None and self.expansion.output_sha256 != self.query_sha256
+            )
+        ):
+            raise ValueError("query expansion differs from the executed selection")
         if (self.retrievals == 2) != (self.query_sha256 is not None):
             raise ValueError("refinement retrieval requires its query digest")
         if self.retrievals == 1 and (
@@ -184,4 +231,15 @@ class ContextRefinementReport(ContractModel):
     @property
     def model_calls(self) -> int:
         """已返回报告的调用数;超时中断的额外尝试见 assessment_attempts。"""
-        return self.initial.model_calls + (self.candidate.model_calls if self.candidate else 0)
+        return (
+            self.initial.model_calls
+            + (self.candidate.model_calls if self.candidate else 0)
+            + (self.expansion.model_calls if self.expansion else 0)
+        )
+
+    @model_serializer(mode="wrap")
+    def legacy_wire(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        data = handler(self)
+        if self.schema_version == 1:
+            data.pop("expansion", None)
+        return data

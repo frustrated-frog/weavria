@@ -8,6 +8,7 @@ from .context_evidence import (
     ContextEvidenceCheck,
     ContextEvidenceDemand,
     ContextEvidenceNeed,
+    ContextQueryExpansion,
     ContextRefinementReport,
 )
 from .context_rerank import ContextRerankReport, RerankDemandReport
@@ -252,6 +253,7 @@ __all__ = [
     "ContextEvidenceCheck",
     "ContextEvidenceDemand",
     "ContextEvidenceNeed",
+    "ContextQueryExpansion",
     "ContextRefinementReport",
     "ContextRelevance",
     "ContextRerankReport",

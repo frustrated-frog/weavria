@@ -26,6 +26,7 @@ from weavria.memory import (
     residual_memory_query,
 )
 
+from .memory_query_expansion import ModelMemoryQueryExpander
 from .memory_retrieval import MemorySnapshotReader, select_task_memory
 from .memory_sufficiency import MemoryEvidenceAssessor
 
@@ -128,6 +129,7 @@ async def refine_task_memory(
     *,
     provider_version: str,
     policy: MemoryRefinementPolicy,
+    query_expander: ModelMemoryQueryExpander | None = None,
 ) -> ContextSupply:
     """一次源读取,最多两次选择;补证故障保留初次供给,取消则整体传播。"""
     async with asyncio.timeout(retriever.policy.max_duration):
@@ -146,7 +148,12 @@ async def refine_task_memory(
     outcome: str = first.failure or "no_gap"
     retrievals = 1
     assessment_attempts = 1
+    expansion = None
     if selection is not None:
+        if query_expander is not None:
+            # 扩展有独立的显式模型预算;追加选择/重审仍共用 refinement 期限。
+            # 扩展失败回退原残差,不能悄悄重试模型或增加第三次检索。
+            selection, expansion = await query_expander.expand(demands, selection, first)
         retrievals = 2
         try:
             async with asyncio.timeout(policy.max_duration):
@@ -183,6 +190,8 @@ async def refine_task_memory(
     # 编译器只按最终 evidence 释放材料;旧报告不能把被替换材料重新带入模型证据。
     report = ContextRefinementReport.model_validate(
         {
+            "schema_version": 2 if expansion is not None else 1,
+            "expansion": expansion,
             "policy_version": policy.version,
             "initial": first,
             "candidate": candidate,

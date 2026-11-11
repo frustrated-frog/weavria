@@ -1,0 +1,10 @@
+{
+  "version": "memory-query-expansion-v2-blind/1",
+  "description": "双通道融合v2固定后冻结、首次执行的四题。与此前语料不同,含关系别称、否定及错误实体。",
+  "cases": [
+    {"id":"custodian", "query":"For the records handling operations briefing, who looks after the collection?", "expected":"Sofia Park", "facts":["The records handling operations briefing reviews paperwork.","Collection custodian: Sofia Park.","Budget reviewer: Mateo Cruz.","Inspection frequency: monthly."]},
+    {"id":"limit", "query":"For the media transfer integration planning memo, how big may one upload be?", "expected":"24 MB", "facts":["The media transfer integration planning memo describes rollout.","Maximum payload size: 24 MB.","Download cache quota: 96 MB.","Session lifetime: 15 minutes."]},
+    {"id":"negative", "query":"For the exterior coating maintenance inspection, which chemical must not be applied?", "expected":"acetone", "facts":["The exterior coating maintenance inspection checks surface quality.","Prohibited solvent: acetone.","Approved cleaner: neutral soap.","Inspection interval: 6 months."]},
+    {"id":"absent", "query":"For the Solace rollout coordination agenda, who gives the final go-ahead for Solace?", "expected":null, "facts":["The Solace rollout coordination agenda records meetings.","Aurora final approver: June Kim.","Northstar final approver: Eli Shah.","Solace approval details have not been recorded."]}
+  ]
+}

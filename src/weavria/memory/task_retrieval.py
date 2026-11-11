@@ -36,10 +36,13 @@ class MemoryDemand:
     demand_id: str
     query: str
     weight: float = 1.0
+    expansion: str = ""
 
     def __post_init__(self) -> None:
         if not self.demand_id.strip() or not self.query.strip() or len(self.query) > 2048:
             raise ValueError("memory demand requires an identity and a bounded nonempty query")
+        if type(self.expansion) is not str or len(self.expansion) > 2048:
+            raise ValueError("memory expansion must be a bounded string")
         if (
             isinstance(self.weight, bool)
             or not math.isfinite(self.weight)
@@ -201,6 +204,8 @@ class TaskMemoryRetriever:
             raise MemoryCapacityError("memory demand count or identities exceed contract")
         if not 1 <= limit <= 100 or max_bytes < 256:
             raise ValueError("invalid memory selection capacity")
+        if self.policy.mode == "dense" and any(d.expansion for d in demands):
+            raise ValueError("lexical expansion requires lexical or hybrid retrieval")
         if self.reranker is not None and measure_reranked is None:
             raise ValueError("reranked retrieval requires complete assessment-aware measurement")
         # 在端口处重新验证,隔离外部可变模型对象。所有编码发生在此检查之后。
@@ -245,12 +250,19 @@ class TaskMemoryRetriever:
             for gid, members in families.items()
         }
         lexical: dict[str, dict[str, int]] = {}
+        expanded: dict[str, dict[str, int]] = {}
         for demand in demands:
             scores: dict[str, float] = {}
             for hit in rank_versions(snapshot.versions, demand.query):
                 gid = group_identity(hit.version)
                 scores[gid] = max(scores.get(gid, 0.0), hit.score)
             lexical[demand.demand_id] = self._ranks(scores)
+            if demand.expansion:
+                extra: dict[str, float] = {}
+                for hit in rank_versions(snapshot.versions, demand.expansion):
+                    gid = group_identity(hit.version)
+                    extra[gid] = max(extra.get(gid, 0.0), hit.score)
+                expanded[demand.demand_id] = self._ranks(extra)
             await asyncio.sleep(0)
         dense: dict[str, dict[str, int]] = {}
         encoded = hits = 0
@@ -271,9 +283,13 @@ class TaskMemoryRetriever:
         for demand in demands:
             ranks_a = lexical[demand.demand_id] if mode != "dense" or fallback else {}
             ranks_b = dense.get(demand.demand_id, {})
-            channels = 2 if mode == "hybrid" and fallback is None else 1
+            ranks_e = expanded.get(demand.demand_id, {})
+            # 查询锚点与别称单独排名,避免长背景的 BM25 原始分数淹没新词。
+            # 别称通道权重为 2,原词法与 Dense 各为 1;按秩归一化后才融合。
+            # 无别称命中时不稀释原排名,所有通道仍共用候选和选择上限。
+            channels = (2 if mode == "hybrid" and fallback is None else 1) + (2 if ranks_e else 0)
             fused: dict[str, float] = {}
-            for gid in sorted(ranks_a.keys() | ranks_b.keys()):
+            for gid in sorted(ranks_a.keys() | ranks_b.keys() | ranks_e.keys()):
                 rank_a, rank_b = ranks_a.get(gid), ranks_b.get(gid)
                 fused[gid] = (
                     sum(
@@ -281,8 +297,12 @@ class TaskMemoryRetriever:
                         for rank in (rank_a, rank_b)
                         if rank is not None
                     )
-                    / channels
-                )
+                    + (
+                        2 * (policy.rank_constant + 1) / (policy.rank_constant + ranks_e[gid])
+                        if gid in ranks_e
+                        else 0
+                    )
+                ) / channels
             # RRF 只负责跨通道排序。它的偏置常数会压平分差,不能直接解释
             # 为需求覆盖强度,否则多个方面的弱匹配会挤掉各自的强匹配。
             # 使用融合名次的倒数作覆盖效用,明确它是序位折扣,不是概率。
@@ -307,6 +327,7 @@ class TaskMemoryRetriever:
                 demand_ids=tuple(queries),
                 # 词法回退改变了候选分布,不能继续套用原 Hybrid 的校准。
                 candidate_version=self.candidate_version
+                + (":lexical-expansion/1" if expanded else "")
                 + ":actual="
                 + ("lexical_fallback" if fallback else mode)
                 + ":corpus="

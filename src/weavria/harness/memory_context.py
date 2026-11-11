@@ -23,6 +23,7 @@ from weavria.memory import (
     TaskMemoryRetriever,
 )
 
+from .memory_query_expansion import ModelMemoryQueryExpander
 from .memory_refinement import MemoryRefinementPolicy, refine_task_memory
 from .memory_retrieval import MemorySnapshotReader, retrieve_task_memory
 from .memory_sufficiency import MemoryEvidenceAssessor
@@ -59,6 +60,7 @@ class MemoryContextSource:
         retriever: TaskMemoryRetriever | None = None,
         evidence: MemoryEvidenceAssessor | None = None,
         refinement: MemoryRefinementPolicy | None = None,
+        query_expander: ModelMemoryQueryExpander | None = None,
     ) -> None:
         # 身份、精确作用域与时间策略由宿主绑定,模型只能影响候选查询词。
         # 复制授权契约避免外部可变对象在一次请求中静默扩大访问范围。
@@ -66,6 +68,15 @@ class MemoryContextSource:
         self._retriever = retriever
         self._evidence = evidence
         self._refinement = refinement
+        self._query_expander = query_expander
+        if query_expander is not None and refinement is None:
+            raise ValueError("query expansion requires explicit refinement")
+        if (
+            query_expander is not None
+            and retriever is not None
+            and retriever.policy.mode == "dense"
+        ):
+            raise ValueError("query expansion requires lexical or hybrid retrieval")
         if refinement is not None and (retriever is None or evidence is None):
             raise ValueError("memory refinement requires retrieval and evidence assessment")
         if retriever is not None:
@@ -76,6 +87,8 @@ class MemoryContextSource:
             self.version += "+" + evidence.version
         if refinement is not None:
             self.version += "+" + refinement.version
+        if query_expander is not None:
+            self.version += "+" + query_expander.version
         self._access = MemoryAccess.model_validate_json(access.model_dump_json())
         self._query = MemoryQuery(
             scope=scope,
@@ -110,6 +123,7 @@ class MemoryContextSource:
                     demands,
                     provider_version=self.version,
                     policy=self._refinement,
+                    query_expander=self._query_expander,
                 )
             except MemoryAccessError as exc:
                 raise ContextSourceError("access_denied") from exc
