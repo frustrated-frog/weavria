@@ -23,6 +23,7 @@ from weavria.memory import (
     TaskMemoryRetriever,
 )
 
+from .memory_refinement import MemoryRefinementPolicy, refine_task_memory
 from .memory_retrieval import MemorySnapshotReader, retrieve_task_memory
 from .memory_sufficiency import MemoryEvidenceAssessor
 
@@ -57,18 +58,24 @@ class MemoryContextSource:
         max_bytes: int = 262144,
         retriever: TaskMemoryRetriever | None = None,
         evidence: MemoryEvidenceAssessor | None = None,
+        refinement: MemoryRefinementPolicy | None = None,
     ) -> None:
         # 身份、精确作用域与时间策略由宿主绑定,模型只能影响候选查询词。
         # 复制授权契约避免外部可变对象在一次请求中静默扩大访问范围。
         self._reader = reader
         self._retriever = retriever
         self._evidence = evidence
+        self._refinement = refinement
+        if refinement is not None and (retriever is None or evidence is None):
+            raise ValueError("memory refinement requires retrieval and evidence assessment")
         if retriever is not None:
             if not isinstance(reader, MemorySnapshotReader):
                 raise ValueError("task memory retrieval requires a complete snapshot reader")
             self.version = "memory-context/2[" + retriever.version + "]"
         if evidence is not None:
             self.version += "+" + evidence.version
+        if refinement is not None:
+            self.version += "+" + refinement.version
         self._access = MemoryAccess.model_validate_json(access.model_dump_json())
         self._query = MemoryQuery(
             scope=scope,
@@ -89,6 +96,34 @@ class MemoryContextSource:
         task: TaskInput,
         demands: tuple[ContextDemand, ...],
     ) -> ContextSupply:
+        if self._refinement is not None:
+            assert isinstance(self._reader, MemorySnapshotReader)
+            assert self._retriever is not None and self._evidence is not None
+            try:
+                return await refine_task_memory(
+                    self._reader,
+                    self._retriever,
+                    self._evidence,
+                    self._access,
+                    self._query.model_copy(update={"valid_at": self._valid_at()}),
+                    task,
+                    demands,
+                    provider_version=self.version,
+                    policy=self._refinement,
+                )
+            except MemoryAccessError as exc:
+                raise ContextSourceError("access_denied") from exc
+            except MemoryCapacityError as exc:
+                raise ContextSourceError("capacity") from exc
+            except MemoryConflictError as exc:
+                raise ContextSourceError("invalid_snapshot") from exc
+            except (
+                MemoryStorageError,
+                MemoryEncodingError,
+                MemoryRerankError,
+                TimeoutError,
+            ) as exc:
+                raise ContextSourceError("unavailable") from exc
         supply = await self._retrieve(
             session_id=session_id, run_id=run_id, task=task, demands=demands
         )

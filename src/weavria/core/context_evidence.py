@@ -120,3 +120,68 @@ class ContextEvidenceAssessment(ContractModel):
                 )
             }
         )
+
+
+class ContextRefinementReport(ContractModel):
+    """一次补证决策的诊断;旧判断仅供审计,不能作为最终可见证据。"""
+
+    policy_version: str = Field(min_length=1, max_length=128)
+    initial: ContextEvidenceAssessment
+    candidate: ContextEvidenceAssessment | None = None
+    query_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    retrievals: int = Field(ge=1, le=2)
+    assessment_attempts: int = Field(ge=1, le=2)
+    outcome: Literal[
+        "no_gap",
+        "unchanged",
+        "protected_evidence",
+        "not_improved",
+        "adopted",
+        "unavailable",
+        "capacity",
+        "invalid_assessment",
+    ]
+
+    @model_validator(mode="after")
+    def binding(self) -> Self:
+        if (self.retrievals == 2) != (self.query_sha256 is not None):
+            raise ValueError("refinement retrieval requires its query digest")
+        if self.retrievals == 1 and (
+            self.candidate is not None or self.outcome != (self.initial.failure or "no_gap")
+        ):
+            raise ValueError("initial-only refinement must preserve its stop reason")
+        if self.retrievals == 2 and (self.initial.failure is not None or self.outcome == "no_gap"):
+            raise ValueError("refinement requires an actionable initial assessment")
+        if self.candidate is not None and (
+            self.retrievals != 2
+            or self.assessment_attempts != 2
+            or self.candidate.task_revision != self.initial.task_revision
+            or self.candidate.demand_sha256 != self.initial.demand_sha256
+        ):
+            raise ValueError("refinement must reassess the same original demands")
+        if self.assessment_attempts > self.retrievals:
+            raise ValueError("assessment attempts exceed retrieval attempts")
+        if self.outcome == "adopted" and (
+            self.candidate is None or self.candidate.failure is not None
+        ):
+            raise ValueError("adoption requires a successful candidate assessment")
+        if self.outcome in {"unchanged", "protected_evidence"} and (
+            self.candidate is not None or self.assessment_attempts != 1
+        ):
+            raise ValueError("pre-assessment rejection cannot include a candidate judgment")
+        if self.outcome == "not_improved" and (
+            self.candidate is None or self.candidate.failure is not None
+        ):
+            raise ValueError("no improvement requires a completed candidate judgment")
+        if (
+            self.candidate is not None
+            and self.candidate.failure is not None
+            and (self.outcome != self.candidate.failure)
+        ):
+            raise ValueError("candidate failure must retain its actual stop reason")
+        return self
+
+    @property
+    def model_calls(self) -> int:
+        """已返回报告的调用数;超时中断的额外尝试见 assessment_attempts。"""
+        return self.initial.model_calls + (self.candidate.model_calls if self.candidate else 0)

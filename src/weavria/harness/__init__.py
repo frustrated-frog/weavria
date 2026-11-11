@@ -98,6 +98,7 @@ from .memory_generation import MemoryGenerationPolicy
 from .memory_interpretation import ModelMemoryRepairingExtractor
 from .memory_joint_evidence import JointMemoryEvidenceAssessor
 from .memory_models import ModelMemoryExtractor, ModelMemoryReviewer
+from .memory_refinement import MemoryRefinementPolicy
 from .memory_session import AcceptedMemoryEvents, SessionMemoryBinding, SessionMemoryIngestor
 from .memory_sufficiency import (
     MemoryEvidenceAssessor,
@@ -259,6 +260,7 @@ __all__ = [
     "MemoryFormationError",
     "MemoryGenerationPolicy",
     "MemoryGroupReader",
+    "MemoryRefinementPolicy",
     "MemoryReviewFeatureProvider",
     "MemoryReviewFeatures",
     "MemoryReviewer",

@@ -13,7 +13,7 @@ from pydantic import (
 )
 
 from ._schema import ContractModel, NonBlankString
-from .context_evidence import ContextEvidenceAssessment
+from .context_evidence import ContextEvidenceAssessment, ContextRefinementReport
 from .context_rerank import ContextRerankReport
 
 
@@ -51,11 +51,12 @@ class ContextSupplyReport(BaseModel):
     """Bind a provider's bounded selection to task demands and its read snapshot."""
 
     model_config = ContractModel.model_config
-    schema_version: Literal[1, 2, 3, 4] = 1
+    schema_version: Literal[1, 2, 3, 4, 5] = 1
     relevance: tuple[ContextRelevance, ...] = Field(default=(), max_length=3200)
     retrieval: RetrievalDiagnostics | None = None
     reranking: ContextRerankReport | None = None
     evidence: ContextEvidenceAssessment | None = None
+    refinement: ContextRefinementReport | None = None
 
     @field_validator("schema_version", mode="before")
     @classmethod
@@ -72,6 +73,8 @@ class ContextSupplyReport(BaseModel):
             data.pop("reranking", None)
         if self.schema_version < 4:
             data.pop("evidence", None)
+        if self.schema_version < 5:
+            data.pop("refinement", None)
         return data
 
     provider_version: NonBlankString
@@ -92,10 +95,10 @@ class ContextSupplyReport(BaseModel):
             raise ValueError("source report v2 requires retrieval diagnostics")
         if self.schema_version < 4 and (self.schema_version == 3) != (self.reranking is not None):
             raise ValueError("reranking diagnostics require source report v3")
-        if (self.schema_version == 4) != (self.evidence is not None):
+        if (self.schema_version >= 4) != (self.evidence is not None):
             raise ValueError("evidence assessment requires source report v4")
         if (
-            self.schema_version == 4
+            self.schema_version >= 4
             and (self.relevance or self.reranking is not None)
             and self.retrieval is None
         ):
@@ -106,6 +109,16 @@ class ContextSupplyReport(BaseModel):
             or self.evidence.supplied_sha256 != self.supplied_sha256
         ):
             raise ValueError("evidence assessment differs from its source binding")
+        if (self.schema_version == 5) != (self.refinement is not None):
+            raise ValueError("refinement diagnostics require source report v5")
+        if self.refinement is not None:
+            final = (
+                self.refinement.candidate
+                if self.refinement.outcome == "adopted"
+                else self.refinement.initial
+            )
+            if final != self.evidence:
+                raise ValueError("refinement decision differs from final evidence")
         keys = [(r.bundle_id, r.demand_id) for r in self.relevance]
         if len(keys) != len(set(keys)):
             raise ValueError("source report repeats a relevance binding")

@@ -53,6 +53,7 @@ from .memory_features import MemoryReviewFeatureProvider, MemoryReviewFeatures
 from .memory_formation import MemoryExtractor, MemoryFormationEngine, MemoryReviewer
 from .memory_generation import MemoryGenerationPolicy
 from .memory_models import ModelMemoryExtractor, ModelMemoryReviewer
+from .memory_refinement import MemoryRefinementPolicy
 from .memory_session import SessionMemoryBinding, SessionMemoryIngestor
 from .memory_sufficiency import MemoryEvidenceAssessor
 from .outcomes import CapabilityOutcomeResolver, CapabilityOutcomeVerifier
@@ -99,6 +100,7 @@ class HarnessMemory:
     include_unknown_time: bool = False
     retrieval: TaskMemoryRetriever | None = None
     evidence_assessor: MemoryEvidenceAssessor | None = None
+    refinement: MemoryRefinementPolicy | None = None
 
     @classmethod
     def from_model(
@@ -434,6 +436,7 @@ class AgentHarness:
                 include_unknown_time=memory.include_unknown_time,
                 retriever=memory.retrieval,
                 evidence=memory.evidence_assessor,
+                refinement=memory.refinement,
             )
             if memory is not None and self._memory_store is not None
             else None

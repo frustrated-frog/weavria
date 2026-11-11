@@ -70,6 +70,24 @@ async def retrieve_task_memory(
     snapshot = MemoryRetrievalSnapshot.model_validate_json(snapshot.model_dump_json())
     if snapshot.query != query:
         raise ValueError("memory reader changed the bound retrieval query")
+    return await select_task_memory(
+        snapshot, retriever, task, demands, provider_version=provider_version
+    )
+
+
+async def select_task_memory(
+    snapshot: MemoryRetrievalSnapshot,
+    retriever: TaskMemoryRetriever,
+    task: TaskInput,
+    demands: tuple[ContextDemand, ...],
+    *,
+    provider_version: str,
+    selection: tuple[ContextDemand, ...] | None = None,
+) -> ContextSupply:
+    """在已授权的固定快照内选择;补证查询只改变排名,审查仍绑定原需求。"""
+    query = snapshot.query
+    if selection is not None and {d.demand_id for d in selection} != {d.demand_id for d in demands}:
+        raise ValueError("selection must preserve original demand identities")
     demand_digest, snapshot_digest = history_query_digest(demands), snapshot.digest()
 
     def supply(
@@ -160,7 +178,7 @@ async def retrieve_task_memory(
 
     recalled = await retriever.retrieve(
         snapshot,
-        tuple(MemoryDemand(d.demand_id, d.query, d.weight) for d in demands),
+        tuple(MemoryDemand(d.demand_id, d.query, d.weight) for d in (selection or demands)),
         limit=query.limit,
         max_bytes=query.max_bytes,
         measure=measure,

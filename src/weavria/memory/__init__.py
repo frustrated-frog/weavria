@@ -75,6 +75,7 @@ from .reranking import (
     MemoryRerankPolicy,
     NullScoreCalibration,
 )
+from .retrieval import residual_memory_query
 from .snapshot import MemoryRetrievalSnapshot
 from .store import SQLiteMemoryStore
 from .task_retrieval import (
@@ -164,6 +165,7 @@ __all__ = [
     "TaskMemoryRetriever",
     "compare_memory_conditions",
     "fact_key",
+    "residual_memory_query",
     "rewrite_fact_set",
     "select_interpretation",
 ]

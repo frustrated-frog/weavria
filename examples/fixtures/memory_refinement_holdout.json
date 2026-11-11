@@ -1,0 +1,10 @@
+{
+  "version": "memory-refinement-holdout/1",
+  "description": "v2残差补证固定后首次执行前冻结的四题验证集,包含词面无交集的预期困难案例。",
+  "cases": [
+    {"id":"museum", "query":"For the museum exhibition conservation inspection checklist, what is the humidity ceiling?", "expected":"55%", "facts":["The museum exhibition conservation inspection checklist covers display cases.","The humidity ceiling is 55%."]},
+    {"id":"support", "query":"For the customer support escalation handover handbook, what is the response deadline?", "expected":"6 hours", "facts":["The customer support escalation handover handbook describes routing.","The response deadline is 6 hours."]},
+    {"id":"not_recorded", "query":"For the laboratory calibration quality assurance report, what was the last measured temperature?", "expected":null, "facts":["The laboratory calibration quality assurance report is filed.","Record the measured temperature after each calibration."]},
+    {"id":"synonym", "query":"For the municipal garden renovation planning meeting, who signs off the plan?", "expected":"Mira Chen", "facts":["The municipal garden renovation planning meeting is scheduled.","Approver: Mira Chen."]}
+  ]
+}

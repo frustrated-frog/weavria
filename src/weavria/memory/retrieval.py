@@ -23,6 +23,17 @@ def _terms(text: str) -> tuple[str, ...]:
     return tuple(result)
 
 
+def residual_memory_query(query: str, backgrounds: Sequence[str]) -> str:
+    """从查询词项减去已读背景的词项;只供排名,不得替换原任务或条件。
+
+    使用与 BM25 相同的归一化/中英文切词。保留原查询词序并去重,无残差时
+    回退原查询。背景判断可能出错,所以这不是事实删除或否定证据。
+    """
+    consumed = {term for text in backgrounds for term in _terms(text)}
+    remaining = tuple(dict.fromkeys(t for t in _terms(query) if t not in consumed))
+    return " ".join(remaining)[:2048] if remaining else query[:2048]
+
+
 def rank_versions(versions: Sequence[MemoryVersion], text: str) -> tuple[MemoryHit, ...]:
     """Rank exact-filter survivors; lexical relevance never confers factual authority.
 

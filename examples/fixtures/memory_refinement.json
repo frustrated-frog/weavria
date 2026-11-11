@@ -1,0 +1,14 @@
+{
+  "version": "memory-refinement/1",
+  "description": "冻结的公开人工构造补证集。每题独立完整语料,排名由BM25决定,不指定初始或补充材料。",
+  "cases": [
+    {"id":"code", "query":"For the alpha overview migration deployment report, what is the beta code?", "expected":"B7", "facts":["The alpha overview migration deployment report is available.","The beta code is B7."]},
+    {"id":"window", "query":"For the release readiness coordination checklist, what is the maintenance window?", "expected":"02:00 UTC", "facts":["The release readiness coordination checklist tracks approvals.","The maintenance window starts at 02:00 UTC."]},
+    {"id":"location", "query":"For the warehouse inventory reconciliation handover, what is the archive location?", "expected":"vault-c", "facts":["The warehouse inventory reconciliation handover covers transfers.","The archive location is vault-c."]},
+    {"id":"retries", "query":"For the pipeline incident diagnosis troubleshooting guide, how many retries are allowed?", "expected":"4", "facts":["The pipeline incident diagnosis troubleshooting guide describes common failures.","A maximum of 4 retries is allowed."]},
+    {"id":"missing", "query":"For the release readiness coordination checklist, what is the approval date?", "expected":null, "facts":["The release readiness coordination checklist tracks approvals.","Record the approval date after the sign-off completes."]},
+    {"id":"simple", "query":"What is the beta code?", "expected":"B7", "facts":["The alpha overview migration deployment report is available.","The beta code is B7."]},
+    {"id":"conditional", "query":"What is the backup interval? The environment has not been chosen.", "expected":null, "facts":["Test environment backups run daily.","Production environment backups run hourly."], "conditions":[{"environment":"test"},{"environment":"production"}]},
+    {"id":"negation", "query":"For the identity security audit compliance checklist, what data must never be logged?", "expected":"access tokens", "facts":["The identity security audit compliance checklist documents controls.","Never log access tokens."]}
+  ]
+}
