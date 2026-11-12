@@ -91,6 +91,14 @@ from .memory_admission import (
     MemoryFormationError,
     ground_memory_candidates,
 )
+from .memory_answers import (
+    MemoryAnswerCitation,
+    MemoryAnswerClaim,
+    MemoryAnswerDraft,
+    MemoryAnswerPolicy,
+    MemoryAnswerResult,
+    ModelMemoryAnswerer,
+)
 from .memory_context import MemoryContextSource, MemoryGroupReader
 from .memory_features import MemoryReviewFeatureProvider, MemoryReviewFeatures
 from .memory_formation import MemoryExtractor, MemoryFormationEngine, MemoryReviewer
@@ -253,6 +261,11 @@ __all__ = [
     "IntentUncertainty",
     "JointMemoryEvidenceAssessor",
     "LiteralTargetResolver",
+    "MemoryAnswerCitation",
+    "MemoryAnswerClaim",
+    "MemoryAnswerDraft",
+    "MemoryAnswerPolicy",
+    "MemoryAnswerResult",
     "MemoryContextSource",
     "MemoryEvidenceAssessor",
     "MemoryEvidencePolicy",
@@ -267,6 +280,7 @@ __all__ = [
     "MemoryReviewFeatures",
     "MemoryReviewer",
     "MemoryUpdateReport",
+    "ModelMemoryAnswerer",
     "ModelMemoryEvidenceAssessor",
     "ModelMemoryExtractor",
     "ModelMemoryQueryExpander",

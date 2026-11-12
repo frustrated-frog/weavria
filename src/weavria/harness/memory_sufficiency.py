@@ -118,7 +118,7 @@ class ModelMemoryEvidenceAssessor:
             raise ValueError("evidence assessment requires a configured structured provider")
         self._provider = provider
         self.policy = policy or MemoryEvidencePolicy()
-        self.version = "memory-evidence/2:" + _sha(configuration_id + repr(self.policy))
+        self.version = "memory-evidence/3:" + _sha(configuration_id + repr(self.policy))
 
     async def assess(
         self, supply: ContextSupply, demands: tuple[ContextDemand, ...]

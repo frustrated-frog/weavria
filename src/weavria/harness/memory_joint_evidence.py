@@ -128,7 +128,7 @@ class JointMemoryEvidenceAssessor:
         self._provider = provider
         self.policy = policy or MemoryEvidencePolicy()
         self.version = (
-            "joint-memory-evidence/3:"
+            "joint-memory-evidence/4:"
             + hashlib.sha256(
                 (configuration_id + repr(self.policy) + _INSTRUCTIONS).encode()
             ).hexdigest()

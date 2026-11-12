@@ -1,0 +1,84 @@
+{
+  "version": "cpython-doc-answers/1",
+  "retrieval_manifest_sha256": "fe58b30d195b96ea57acfaeac1b10af2e9f21026a4dcf32951a1211a9a82e96f",
+  "required_facts": {
+    "a1": [
+      "Use try/finally for coroutine cleanup; if CancelledError is caught, normally propagate it again after cleanup."
+    ],
+    "a2": [
+      "The event loop keeps weak task references; an otherwise unreferenced task may be garbage collected before completion."
+    ],
+    "a3": [
+      "TaskGroup cancels remaining tasks when a child fails with an exception other than CancelledError."
+    ],
+    "a4": [
+      "TaskGroup and timeout use cancellation internally; swallowing CancelledError can break their behavior."
+    ],
+    "a5": [
+      "asyncio.shield protects the inner task from caller cancellation; the caller still receives CancelledError."
+    ],
+    "a6": [
+      "After the tasks finish, non-cancellation failures are combined into ExceptionGroup or BaseExceptionGroup and raised."
+    ],
+    "s1": [
+      "Use Popen.communicate rather than waiting without draining pipes to avoid blocking on a full pipe."
+    ],
+    "s2": [
+      "A communicate timeout does not kill the child; kill it and call communicate again to finish cleanup."
+    ],
+    "s3": [
+      "A negative returncode -N means termination by signal N on POSIX."
+    ],
+    "s4": [
+      "communicate buffers the read data in memory, so large or unlimited output is unsuitable."
+    ],
+    "s5": [
+      "Catching TimeoutExpired and retrying communicate does not lose output."
+    ],
+    "s6": [
+      "On POSIX terminate sends SIGTERM whereas kill sends SIGKILL.",
+      "On Windows terminate uses TerminateProcess and kill is an alias for terminate."
+    ],
+    "p1": [
+      "Following a symlink to an ancestor can recurse forever; Path.walk does not track previously visited directories."
+    ],
+    "p2": [
+      "With parents=True, missing parents use default permissions and ignore the requested mode."
+    ],
+    "p3": [
+      "Path.walk ignores os.scandir errors by default.",
+      "An on_error callback receives OSError and can handle it or re-raise to stop walking."
+    ],
+    "p4": [
+      "Path.walk does not follow symbolic links by default; such links are put in filenames."
+    ],
+    "p5": [
+      "Path.touch with exist_ok=True succeeds for an existing file and updates its modification time."
+    ],
+    "p6": [
+      "Set the case_sensitive keyword argument of Path.glob or rglob explicitly to True or False."
+    ],
+    "l1": [
+      "Handlers on a logger and its ancestors may emit the same record multiple times due to propagation."
+    ],
+    "l2": [
+      "Logging uses a module lock for shared data and a lock on each handler for underlying IO."
+    ],
+    "l3": [
+      "Propagation passes directly to ancestor handlers; ancestor logger levels and filters are not considered."
+    ],
+    "l4": [
+      "logging.shutdown flushes and closes all handlers at application exit."
+    ],
+    "l5": [
+      "Threading locks are not always re-entrant, so logging from asynchronous signal handlers can be unsafe."
+    ],
+    "l6": [
+      "Propagation stops at the first ancestor with propagate=False, after offering the event to its handlers."
+    ],
+    "n1": [],
+    "n2": [],
+    "n3": [],
+    "n4": []
+  }
+}

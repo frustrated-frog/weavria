@@ -76,9 +76,21 @@ class Transport:
 
     async def complete(self, body: dict[str, Any]) -> object:
         self.calls += 1
-        response = await self.client.post(self.url, json=body | self.options)
-        observation: dict[str, object] = {"status": response.status_code}
+        # 每次尝试先占一条记录。网络失败和取消也消耗调用,不能让后续按调用
+        # 下标切片的实验误把下一题的 Token 记到当前题,或静默丢掉成功调用。
+        observation: dict[str, object] = {"outcome": "pending"}
         self.observations.append(observation)
+        try:
+            response = await self.client.post(self.url, json=body | self.options)
+        except asyncio.CancelledError:
+            observation["outcome"] = "cancelled"
+            raise
+        except httpx.HTTPError:
+            observation["outcome"] = "transport_error"
+            raise
+        # 有响应时保留既有白名单形状;outcome 只标识没有 HTTP 响应的尝试。
+        observation.pop("outcome")
+        observation["status"] = response.status_code
         response.raise_for_status()
         payload: object = response.json()
         # Explicit allowlist: never retain response text, reasoning, headers or credentials.

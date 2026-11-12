@@ -7,6 +7,7 @@ from weavria.context import ContextDemand
 from weavria.core import ContextEvidenceCheck, ContextEvidenceDemand, ContextEvidenceNeed
 from weavria.memory import MemoryVersion, compare_memory_conditions
 
+from .memory_quotes import locate_memory_quote
 from .memory_sufficiency_wire import EvidenceReview, QuestionAnalysis
 
 
@@ -61,10 +62,13 @@ def reduce_memory_evidence(
             for item in decision.members:
                 bid, version = members[item.member]
                 assertion = version.assertion
-                if (item.relation != "background" and not item.quote) or (
-                    item.quote and item.quote not in assertion.text
-                ):
+                if item.relation != "background" and not item.quote.strip():
                     raise ValueError("review quote is not in its bound member")
+                # 保留已有精确引文契约;仅在精确定位失败时尝试源文锚定的表示修复。
+                # 哈希必须绑定恢复后的原文,不能把模型中的换行转义当作事实内容。
+                quote = item.quote
+                if quote and quote not in assertion.text:
+                    quote = locate_memory_quote(assertion.text, quote).quote
                 applicability = compare_memory_conditions(
                     conditions, assertion.qualifiers, item.condition_links
                 ).relation
@@ -75,9 +79,7 @@ def reduce_memory_evidence(
                         revision=version.revision,
                         relation=item.relation,
                         applicability=applicability,
-                        quote_sha256=hashlib.sha256(item.quote.encode()).hexdigest()
-                        if item.quote
-                        else None,
+                        quote_sha256=hashlib.sha256(quote.encode()).hexdigest() if quote else None,
                         condition_edges=tuple(
                             (e.left_side, e.left_key, e.right_side, e.right_key, e.relation)
                             for e in item.condition_links
