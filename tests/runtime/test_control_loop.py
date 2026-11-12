@@ -2433,6 +2433,7 @@ async def test_unverifiable_is_distinct_from_verified_and_retains_explanation() 
 
 
 async def test_repeated_unsatisfied_finish_without_new_evidence_fails_closed() -> None:
+    # 两次 Finish 虽然文案不同, 中间却没有新增工具证据, 待修问题也完全相同.
     agent = make_loop(
         FakeControlProvider((batch(call("source")), finish("bad"), finish("still bad"))),
         completion=ValueVerifier(),
@@ -2442,11 +2443,13 @@ async def test_repeated_unsatisfied_finish_without_new_evidence_fails_closed() -
     assert result.status is RunStatus.FAILED and result.output is None
     assert result.error is not None
     assert result.error.category is ErrorCategory.COMPLETION_REJECTED
+    # 宿主应保留两次核验事实, 但不能把反复 Repair 误记为完成结果.
     assert result.task_outcome == "unverified" and result.assessment is None
     checks = [event.data for event in agent.events if isinstance(event.data, CompletionChecked)]
     assert [check.assessment.decision.kind for check in checks] == ["repair", "repair"]
     assert (
         isinstance(agent.events[-1].data, RunEnded)
+        # 明确记录停滞原因, 方便区分证据不足与普通模型或工具失败.
         and agent.events[-1].data.reason == "completion_repair_stalled"
     )
     replay(agent)

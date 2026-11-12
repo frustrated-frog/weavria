@@ -1331,12 +1331,16 @@ def _reduce_control(
 
 def completion_repair_sha256(decision: CompletionRepair) -> str:
     """Bind stable issue classes independently of candidate-specific guidance wording."""
+    # 只绑定稳定的问题类别, 不把每次生成的 guidance 文案写进签名.
+    # 这样模型即使换一种说法, 只要待修问题没变, 仍会被识别为同一次修复.
     payload = "[" + ",".join(decision.issue_codes) + "]"
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
 def completion_frontier_sha256(state: RunState) -> str:
     """Bind the task and accepted execution facts visible to completion policy."""
+    # 修复是否产生进展要看当前任务与已接受工具事实, 不能只比较答案文本.
+    # 新任务版本或新 Tool Record 会改变前沿; 只有二者都不变时才算原地重试.
     payload = "\n".join((state.task_json, *state.records_json))
     return hashlib.sha256(payload.encode()).hexdigest()
 
