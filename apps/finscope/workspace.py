@@ -25,6 +25,8 @@ from weavria.harness import (
 )
 from weavria.tools import RegisteredTool, ToolContext, ToolFault, TypedTool
 
+from .capital_replay import summarize_replay, trading_minute
+
 type CatalogueArea = Literal[
     "dashboard",
     "dashboard_hotspots",
@@ -150,6 +152,7 @@ type ResourceKind = Literal[
     "stock_valuation",
     "market_intel_refresh_run",
     "market_capital_behavior",
+    "market_capital_replay",
     "market_dragon_tiger",
     "market_latest_interpretation",
     "market_interpretation",
@@ -426,6 +429,12 @@ _RESOURCE_ROUTES: dict[ResourceKind, _ResourceRoute] = {
         "numeric",
         fixed_parameters=(("range", "20d"), ("granularity", "5m")),
     ),
+    "market_capital_replay": _ResourceRoute(
+        "/api/market-intel/instruments/{identifier}/capital-replay",
+        "numeric",
+        secondary_kind="date",
+        fixed_parameters=(("refresh", "false"),),
+    ),
     "market_dragon_tiger": _ResourceRoute(
         "/api/market-intel/instruments/{identifier}/dragon-tiger",
         "numeric",
@@ -611,10 +620,28 @@ class FinScopeResourceInput(_WorkspaceModel):
         max_length=64,
         pattern=_IDENTIFIER_PATTERN,
     )
+    from_time: str = Field(
+        default="09:30",
+        pattern=r"^\d{2}:\d{2}$",
+        description="Only market_capital_replay: inclusive range start.",
+    )
+    to_time: str = Field(
+        default="15:00",
+        pattern=r"^\d{2}:\d{2}$",
+        description=(
+            "Only market_capital_replay: inclusive range end; "
+            "secondary_identifier is the trading date."
+        ),
+    )
     limit: int = Field(default=20, ge=1, le=200)
 
     @model_validator(mode="after")
     def validate_identifiers_for_kind(self) -> "FinScopeResourceInput":
+        if self.kind == "market_capital_replay":
+            if trading_minute(self.from_time) > trading_minute(self.to_time):
+                raise ValueError("replay range is reversed")
+        elif self.from_time != "09:30" or self.to_time != "15:00":
+            raise ValueError("time ranges only apply to market_capital_replay")
         route = _RESOURCE_ROUTES[self.kind]
         _validate_selector(self.identifier, route.identifier_kind, "identifier")
         _validate_optional_selector(
@@ -711,6 +738,10 @@ class FinScopeWorkspaceClient:
     async def read_resource(self, request: FinScopeResourceInput) -> FinScopeReadOutput:
         path, parameters = _resource_request(request)
         data = await self._get(path, parameters)
+        if request.kind == "market_capital_replay":
+            data = summarize_replay(
+                data, request.secondary_identifier, request.from_time, request.to_time
+            )
         return FinScopeReadOutput(
             source_id=_resource_source_id(request),
             resource_type=request.kind,
@@ -861,7 +892,7 @@ def finscope_workspace_tools(client: FinScopeWorkspaceClient) -> tuple[Registere
             intent_signals=(
                 "详情 原文 上下文 历史 证据",
                 "研究报告 财报 研报 归因 产业链",
-                "股票 数据集 因子 实验 预测 任务状态",
+                "股票 数据集 因子 实验 预测 任务状态 分钟资金复盘 区间资金 转折 后续表现",
             ),
             input_type=FinScopeResourceInput,
             output_type=FinScopeReadOutput,
@@ -1038,8 +1069,20 @@ def finscope_workspace_evidence_profiles() -> tuple[CapabilityEvidenceProfile, .
         CapabilityEvidenceProfile(
             capability_name="read_finscope_resource",
             capability_version="1",
-            profile_version="finscope-resource-evidence/3",
+            profile_version="finscope-resource-evidence/4",
             surfaces=(
+                EvidenceSurface(
+                    surface_id="workspace.resource.capital_replay",
+                    description=(
+                        "Minute capital replay, interval flow, direction changes "
+                        "and subsequent returns. "
+                        "Use instrument id; secondary_identifier is trading date; "
+                        "from_time/to_time bound the range."
+                    ),
+                    demand_policy="explicit_only",
+                    required_fields=("/data",),
+                    parameter_constraints=constraint("/kind", "market_capital_replay"),
+                ),
                 EvidenceSurface(
                     surface_id="workspace.resource.stock_price_performance",
                     description=(

@@ -135,7 +135,7 @@ Agent 页只显示本地配置指引，不会尝试访问远端服务。Sidecar 
   FinScope 共享对话组件还会在 Markdown 展示时过滤普通正文、列表和表格中的内部标记，兼容已有
   回答；原始成果和证据记录保持可追溯。HTTP 400/422 明确分类为参数错误，404 保留为所请求
   资源未找到，429/5xx 仍按依赖故障和原有重试语义报告，不以空结果伪装失败。
-- HTTP Host 当前提供同步消息接口，不提供流式 Token 或实时事件推送。
+- HTTP Host 保留同步消息接口, 并提供异步请求、阶段轮询、服务端停止和历史读取; 不提供逐 Token 流。
 - Sidecar 只返回结构化 JSON；Markdown 展示、交互状态和错误提示由宿主应用负责。
 - Sidecar 面向本机单用户实验，没有远程部署所需的认证、TLS 和多租户隔离。
 
@@ -172,3 +172,29 @@ Task Understanding Provider 的调用数、Token、覆盖 verdict、修复次数
 `--understanding forced-broad --coverage model` 是修复路径诊断：它只把第一份候选规格替换为合法但
 宽泛的 `/data` 需求，之后的义务审计、规格修复和复审都由真实理解模型完成。它用于证明有界修复
 链路，不计入自然规划成功率，也不是生产配置。
+
+
+## 对话界面协议（新增）
+
+- `GET /api/sessions`：最近 100 个宿主已索引会话。
+- `GET /api/sessions/{id}/history?before={ordinal}`：每页 30 个框架轮次及宿主请求投影。
+- `POST /api/sessions/{id}/requests`：沿用消息输入结构, 返回 202 和 `input_id/status/phase/tools/result`。
+- `GET /api/sessions/{id}/requests/{input_id}`：轮询当前阶段、工具状态与最终结果。
+- `POST /api/sessions/{id}/requests/{input_id}/cancel`：停止对应的服务端 Task 并等待清理。
+- `GET /api/sessions/{id}/sources/{run_id}/{call_id}`：读取该会话实际调用保存的原始 Artifact。
+
+同一个 `input_id` 配同一请求返回已有状态; 参数不同返回 409。新输入与运行中的同会话请求冲突也返回 409。
+取消后宿主返回 `cancelled`, 框架保留自己的中断语义和事件。已保存的完成结果优先于迟到的停止请求。
+关闭页面只断开轮询, 不代表停止服务端任务。正常关机取消并等待全部宿主 Task;
+异常重启把未结束的宿主请求标记为 `interrupted`, 不自动重放模型。
+
+宿主 UI 索引位于状态文件同目录的 `*.ui.sqlite3`, 只维护会话发现、请求与展示投影;
+不直接读取或修改框架 SQLite 表。旧版会话由浏览器已有 session ID 首次读取时纳入索引。
+这是本机单用户、单进程 Sidecar 的接口, 不适用于多 Worker 共用索引或远程多用户服务。
+
+`read_finscope_resource(kind="market_capital_replay", identifier="40", secondary_identifier="2026-11-12",
+from_time="14:16", to_time="14:20")` 只调用 FinScope `capital-replay?refresh=false`。
+它返回指定日/区间的分钟证据、覆盖率、关键转折、大额净额变号和 5/15/30 个交易分钟后的收益。
+关键转折沿用 FinScope 价格段落及五分钟集中净流向规则, 不跨缺口或午休识别; 规则实现见 replay_turns.py。
+变号不等于机构行为或交易信号; 缺少连续价格时不计算后续收益, 缺少资金样本时不补零计算净额。
+必须先更新 FinScope 后端, 再更新 Sidecar 和前端。

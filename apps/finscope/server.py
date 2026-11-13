@@ -6,11 +6,11 @@ from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from typing import Annotated, Literal
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi import Path as ApiPath
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
 from weavria.context import ContextCompilerConfig, ModelRequestContextConfig
 from weavria.core import ApplicationObservation, CompletionUnverifiable, ErrorCategory
@@ -38,6 +38,7 @@ from .completion import (
     MarketPulseEvidenceExtractor,
 )
 from .config import FinScopeSettings
+from .conversations import ConversationHost
 from .market import MarketPulseClient, market_pulse_evidence_profile, market_pulse_tool
 from .model import HTTPChatCompletionTransport
 from .policy import FinScopeReadOnlyPolicy
@@ -112,12 +113,14 @@ class MessageOutput(BaseModel):
     completion_reason: str | None = None
     tools: tuple[ToolTrace, ...]
     clarification_id: str | None = None
+    sources: tuple[dict[str, JsonValue], ...] = ()
 
 
 class _Runtime:
     def __init__(self, harness: AgentHarness) -> None:
         self.harness = harness
         self.engine = harness.sessions
+        self.host: ConversationHost
 
 
 def create_app(
@@ -298,7 +301,15 @@ def create_app(
             configuration_metadata=profile,
         )
         await harness.__aenter__()
-        app.state.runtime = _Runtime(harness)
+        runtime = _Runtime(harness)
+        host = ConversationHost(
+            resolved.state_path.with_suffix(".ui.sqlite3"),
+            harness.sessions,
+            lambda sid, payload: _execute_json(runtime, sid, payload),
+        )
+        await host.open()
+        runtime.host = host
+        app.state.runtime = runtime
         try:
             logging.getLogger("uvicorn.error").info(
                 "FinScope effective runtime configuration: %s",
@@ -306,6 +317,7 @@ def create_app(
             )
             yield
         finally:
+            await host.close()
             await harness.close()
             if created_transport is not None:
                 await created_transport.aclose()
@@ -356,7 +368,9 @@ def create_app(
     @app.post("/api/sessions", response_model=SessionCreated, status_code=201)
     async def create_session(request: Request) -> SessionCreated:
         runtime = _runtime(request)
-        return SessionCreated(session_id=await runtime.harness.create())
+        session_id = await runtime.harness.create()
+        await runtime.host.register(session_id)
+        return SessionCreated(session_id=session_id)
 
     @app.post("/api/sessions/{session_id}/messages", response_model=MessageOutput)
     async def send_message(
@@ -364,71 +378,203 @@ def create_app(
         payload: MessageInput,
         session_id: Annotated[str, ApiPath(min_length=1, max_length=128)],
     ) -> MessageOutput:
-        runtime = _runtime(request)
+        return await _execute_message(_runtime(request), session_id, payload)
+
+    @app.get("/api/sessions")
+    async def list_sessions(request: Request) -> list[dict[str, JsonValue]]:
+        return await _runtime(request).host.sessions()
+
+    @app.get("/api/sessions/{session_id}/history")
+    async def history(
+        request: Request, session_id: str, before: int | None = Query(default=None, ge=1)
+    ) -> dict[str, JsonValue]:
         try:
-            result = (
-                await runtime.harness.send(
-                    session_id,
-                    payload.text.strip(),
-                    input_id=payload.input_id,
-                    application_context=(
-                        ApplicationObservation(
-                            observation_id=f"page-{payload.input_id}",
-                            input_id=payload.input_id,
-                            provider="finscope",
-                            payload_schema="finscope.page-context/1",
-                            payload=payload.context.model_dump(mode="json"),
-                        ),
-                    ),
-                    clarification_id=payload.clarification_id,
-                )
-            ).session
+            return await _runtime(request).host.history(session_id, before)
         except KeyError as exc:
-            raise HTTPException(status_code=404, detail="session not found") from exc
-        turn = await runtime.engine.store.turn(session_id, result.run_id)
-        tools = tuple(
-            ToolTrace(
-                call_id=call.call_id,
-                tool_name=call.tool_name,
-                status="succeeded" if call.artifact is not None else "failed",
-            )
-            for call in (turn.calls if turn else ())
-        )
-        run_error = result.report.error
-        error = (
-            "FinScope 数据服务暂时不可用。重试后仍未取得所需数据。"
-            if run_error is not None and run_error.category is ErrorCategory.SOURCE_UNAVAILABLE
-            else run_error.message
-            if run_error is not None
-            else None
-        )
-        completion_reason = (
-            result.report.assessment.decision.reason
-            if result.report.assessment is not None
-            and isinstance(result.report.assessment.decision, CompletionUnverifiable)
-            else None
-        )
-        pending = next(
-            (
-                item.pending_clarification
-                for item in await runtime.engine.store.pending_clarifications(session_id)
-                if item.run_id == result.run_id and item.pending_clarification is not None
-            ),
-            None,
-        )
-        return MessageOutput(
-            session_id=session_id,
-            run_id=result.run_id,
-            status=result.report.status.value,
-            task_outcome=result.report.task_outcome,
-            answer=result.report.output,
-            error=error,
-            completion_reason=completion_reason,
-            tools=tools,
-            clarification_id=pending.clarification_id if pending is not None else None,
-        )
+            raise HTTPException(404, "session not found") from exc
+
+    @app.post("/api/sessions/{session_id}/requests", status_code=202)
+    async def start_message(
+        request: Request, session_id: str, payload: MessageInput
+    ) -> dict[str, JsonValue]:
+        try:
+            return await _runtime(request).host.start(session_id, payload.model_dump(mode="json"))
+        except KeyError as exc:
+            raise HTTPException(404, "session not found") from exc
+
+    @app.get("/api/sessions/{session_id}/requests/{input_id}")
+    async def progress(request: Request, session_id: str, input_id: str) -> dict[str, JsonValue]:
+        try:
+            return await _runtime(request).host.get(session_id, input_id)
+        except KeyError as exc:
+            raise HTTPException(404, "request not found") from exc
+
+    @app.post("/api/sessions/{session_id}/requests/{input_id}/cancel")
+    async def cancel(request: Request, session_id: str, input_id: str) -> dict[str, JsonValue]:
+        try:
+            return await _runtime(request).host.cancel(session_id, input_id)
+        except KeyError as exc:
+            raise HTTPException(404, "request not found") from exc
+
+    @app.get("/api/sessions/{session_id}/sources/{run_id}/{call_id}")
+    async def source(request: Request, session_id: str, run_id: str, call_id: str) -> JsonValue:
+        try:
+            records = await _runtime(request).engine.store.run_records(session_id, run_id)
+        except KeyError as exc:
+            raise HTTPException(404, "source not found") from exc
+        for record in records:
+            observation = record.exchange.observation
+            if record.exchange.action.call_id == call_id and observation.kind == "tool_succeeded":
+                if record.artifact is not None:
+                    return (
+                        await _runtime(request).engine.store.get(
+                            run_id, record.artifact.artifact_id
+                        )
+                    ).value
+                return observation.output
+        raise HTTPException(404, "source not found")
 
     return app
+
+
+async def _execute_json(
+    runtime: _Runtime, session_id: str, payload: dict[str, JsonValue]
+) -> dict[str, JsonValue]:
+    return (
+        await _execute_message(runtime, session_id, MessageInput.model_validate(payload))
+    ).model_dump(mode="json")
+
+
+async def _execute_message(
+    runtime: _Runtime, session_id: str, payload: MessageInput
+) -> MessageOutput:
+    try:
+        result = (
+            await runtime.harness.send(
+                session_id,
+                payload.text.strip(),
+                input_id=payload.input_id,
+                application_context=(
+                    ApplicationObservation(
+                        observation_id=f"page-{payload.input_id}",
+                        input_id=payload.input_id,
+                        provider="finscope",
+                        payload_schema="finscope.page-context/1",
+                        payload=payload.context.model_dump(mode="json"),
+                    ),
+                ),
+                clarification_id=payload.clarification_id,
+            )
+        ).session
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="session not found") from exc
+    turn = await runtime.engine.store.turn(session_id, result.run_id)
+    tools = tuple(
+        ToolTrace(
+            call_id=call.call_id,
+            tool_name=call.tool_name,
+            status="succeeded" if call.artifact is not None else "failed",
+        )
+        for call in (turn.calls if turn else ())
+    )
+    run_error = result.report.error
+    error = (
+        "FinScope 数据服务暂时不可用。重试后仍未取得所需数据。"
+        if run_error is not None and run_error.category is ErrorCategory.SOURCE_UNAVAILABLE
+        else run_error.message
+        if run_error is not None
+        else None
+    )
+    completion_reason = (
+        result.report.assessment.decision.reason
+        if result.report.assessment is not None
+        and isinstance(result.report.assessment.decision, CompletionUnverifiable)
+        else None
+    )
+    pending = next(
+        (
+            item.pending_clarification
+            for item in await runtime.engine.store.pending_clarifications(session_id)
+            if item.run_id == result.run_id and item.pending_clarification is not None
+        ),
+        None,
+    )
+    return MessageOutput(
+        session_id=session_id,
+        run_id=result.run_id,
+        status=result.report.status.value,
+        task_outcome=result.report.task_outcome,
+        answer=result.report.output,
+        error=error,
+        completion_reason=completion_reason,
+        tools=tools,
+        clarification_id=pending.clarification_id if pending is not None else None,
+        sources=await _source_cards(runtime, session_id, result.run_id),
+    )
+
+
+async def _source_cards(
+    runtime: _Runtime, session_id: str, run_id: str
+) -> tuple[dict[str, JsonValue], ...]:
+    cards: list[dict[str, JsonValue]] = []
+    for record in await runtime.engine.store.run_records(session_id, run_id):
+        observation = record.exchange.observation
+        if observation.kind != "tool_succeeded" or not isinstance(observation.output, dict):
+            continue
+        output = (
+            (await runtime.engine.store.get(run_id, record.artifact.artifact_id)).value
+            if record.artifact
+            else observation.output
+        )
+        if not isinstance(output, dict):
+            continue
+        action = record.exchange.action
+        arguments = action.arguments
+        kind = str(arguments.get("kind", ""))
+        identifier = str(arguments.get("identifier", ""))
+        data = output.get("data")
+        href: str | None = None
+        if kind in ("market_capital_replay", "market_capital_behavior"):
+            from urllib.parse import urlencode
+
+            href = "?" + urlencode(
+                {
+                    "agentView": "marketIntel",
+                    "instrument": identifier,
+                    "replayDate": str(
+                        arguments.get("secondary_identifier")
+                        or (data.get("date") if isinstance(data, dict) else "")
+                        or ""
+                    ),
+                    "replayFrom": str(arguments.get("from_time", "09:30")),
+                    "replayTo": str(arguments.get("to_time", "15:00")),
+                }
+            )
+        elif kind == "financial_report":
+            href = "?agentView=financials&report=" + identifier
+        data = output.get("data")
+        title = data.get("title") or data.get("name") if isinstance(data, dict) else None
+        cards.append(
+            {
+                "call_id": action.call_id,
+                "run_id": run_id,
+                "label": str(
+                    title
+                    or {
+                        "market_capital_replay": "分钟资金复盘",
+                        "market_capital_behavior": "资金行为",
+                        "financial_report": "财务报告",
+                        "article": "文章原文",
+                    }.get(kind)
+                    or kind
+                    or output.get("resource_type")
+                    or "市场状态证据"
+                ),
+                "source_id": output.get("source_id"),
+                "href": href,
+            }
+        )
+    return tuple(cards)
 
 
 def _runtime(request: Request) -> _Runtime:

@@ -19,9 +19,11 @@ from weavria.core import (
     FinishAction,
     Message,
     MessageRole,
+    ModelRequest,
     ModelResponse,
     ModelTurn,
     SessionContextCompiled,
+    SessionRequest,
     SessionRunEvent,
     ToolBatch,
     ToolCallAction,
@@ -372,6 +374,17 @@ async def test_session_api_executes_real_runtime_and_reports_tool_trace(
                 if not running.done():
                     running.cancel()
                 await asyncio.gather(running, return_exceptions=True)
+            if response.status_code == 200 and response.json().get("sources"):
+                source = response.json()["sources"][0]
+                evidence = await client.get(
+                    f"/api/sessions/{created.session_id}/sources/{source['run_id']}/{source['call_id']}"
+                )
+                assert evidence.status_code == 200
+                assert evidence.json()["source_id"].startswith("market-pulse:")
+                wrong = await client.get(
+                    f"/api/sessions/unrelated/sources/{source['run_id']}/{source['call_id']}"
+                )
+                assert wrong.status_code == 404
             events = await app.state.runtime.engine.store.events(created.session_id, limit=256)
 
     with sqlite3.connect(settings.state_path) as database:
@@ -1244,3 +1257,135 @@ async def test_startup_profile_matches_persisted_run_and_excludes_credentials(
     assert "PRIVATE" not in profile_log and "PRIVATE" not in json.dumps(saved)
     for request in (*model.requests, *interpreter.requests):
         assert profile["sha256"] not in request.model_dump_json()
+
+
+@pytest.mark.parametrize("block_understanding", [True, False])
+async def test_async_request_cancel_waits_for_model_cleanup_and_restores_history(
+    tmp_path: Path, block_understanding: bool
+) -> None:
+    entered, cleaned = asyncio.Event(), asyncio.Event()
+
+    class BlockingInterpreter(FakeModelProvider):
+        async def generate(self, request: ModelRequest) -> ModelResponse:
+            if block_understanding:
+                entered.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    cleaned.set()
+            return await super().generate(request)
+
+    class BlockingExecution(FakeSessionProvider):
+        async def generate_session(self, request: SessionRequest) -> ModelTurn:
+            if not block_understanding:
+                entered.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    cleaned.set()
+            return await super().generate_session(request)
+
+    settings = FinScopeSettings(
+        model_base_url="http://model.test",
+        model_name="fake",
+        model_api_key="",
+        state_path=tmp_path / "sessions.sqlite3",
+    )
+
+    def application():
+        return create_app(
+            settings,
+            provider=BlockingExecution((ModelTurn(decision=FinishAction(output="done")),)),
+            interpreter_provider=BlockingInterpreter((_declaration(_direct()),)),
+        )
+
+    app = application()
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://host"
+        ) as client:
+            sid = (await client.post("/api/sessions")).json()["session_id"]
+            path = f"/api/sessions/{sid}/requests"
+            message = {
+                "input_id": "cancel-me",
+                "text": "你是谁",
+                "context": {
+                    "schema_version": 1,
+                    "surface": "finscope_workspace",
+                    "current_view": "agent",
+                    "navigation": {"view": "agent", "label": "Agent"},
+                },
+            }
+            assert (await client.post(path, json=message)).status_code == 202
+            await asyncio.wait_for(entered.wait(), 3)
+            assert (await client.get(path + "/cancel-me")).json()["status"] == "running"
+            assert (await client.post(path, json=message)).status_code == 202
+            changed = {**message, "text": "different"}
+            assert (await client.post(path, json=changed)).status_code == 409
+            assert (
+                await client.post(path, json={**message, "input_id": "second"})
+            ).status_code == 409
+            stopped = await client.post(path + "/cancel-me/cancel")
+            assert stopped.json()["status"] == "cancelled"
+            assert cleaned.is_set(), "HTTP cancellation must join downstream cleanup"
+            assert not app.state.runtime.host.tasks
+            assert (await client.post(path + "/cancel-me/cancel")).json()["status"] == "cancelled"
+    # 宿主索引在新实例恢复, 已停止的请求不会再次派发模型.
+    reopened = application()
+    async with reopened.router.lifespan_context(reopened):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=reopened), base_url="http://host"
+        ) as client:
+            assert (await client.get("/api/sessions")).json()[0]["session_id"] == sid
+            history = (await client.get(f"/api/sessions/{sid}/history")).json()
+            assert history["requests"][0]["status"] == "cancelled"
+            assert history["requests"][0]["text"] == "你是谁"
+            assert (await client.post(path, json=message)).json()["status"] == "cancelled"
+            assert not reopened.state.runtime.host.tasks
+
+
+async def test_async_completed_request_is_durable_and_repeated_input_does_not_call_model(
+    tmp_path: Path,
+) -> None:
+    provider = FakeSessionProvider((ModelTurn(decision=FinishAction(output="已完成回答")),))
+    settings = FinScopeSettings(
+        model_base_url="http://model.test",
+        model_name="fake",
+        model_api_key="",
+        state_path=tmp_path / "sessions.sqlite3",
+    )
+    app = create_app(
+        settings,
+        provider=provider,
+        interpreter_provider=FakeModelProvider((_declaration(_direct()),)),
+    )
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://host"
+        ) as client:
+            sid = (await client.post("/api/sessions")).json()["session_id"]
+            path = f"/api/sessions/{sid}/requests"
+            message = {
+                "input_id": "once",
+                "text": "你是谁",
+                "context": {
+                    "schema_version": 1,
+                    "surface": "finscope_workspace",
+                    "current_view": "agent",
+                    "navigation": {"view": "agent", "label": "Agent"},
+                },
+            }
+            assert (await client.post(path, json=message)).status_code == 202
+            result = (await client.get(path + "/once")).json()
+            for _ in range(100):
+                result = (await client.get(path + "/once")).json()
+                if result["status"] == "finished":
+                    break
+                await asyncio.sleep(0.01)
+            assert result["status"] == "finished", result
+            assert result["result"]["answer"] == "已完成回答"
+            assert (await client.post(path, json=message)).json() == result
+            assert (await client.post(path + "/once/cancel")).json() == result
+            history = (await client.get(f"/api/sessions/{sid}/history")).json()
+            assert history["requests"][0]["result"]["answer"] == "已完成回答"
+            assert len(provider.requests) == 1
