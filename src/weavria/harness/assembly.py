@@ -63,7 +63,8 @@ from .session import TaskAwareSessionPreparer
 from .task_continuation import TaskContinuation
 from .task_view import TaskModelViewProjector
 from .understanding import ModelTaskInterpreter, TaskUnderstandingEngine
-from .work import work_tool
+from .work import WorkRechecker, work_tool
+from .work_recheck import ModelWorkRechecker
 from .working_set import AdaptiveCapabilityPolicy, CapabilityWorkingSetPolicy
 
 
@@ -260,6 +261,7 @@ class AgentHarness:
         evidence 声明应用证据和发现约束; 审计复用理解模型及其独立预算。
         """
         understanding = None
+        work_rechecker = None
         if not config.task_understanding and (
             evidence is not None or preparation_context is not None
         ):
@@ -287,6 +289,12 @@ class AgentHarness:
                 config=preparation_context,
             )
             interpreter = ModelTaskInterpreter(reasoning_model, context_compiler=compiler)
+            if config.work_recheck:
+                work_rechecker = ModelWorkRechecker(
+                    reasoning_model,
+                    context_compiler=compiler,
+                    configuration_id=config.configuration_id,
+                )
             audit = evidence is not None and evidence.audit_requirements
             understanding = TaskUnderstandingEngine(
                 interpreter,
@@ -339,6 +347,7 @@ class AgentHarness:
             outcome_verifiers=evidence.outcome_verifiers if evidence is not None else (),
             discovery_policy=evidence.discovery_policy if evidence is not None else None,
             working_records=config.working_records,
+            work_rechecker=work_rechecker,
             adaptive_capabilities=config.adaptive_capabilities,
             memory=memory,
             history_retrieval=HistoryRetrievalConfig() if config.history_retrieval else None,
@@ -378,6 +387,7 @@ class AgentHarness:
         outcome_verifiers: tuple[CapabilityOutcomeVerifier, ...] = (),
         discovery_policy: CapabilityDiscoveryPolicy | None = None,
         working_records: bool = False,
+        work_rechecker: WorkRechecker | None = None,
         working_set: CapabilityWorkingSetPolicy | None = None,
         adaptive_capabilities: bool = True,
         memory: HarnessMemory | None = None,
@@ -395,6 +405,8 @@ class AgentHarness:
             raise ValueError("outcome verifiers require understanding and adaptive capabilities")
         if working_records and understanding is None:
             raise ValueError("working records require task understanding")
+        if work_rechecker is not None and not working_records:
+            raise ValueError("work rechecker requires working records")
         if working_records:
             for component in (working_set, task_model_projector):
                 if (
@@ -464,6 +476,7 @@ class AgentHarness:
                 if adaptive_capabilities
                 else None,
                 working_records=working_records,
+                work_recheck=work_rechecker is not None,
                 outcomes=CapabilityOutcomeResolver(outcome_verifiers)
                 if outcome_verifiers
                 else None,
@@ -472,7 +485,7 @@ class AgentHarness:
             else None,
             context_source=source,
             support_tools=(
-                *((work_tool(),) if working_records else ()),
+                *((work_tool(rechecker=work_rechecker),) if working_records else ()),
                 *((context_summary_tool(),) if context.semantic_compaction else ()),
             ),
             history_retrieval=history_retrieval,
@@ -486,6 +499,7 @@ class AgentHarness:
                 "harness_version": "unified-harness/8",
                 "configuration_id": configuration_id,
                 "working_records": working_records,
+                "work_recheck_version": work_rechecker.version if work_rechecker else None,
                 "harness_max_request_duration": duration,
                 "memory_catchup_fraction": memory_catchup_fraction,
                 "memory_admission_version": memory.admission.version

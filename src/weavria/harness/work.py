@@ -4,7 +4,7 @@ import hashlib
 import json
 import re
 from collections.abc import Awaitable, Callable
-from typing import Annotated, Literal, Self
+from typing import Annotated, Literal, Protocol, Self
 
 from pydantic import (
     BaseModel,
@@ -22,6 +22,7 @@ from weavria.tools import ToolContext, ToolFault, TypedTool, resolve_pointer
 
 from .requirements import NeedLedger, NeedStatus
 from .understanding import TaskFrame
+from .work_recheck_contracts import WorkRecheckReceipt
 
 WORK_TOOL = "propose_work"
 MAX_WORK_BYTES = 8192
@@ -46,7 +47,7 @@ class WorkContract(_WorkBase):
 
 class _VersionedWork(_WorkBase):
     # v1 文档继续按原协议读取;带依赖或版本元数据的记录必须显式写为 v2。
-    schema_version: Literal[1, 2] = 2
+    schema_version: Literal[1, 2, 3] = 2
 
 
 class WorkDependency(WorkContract):
@@ -132,9 +133,14 @@ class WorkSource(WorkContract):
 class WorkProposal(_VersionedWork):
     update: WorkUpdate
     sources: tuple[WorkSource, ...]
+    rechecks: tuple[WorkRecheckReceipt, ...] = Field(
+        default=(), max_length=6, exclude_if=lambda value: not value
+    )
 
     @model_validator(mode="after")
     def version_contract(self) -> Self:
+        if self.rechecks and self.schema_version != 3:
+            raise ValueError("work recheck receipts require schema v3")
         if self.schema_version == 1 and any(n.depends_on for n in self.update.notes):
             raise ValueError("work dependencies require schema v2")
         return self
@@ -153,8 +159,15 @@ class WorkingState(_VersionedWork):
     next_query: str = Field(default="", max_length=240)
     invalidated_note_ids: tuple[Identity, ...] = Field(default=(), max_length=6)
     last_notice: Literal[
-        "empty", "accepted", "stale_revision", "unknown_need", "invalid_dependency", "revised"
+        "empty",
+        "accepted",
+        "stale_revision",
+        "unknown_need",
+        "invalid_dependency",
+        "revised",
+        "recheck_required",
     ] = "empty"
+    recheck_required: bool = Field(default=False, exclude_if=lambda value: not value)
     note_revisions: dict[Identity, Annotated[int, Field(ge=0)]] = Field(
         default_factory=dict, max_length=6, exclude_if=lambda value: not value
     )
@@ -164,6 +177,10 @@ class WorkingState(_VersionedWork):
 
     @model_validator(mode="after")
     def bounded(self) -> Self:
+        if (
+            self.recheck_required or self.last_notice == "recheck_required"
+        ) and self.schema_version != 3:
+            raise ValueError("evidence recheck state requires schema v3")
         _dependency_order(self.notes)
         if self.schema_version == 1:
             if (
@@ -436,7 +453,54 @@ def _source_label(value: str, start: int, end: int) -> str | None:
     return label
 
 
-def work_tool() -> TypedTool[WorkDraft, WorkProposal]:
+class WorkRechecker(Protocol):
+    """工具内执行的有界审查端口;不得在归约或回放时重新调用。"""
+
+    @property
+    def version(self) -> str: ...
+
+    async def review(
+        self, update: WorkUpdate, context: ToolContext
+    ) -> tuple[WorkRecheckReceipt, ...]: ...
+
+
+def work_update_sha256(update: WorkUpdate) -> str:
+    """收据绑定完整提案,防止被用于另一份文字、来源或依赖更新。"""
+    return hashlib.sha256(update.model_dump_json().encode()).hexdigest()
+
+
+def recheck_targets(state: WorkingState, update: WorkUpdate) -> tuple[str, ...]:
+    """确定受影响且试图改变的旧节点,连同删除和同批上游修订一起检查。
+
+    未改的失效节点继续由原 DAG 阻止交付。把父子同时换绑也不能逃过检查:
+    用候选父版本检查旧边,识别本次才会失效的节点,再让重验器要求分步提交。
+    """
+    versions = {
+        **dict.fromkeys((n.note_id for n in state.notes), -1),
+        **_next_note_versions(state, update.notes),
+    }
+    affected = set(state.stale_note_ids) | {
+        issue.note_id for issue in _dependency_issues(state.notes, versions)
+    }
+    proposed = {note.note_id: note for note in update.notes}
+    return tuple(
+        note.note_id
+        for note in state.notes
+        if note.note_id in affected
+        # 计划/假设本身不是完成证据,允许继续组织工作。只有既有结果,或准备
+        # 提升为结果的记录需要证据重验;把旧结果降成计划也不能绕过检查。
+        and (
+            note.kind == "result"
+            or (note.note_id in proposed and proposed[note.note_id].kind == "result")
+        )
+        and (
+            note.note_id not in proposed
+            or _note_content(note) != _note_content(proposed[note.note_id])
+        )
+    )
+
+
+def work_tool(*, rechecker: WorkRechecker | None = None) -> TypedTool[WorkDraft, WorkProposal]:
     async def propose(draft: WorkDraft, context: ToolContext) -> WorkProposal:
         try:
             update = _bind_draft(draft, context)
@@ -484,7 +548,13 @@ def work_tool() -> TypedTool[WorkDraft, WorkProposal]:
                 )
         # 这里只生成提议 Artifact,不写隐藏状态。Runtime 接受结果后才做归约;
         # 同批业务工具的新结果尚未接受,不能被工作提议提前引用。
-        proposal = WorkProposal(update=update, sources=tuple(sources))
+        receipts = await rechecker.review(update, context) if rechecker is not None else ()
+        proposal = WorkProposal(
+            schema_version=3 if rechecker is not None else 2,
+            update=update,
+            sources=tuple(sources),
+            rechecks=receipts,
+        )
         # 归约后的诊断有额外开销。按每条边的最长诊断键预留空间,确保工具
         # 接受的提案不会在后续无 I/O 的状态归约阶段才撞上持久化字节上限。
         overhead = {
@@ -504,7 +574,10 @@ def work_tool() -> TypedTool[WorkDraft, WorkProposal]:
 
     return _WorkTool(
         name=WORK_TOOL,
-        version="5",
+        # 输出 Schema 新增可选收据,即使策略关闭也更新描述版本,避免旧目录缓存
+        # 把新 Schema 误认为旧 v5。默认生成的提案仍为无收据的 v2。
+        version="6:" + rechecker.version if rechecker is not None else "6",
+        timeout_seconds=60 if rechecker is not None else 10,
         input_type=WorkDraft,
         output_type=WorkProposal,
         description=(
@@ -518,6 +591,14 @@ def work_tool() -> TypedTool[WorkDraft, WorkProposal]:
             "Sourced results lower exploration priority; issues/next_need_ids raise it. "
             "Check working_state.last_notice for acceptance. Notes are not proof or private "
             "reasoning. Honor requested working notes even for short answers."
+            + (
+                " Evidence recheck is enabled: submit one dependency frontier at a time. "
+                "Changes to stale notes are reviewed against authorized original sources. "
+                "Read rechecks diagnostics; failed reviews leave ALL notes unchanged. "
+                "Keep source ranges and parent dependencies; fetch missing evidence before retry."
+                if rechecker is not None
+                else ""
+            )
         ),
         execute=propose,
     )
@@ -541,6 +622,8 @@ def revise_work(state: WorkingState, before: TaskFrame, after: TaskFrame) -> Wor
     refs = {ref.model_dump_json() for n in notes for ref in n.sources}
     # 下一步意图是当前整体目标下的决定,即使局部笔记保留也必须重新提出。
     return WorkingState(
+        schema_version=3 if state.recheck_required else 2,
+        recheck_required=state.recheck_required,
         task_revision=after.request_anchor.task_revision,
         revision=state.revision + 1,
         processed_records=state.processed_records,
@@ -593,7 +676,12 @@ async def reduce_work(
             # 与 CAS 一样只拒绝该提案,保留先前提交的完整状态并推进处理游标。
             state = state.model_copy(update={"last_notice": "invalid_dependency"})
             continue
+        if state.recheck_required and not _rechecks_accept(state, proposal, artifact.reference):
+            state = state.model_copy(update={"last_notice": "recheck_required"})
+            continue
         state = WorkingState(
+            schema_version=3 if state.recheck_required else 2,
+            recheck_required=state.recheck_required,
             task_revision=state.task_revision,
             revision=state.revision + 1,
             processed_records=state.processed_records,
@@ -606,6 +694,38 @@ async def reduce_work(
             last_notice="accepted",
         )
     return state.model_copy(update={"processed_records": len(records)})
+
+
+def _rechecks_accept(state: WorkingState, proposal: WorkProposal, parent: ArtifactRef) -> bool:
+    """重放只核对已接受工具事实,绝不依据模型输入自签收据或再次审查。"""
+    targets = recheck_targets(state, proposal.update)
+    receipts = {receipt.note_id: receipt for receipt in proposal.rechecks}
+    if len(receipts) != len(proposal.rechecks) or set(receipts) != set(targets):
+        return False
+    old = {note.note_id: note for note in state.notes}
+    new = {note.note_id: note for note in proposal.update.notes}
+    for identity in targets:
+        receipt = receipts[identity]
+        candidate = new.get(identity)
+        expected = (
+            "withdrawn"
+            if candidate is None or candidate.kind == "rejected"
+            else "supported"
+            if candidate.summary == old[identity].summary
+            else "revised"
+        )
+        if (
+            receipt.status != expected
+            or receipt.task_revision != state.task_revision
+            or receipt.base_revision != state.revision
+            or receipt.prior_revision != _note_versions(state)[identity]
+            or receipt.update_sha256 != work_update_sha256(proposal.update)
+            or receipt.packet.run_id != parent.run_id
+            or receipt.packet.call_id != parent.call_id
+            or receipt.packet.artifact_id == parent.artifact_id
+        ):
+            return False
+    return True
 
 
 AnalysisStatus = Literal["analysis_pending", "finding_recorded", "open_question"]

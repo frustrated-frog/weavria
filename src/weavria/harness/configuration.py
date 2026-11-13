@@ -29,6 +29,7 @@ class HarnessConfig:
     memory_catchup_fraction: float = 0.1
     project_task_view: bool = True
     adaptive_capabilities: bool = True
+    work_recheck: bool = False
 
     def __post_init__(self) -> None:
         if not self.configuration_id.strip() or len(self.configuration_id) > 128:
@@ -40,6 +41,7 @@ class HarnessConfig:
             self.history_retrieval,
             self.context_recovery,
             self.working_records,
+            self.work_recheck,
         ):
             if type(enabled) is not bool:
                 raise ValueError("Harness feature switches must be booleans")
@@ -47,6 +49,8 @@ class HarnessConfig:
             raise ValueError("adaptive capabilities require task model projection")
         if self.working_records and not self.task_understanding:
             raise ValueError("working records require task understanding")
+        if self.work_recheck and not self.working_records:
+            raise ValueError("work recheck requires working records")
         if self.working_records and not self.project_task_view:
             raise ValueError("working records require task model projection")
         if self.context.semantic_compaction and not self.context_recovery:

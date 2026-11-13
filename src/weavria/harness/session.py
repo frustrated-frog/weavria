@@ -71,10 +71,14 @@ class TaskAwareSessionPreparer:
         clarification: ClarificationPolicy | None = None,
         working_set: CapabilityWorkingSetPolicy | None = None,
         working_records: bool = False,
+        work_recheck: bool = False,
         outcomes: CapabilityOutcomeResolver | None = None,
     ) -> None:
         self._outcomes = outcomes
         self._working_records = working_records
+        if work_recheck and not working_records:
+            raise ValueError("work recheck requires working records")
+        self._work_recheck = work_recheck
         self._working_set = working_set
         self._understanding = understanding
         self._evidence = evidence or EvidenceResolver()
@@ -103,7 +107,8 @@ class TaskAwareSessionPreparer:
     def version(self) -> str:
         return (
             f"task-aware-session/15[work={self._working_records};"
-            f"{self._outcomes.version if self._outcomes else 'no-outcomes'};"
+            + ("evidence-recheck/3;" if self._work_recheck else "")
+            + f"{self._outcomes.version if self._outcomes else 'no-outcomes'};"
             f"{self._understanding.version};{self._evidence.version};"
             f"{self._capabilities.version};{self._clarification.version};"
             f"{self._working_set.version if self._working_set else 'monotonic-view/1'}]"
@@ -283,7 +288,13 @@ class TaskAwareSessionPreparer:
             )
             observation = task_frame_observation(frame)
         working = (
-            WorkingState(task_revision=context.task.revision) if self._working_records else None
+            WorkingState(
+                schema_version=3 if self._work_recheck else 2,
+                recheck_required=self._work_recheck,
+                task_revision=context.task.revision,
+            )
+            if self._working_records
+            else None
         )
         if (
             working is not None

@@ -184,9 +184,12 @@ from .work import (
     WorkDependencyIssue,
     WorkingState,
     WorkNote,
+    WorkRechecker,
     WorkReference,
     WorkUpdate,
 )
+from .work_recheck import ModelWorkRechecker
+from .work_recheck_contracts import WorkRecheckReceipt
 from .working_set import AdaptiveCapabilityPolicy, CapabilityWorkingSet, CapabilityWorkingSetPolicy
 
 __all__ = [
@@ -288,6 +291,7 @@ __all__ = [
     "ModelMemoryReviewer",
     "ModelRequirementCoverageValidator",
     "ModelTaskInterpreter",
+    "ModelWorkRechecker",
     "NeedFailure",
     "NeedFinalizationPolicy",
     "NeedLedger",
@@ -344,6 +348,8 @@ __all__ = [
     "WorkDependency",
     "WorkDependencyIssue",
     "WorkNote",
+    "WorkRecheckReceipt",
+    "WorkRechecker",
     "WorkReference",
     "WorkUpdate",
     "WorkingState",

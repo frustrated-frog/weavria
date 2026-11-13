@@ -58,6 +58,9 @@ async def main() -> None:
     )
     parser.add_argument("--understand", action="store_true")
     parser.add_argument("--working-records", action="store_true", help="启用有界工作记录与任务理解")
+    parser.add_argument(
+        "--work-recheck", action="store_true", help="显式启用失效工作结论的证据重验"
+    )
     args = parser.parse_args()
     if bool(args.snapshot) != bool(args.scene) or (args.snapshot and args.documents):
         parser.error("--snapshot 与 --scene 必须一起提供,且不能同时使用 --documents")
@@ -101,8 +104,9 @@ async def main() -> None:
         harness_config = HarnessConfig(
             configuration_id="harness-cli-v2",
             context=ContextCompilerConfig(window_tokens=64000, output_tokens=4096),
-            task_understanding=args.understand or args.working_records,
-            working_records=args.working_records,
+            task_understanding=args.understand or args.working_records or args.work_recheck,
+            working_records=args.working_records or args.work_recheck,
+            work_recheck=args.work_recheck,
             memory_write="basic" if args.memory else "off",
             preparation_max_duration=60,
             limits=RunLimits(max_duration=120, max_request_bytes=128000),
