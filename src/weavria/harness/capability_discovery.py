@@ -25,6 +25,14 @@ from weavria.models import ModelCallError, ModelProvider, call_model
 from weavria.sessions import SessionTaskPreparationError
 
 from .capabilities import CapabilityDescriptor, CatalogSnapshot
+from .capability_fit import (
+    FIT_INSTRUCTIONS,
+    CapabilityFitConfig,
+    CapabilityFitProposal,
+    CapabilityFitReport,
+    fit_request,
+    validate_fit,
+)
 from .capability_index import (
     CapabilityIndexError,
     CapabilityRetrievalReport,
@@ -53,12 +61,20 @@ class CapabilityDiscoveryConfig(_Value):
     max_candidates: int = Field(default=12, ge=1, le=32)
     max_calls: int = Field(default=32, ge=1, le=64)
     max_input_tokens: int = Field(default=120_000, ge=1, le=1_000_000)
+    fit: CapabilityFitConfig | None = None
+
+    @model_serializer(mode="wrap")
+    def serialize_config(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        result = handler(self)
+        if self.fit is None:
+            result.pop("fit", None)
+        return result
 
 
 class CapabilityDiscoveryStep(_Value):
     """一次实际发送尝试的身份与成本;失败调用不被后续成功覆盖。"""
 
-    stage: Literal["scan", "merge"]
+    stage: Literal["scan", "merge", "inspect"]
     offered_names: tuple[str, ...]
     selected_names: tuple[str, ...] = ()
     request_sha256: str
@@ -73,7 +89,7 @@ class CapabilityDiscoveryStep(_Value):
 class CapabilityDiscoveryReport(_Value):
     """可归档的内容无关报告;完整扫描不代表模型没有遗漏。"""
 
-    schema_version: Literal[1, 2] = 1
+    schema_version: Literal[1, 2, 3] = 1
     policy_version: str
     catalogue_sha256: str
     context_sha256: str
@@ -87,10 +103,16 @@ class CapabilityDiscoveryReport(_Value):
     scan_scope: Literal["full_catalogue", "indexed_candidates"] = "full_catalogue"
     retrieval: CapabilityRetrievalReport | None = None
     fallback_reason: Literal["context_requires_full_scan"] | None = None
+    repairs: tuple[CapabilityRetrievalReport, ...] = ()
+    reviews: tuple[CapabilityFitReport, ...] = ()
+    stop_reason: str | None = None
 
     @model_serializer(mode="wrap")
     def serialize_report(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
         result = handler(self)
+        if self.schema_version < 3:
+            for field in ("repairs", "reviews", "stop_reason"):
+                result.pop(field, None)
         if self.schema_version == 1:
             for field in ("scan_scope", "retrieval", "fallback_reason"):
                 result.pop(field, None)
@@ -119,6 +141,8 @@ class CapabilityDiscoveryReport(_Value):
             raise ValueError("retrieval must bind the same discovery catalogue")
         if self.fallback_reason is not None and self.scan_scope != "full_catalogue":
             raise ValueError("context fallback must scan the full catalogue")
+        if self.repairs and (self.scan_scope != "indexed_candidates" or self.retrieval is None):
+            raise ValueError("repair retrieval requires an initial indexed scan")
         scanned = tuple(
             name
             for step in self.steps
@@ -131,15 +155,82 @@ class CapabilityDiscoveryReport(_Value):
             or not 0 <= self.scanned_count <= self.catalogue_size
         ):
             raise ValueError("discovery scan accounting is inconsistent")
+        if self.schema_version < 3 and (
+            self.repairs
+            or self.reviews
+            or self.stop_reason is not None
+            or any(s.stage == "inspect" for s in self.steps)
+        ):
+            raise ValueError("fit review requires discovery report v3")
+        if self.schema_version == 3:
+            nominated_before: set[str] = set()
+            for step in self.steps:
+                if step.stage == "inspect" and not set(step.offered_names) <= nominated_before:
+                    raise ValueError("inspection cannot introduce unnominated capabilities")
+                if step.status == "accepted":
+                    if not set(step.selected_names) <= set(step.offered_names):
+                        raise ValueError("accepted selections must belong to the offered view")
+                    if step.stage in {"scan", "merge"}:
+                        nominated_before.update(step.selected_names)
+            requested_queries = [q for review in self.reviews for q in review.query_sha256]
+            for repair in self.repairs:
+                if repair.query_sha256 not in requested_queries:
+                    raise ValueError("repair query must originate from an accepted fit gap")
+                requested_queries.remove(repair.query_sha256)
         target = self.catalogue_size
         if self.scan_scope == "indexed_candidates":
             if self.retrieval is None:
                 if self.status == "completed" or self.steps:
                     raise ValueError("indexed scan requires completed retrieval")
             else:
-                target = len(self.retrieval.candidate_names)
-                if not set(scanned) <= set(self.retrieval.candidate_names):
+                retrieved = set(self.retrieval.candidate_names)
+                for repair in self.repairs:
+                    if (
+                        repair.catalogue_sha256 != self.catalogue_sha256
+                        or repair.catalogue_size != self.catalogue_size
+                        or set(repair.candidate_names) & retrieved
+                        or set(repair.excluded_names) != retrieved
+                    ):
+                        raise ValueError("repair retrieval must advance the same catalogue")
+                    retrieved.update(repair.candidate_names)
+                target = len(retrieved)
+                if not set(scanned) <= retrieved:
                     raise ValueError("scan contains names outside retrieved candidates")
+        inspected = [
+            i for i, s in enumerate(self.steps) if s.stage == "inspect" and s.status == "accepted"
+        ]
+        if [r.step_index for r in self.reviews] != inspected:
+            raise ValueError("fit reviews must match accepted inspect steps")
+        for review in self.reviews:
+            step = self.steps[review.step_index]
+            size = len(step.offered_names)
+            if (
+                len(review.decisions) != size
+                or len(review.request_quote_sha256) != size
+                or len(review.support_sha256) != size
+                or tuple(step.selected_names) != review.accepted_names
+                or not set(review.accepted_names) <= set(step.offered_names)
+                or len(review.gap_source_sha256) != len(review.query_sha256)
+                or (review.outcome == "search") != bool(review.query_sha256)
+                or set(review.accepted_names)
+                != {
+                    name
+                    for name, decision in zip(step.offered_names, review.decisions, strict=True)
+                    if decision == "supported"
+                }
+                or (review.outcome == "ready" and not review.accepted_names)
+                or (review.outcome == "no_tools" and review.accepted_names)
+            ):
+                raise ValueError("fit review accounting is inconsistent")
+        if self.status == "completed" and self.schema_version == 3:
+            if (
+                not self.reviews
+                or self.reviews[-1].outcome not in {"ready", "no_tools"}
+                or self.selected_names != self.reviews[-1].accepted_names
+                or self.stop_reason != self.reviews[-1].outcome
+                or self.reviews[-1].step_index != len(self.steps) - 1
+            ):
+                raise ValueError("completed fit discovery requires final applicability acceptance")
         if self.status == "completed":
             if self.scanned_count != target or any(s.status != "accepted" for s in self.steps):
                 raise ValueError("completed discovery requires complete accepted scan")
@@ -255,6 +346,8 @@ class ModelCapabilityDiscovery:
                 "instructions": _INSTRUCTIONS,
             }
         )
+        if self.config.fit is not None:
+            self.version += ";fit/1:" + _digest(FIT_INSTRUCTIONS)
         if candidate_index is not None:
             self.version += ";query=task-goal-constraints/1;" + candidate_index.version
 
@@ -278,6 +371,9 @@ class ModelCapabilityDiscovery:
         selected: tuple[str, ...] = ()
         scanned = 0
         retrieval: CapabilityRetrievalReport | None = None
+        repairs: list[CapabilityRetrievalReport] = []
+        reviews: list[CapabilityFitReport] = []
+        stop_reason: str | None = None
         scope: Literal["full_catalogue", "indexed_candidates"] = (
             "full_catalogue" if self._index is None else "indexed_candidates"
         )
@@ -285,7 +381,9 @@ class ModelCapabilityDiscovery:
 
         def report(status: str, failure_code: str | None = None) -> CapabilityDiscoveryReport:
             return CapabilityDiscoveryReport(
-                schema_version=1 if self._index is None else 2,
+                schema_version=3
+                if self.config.fit is not None
+                else (1 if self._index is None else 2),
                 policy_version=self.version,
                 catalogue_sha256=catalogue.catalogue_sha256,
                 context_sha256=hashlib.sha256(context_json.encode()).hexdigest(),
@@ -299,6 +397,9 @@ class ModelCapabilityDiscovery:
                 scan_scope=scope,
                 retrieval=retrieval,
                 fallback_reason=fallback,
+                repairs=tuple(repairs),
+                reviews=tuple(reviews),
+                stop_reason=stop_reason,
             )
 
         def request(batch: tuple[dict[str, object], ...], limit: int) -> ModelRequest:
@@ -311,16 +412,18 @@ class ModelCapabilityDiscovery:
                 ),
             )
 
-        async def nominate(
-            batch: tuple[dict[str, object], ...], stage: Literal["scan", "merge"], limit: int
-        ) -> tuple[str, ...]:
-            plan = self._compiler.compile(request(batch, limit))
+        async def invoke(
+            payload: ModelRequest,
+            names: tuple[str, ...],
+            stage: Literal["scan", "merge", "inspect"],
+            tool_name: str,
+        ) -> str:
+            plan = self._compiler.compile(payload)
             if len(steps) >= self.config.max_calls or (
                 sum(s.input_tokens for s in steps) + plan.diagnostic.input_tokens
                 > self.config.max_input_tokens
             ):
                 raise _Capacity("discovery aggregate budget exceeded")
-            names = tuple(str(c["name"]) for c in batch)
             # 发送前占位,模型错误、取消和超时不会让后续用量错配到这个请求。
             steps.append(
                 CapabilityDiscoveryStep(
@@ -338,17 +441,21 @@ class ModelCapabilityDiscovery:
                 max_duration=max(0.000001, deadline - asyncio.get_running_loop().time()),
             )
             action = response.action
-            if (
-                not isinstance(action, ToolCallAction)
-                or action.tool_name != "nominate_capabilities"
-            ):
+            if not isinstance(action, ToolCallAction) or action.tool_name != tool_name:
                 raise _InvalidNomination("unexpected_action")
             encoded = _json(action.arguments)
-            if len(encoded.encode()) > 16384:
+            if len(encoded.encode()) > (32768 if stage == "inspect" else 16384):
                 raise _InvalidNomination("proposal_capacity")
             steps[-1] = steps[-1].model_copy(
                 update={"proposal_sha256": hashlib.sha256(encoded.encode()).hexdigest()}
             )
+            return encoded
+
+        async def nominate(
+            batch: tuple[dict[str, object], ...], stage: Literal["scan", "merge"], limit: int
+        ) -> tuple[str, ...]:
+            names = tuple(str(c["name"]) for c in batch)
+            encoded = await invoke(request(batch, limit), names, stage, "nominate_capabilities")
             proposal = _Nomination.model_validate_json(encoded)
             chosen = proposal.names
             if len(chosen) > limit:
@@ -366,6 +473,120 @@ class ModelCapabilityDiscovery:
                 }
             )
             return tuple(sorted(chosen))
+
+        async def scan(candidates: tuple[CapabilityDescriptor, ...]) -> tuple[str, ...]:
+            nonlocal cards, scanned
+            batch_cards = tuple(_card(c) for c in sorted(candidates, key=lambda c: c.name))
+            by_name.update({str(c["name"]): c for c in batch_cards})
+            cards = tuple(by_name[n] for n in sorted(by_name))
+            # 先完整规划批次,单卡放不下时不花费任何模型调用。每张卡保留全文说明。
+            batches: list[tuple[dict[str, object], ...]] = []
+            current: tuple[dict[str, object], ...] = ()
+            limit = self.config.nominations_per_batch
+            for card in batch_cards:
+                await asyncio.sleep(0)
+                trial = (*current, card)
+                try:
+                    if len(trial) > self.config.cards_per_batch:
+                        raise _Capacity("batch count reached")
+                    self._compiler.compile(request(trial, limit))
+                except (ModelRequestContextError, _Capacity):
+                    if not current:
+                        raise _Capacity("a capability card cannot fit") from None
+                    batches.append(current)
+                    current = (card,)
+                    self._compiler.compile(request(current, limit))
+                else:
+                    current = trial
+            if current:
+                batches.append(current)
+            if len(steps) + len(batches) > self.config.max_calls:
+                raise _Capacity("complete scan exceeds call budget")
+            nominees: set[str] = set()
+            for batch in batches:
+                nominees.update(await nominate(batch, "scan", limit))
+                scanned += len(batch)
+            chosen = tuple(sorted(nominees))
+            if len(chosen) > self.config.max_candidates:
+                chosen = await nominate(
+                    tuple(by_name[name] for name in chosen),
+                    "merge",
+                    self.config.max_candidates,
+                )
+            return chosen
+
+        async def inspect_and_repair(initial: tuple[str, ...]) -> tuple[str, ...]:
+            nonlocal stop_reason
+            fit = self.config.fit
+            assert fit is not None
+            context: dict[str, JsonValue] = json.loads(context_json)
+            task = TaskInput.model_validate_json(_json(context.get("task")))
+            descriptors = {c.name: c for c in catalogue.capabilities}
+            pool = initial
+            for round_number in range(fit.max_repairs + 1):
+                if len(pool) > fit.max_expanded_tools:
+                    raise _Capacity("fit expansion capacity exceeded")
+                expanded = tuple(descriptors[n] for n in sorted(pool))
+                encoded = await invoke(
+                    fit_request(
+                        context,
+                        expanded,
+                        max_selected=self.config.max_candidates,
+                        max_queries=fit.max_queries_per_round,
+                    ),
+                    tuple(c.name for c in expanded),
+                    "inspect",
+                    "inspect_capability_fit",
+                )
+                proposal = CapabilityFitProposal.model_validate_json(encoded)
+                try:
+                    review = validate_fit(
+                        proposal,
+                        expanded,
+                        task,
+                        step_index=len(steps) - 1,
+                        max_selected=self.config.max_candidates,
+                        max_queries=fit.max_queries_per_round,
+                    )
+                except ValueError as exc:
+                    raise _InvalidNomination(str(exc)) from exc
+                steps[-1] = steps[-1].model_copy(
+                    update={
+                        "status": "accepted",
+                        "selected_names": proposal.selected_names,
+                    }
+                )
+                reviews.append(review)
+                if proposal.outcome != "search":
+                    stop_reason = proposal.outcome
+                    return proposal.selected_names
+                if len(by_name) == len(descriptors):
+                    stop_reason = "catalogue_examined"
+                elif round_number == fit.max_repairs:
+                    stop_reason = "repairs_exhausted"
+                elif self._index is None:
+                    stop_reason = "index_unavailable"
+                if stop_reason is not None:
+                    raise _NoProgress(stop_reason)
+                assert self._index is not None
+                unseen: set[str] = set()
+                for gap in proposal.gaps:
+                    # 排除发生在通道 top-k 之前;同轮多个缺口也不重复消费候选名额。
+                    result = await self._index.retrieve(
+                        catalogue,
+                        gap.query,
+                        exclude_names=tuple(sorted(set(by_name) | unseen)),
+                        max_duration=max(0.000001, deadline - asyncio.get_running_loop().time()),
+                    )
+                    repairs.append(result)
+                    unseen.update(result.candidate_names)
+                if not unseen:
+                    stop_reason = "no_new_candidates"
+                    raise _NoProgress(stop_reason)
+                new_names = await scan(tuple(descriptors[n] for n in sorted(unseen)))
+                # 保留已支持操作,但每轮联合复查,允许撤销此前的错误判断。
+                pool = tuple(sorted(set(proposal.selected_names) | set(new_names)))
+            raise AssertionError("bounded fit loop must terminate")
 
         try:
             async with asyncio.timeout_at(deadline):
@@ -418,42 +639,9 @@ class ModelCapabilityDiscovery:
                         )
                         allowed = set(retrieval.candidate_names)
                         candidates = tuple(c for c in candidates if c.name in allowed)
-                cards = tuple(_card(c) for c in sorted(candidates, key=lambda c: c.name))
-                by_name = {str(c["name"]): c for c in cards}
-                # 先完整规划批次,单卡放不下时不花费任何模型调用。每张卡保留全文说明。
-                batches: list[tuple[dict[str, object], ...]] = []
-                current: tuple[dict[str, object], ...] = ()
-                limit = self.config.nominations_per_batch
-                for card in cards:
-                    await asyncio.sleep(0)
-                    trial = (*current, card)
-                    try:
-                        if len(trial) > self.config.cards_per_batch:
-                            raise _Capacity("batch count reached")
-                        self._compiler.compile(request(trial, limit))
-                    except (ModelRequestContextError, _Capacity):
-                        if not current:
-                            raise _Capacity("a capability card cannot fit") from None
-                        batches.append(current)
-                        current = (card,)
-                        self._compiler.compile(request(current, limit))
-                    else:
-                        current = trial
-                if current:
-                    batches.append(current)
-                if len(batches) > self.config.max_calls:
-                    raise _Capacity("complete scan exceeds call budget")
-                nominees: set[str] = set()
-                for batch in batches:
-                    nominees.update(await nominate(batch, "scan", limit))
-                    scanned += len(batch)
-                selected = tuple(sorted(nominees))
-                if len(selected) > self.config.max_candidates:
-                    selected = await nominate(
-                        tuple(by_name[name] for name in selected),
-                        "merge",
-                        self.config.max_candidates,
-                    )
+                selected = await scan(candidates)
+                if self.config.fit is not None:
+                    selected = await inspect_and_repair(selected)
                 result = report("completed")
                 if self._on_report is not None:
                     try:
@@ -472,6 +660,8 @@ class ModelCapabilityDiscovery:
                     if exc.capacity
                     else ErrorCategory.MODEL_FAILURE
                 )
+            elif isinstance(exc, _NoProgress):
+                category = ErrorCategory.NO_PROGRESS
             elif isinstance(exc, TimeoutError):
                 category = ErrorCategory.TIMEOUT
             elif isinstance(exc, ModelCallError):
@@ -493,7 +683,7 @@ class ModelCapabilityDiscovery:
                 report(
                     category.value,
                     str(exc)
-                    if isinstance(exc, (_InvalidNomination, CapabilityIndexError))
+                    if isinstance(exc, (_InvalidNomination, CapabilityIndexError, _NoProgress))
                     else type(exc).__name__,
                 ),
             ) from exc
@@ -509,3 +699,7 @@ class _InvalidNomination(ValueError):
 
 class _ReportFailure(Exception):
     pass
+
+
+class _NoProgress(Exception):
+    """有缺口但当前有界搜索无法前进,不把它误报为模型格式错误。"""

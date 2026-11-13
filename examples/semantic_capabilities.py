@@ -14,10 +14,12 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from examples.live_memory_formation import Transport
 from weavria.context import ModelRequestContextCompiler, ModelRequestContextConfig
-from weavria.core import TaskInput
+from weavria.core import ErrorCategory, TaskInput
 from weavria.harness import (
+    CapabilityDiscoveryConfig,
     CapabilityDiscoveryError,
     CapabilityDiscoveryReport,
+    CapabilityFitConfig,
     CapabilityQuery,
     CapabilityResolver,
     CatalogSnapshot,
@@ -37,12 +39,18 @@ from weavria.tools import ToolContext, ToolRegistry, TypedTool
 class Definition(BaseModel):
     name: str
     description: str
+    input_kind: Literal["subject", "path", "archive", "person", "host"] = "subject"
+    output_kind: Literal[
+        "generic", "digest", "text", "metadata", "revisions", "busy", "free", "certificate"
+    ] = "generic"
 
 
 class Case(BaseModel):
     id: str
     query: str
     expected: tuple[str, ...]
+    unavailable: bool = False
+    alternatives: tuple[tuple[str, ...], ...] = ()
 
 
 class Dataset(BaseModel):
@@ -67,10 +75,85 @@ class Output(BaseModel):
     source: str = Field(description="Identity of the source that produced the records.")
 
 
+class FileInput(BaseModel):
+    path: str = Field(description="Filesystem path of an existing local file.")
+
+
+class ArchiveInput(BaseModel):
+    archive_id: str = Field(
+        pattern=r"^ARC-[0-9]+$", description="Archive identifier, not a filesystem path."
+    )
+
+
+class PersonInput(BaseModel):
+    person: str
+    start: str = Field(description="Start of requested time window.")
+    end: str = Field(description="End of requested time window.")
+    duration_minutes: int = Field(default=30, ge=1)
+
+
+class HostInput(BaseModel):
+    hostname: str
+
+
+class DigestOutput(BaseModel):
+    sha256: str = Field(
+        pattern=r"^[a-f0-9]{64}$", description="SHA-256 computed from the complete file bytes."
+    )
+
+
+class TextOutput(BaseModel):
+    text: str = Field(description="Complete stored document text.")
+
+
+class MetadataOutput(BaseModel):
+    size_bytes: int = Field(description="File byte length; not its content or content hash.")
+    modified_at: str = Field(description="Last modification timestamp.")
+
+
+class RevisionsOutput(BaseModel):
+    changes: list[str] = Field(description="Changes between saved document revisions.")
+
+
+class BusyOutput(BaseModel):
+    busy_intervals: list[str] = Field(
+        description="Occupied intervals only, not available appointment slots."
+    )
+
+
+class FreeOutput(BaseModel):
+    available_slots: list[str] = Field(
+        description="Unoccupied intervals that fit the requested duration."
+    )
+
+
+class CertificateOutput(BaseModel):
+    expires_at: str = Field(description="Expiry time from the currently served TLS certificate.")
+
+
+INPUT_TYPES: dict[str, type[BaseModel]] = {
+    "subject": Input,
+    "path": FileInput,
+    "archive": ArchiveInput,
+    "person": PersonInput,
+    "host": HostInput,
+}
+OUTPUT_TYPES: dict[str, type[BaseModel]] = {
+    "generic": Output,
+    "digest": DigestOutput,
+    "text": TextOutput,
+    "metadata": MetadataOutput,
+    "revisions": RevisionsOutput,
+    "busy": BusyOutput,
+    "free": FreeOutput,
+    "certificate": CertificateOutput,
+}
+
+
 def registry(dataset: Dataset) -> ToolRegistry:
     """目录生成只使用定义,不读取问题或期望答案;本实验禁止真正执行占位工具。"""
 
-    async def unavailable(arguments: Input, context: ToolContext) -> Output:
+    async def unavailable(arguments: BaseModel, context: ToolContext) -> BaseModel:
         raise AssertionError("discovery experiment must never execute business tools")
 
     definitions = [*dataset.tools]
@@ -88,8 +171,8 @@ def registry(dataset: Dataset) -> ToolRegistry:
                 name=d.name,
                 version="1",
                 description=d.description,
-                input_type=Input,
-                output_type=Output,
+                input_type=INPUT_TYPES[d.input_kind],
+                output_type=OUTPUT_TYPES[d.output_kind],
                 execute=unavailable,
             )
             for d in definitions
@@ -101,6 +184,7 @@ def implementation_digests() -> dict[str, str]:
     root = Path(__file__).resolve().parents[1]
     paths = (
         "src/weavria/harness/capability_discovery.py",
+        "src/weavria/harness/capability_fit.py",
         "src/weavria/harness/capability_index.py",
         "examples/hybrid_capabilities.py",
         "src/weavria/harness/capabilities.py",
@@ -115,7 +199,10 @@ def implementation_digests() -> dict[str, str]:
 
 
 async def experiment(
-    args: argparse.Namespace, *, candidate_index: HybridCapabilityIndex | None = None
+    args: argparse.Namespace,
+    *,
+    candidate_index: HybridCapabilityIndex | None = None,
+    variants: tuple[str, ...] | None = None,
 ) -> None:
     raw = args.dataset.read_bytes()
     dataset = Dataset.model_validate_json(raw)
@@ -182,13 +269,13 @@ async def experiment(
         for repeat in range(args.repeats):
             for index, case in enumerate(dataset.cases):
                 # 冻结每个任务的原文,只改变发现入口;轮换次序,不挑选较好运行。
-                variants = (
+                arms = variants or (
                     ("lexical", "semantic", "full")
                     if candidate_index is None
                     else ("lexical", "semantic", "full", "hybrid")
                 )
-                offset = (repeat + index) % len(variants)
-                for variant in (*variants[offset:], *variants[:offset]):
+                offset = (repeat + index) % len(arms)
+                for variant in (*arms[offset:], *arms[:offset]):
                     start = time.monotonic()
                     calls = transport.calls
                     discovered: list[CapabilityDiscoveryReport] = []
@@ -205,9 +292,18 @@ async def experiment(
                             context_compiler=compiler,
                             configuration_id=config.model,
                             on_report=save,
-                            candidate_index=candidate_index if variant == "hybrid" else None,
+                            candidate_index=candidate_index
+                            if variant in {"hybrid", "fit_only", "fit_repair"}
+                            else None,
+                            config=CapabilityDiscoveryConfig(
+                                fit=CapabilityFitConfig(
+                                    max_repairs=0 if variant == "fit_only" else 2
+                                )
+                            )
+                            if variant in {"fit_only", "fit_repair"}
+                            else None,
                         )
-                        if variant in {"semantic", "hybrid"}
+                        if variant in {"semantic", "hybrid", "fit_only", "fit_repair"}
                         else None
                     )
                     engine = TaskUnderstandingEngine(
@@ -228,6 +324,8 @@ async def experiment(
                         "status": "pending",
                         "selected": (),
                         "exact_selection": False,
+                        "expected_behavior": False,
+                        "stopped_unresolved": False,
                     }
                     rows.append(row)
                     try:
@@ -243,6 +341,14 @@ async def experiment(
                             selected=selected,
                             route=prepared.record.specification.route,
                             exact_selection=set(selected) == set(case.expected),
+                            expected_behavior=(
+                                not selected and prepared.record.specification.route != "execute"
+                            )
+                            if case.unavailable
+                            else any(
+                                set(selected) == set(names)
+                                for names in (case.expected, *case.alternatives)
+                            ),
                             candidates=prepared.record.available_capabilities,
                             request_sha256=prepared.record.request_sha256,
                         )
@@ -250,6 +356,10 @@ async def experiment(
                         row.update(status="failed", error=type(exc).__name__)
                         if isinstance(exc, CapabilityDiscoveryError):
                             discovered.append(exc.report)
+                            if exc.error.category is ErrorCategory.NO_PROGRESS:
+                                row.update(
+                                    stopped_unresolved=True, expected_behavior=case.unavailable
+                                )
                     finally:
                         row.update(
                             elapsed_seconds=round(time.monotonic() - start, 3),

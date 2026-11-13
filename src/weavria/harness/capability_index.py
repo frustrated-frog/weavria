@@ -15,9 +15,11 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    SerializerFunctionWrapHandler,
     TypeAdapter,
     ValidationError,
     field_validator,
+    model_serializer,
     model_validator,
 )
 
@@ -66,7 +68,7 @@ class CapabilityIndexConfig(_Value):
 class CapabilityRetrievalReport(_Value):
     """只含身份和名次,不保存查询正文、目录正文或向量。"""
 
-    schema_version: Literal[1] = 1
+    schema_version: Literal[1, 2] = 1
     policy_version: str
     encoder_version: str
     catalogue_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
@@ -81,6 +83,14 @@ class CapabilityRetrievalReport(_Value):
     lexical_ranking: tuple[str, ...]
     dense_ranking: tuple[str, ...]
     candidate_names: tuple[str, ...]
+    excluded_names: tuple[str, ...] = ()
+
+    @model_serializer(mode="wrap")
+    def serialize_report(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        result = handler(self)
+        if self.schema_version == 1:
+            result.pop("excluded_names", None)
+        return result
 
     @field_validator("schema_version", mode="before")
     @classmethod
@@ -91,12 +101,23 @@ class CapabilityRetrievalReport(_Value):
 
     @model_validator(mode="after")
     def consistent(self) -> Self:
+        if (self.schema_version == 2) != bool(self.excluded_names):
+            raise ValueError("exclusion requires retrieval report v2")
+        if (
+            len(set(self.excluded_names)) != len(self.excluded_names)
+            or len(self.excluded_names) > self.catalogue_size
+        ):
+            raise ValueError("excluded identities must be unique catalogue members")
         if self.encoded_passages + self.reused_passages != self.passage_count:
             raise ValueError("passage accounting is inconsistent")
         if self.passage_count > 0 and self.dimension == 0:
             raise ValueError("nonempty index requires vector dimensions")
         for names in (self.lexical_ranking, self.dense_ranking, self.candidate_names):
-            if len(names) > self.catalogue_size or len(names) != len(set(names)):
+            if (
+                len(names) > self.catalogue_size - len(self.excluded_names)
+                or len(names) != len(set(names))
+                or set(names) & set(self.excluded_names)
+            ):
                 raise ValueError("retrieval ranks must contain unique catalogue identities")
         if not set(self.candidate_names) <= set(self.lexical_ranking + self.dense_ranking):
             raise ValueError("candidates must originate from retrieval channels")
@@ -276,7 +297,12 @@ class HybridCapabilityIndex:
         ), len(missing)
 
     async def retrieve(
-        self, catalogue: CatalogSnapshot, query: str, *, max_duration: float
+        self,
+        catalogue: CatalogSnapshot,
+        query: str,
+        *,
+        max_duration: float,
+        exclude_names: tuple[str, ...] = (),
     ) -> CapabilityRetrievalReport:
         """期限包含排队与构建;失败不发布新快照,也不返回旧目录的部分候选。"""
         if isinstance(max_duration, bool) or not math.isfinite(max_duration) or max_duration <= 0:
@@ -289,6 +315,13 @@ class HybridCapabilityIndex:
             ):
                 raise CapabilityIndexError("index_catalogue_capacity", capacity=True)
             catalogue = CatalogSnapshot.model_validate_json(serialized)
+            if (
+                type(exclude_names) is not tuple
+                or len(set(exclude_names)) != len(exclude_names)
+                or not set(exclude_names) <= {c.name for c in catalogue.capabilities}
+            ):
+                raise CapabilityIndexError("invalid_exclusion")
+            excluded = frozenset(exclude_names)
             if not query.strip():
                 raise CapabilityIndexError("empty_query")
             if len(query.encode()) > self.config.max_query_bytes:
@@ -299,8 +332,8 @@ class HybridCapabilityIndex:
             async with self._lock:
                 self._check_version()
                 snapshot, encoded_count = await self._build(catalogue)
-                lexical = await self._lexical(snapshot, query)
-                dense = await self._dense(snapshot, chunks)
+                lexical = await self._lexical(snapshot, query, excluded)
+                dense = await self._dense(snapshot, chunks, excluded)
                 scores: dict[str, float] = defaultdict(float)
                 for ranking in (lexical, dense):
                     for rank, name in enumerate(ranking, 1):
@@ -312,6 +345,8 @@ class HybridCapabilityIndex:
                 if asyncio.get_running_loop().time() >= deadline:
                     raise TimeoutError
                 report = CapabilityRetrievalReport(
+                    schema_version=2 if excluded else 1,
+                    excluded_names=tuple(sorted(excluded)),
                     policy_version=self.version,
                     encoder_version=self._encoder_version,
                     catalogue_sha256=catalogue.catalogue_sha256,
@@ -330,7 +365,9 @@ class HybridCapabilityIndex:
                 self._snapshot = snapshot
                 return report
 
-    async def _lexical(self, snapshot: _Snapshot, query: str) -> tuple[str, ...]:
+    async def _lexical(
+        self, snapshot: _Snapshot, query: str, excluded: frozenset[str]
+    ) -> tuple[str, ...]:
         scores: dict[int, float] = defaultdict(float)
         size = len(snapshot.names)
         average = sum(snapshot.lengths) / max(size, 1)
@@ -343,11 +380,16 @@ class HybridCapabilityIndex:
                     0.25 + 0.75 * snapshot.lengths[i] / max(average, 1)
                 )
                 scores[i] += weight * inverse * frequency * 2.5 / denominator
-        ranked = sorted(scores, key=lambda i: (-scores[i], snapshot.names[i]))
+        ranked = sorted(
+            (i for i in scores if snapshot.names[i] not in excluded),
+            key=lambda i: (-scores[i], snapshot.names[i]),
+        )
         return tuple(snapshot.names[i] for i in ranked[: self.config.channel_limit])
 
-    async def _dense(self, snapshot: _Snapshot, chunks: tuple[str, ...]) -> tuple[str, ...]:
-        if not snapshot.names:
+    async def _dense(
+        self, snapshot: _Snapshot, chunks: tuple[str, ...], excluded: frozenset[str]
+    ) -> tuple[str, ...]:
+        if len(excluded) == len(snapshot.names):
             return ()
         if len(snapshot.vectors) * snapshot.dimension * len(chunks) > self.config.max_dot_products:
             raise CapabilityIndexError("index_query_work_capacity", capacity=True)
@@ -362,7 +404,7 @@ class HybridCapabilityIndex:
                 await asyncio.sleep(0)
             scores[key] = max(sum(a * b for a, b in zip(q, vector, strict=True)) for q in queries)
         ranked = sorted(
-            range(len(snapshot.names)),
+            (i for i, name in enumerate(snapshot.names) if name not in excluded),
             key=lambda i: (
                 -max(scores[k] for k in snapshot.owners[i]),
                 snapshot.names[i],

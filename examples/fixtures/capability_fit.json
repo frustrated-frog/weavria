@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "version": "capability-fit-holdout/1",
+  "tools": [
+    {"name": "read_archived_text", "description": "Retrieve a stored archive document's text.", "input_kind": "archive", "output_kind": "text"},
+    {"name": "read_file_metadata", "description": "Inspect basic properties of a local file.", "input_kind": "path", "output_kind": "metadata"},
+    {"name": "compute_file_checksum", "description": "Compute a content checksum from an existing file.", "input_kind": "path", "output_kind": "digest"},
+    {"name": "read_document_history", "description": "Retrieve saved revision changes for an archive document.", "input_kind": "archive", "output_kind": "revisions"},
+    {"name": "read_calendar_busy", "description": "Inspect a person's occupied calendar intervals.", "input_kind": "person", "output_kind": "busy"},
+    {"name": "find_available_slots", "description": "Find gaps in a person's schedule that fit a requested duration.", "input_kind": "person", "output_kind": "free"},
+    {"name": "inspect_tls_expiry", "description": "Inspect the certificate currently served by a host.", "input_kind": "host", "output_kind": "certificate"},
+    {"name": "read_security_events", "description": "Read past security audit events about a service, including certificate installation operations."},
+    {"name": "read_project_roster", "description": "Read the people assigned to a project and their responsibilities."}
+  ],
+  "domains": ["billing", "deployments", "inventory", "notifications", "routing", "sessions", "search", "analytics", "backups", "queues", "caches", "authentication"],
+  "views": ["configuration", "access_rules", "error_logs", "quota_limits", "documentation", "latency_metrics", "retention_policy"],
+  "cases": [
+    {"id": "content_identity", "query": "Get a value derived from every byte of /work/build.bin so I can verify that two copies have identical contents.", "expected": ["compute_file_checksum"]},
+    {"id": "archive_body", "query": "请取出归档号 ARC-204 的完整正文。目录条目和文件属性不能代替正文。", "expected": ["read_archived_text"]},
+    {"id": "file_timestamp", "query": "When was /work/notes.txt last modified, and how many bytes does it occupy?", "expected": ["read_file_metadata"]},
+    {"id": "body_and_changes", "query": "读取 ARC-204 正文，并列出它已保存修订之间的变化。", "expected": ["read_archived_text", "read_document_history"]},
+    {"id": "free_slots", "query": "List Lee's available 30-minute appointment slots between 2026-11-16T09:00:00Z and 2026-11-16T17:00:00Z.", "expected": ["find_available_slots"], "alternatives": [["read_calendar_busy"]]},
+    {"id": "occupied_intervals", "query": "列出 Lee 在 2026-11-16T09:00:00Z 到 2026-11-16T17:00:00Z 之间已经被占用的日历区间。", "expected": ["read_calendar_busy"]},
+    {"id": "current_expiry", "query": "Give the expiry time of the TLS certificate currently served by docs.example.test; an old installation log is not enough.", "expected": ["inspect_tls_expiry"]},
+    {"id": "roster", "query": "¿Quién tiene asignada cada responsabilidad en el proyecto Aurora? Consulta el registro del proyecto.", "expected": ["read_project_roster"]},
+    {"id": "delete_file", "query": "Permanently delete /work/obsolete.txt from the filesystem.", "expected": [], "unavailable": true},
+    {"id": "send_invitation", "query": "Send Lee a calendar invitation for 2026-11-16T10:00:00Z. I want it delivered, not a list of calendar events.", "expected": [], "unavailable": true},
+    {"id": "local_file_text", "query": "Read the full text of the local file /work/notes.txt. It has not been uploaded to an archive.", "expected": [], "unavailable": true},
+    {"id": "general_explanation", "query": "Explain the conceptual difference between a file's byte length and its content hash. No file access is needed.", "expected": []}
+  ]
+}

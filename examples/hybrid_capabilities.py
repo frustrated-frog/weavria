@@ -20,7 +20,13 @@ async def run(args: argparse.Namespace) -> None:
     async with OnnxE5MemoryEncoder(args.model, args.tokenizer) as encoder:
         index = HybridCapabilityIndex(encoder)
         if args.live:
-            await experiment(args, candidate_index=index)
+            await experiment(
+                args,
+                candidate_index=index,
+                variants=("hybrid", "fit_only", "fit_repair", "full")
+                if getattr(args, "fit", False)
+                else None,
+            )
             return
         raw = args.dataset.read_bytes()
         dataset = Dataset.model_validate_json(raw)
@@ -78,6 +84,9 @@ def main() -> None:
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--tokenizer", type=Path, required=True)
     parser.add_argument("--live", action="store_true")
+    parser.add_argument(
+        "--fit", action="store_true", help="对比原混合、只检查、检查加补搜和完整目录"
+    )
     parser.add_argument("--repeats", type=int, choices=range(1, 4), default=2)
     parser.add_argument(
         "--dataset",

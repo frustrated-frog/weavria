@@ -896,7 +896,7 @@ class TaskUnderstandingRecord(BaseModel):
     """Content-free request identity plus the accepted typed interpretation."""
 
     model_config = _Contract.model_config
-    schema_version: Literal[1, 2, 3] = 1
+    schema_version: Literal[1, 2, 3, 4] = 1
     interpreter_version: _Text
     request_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     available_capabilities: tuple[_CapabilityName, ...]
@@ -2575,7 +2575,11 @@ class TaskUnderstandingEngine:
                 )
             ) from exc
         record = TaskUnderstandingRecord(
-            schema_version=(3 if discovery_report.schema_version == 2 else 2)
+            schema_version=(
+                4
+                if discovery_report.schema_version == 3
+                else (3 if discovery_report.schema_version == 2 else 2)
+            )
             if discovery_report is not None
             else 1,
             discovery=discovery_report,

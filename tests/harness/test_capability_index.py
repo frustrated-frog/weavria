@@ -291,3 +291,25 @@ async def test_timeout_during_encoding_cleans_up_and_can_retry() -> None:
     assert cleaned.is_set()
     encoder.blocked = False
     assert (await index.retrieve(source, "time", max_duration=2)).encoded_passages == 1
+
+
+async def test_exclusion_precedes_top_k_and_does_not_rebuild_authorized_index() -> None:
+    index = HybridCapabilityIndex(
+        Encoder(), config=CapabilityIndexConfig(channel_limit=1, candidate_limit=1)
+    )
+    source = catalogue(
+        ("alpha", "Read a document"), ("beta", "Read a document"), ("gamma", "Read a document")
+    )
+    first = await index.retrieve(source, "document", max_duration=2)
+    second = await index.retrieve(source, "document", exclude_names=("alpha",), max_duration=2)
+    assert first.candidate_names == ("alpha",) and second.candidate_names == ("beta",)
+    assert second.lexical_ranking == second.dense_ranking == ("beta",)
+    assert second.index_sha256 == first.index_sha256 and second.encoded_passages == 0
+    assert first.schema_version == 1 and "excluded_names" not in first.model_dump_json()
+    assert second.schema_version == 2 and second.excluded_names == ("alpha",)
+    exhausted = await index.retrieve(
+        source, "document", exclude_names=("alpha", "beta", "gamma"), max_duration=2
+    )
+    assert exhausted.candidate_names == ()
+    with pytest.raises(CapabilityIndexError, match="invalid_exclusion"):
+        await index.retrieve(source, "document", exclude_names=("unknown",), max_duration=2)

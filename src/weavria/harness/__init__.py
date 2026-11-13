@@ -37,6 +37,7 @@ from .capability_discovery import (
     CapabilityDiscoveryStep,
     ModelCapabilityDiscovery,
 )
+from .capability_fit import CapabilityFitConfig, CapabilityFitReport
 from .capability_index import (
     CapabilityEncoder,
     CapabilityIndexConfig,
@@ -227,6 +228,8 @@ __all__ = [
     "CapabilityEncoder",
     "CapabilityEpochView",
     "CapabilityEvidenceProfile",
+    "CapabilityFitConfig",
+    "CapabilityFitReport",
     "CapabilityIndexConfig",
     "CapabilityIndexError",
     "CapabilityNeed",
