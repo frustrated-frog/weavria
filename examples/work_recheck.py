@@ -16,6 +16,8 @@ from pydantic import BaseModel, ConfigDict
 from examples.live_memory_formation import Transport
 from weavria.context import ContextCompilerConfig
 from weavria.core import (
+    ModelTurn,
+    SessionRequest,
     SessionRunEvent,
     SessionSemanticCommitted,
     ToolFailedObservation,
@@ -24,10 +26,12 @@ from weavria.core import (
 from weavria.harness import AgentHarness, HarnessConfig
 from weavria.harness.work import WorkProposal, load_work
 from weavria.models import (
+    ModelCapabilities,
     OpenAICompatibleConfig,
     OpenAICompatibleProvider,
     OpenAICompatibleSessionProvider,
     OpenAICompatibleTokenCounter,
+    SessionModelProvider,
 )
 from weavria.runtime import RunLimits
 from weavria.tools import ToolContext, ToolRegistry, TypedTool
@@ -59,6 +63,22 @@ class Read(BaseModel):
 class Document(BaseModel):
     version: str
     text: str
+
+
+class CapturingActor:
+    """仅用于显式本地诊断:记录规范请求,不采集认证头、原始响应或私有推理。"""
+
+    def __init__(self, provider: SessionModelProvider) -> None:
+        self.provider = provider
+        self.requests: list[SessionRequest] = []
+
+    @property
+    def capabilities(self) -> ModelCapabilities:
+        return self.provider.capabilities
+
+    async def generate_session(self, request: SessionRequest) -> ModelTurn:
+        self.requests.append(request.model_copy(deep=True))
+        return await self.provider.generate_session(request)
 
 
 def registry(case: Case) -> ToolRegistry:
@@ -98,7 +118,19 @@ def implementation_digests() -> dict[str, str]:
     root = Path(__file__).resolve().parents[1] / "src/weavria/harness"
     return {
         name: hashlib.sha256((root / name).read_bytes()).hexdigest()
-        for name in ("work.py", "work_recheck.py", "work_recheck_contracts.py", "session.py")
+        for name in (
+            "work.py",
+            "work_recheck.py",
+            "work_recheck_contracts.py",
+            "session.py",
+            "requirements.py",
+            "completion.py",
+            "coverage.py",
+            "task_view.py",
+            "understanding.py",
+            "../models/openai_compatible.py",
+            "../core/outcomes.py",
+        )
     }
 
 
@@ -144,6 +176,7 @@ async def experiment(args: argparse.Namespace) -> None:
                         continue
                     # 交替顺序减小固定先后偏差;两个策略采用相同任务、模型和预算。
                     for enabled in (False, True) if repeat % 2 == 0 else (True, False):
+                        captured = CapturingActor(actor) if args.capture_requests else None
                         started = time.monotonic()
                         calls = transport.calls
                         key = f"{case.id}-{repeat}-{enabled}"
@@ -169,7 +202,7 @@ async def experiment(args: argparse.Namespace) -> None:
                                         max_request_bytes=128000,
                                     ),
                                 ),
-                                model=actor,
+                                model=captured or actor,
                                 tools=registry(case),
                                 token_counter=counter,
                                 reasoning_model=reasoner,
@@ -296,6 +329,19 @@ async def experiment(args: argparse.Namespace) -> None:
                             elapsed_seconds=round(time.monotonic() - started, 2),
                             provider_observations=transport.observations[calls:],
                         )
+                        if captured is not None:
+                            request_path = args.output.parent / (
+                                args.output.stem + "-" + key + ".requests.json"
+                            )
+                            request_path.write_text(
+                                json.dumps(
+                                    [r.model_dump(mode="json") for r in captured.requests],
+                                    ensure_ascii=False,
+                                    indent=2,
+                                )
+                                + "\n"
+                            )
+                            row["requests"] = str(request_path)
                         rows.append(row)
                         args.output.write_text(
                             json.dumps(
@@ -326,6 +372,9 @@ def main() -> None:
         default=Path(__file__).resolve().parents[1] / "tests/fixtures/work_recheck/tasks.json",
     )
     parser.add_argument("--live", action="store_true")
+    parser.add_argument(
+        "--capture-requests", action="store_true", help="本地保存模型实际收到的公开上下文"
+    )
     parser.add_argument("--repeats", type=int, choices=range(1, 6), default=1)
     parser.add_argument("--case", action="append")
     parser.add_argument("--output", type=Path, default=Path(".weavria/work-recheck/results.json"))
