@@ -68,6 +68,8 @@ def test_observation_rejects_ambiguous_or_invalid_outcomes(payload: dict[str, ob
 def test_terminal_result_round_trips(
     status: RunStatus, output: str | None, error: RunError | None
 ) -> None:
+    # 四类合法终止结果分别序列化再恢复, 确认状态语义不会在持久化后丢失.
+    # 空字符串仍是合法 output; 它与没有产出任何结果的 None 不同.
     result = AgentResult.model_validate(
         {"run_id": "run-1", "status": status, "output": output, "error": error}
     )
@@ -92,6 +94,8 @@ def test_terminal_result_round_trips(
 def test_result_rejects_nonterminal_or_contradictory_outcomes(
     status: RunStatus, output: str | None, error: RunError | None
 ) -> None:
+    # 运行中状态不能伪装成终止结果, 每种终止状态也只能携带自己的合法字段.
+    # 这些反例防止 completed/failed/cancelled/budget_exhausted 在边界上互相污染.
     with pytest.raises(ValidationError):
         AgentResult.model_validate(
             {"run_id": "run-1", "status": status, "output": output, "error": error}

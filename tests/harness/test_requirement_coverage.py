@@ -609,19 +609,9 @@ async def test_coverage_stops_when_repair_repeats_the_same_candidate_and_blocker
 
 async def test_coverage_rejects_an_anchor_into_generated_constraints() -> None:
     assessment = _assessment(covered=True)
-    first, *rest = assessment.obligations
-    invalid = assessment.model_copy(
-        update={
-            "obligations": (
-                first.model_copy(
-                    update={
-                        "origin": "task_constraint",
-                        "source": ObligationSource(start=0, end=3, constraint_index=0),
-                    }
-                ),
-                *rest,
-            )
-        }
+    invalid = json.loads(assessment.model_dump_json())
+    invalid["obligations"][0].update(
+        origin="task_constraint", source={"quote": "Summarize", "constraint_index": 0}
     )
     provider = FakeModelProvider(
         tuple(
@@ -629,10 +619,10 @@ async def test_coverage_rejects_an_anchor_into_generated_constraints() -> None:
                 action=ToolCallAction(
                     call_id=f"audit-{index}",
                     tool_name="declare_requirement_coverage",
-                    arguments=result.model_dump(mode="json"),
+                    arguments=result,
                 )
             )
-            for index, result in enumerate((invalid, assessment))
+            for index, result in enumerate((invalid, assessment.model_dump(mode="json")))
         )
     )
     accepted = await ModelRequirementCoverageValidator(provider).assess(
@@ -648,6 +638,82 @@ async def test_coverage_rejects_an_anchor_into_generated_constraints() -> None:
     assert provider.requests[0].task.constraints
     assert "invalid_obligation_source" in provider.requests[1].instructions
     assert accepted == assessment
+
+
+@pytest.mark.parametrize(
+    ("goal", "quote", "occurrence", "start", "end"),
+    (
+        ("核对🙂报告,解释详细发现", "🙂报告", None, 2, 5),
+        ("核对报告,再核对报告", "报告", 1, 8, 10),
+        ("核对[a.b]内容", "[a.b]", None, 2, 7),
+        ("核对报告\n解释详细发现", "报告\n解释", None, 2, 7),
+    ),
+)
+async def test_auditor_quotes_resolve_to_host_unicode_spans(
+    goal: str, quote: str, occurrence: int | None, start: int, end: int
+) -> None:
+    wire = json.loads(_assessment(covered=True).model_dump_json())
+    wire["obligations"][0]["source"] = {"quote": quote, "occurrence": occurrence}
+    provider = FakeModelProvider(
+        (
+            ModelResponse(
+                action=ToolCallAction(
+                    call_id="audit",
+                    tool_name="declare_requirement_coverage",
+                    arguments=wire,
+                )
+            ),
+        )
+    )
+    accepted = await ModelRequirementCoverageValidator(provider).assess(
+        TaskUnderstandingInput(task=TaskInput(goal=goal), capabilities=(_capability_view(),)),
+        _repaired_specification(),
+        max_duration=1,
+    )
+
+    assert accepted.obligations[0].source == ObligationSource(start=start, end=end)
+    assert "quote" not in accepted.obligations[0].model_dump_json()
+    assert RequirementCoverageAssessment.model_validate_json(accepted.model_dump_json()) == accepted
+
+
+@pytest.mark.parametrize(
+    ("quote", "occurrence", "code"),
+    (
+        ("PRIVATE-absent-text", None, "source_quote_not_found"),
+        ("报告", None, "source_quote_ambiguous"),
+        ("报告", 2, "source_quote_occurrence_out_of_range"),
+    ),
+)
+async def test_auditor_rejects_invalid_quotes_with_safe_reason_codes(
+    quote: str, occurrence: int | None, code: str
+) -> None:
+    wire = json.loads(_assessment(covered=True).model_dump_json())
+    wire["obligations"][0]["source"] = {"quote": quote, "occurrence": occurrence}
+    provider = FakeModelProvider(
+        tuple(
+            ModelResponse(
+                action=ToolCallAction(
+                    call_id=f"audit-{index}",
+                    tool_name="declare_requirement_coverage",
+                    arguments=wire,
+                )
+            )
+            for index in range(2)
+        )
+    )
+    with pytest.raises(RequirementCoverageError) as raised:
+        await ModelRequirementCoverageValidator(provider).assess(
+            TaskUnderstandingInput(
+                task=TaskInput(goal="核对报告,再核对报告"), capabilities=(_capability_view(),)
+            ),
+            _repaired_specification(),
+            max_duration=1,
+        )
+
+    assert raised.value.error.cause_type == f"CoverageValidation:{code}"
+    assert "PRIVATE" not in raised.value.error.message
+    assert code in provider.requests[1].instructions
+    assert len(raised.value.attempts) == 2
 
 
 async def test_model_reaudit_only_returns_findings_for_host_frozen_obligations() -> None:

@@ -12,7 +12,8 @@ from pathlib import Path
 
 from pydantic import JsonValue
 
-from weavria.sessions import SessionConflictError, SessionEngine
+from weavria.core import ErrorCategory
+from weavria.sessions import SessionConflictError, SessionEngine, SessionTaskPreparationError
 
 Payload = dict[str, JsonValue]
 Execute = Callable[[str, Payload], Awaitable[Payload]]
@@ -162,6 +163,43 @@ class ConversationHost:
                 session_id, input_id, "interrupted" if self.closing else "cancelled", None
             )
             raise
+        except SessionTaskPreparationError as exc:
+            # 稳定错误类别可形成用户提示, 原始模型输出和异常堆栈仍留在服务器。
+            item = await self.get(session_id, input_id)
+            run_id = item.get("run_id")
+            messages = {
+                ErrorCategory.INVALID_MODEL_RESPONSE: "问题理解或任务要求校验未通过",
+                ErrorCategory.MODEL_FAILURE: "任务准备时模型服务调用失败",
+                ErrorCategory.TIMEOUT: "任务准备超时",
+                ErrorCategory.CONTEXT_BUDGET_EXCEEDED: "任务准备所需内容超出了上下文预算",
+            }
+            message = messages.get(exc.error.category, "任务准备未完成")
+            if exc.error.cause_type in {
+                "CoverageValidation:source_quote_not_found",
+                "CoverageValidation:source_quote_ambiguous",
+                "CoverageValidation:source_quote_occurrence_out_of_range",
+                "CoverageValidation:invalid_obligation_source",
+            }:
+                message = "任务要求的原文引用未通过校验"
+            await self._finish(
+                session_id,
+                input_id,
+                "failed",
+                {
+                    "session_id": session_id,
+                    "run_id": run_id,
+                    "status": "failed",
+                    "task_outcome": "unverifiable",
+                    "answer": None,
+                    "error": f"{message}。请重试。诊断编号 {input_id}",
+                    "completion_reason": None,
+                    "tools": [],
+                    "sources": [],
+                    "clarification_id": None,
+                }
+                if isinstance(run_id, str)
+                else None,
+            )
         except Exception:
             # 诊断留在服务器日志, 不把供应商响应或本地路径发送给浏览器.
             import logging
@@ -231,6 +269,7 @@ class ConversationHost:
                 break
         item["phase"] = "正在停止并保存执行状态" if item["status"] == "cancelling" else phase
         item["tools"] = list(tools.values())
+        item["run_id"] = run_id
         return item
 
     async def cancel(self, session_id: str, input_id: str) -> Payload:

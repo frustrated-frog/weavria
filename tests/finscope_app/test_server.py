@@ -1097,6 +1097,75 @@ async def test_invalid_task_understanding_returns_safe_gateway_error(tmp_path: P
     await market_http.aclose()
 
 
+@pytest.mark.parametrize("stage", ("interpretation", "coverage"))
+async def test_background_preparation_failure_survives_polling_and_history(
+    tmp_path: Path, stage: str
+) -> None:
+    provider = FakeSessionProvider(())
+    if stage == "interpretation":
+        responses = (
+            ModelResponse(action=FinishAction(output="PRIVATE-invalid-specification")),
+            ModelResponse(action=FinishAction(output="PRIVATE-invalid-specification")),
+        )
+    else:
+        coverage = json.loads(_market_coverage().model_dump_json())
+        coverage["action"]["arguments"]["obligations"][0]["source"] = {
+            "quote": "PRIVATE-absent-source"
+        }
+        responses = (
+            _declaration(_market_execution()),
+            *(ModelResponse.model_validate_json(json.dumps(coverage)) for _ in range(2)),
+        )
+    interpreter = FakeModelProvider(responses)
+    app = create_app(
+        FinScopeSettings(
+            model_base_url="http://model.test",
+            model_name="fake",
+            model_api_key="",
+            state_path=tmp_path / "sessions.sqlite3",
+        ),
+        provider=provider,
+        interpreter_provider=interpreter,
+    )
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://sidecar.test"
+        ) as client:
+            session_id = (await client.post("/api/sessions")).json()["session_id"]
+            prefix = f"/api/sessions/{session_id}"
+            input_id = "invalid-background-preparation"
+            payload = {
+                "input_id": input_id,
+                "text": "说明当前情况",
+                "context": {
+                    "surface": "finscope_workspace",
+                    "current_view": "agent",
+                    "navigation": {"view": "agent", "label": "Agent"},
+                },
+            }
+            started = await client.post(f"{prefix}/requests", json=payload)
+            assert started.status_code == 202
+            async with asyncio.timeout(3):
+                while True:
+                    job = (await client.get(f"{prefix}/requests/{payload['input_id']}")).json()
+                    if job["status"] == "failed":
+                        break
+                    await asyncio.sleep(0.01)
+            result = MessageOutput.model_validate(job["result"])
+            assert result.status == "failed" and result.answer is None
+            assert result.error is not None
+            assert ("原文引用" if stage == "coverage" else "问题理解") in result.error
+            assert input_id in result.error
+            assert "PRIVATE" not in result.error
+            assert result.run_id == job["run_id"]
+            history = (await client.get(f"{prefix}/history")).json()
+            assert history["requests"][0]["result"] == job["result"]
+            repeated = await client.post(f"{prefix}/requests", json=payload)
+            assert repeated.json()["result"] == job["result"]
+    assert len(interpreter.requests) == len(responses)
+    assert provider.requests == ()
+
+
 async def test_sidecar_exposes_api_without_hosting_application_ui(tmp_path: Path) -> None:
     provider = FakeSessionProvider(())
     market_http = httpx.AsyncClient(

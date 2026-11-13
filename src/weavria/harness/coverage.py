@@ -152,14 +152,17 @@ class ObligationSource(_CoverageContract):
         return self
 
 
-class SemanticObligation(_CoverageContract):
-    """One independently omissible outcome inferred from the original request."""
-
+class _SemanticObligationFields(_CoverageContract):
     obligation_id: _Identifier
     description: _Text
     kind: Literal["information", "deliverable"]
     required: bool = True
     origin: Literal["task_goal", "task_constraint", "conversation", "prior_work"]
+
+
+class SemanticObligation(_SemanticObligationFields):
+    """One independently omissible outcome inferred from the original request."""
+
     source: ObligationSource | None = None
 
     @model_serializer(mode="wrap")
@@ -261,6 +264,64 @@ class _FrozenCoverageFindings(_CoverageContract):
     findings: tuple[ObligationCoverage, ...] = Field(min_length=1, max_length=12)
     scope_expanded: bool = False
     scope_undercovered: bool = False
+
+
+class _QuotedSource(_CoverageContract):
+    quote: str = Field(min_length=1, max_length=4096)
+    occurrence: int | None = Field(default=None, ge=0, le=63)
+    constraint_index: int | None = Field(default=None, ge=0)
+    clarification_question_id: _Reference | None = None
+
+
+class _QuotedObligation(_SemanticObligationFields):
+    source: _QuotedSource | None = None
+
+
+class _QuotedCoverageAssessment(_FrozenCoverageFindings):
+    # 模型输入边界只接收引文, 持久化报告继续使用宿主解析后的 Unicode 区间。
+    obligations: tuple[_QuotedObligation, ...] = Field(min_length=1, max_length=12)
+
+    def resolve(self, request: TaskUnderstandingInput) -> RequirementCoverageAssessment:
+        """Resolve literal source selections before freezing the normalized audit."""
+        resolved: list[SemanticObligation] = []
+        for item in self.obligations:
+            selection = item.source
+            source = None
+            if selection is not None:
+                text = _obligation_source_text(
+                    item.origin,
+                    selection.constraint_index,
+                    selection.clarification_question_id,
+                    request,
+                )
+                start = text.find(selection.quote)
+                if start < 0 or not selection.quote.strip():
+                    raise ValueError("obligation quote is absent from its source")
+                if selection.occurrence is None and text.find(selection.quote, start + 1) >= 0:
+                    raise ValueError("obligation quote is ambiguous")
+                # 精确查找同时保留标点和 Unicode 字符边界。重复引文按显式序号定位,
+                # 不靠最近历史或相似文本猜测出处; 生成的约束也不能成为原始输入。
+                for _ in range(selection.occurrence or 0):
+                    start = text.find(selection.quote, start + 1)
+                    if start < 0:
+                        raise ValueError("obligation quote occurrence is outside its source")
+                source = ObligationSource(
+                    start=start,
+                    end=start + len(selection.quote),
+                    constraint_index=selection.constraint_index,
+                    clarification_question_id=selection.clarification_question_id,
+                )
+            resolved.append(
+                SemanticObligation.model_validate(
+                    {**item.model_dump(mode="python", exclude={"source"}), "source": source}
+                )
+            )
+        return RequirementCoverageAssessment(
+            obligations=tuple(resolved),
+            findings=self.findings,
+            scope_expanded=self.scope_expanded,
+            scope_undercovered=self.scope_undercovered,
+        )
 
 
 class ScopeDecision(_CoverageContract):
@@ -474,7 +535,7 @@ class TaskSpecificationRepairer(Protocol):
 class ModelRequirementCoverageValidator:
     """Use a separate structured model pass to audit semantic task coverage."""
 
-    version = "model-requirement-coverage/9"
+    version = "model-requirement-coverage/10"
 
     def __init__(
         self,
@@ -565,7 +626,7 @@ class ModelRequirementCoverageValidator:
             )
         schema = json.dumps(
             (
-                RequirementCoverageAssessment if obligations is None else _FrozenCoverageFindings
+                _QuotedCoverageAssessment if obligations is None else _FrozenCoverageFindings
             ).model_json_schema(),
             ensure_ascii=False,
             separators=(",", ":"),
@@ -625,13 +686,15 @@ class ModelRequirementCoverageValidator:
             "marked required=false. Do not promote them because the candidate mentions them. "
             "For example, a request for the current state of an entity requires its current "
             "state; background, causes and forecasts require separate demand. "
-            "Anchor obligations with source spans using zero-based Unicode indices into the "
-            "original task goal (origin=task_goal), or its original user constraints "
+            "Anchor obligations with source.quote copied exactly from the original task goal "
+            "(origin=task_goal), or its original user constraints "
             "(origin=task_constraint and constraint_index). The request starts with "
             f"{len(request.task.constraints)} original constraints. Later appended entries "
             "are generated context and cannot be cited. "
-            "For a bound clarification, use origin=conversation, a span in the current answer "
-            "and its exact clarification_question_id. Omit the source if no such anchor exists. "
+            "For a bound clarification, use origin=conversation, an exact quote from the current "
+            "answer and its clarification_question_id. The host computes character positions. "
+            "For repeated text, copy a longer unique quote or give its zero-based occurrence. "
+            "Omit the source if no such anchor exists. "
             "An explicit_only surface requires a semantic demand "
             "within the current request's scope. Use history only to resolve a reference or "
             "continuation in the current request or a bound clarification. A standalone "
@@ -784,7 +847,11 @@ class ModelRequirementCoverageValidator:
                         allow_nan=False,
                         separators=(",", ":"),
                     )
-                    if obligations is not None and "obligations" not in action.arguments:
+                    if obligations is None:
+                        assessment = _QuotedCoverageAssessment.model_validate_json(payload).resolve(
+                            request
+                        )
+                    elif "obligations" not in action.arguments:
                         findings = _FrozenCoverageFindings.model_validate_json(payload)
                         assessment = RequirementCoverageAssessment(
                             obligations=obligations,
@@ -814,8 +881,16 @@ class ModelRequirementCoverageValidator:
                     failure = exc
             validation_error = RunError(
                 category=ErrorCategory.INVALID_MODEL_RESPONSE,
-                message=f"Requirement coverage validator returned {last_action_kind}",
-                cause_type=type(failure).__name__ if failure is not None else None,
+                message=(
+                    f"Requirement coverage validation failed ({_coverage_retry_feedback(failure)})"
+                    if failure is not None
+                    else f"Requirement coverage validator returned {last_action_kind}"
+                ),
+                cause_type=(
+                    f"CoverageValidation:{_coverage_retry_feedback(failure)}"
+                    if failure is not None
+                    else None
+                ),
             )
             attempts.append(
                 TaskPreparationAttemptDiagnostic(
@@ -848,6 +923,33 @@ class ModelRequirementCoverageValidator:
         raise error
 
 
+def _obligation_source_text(
+    origin: str,
+    constraint_index: int | None,
+    clarification_question_id: str | None,
+    request: TaskUnderstandingInput,
+) -> str:
+    if constraint_index is not None:
+        if (
+            origin != "task_constraint"
+            or constraint_index >= len(request.task.constraints)
+            or clarification_question_id is not None
+        ):
+            raise ValueError("obligation source is outside the current task")
+        return request.task.constraints[constraint_index]
+    if clarification_question_id is None:
+        valid_origin = origin == "task_goal"
+    else:
+        valid_origin = (
+            origin == "conversation"
+            and request.prior_clarification_question is not None
+            and clarification_question_id == request.prior_clarification_question_id
+        )
+    if not valid_origin:
+        raise ValueError("obligation source is outside the current task")
+    return request.task.goal
+
+
 def validate_obligation_sources(
     obligations: tuple[SemanticObligation, ...], request: TaskUnderstandingInput
 ) -> None:
@@ -856,24 +958,12 @@ def validate_obligation_sources(
         source = obligation.source
         if source is None:
             continue
-        if source.constraint_index is not None:
-            if obligation.origin != "task_constraint" or source.constraint_index >= len(
-                request.task.constraints
-            ):
-                raise ValueError("obligation source is outside the current task")
-            original_text = request.task.constraints[source.constraint_index]
-        else:
-            original_text = request.task.goal
-            if source.clarification_question_id is None:
-                valid_origin = obligation.origin == "task_goal"
-            else:
-                valid_origin = (
-                    obligation.origin == "conversation"
-                    and request.prior_clarification_question is not None
-                    and source.clarification_question_id == request.prior_clarification_question_id
-                )
-            if not valid_origin:
-                raise ValueError("obligation source is outside the current task")
+        original_text = _obligation_source_text(
+            obligation.origin,
+            source.constraint_index,
+            source.clarification_question_id,
+            request,
+        )
         if source.end > len(original_text) or not original_text[source.start : source.end].strip():
             raise ValueError("obligation source is outside the current task")
 
@@ -1077,6 +1167,9 @@ def _coverage_retry_feedback(error: ValidationError | ValueError | None) -> str:
         ),
         "coverage assessment changed frozen obligations": "changed_frozen_obligations",
         "obligation source is outside the current task": "invalid_obligation_source",
+        "obligation quote is absent from its source": "source_quote_not_found",
+        "obligation quote is ambiguous": "source_quote_ambiguous",
+        "obligation quote occurrence is outside its source": "source_quote_occurrence_out_of_range",
     }
     return categories.get(str(error), "invalid_cross_reference")
 

@@ -36,6 +36,8 @@ class AgentResult(ContractModel):
     """v1 execution result: completed has output, without asserting task quality."""
 
     run_id: NonBlankString
+    # 终止状态不能合并成一个失败: failed 表示存在可分类的执行错误,
+    # cancelled 和 budget_exhausted 则分别表示外部中断与控制预算边界.
     status: Literal[
         RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED, RunStatus.BUDGET_EXHAUSTED
     ]
@@ -46,12 +48,18 @@ class AgentResult(ContractModel):
     def validate_terminal_outcome(self) -> Self:
         """Reject contradictory output/error combinations at the boundary."""
         if self.status is RunStatus.COMPLETED:
+            # completed 只说明本次执行产出了可交付文本, 不自动证明任务质量;
+            # 所以它必须有 output, 且不能同时携带 RunError.
             if self.output is None or self.error is not None:
                 raise ValueError("completed result requires output and forbids error")
         elif self.status is RunStatus.FAILED:
+            # failed 必须给调用方稳定的错误事实, 便于决定重试, 告警或人工处理.
+            # 没有 error 时, 不能把取消或预算耗尽偷换成系统故障.
             if self.error is None or self.output is not None:
                 raise ValueError("failed result requires error and forbids output")
         elif self.output is not None or self.error is not None:
+            # 取消和预算耗尽不是伪造出来的执行错误, 也不能发布半成品 output.
+            # 具体原因保留在终止事件中, 结果边界只表达互斥的高层状态.
             raise ValueError("cancelled/budget_exhausted result forbids output and error")
         return self
 
