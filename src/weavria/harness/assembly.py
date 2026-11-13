@@ -47,6 +47,7 @@ from weavria.tools import ToolPolicy, ToolRegistry, context_summary_tool
 
 from .capabilities import CapabilityDiscoveryPolicy, CapabilityResolver
 from .capability_discovery import CapabilityDiscoveryReport, ModelCapabilityDiscovery
+from .capability_index import HybridCapabilityIndex
 from .configuration import HarnessConfig
 from .coverage import CapabilityEvidenceProfile, ModelRequirementCoverageValidator
 from .memory_admission import ConservativeMemoryAdmission, MemoryFormationError
@@ -248,6 +249,7 @@ class AgentHarness:
         evidence: HarnessEvidence | None = None,
         preparation_context: ModelRequestContextConfig | None = None,
         discovery_reporter: Callable[[CapabilityDiscoveryReport], Awaitable[None]] | None = None,
+        capability_index: HybridCapabilityIndex | None = None,
         task_model_projector: TaskModelProjector | None = None,
         configuration_metadata: dict[str, JsonValue] | None = None,
         memory: HarnessMemory | None = None,
@@ -262,11 +264,15 @@ class AgentHarness:
         reasoning_model 供任务理解使用,也是未单独指定 memory_model 时的形成
         模型。模型连接和匹配的计量器由宿主提供,框架不猜测供应商或认证信息。
         evidence 声明应用证据和发现约束; 审计复用理解模型及其独立预算。
+        capability_index 可缩小语义发现的检查范围;宿主先打开其编码器,
+        并在 Harness 关闭后再关闭编码器。仅开启 semantic_discovery 时可注入。
         """
         understanding = None
         work_rechecker = None
-        if discovery_reporter is not None and config.semantic_discovery is None:
-            raise ValueError("discovery reporter requires semantic discovery")
+        if (
+            discovery_reporter is not None or capability_index is not None
+        ) and config.semantic_discovery is None:
+            raise ValueError("discovery reporter and index require semantic discovery")
         if not config.task_understanding and (
             evidence is not None or preparation_context is not None
         ):
@@ -317,6 +323,7 @@ class AgentHarness:
                     configuration_id=config.configuration_id,
                     config=config.semantic_discovery,
                     on_report=discovery_reporter,
+                    candidate_index=capability_index,
                 )
                 if config.semantic_discovery is not None
                 else None,

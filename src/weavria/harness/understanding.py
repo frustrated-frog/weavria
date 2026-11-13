@@ -896,7 +896,7 @@ class TaskUnderstandingRecord(BaseModel):
     """Content-free request identity plus the accepted typed interpretation."""
 
     model_config = _Contract.model_config
-    schema_version: Literal[1, 2] = 1
+    schema_version: Literal[1, 2, 3] = 1
     interpreter_version: _Text
     request_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     available_capabilities: tuple[_CapabilityName, ...]
@@ -920,8 +920,9 @@ class TaskUnderstandingRecord(BaseModel):
 
     @model_validator(mode="after")
     def validate_discovery(self) -> Self:
-        if (self.schema_version == 2) != (self.discovery is not None):
-            raise ValueError("discovery report requires understanding record v2")
+        expected_version = 1 if self.discovery is None else self.discovery.schema_version + 1
+        if self.schema_version != expected_version:
+            raise ValueError("discovery report requires its matching understanding record version")
         if self.discovery is not None and (
             self.discovery.status != "completed"
             or set(self.discovery.selected_names) != set(self.available_capabilities)
@@ -2574,7 +2575,9 @@ class TaskUnderstandingEngine:
                 )
             ) from exc
         record = TaskUnderstandingRecord(
-            schema_version=2 if discovery_report is not None else 1,
+            schema_version=(3 if discovery_report.schema_version == 2 else 2)
+            if discovery_report is not None
+            else 1,
             discovery=discovery_report,
             interpreter_version=self._interpreter.version,
             request_sha256=request_sha256,

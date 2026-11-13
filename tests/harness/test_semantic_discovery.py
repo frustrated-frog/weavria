@@ -3,6 +3,7 @@
 import asyncio
 import json
 from pathlib import Path
+from typing import Literal
 
 import pytest
 import tiktoken
@@ -30,11 +31,13 @@ from weavria.harness import (
     CapabilityDiscoveryConfig,
     CapabilityDiscoveryError,
     CapabilityDiscoveryReport,
+    CapabilityIndexConfig,
     CapabilityNeed,
     CapabilityResolver,
     CatalogSnapshot,
     CompletionCriterion,
     HarnessConfig,
+    HybridCapabilityIndex,
     ModelCapabilityDiscovery,
     TaskAwareSessionPreparer,
     TaskSpecification,
@@ -428,8 +431,9 @@ async def test_registration_order_does_not_change_scan_partitions() -> None:
     assert reports[0].steps == reports[1].steps
 
 
+@pytest.mark.parametrize("indexed", [False, True])
 async def test_recommended_harness_configuration_runs_discovery_with_shared_preparation_model(
-    tmp_path: Path, session_counter: OpenAICompatibleTokenCounter
+    tmp_path: Path, session_counter: OpenAICompatibleTokenCounter, indexed: bool
 ) -> None:
     specification = TaskSpecification(
         route="direct",
@@ -478,15 +482,21 @@ async def test_recommended_harness_configuration_runs_discovery_with_shared_prep
         reasoning_model=reasoner,
         reasoning_counter=session_counter,
         discovery_reporter=save,
+        capability_index=HybridCapabilityIndex(
+            IndexEncoder(), config=CapabilityIndexConfig(candidate_limit=2)
+        )
+        if indexed
+        else None,
     ) as harness:
         await harness.sessions.create("s")
         result = await harness.send("s", "Explain a concept", input_id="i")
     assert result.session.report.status is RunStatus.COMPLETED
     assert len(reports) == 1
     assert len(reasoner.requests) == len(reports[0].steps) + 1
-    assert len(reports[0].steps) > 1
+    assert len(reports[0].steps) == 1 if indexed else len(reports[0].steps) > 1
     assert all(s.request_bytes <= 64000 for s in reports[0].steps)
-    assert reports[0].scanned_count == 20
+    assert reports[0].scanned_count == (2 if indexed else 20)
+    assert reports[0].catalogue_size == 20
 
 
 async def test_report_sink_failure_prevents_candidate_publication() -> None:
@@ -574,4 +584,101 @@ async def test_invalid_request_identity_is_rejected_before_discovery_io() -> Non
     )
     with pytest.raises(ValueError, match="input_id cannot anchor"):
         await engine.prepare(input_id="", task=TaskInput(goal="Read"), history=(), tools=registry())
+    assert not provider.requests
+
+
+class IndexEncoder:
+    version = "test-index/1"
+
+    async def encode(
+        self, texts: tuple[str, ...], *, role: Literal["query", "passage"]
+    ) -> tuple[tuple[float, ...], ...]:
+        return tuple((1.0, 0.0) for _ in texts)
+
+
+async def test_indexed_discovery_preparation_binds_v3_and_expands_only_nominated_schema() -> None:
+    class ConstraintEncoder(IndexEncoder):
+        async def encode(
+            self, texts: tuple[str, ...], *, role: Literal["query", "passage"]
+        ) -> tuple[tuple[float, ...], ...]:
+            if role == "query":
+                assert any("retain the explicit constraint" in text for text in texts)
+            return await super().encode(texts, role=role)
+
+    interpreter = Interpreter(direct=True)
+    discovery = ModelCapabilityDiscovery(
+        FakeModelProvider((nomination("read_000"),)),
+        context_compiler=compiler(),
+        configuration_id="indexed",
+        candidate_index=HybridCapabilityIndex(
+            ConstraintEncoder(), config=CapabilityIndexConfig(candidate_limit=2)
+        ),
+    )
+    prepared = await TaskUnderstandingEngine(interpreter, discovery=discovery).prepare(
+        input_id="i",
+        task=TaskInput(goal="Explain", constraints=("retain the explicit constraint",)),
+        history=(),
+        tools=registry(10),
+    )
+    record = prepared.record
+    assert record.schema_version == 3
+    report = record.discovery
+    assert report is not None and report.schema_version == 2
+    assert report.catalogue_size == 10 and report.scanned_count == 2
+    assert report.scan_scope == "indexed_candidates"
+    assert record.available_capabilities == ("read_000",)
+    assert record.selected_capabilities == ()
+    assert TaskUnderstandingRecord.model_validate_json(record.model_dump_json()) == record
+    assert report.retrieval is not None
+    with pytest.raises(ValueError, match="matching understanding record version"):
+        TaskUnderstandingRecord.model_validate(record.model_copy(update={"schema_version": 2}))
+    with pytest.raises(ValueError, match="report v2"):
+        CapabilityDiscoveryReport.model_validate(report.model_copy(update={"schema_version": 1}))
+    with pytest.raises(ValueError, match="same discovery catalogue"):
+        CapabilityDiscoveryReport.model_validate(
+            report.model_copy(update={"catalogue_sha256": "0" * 64})
+        )
+
+
+async def test_contextual_request_explicitly_uses_full_scan_without_encoding() -> None:
+    class Unusable(IndexEncoder):
+        async def encode(
+            self, texts: tuple[str, ...], *, role: Literal["query", "passage"]
+        ) -> tuple[tuple[float, ...], ...]:
+            raise AssertionError("context fallback must not query last-sentence embeddings")
+
+    discovery = ModelCapabilityDiscovery(
+        FakeModelProvider((nomination(),)),
+        context_compiler=compiler(),
+        configuration_id="indexed",
+        candidate_index=HybridCapabilityIndex(Unusable()),
+    )
+    report = await discovery.discover(
+        CatalogSnapshot.from_registry(registry(4)),
+        {"task": {"goal": "继续查"}, "history": [{"role": "user", "content": "Earlier task"}]},
+        max_duration=3,
+    )
+    assert report.schema_version == 2
+    assert report.scanned_count == report.catalogue_size == 4
+    assert report.scan_scope == "full_catalogue"
+    assert report.fallback_reason == "context_requires_full_scan" and report.retrieval is None
+
+
+async def test_index_capacity_failure_is_a_discovery_failure_before_model_io() -> None:
+    provider = FakeModelProvider(())
+    discovery = ModelCapabilityDiscovery(
+        provider,
+        context_compiler=compiler(),
+        configuration_id="indexed",
+        candidate_index=HybridCapabilityIndex(
+            IndexEncoder(), config=CapabilityIndexConfig(max_tools=1)
+        ),
+    )
+    with pytest.raises(CapabilityDiscoveryError) as caught:
+        await discovery.discover(
+            CatalogSnapshot.from_registry(registry(4)), {"task": {"goal": "Read"}}, max_duration=3
+        )
+    assert caught.value.error.category is ErrorCategory.CONTEXT_BUDGET_EXCEEDED
+    assert caught.value.report.schema_version == 2 and not caught.value.report.steps
+    assert caught.value.report.failure_code == "index_catalogue_capacity"
     assert not provider.requests

@@ -12,8 +12,10 @@ from pydantic import (
     ConfigDict,
     Field,
     JsonValue,
+    SerializerFunctionWrapHandler,
     ValidationError,
     field_validator,
+    model_serializer,
     model_validator,
 )
 
@@ -23,6 +25,11 @@ from weavria.models import ModelCallError, ModelProvider, call_model
 from weavria.sessions import SessionTaskPreparationError
 
 from .capabilities import CapabilityDescriptor, CatalogSnapshot
+from .capability_index import (
+    CapabilityIndexError,
+    CapabilityRetrievalReport,
+    HybridCapabilityIndex,
+)
 
 
 class _Value(BaseModel):
@@ -66,7 +73,7 @@ class CapabilityDiscoveryStep(_Value):
 class CapabilityDiscoveryReport(_Value):
     """可归档的内容无关报告;完整扫描不代表模型没有遗漏。"""
 
-    schema_version: Literal[1] = 1
+    schema_version: Literal[1, 2] = 1
     policy_version: str
     catalogue_sha256: str
     context_sha256: str
@@ -77,6 +84,17 @@ class CapabilityDiscoveryReport(_Value):
     steps: tuple[CapabilityDiscoveryStep, ...]
     status: str
     failure_code: str | None = None
+    scan_scope: Literal["full_catalogue", "indexed_candidates"] = "full_catalogue"
+    retrieval: CapabilityRetrievalReport | None = None
+    fallback_reason: Literal["context_requires_full_scan"] | None = None
+
+    @model_serializer(mode="wrap")
+    def serialize_report(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        result = handler(self)
+        if self.schema_version == 1:
+            for field in ("scan_scope", "retrieval", "fallback_reason"):
+                result.pop(field, None)
+        return result
 
     @field_validator("schema_version", mode="before")
     @classmethod
@@ -87,6 +105,20 @@ class CapabilityDiscoveryReport(_Value):
 
     @model_validator(mode="after")
     def validate_coverage(self) -> Self:
+        if self.schema_version == 1 and (
+            self.scan_scope != "full_catalogue"
+            or self.retrieval is not None
+            or self.fallback_reason is not None
+        ):
+            raise ValueError("indexed discovery requires report v2")
+        if self.retrieval is not None and (
+            self.scan_scope != "indexed_candidates"
+            or self.retrieval.catalogue_sha256 != self.catalogue_sha256
+            or self.retrieval.catalogue_size != self.catalogue_size
+        ):
+            raise ValueError("retrieval must bind the same discovery catalogue")
+        if self.fallback_reason is not None and self.scan_scope != "full_catalogue":
+            raise ValueError("context fallback must scan the full catalogue")
         scanned = tuple(
             name
             for step in self.steps
@@ -99,10 +131,17 @@ class CapabilityDiscoveryReport(_Value):
             or not 0 <= self.scanned_count <= self.catalogue_size
         ):
             raise ValueError("discovery scan accounting is inconsistent")
+        target = self.catalogue_size
+        if self.scan_scope == "indexed_candidates":
+            if self.retrieval is None:
+                if self.status == "completed" or self.steps:
+                    raise ValueError("indexed scan requires completed retrieval")
+            else:
+                target = len(self.retrieval.candidate_names)
+                if not set(scanned) <= set(self.retrieval.candidate_names):
+                    raise ValueError("scan contains names outside retrieved candidates")
         if self.status == "completed":
-            if self.scanned_count != self.catalogue_size or any(
-                s.status != "accepted" for s in self.steps
-            ):
+            if self.scanned_count != target or any(s.status != "accepted" for s in self.steps):
                 raise ValueError("completed discovery requires complete accepted scan")
             nominated = {name for s in self.steps for name in s.selected_names}
             if (
@@ -184,7 +223,7 @@ def _card(item: CapabilityDescriptor) -> dict[str, object]:
 
 
 class ModelCapabilityDiscovery:
-    """扫描整个已授权目录,合并语义提名,只返回待展开的候选名称。
+    """检查授权目录或显式索引候选,合并语义提名,只返回待展开的名称。
 
     每次调用的状态全部在 discover 局部保存,同一实例可被不同 Session 使用。
     模型连接归宿主管理。报告接收函数只在成功路径调用并共享准备期限;
@@ -199,6 +238,7 @@ class ModelCapabilityDiscovery:
         configuration_id: str,
         config: CapabilityDiscoveryConfig | None = None,
         on_report: Callable[[CapabilityDiscoveryReport], Awaitable[None]] | None = None,
+        candidate_index: HybridCapabilityIndex | None = None,
     ) -> None:
         if not configuration_id.strip() or not provider.capabilities.tool_calls:
             raise ValueError("semantic discovery requires a configured structured model")
@@ -206,6 +246,7 @@ class ModelCapabilityDiscovery:
             config or CapabilityDiscoveryConfig()
         )
         self._provider, self._compiler, self._on_report = provider, context_compiler, on_report
+        self._index = candidate_index
         self.version = "semantic-capability-discovery/1:" + _digest(
             {
                 "configuration": configuration_id,
@@ -214,6 +255,8 @@ class ModelCapabilityDiscovery:
                 "instructions": _INSTRUCTIONS,
             }
         )
+        if candidate_index is not None:
+            self.version += ";query=task-goal-constraints/1;" + candidate_index.version
 
     async def discover(
         self,
@@ -222,31 +265,40 @@ class ModelCapabilityDiscovery:
         *,
         max_duration: float,
     ) -> CapabilityDiscoveryReport:
-        """完整扫描成功才发布结果;容量、非法身份、模型失败和超时均显式失败。"""
+        """本次扫描范围全部成功才发布结果;失败不会返回部分候选。"""
         if isinstance(max_duration, bool) or not math.isfinite(max_duration) or max_duration <= 0:
             raise ValueError("discovery duration must be positive and finite")
         deadline = asyncio.get_running_loop().time() + max_duration
         # 防御可变嵌套 dict;快照之后宿主变更不应改变同一轮的模型可见身份。
         catalogue = CatalogSnapshot.model_validate_json(catalogue.model_dump_json())
         context_json = _json(request_context)
-        cards = tuple(_card(c) for c in sorted(catalogue.capabilities, key=lambda c: c.name))
-        by_name = {str(c["name"]): c for c in cards}
+        cards: tuple[dict[str, object], ...] = ()
+        by_name: dict[str, dict[str, object]] = {}
         steps: list[CapabilityDiscoveryStep] = []
         selected: tuple[str, ...] = ()
         scanned = 0
+        retrieval: CapabilityRetrievalReport | None = None
+        scope: Literal["full_catalogue", "indexed_candidates"] = (
+            "full_catalogue" if self._index is None else "indexed_candidates"
+        )
+        fallback: Literal["context_requires_full_scan"] | None = None
 
         def report(status: str, failure_code: str | None = None) -> CapabilityDiscoveryReport:
             return CapabilityDiscoveryReport(
+                schema_version=1 if self._index is None else 2,
                 policy_version=self.version,
                 catalogue_sha256=catalogue.catalogue_sha256,
                 context_sha256=hashlib.sha256(context_json.encode()).hexdigest(),
                 cards_sha256=_digest(cards),
-                catalogue_size=len(cards),
+                catalogue_size=len(catalogue.capabilities),
                 scanned_count=scanned,
                 selected_names=selected if status == "completed" else (),
                 steps=tuple(steps),
                 status=status,
                 failure_code=failure_code,
+                scan_scope=scope,
+                retrieval=retrieval,
+                fallback_reason=fallback,
             )
 
         def request(batch: tuple[dict[str, object], ...], limit: int) -> ModelRequest:
@@ -317,10 +369,57 @@ class ModelCapabilityDiscovery:
 
         try:
             async with asyncio.timeout_at(deadline):
-                if len(cards) > self.config.max_tools or (
+                if len(catalogue.capabilities) > self.config.max_tools or (
                     len(catalogue.model_dump_json().encode()) > self.config.max_catalogue_bytes
                 ):
                     raise _Capacity("discovery catalogue capacity exceeded")
+                candidates = catalogue.capabilities
+                if self._index is not None:
+                    # 带指代的任务需要先解释上下文。本阶段明确回到完整扫描,
+                    # 不把“最后一句的向量”伪装成对完整会话的理解。
+                    context: dict[str, JsonValue] = json.loads(context_json)
+                    task = context.get("task")
+                    contextual = any(
+                        context.get(key)
+                        for key in (
+                            "history",
+                            "application_context",
+                            "prior_specification",
+                            "prior_clarification_question",
+                            "prior_clarification_question_id",
+                            "context_supply",
+                        )
+                    )
+                    if contextual:
+                        scope, fallback = "full_catalogue", "context_requires_full_scan"
+                    else:
+                        goal = task.get("goal") if isinstance(task, dict) else None
+                        if not isinstance(goal, str):
+                            raise CapabilityIndexError("missing_task_query")
+                        constraints: JsonValue = (
+                            task.get("constraints", []) if isinstance(task, dict) else []
+                        )
+                        if not isinstance(constraints, list) or any(
+                            not isinstance(value, str) for value in constraints
+                        ):
+                            raise CapabilityIndexError("invalid_task_constraints")
+                        # 约束是当前任务的一部分,可能包含关键动作或来源条件。
+                        # 保留原文,不借助字符串猜测哪些约束“重要”。
+                        query = goal
+                        for constraint in constraints:
+                            if isinstance(constraint, str):
+                                query += "\nConstraint: " + constraint
+                        retrieval = await self._index.retrieve(
+                            catalogue,
+                            query,
+                            max_duration=max(
+                                0.000001, deadline - asyncio.get_running_loop().time()
+                            ),
+                        )
+                        allowed = set(retrieval.candidate_names)
+                        candidates = tuple(c for c in candidates if c.name in allowed)
+                cards = tuple(_card(c) for c in sorted(candidates, key=lambda c: c.name))
+                by_name = {str(c["name"]): c for c in cards}
                 # 先完整规划批次,单卡放不下时不花费任何模型调用。每张卡保留全文说明。
                 batches: list[tuple[dict[str, object], ...]] = []
                 current: tuple[dict[str, object], ...] = ()
@@ -367,6 +466,12 @@ class ModelCapabilityDiscovery:
         except Exception as exc:
             if isinstance(exc, (ModelRequestContextError, _Capacity)):
                 category = ErrorCategory.CONTEXT_BUDGET_EXCEEDED
+            elif isinstance(exc, CapabilityIndexError):
+                category = (
+                    ErrorCategory.CONTEXT_BUDGET_EXCEEDED
+                    if exc.capacity
+                    else ErrorCategory.MODEL_FAILURE
+                )
             elif isinstance(exc, TimeoutError):
                 category = ErrorCategory.TIMEOUT
             elif isinstance(exc, ModelCallError):
@@ -387,7 +492,9 @@ class ModelCapabilityDiscovery:
                 ),
                 report(
                     category.value,
-                    str(exc) if isinstance(exc, _InvalidNomination) else type(exc).__name__,
+                    str(exc)
+                    if isinstance(exc, (_InvalidNomination, CapabilityIndexError))
+                    else type(exc).__name__,
                 ),
             ) from exc
 

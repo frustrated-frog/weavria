@@ -37,6 +37,13 @@ from .capability_discovery import (
     CapabilityDiscoveryStep,
     ModelCapabilityDiscovery,
 )
+from .capability_index import (
+    CapabilityEncoder,
+    CapabilityIndexConfig,
+    CapabilityIndexError,
+    CapabilityRetrievalReport,
+    HybridCapabilityIndex,
+)
 from .clarification import (
     BlockingAmbiguityPolicy,
     ClarificationPlan,
@@ -217,8 +224,11 @@ __all__ = [
     "CapabilityDiscoveryPolicy",
     "CapabilityDiscoveryReport",
     "CapabilityDiscoveryStep",
+    "CapabilityEncoder",
     "CapabilityEpochView",
     "CapabilityEvidenceProfile",
+    "CapabilityIndexConfig",
+    "CapabilityIndexError",
     "CapabilityNeed",
     "CapabilityOutcome",
     "CapabilityOutcomeContext",
@@ -227,6 +237,7 @@ __all__ = [
     "CapabilityOutcomeVerifier",
     "CapabilityQuery",
     "CapabilityResolver",
+    "CapabilityRetrievalReport",
     "CapabilityRetriever",
     "CapabilityView",
     "CapabilityWorkingSet",
@@ -265,6 +276,7 @@ __all__ = [
     "HarnessEvidence",
     "HarnessMemory",
     "HarnessResult",
+    "HybridCapabilityIndex",
     "InformationNeed",
     "InformationRequirement",
     "IntentActionValue",

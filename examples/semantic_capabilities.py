@@ -21,6 +21,7 @@ from weavria.harness import (
     CapabilityQuery,
     CapabilityResolver,
     CatalogSnapshot,
+    HybridCapabilityIndex,
     ModelCapabilityDiscovery,
     ModelTaskInterpreter,
     TaskUnderstandingEngine,
@@ -100,6 +101,8 @@ def implementation_digests() -> dict[str, str]:
     root = Path(__file__).resolve().parents[1]
     paths = (
         "src/weavria/harness/capability_discovery.py",
+        "src/weavria/harness/capability_index.py",
+        "examples/hybrid_capabilities.py",
         "src/weavria/harness/capabilities.py",
         "src/weavria/harness/understanding.py",
         "src/weavria/harness/coverage.py",
@@ -111,7 +114,9 @@ def implementation_digests() -> dict[str, str]:
     return {p: hashlib.sha256((root / p).read_bytes()).hexdigest() for p in paths}
 
 
-async def experiment(args: argparse.Namespace) -> None:
+async def experiment(
+    args: argparse.Namespace, *, candidate_index: HybridCapabilityIndex | None = None
+) -> None:
     raw = args.dataset.read_bytes()
     dataset = Dataset.model_validate_json(raw)
     tools = registry(dataset)
@@ -166,6 +171,10 @@ async def experiment(args: argparse.Namespace) -> None:
         "model": asdict(config),
         "options": options,
         "catalogue_size": len(catalogue.capabilities),
+        "index_version": candidate_index.version if candidate_index is not None else None,
+        "index_config": candidate_index.config.model_dump(mode="json")
+        if candidate_index is not None
+        else None,
         "rows": rows,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -173,7 +182,11 @@ async def experiment(args: argparse.Namespace) -> None:
         for repeat in range(args.repeats):
             for index, case in enumerate(dataset.cases):
                 # 冻结每个任务的原文,只改变发现入口;轮换次序,不挑选较好运行。
-                variants = ("lexical", "semantic", "full")
+                variants = (
+                    ("lexical", "semantic", "full")
+                    if candidate_index is None
+                    else ("lexical", "semantic", "full", "hybrid")
+                )
                 offset = (repeat + index) % len(variants)
                 for variant in (*variants[offset:], *variants[:offset]):
                     start = time.monotonic()
@@ -192,8 +205,9 @@ async def experiment(args: argparse.Namespace) -> None:
                             context_compiler=compiler,
                             configuration_id=config.model,
                             on_report=save,
+                            candidate_index=candidate_index if variant == "hybrid" else None,
                         )
-                        if variant == "semantic"
+                        if variant in {"semantic", "hybrid"}
                         else None
                     )
                     engine = TaskUnderstandingEngine(
