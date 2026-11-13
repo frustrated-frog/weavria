@@ -1,0 +1,164 @@
+{
+  "schema_version": 1,
+  "version": "capability-execution/1",
+  "environment_sha256": "a9d51fe86ea613baeb92fb8b62befe2719802348a5cb2b82a380bbf0e5c62960",
+  "cases": [
+    {
+      "id": "file_fingerprint",
+      "query": "Determine the content fingerprint of /work/build.bin so I can compare copies. Return only JSON with the key sha256.",
+      "expected": {
+        "sha256": "a3693cb6fb00555c7138b6fb08a4b3a17556a1d6a3ebd6c9df15e1600a107549"
+      },
+      "evidence_paths": [
+        [
+          {
+            "name": "compute_file_checksum",
+            "arguments": {
+              "path": "/work/build.bin"
+            }
+          }
+        ]
+      ]
+    },
+    {
+      "id": "file_properties",
+      "query": "When was /work/notes.txt last modified and how many bytes does it occupy? Return only JSON with keys size_bytes and modified_at, with UTC formatted as YYYY-MM-DDTHH:MM:SSZ.",
+      "expected": {
+        "size_bytes": 55,
+        "modified_at": "2026-11-10T12:34:56Z"
+      },
+      "evidence_paths": [
+        [
+          {
+            "name": "read_file_metadata",
+            "arguments": {
+              "path": "/work/notes.txt"
+            }
+          }
+        ]
+      ]
+    },
+    {
+      "id": "archive_revision",
+      "query": "读取归档 ARC-204 的最新完整正文，并比较第 1、2 版。只返回 JSON：current_text 是完整正文，removed_lines 和 added_lines 分别是删除、新增的完整行（不含换行符），按原文顺序排列。",
+      "expected": {
+        "current_text": "Owner: Mira\nBatch size: 96\nTransport: HTTPS\n",
+        "removed_lines": [
+          "Batch size: 64",
+          "Transport: SFTP"
+        ],
+        "added_lines": [
+          "Batch size: 96",
+          "Transport: HTTPS"
+        ]
+      },
+      "evidence_paths": [
+        [
+          {
+            "name": "read_document_history",
+            "arguments": {
+              "archive_id": "ARC-204"
+            }
+          }
+        ]
+      ]
+    },
+    {
+      "id": "locate_fingerprint",
+      "query": "Look up the current local location of asset release-17, then calculate its SHA-256 from every byte. Do not guess the location. Return only JSON with keys path and sha256.",
+      "expected": {
+        "path": "/objects/7e49c2a8.bin",
+        "sha256": "84025b5fee69ce08d8bbfc94e1be267ce8c1adb2621a9cf06e9ff37414188b29"
+      },
+      "evidence_paths": [
+        [
+          {
+            "name": "locate_asset",
+            "arguments": {
+              "asset_id": "release-17"
+            }
+          },
+          {
+            "name": "compute_file_checksum",
+            "arguments": {
+              "path": "/objects/7e49c2a8.bin"
+            }
+          }
+        ]
+      ],
+      "ordered": true
+    },
+    {
+      "id": "free_windows",
+      "query": "List all maximal free windows of at least 30 minutes for Lee between 2026-11-16T09:00:00Z and 2026-11-16T13:00:00Z. Merge overlapping or touching busy intervals; do not enumerate appointment start times. Return only JSON {\"intervals\":[{\"start\":\"UTC timestamp\",\"end\":\"UTC timestamp\"}]} in chronological order, with timestamps formatted YYYY-MM-DDTHH:MM:SSZ.",
+      "expected": {
+        "intervals": [
+          {
+            "start": "2026-11-16T09:15:00Z",
+            "end": "2026-11-16T10:00:00Z"
+          },
+          {
+            "start": "2026-11-16T10:45:00Z",
+            "end": "2026-11-16T11:30:00Z"
+          }
+        ]
+      },
+      "evidence_paths": [
+        [
+          {
+            "name": "find_available_slots",
+            "arguments": {
+              "person": "Lee",
+              "start": "2026-11-16T09:00:00Z",
+              "end": "2026-11-16T13:00:00Z",
+              "duration_minutes": 30
+            }
+          }
+        ],
+        [
+          {
+            "name": "read_calendar_busy",
+            "arguments": {
+              "person": "Lee",
+              "start": "2026-11-16T09:00:00Z",
+              "end": "2026-11-16T13:00:00Z"
+            }
+          }
+        ]
+      ]
+    },
+    {
+      "id": "delete_unavailable",
+      "query": "Permanently delete /work/obsolete.txt. If there is no capability to perform this operation, return only JSON {\"status\":\"unavailable\"}; otherwise return {\"status\":\"deleted\"}.",
+      "expected": {
+        "status": "unavailable"
+      },
+      "evidence_paths": [
+        []
+      ],
+      "unavailable": true
+    },
+    {
+      "id": "text_unavailable",
+      "query": "Read the full text of the local file /work/notes.txt, which has not been uploaded to an archive. If no capability can read its text, return only JSON {\"status\":\"unavailable\"}; otherwise return {\"text\":\"the complete text\"}.",
+      "expected": {
+        "status": "unavailable"
+      },
+      "evidence_paths": [
+        []
+      ],
+      "unavailable": true
+    },
+    {
+      "id": "no_tools",
+      "query": "No file access is needed. Does byte length uniquely identify file contents, and does a content hash depend on file contents? Return only JSON with boolean keys length_identifies_content and hash_depends_on_content.",
+      "expected": {
+        "length_identifies_content": false,
+        "hash_depends_on_content": true
+      },
+      "evidence_paths": [
+        []
+      ]
+    }
+  ]
+}

@@ -32,6 +32,8 @@ Weavria 是一套实验性的 Python Agent Harness 与 Runtime，重点是让模
 
 ## 开发环境
 
+大目录能力发现可通过 `uv run python -m examples.live_capability_execution` 校验本地执行任务集，显式 `--live` 才调用真实模型。实验对比混合发现、适用性检查、补搜和完整目录，使用独立答案与执行证据验收。运行方式、时效性接入及局限见[能力发现的本地执行与独立验收](docs/能力发现的本地执行与独立验收.md)。
+
 需要 Python 3.12+ 与 uv：
 
 ```bash
