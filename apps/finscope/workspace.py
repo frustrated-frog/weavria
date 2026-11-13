@@ -55,8 +55,6 @@ type CatalogueArea = Literal[
     "radar_followed",
     "radar_notifications",
     "major_events",
-    "global_expectations",
-    "global_expectations_feed",
     "market_pulse_dates",
     "market_indices",
     "sector_industry_overview",
@@ -260,8 +258,6 @@ _CATALOGUE_ROUTES: dict[CatalogueArea, _CatalogueRoute] = {
     "radar_followed": _CatalogueRoute("/api/research-radar/followed", "limit"),
     "radar_notifications": _CatalogueRoute("/api/research-radar/notifications", "limit"),
     "major_events": _CatalogueRoute("/api/major-events"),
-    "global_expectations": _CatalogueRoute("/api/global-expectations"),
-    "global_expectations_feed": _CatalogueRoute("/api/global-expectations/feed"),
     "market_pulse_dates": _CatalogueRoute("/api/market-pulse/dates"),
     "market_indices": _CatalogueRoute(
         "/api/market-indices", fixed_parameters=(("refresh", "false"),)
@@ -985,7 +981,7 @@ def finscope_workspace_evidence_profiles() -> tuple[CapabilityEvidenceProfile, .
                 ),
                 _catalogue_surface(
                     "news",
-                    "News, radar, major events, and global expectations",
+                    "News, radar, and major events",
                     "news",
                     "news_categories",
                     "news_window",
@@ -994,8 +990,6 @@ def finscope_workspace_evidence_profiles() -> tuple[CapabilityEvidenceProfile, .
                     "radar_followed",
                     "radar_notifications",
                     "major_events",
-                    "global_expectations",
-                    "global_expectations_feed",
                 ),
                 _catalogue_surface(
                     "market",
