@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "version": "semantic-capabilities/1",
+  "tools": [
+    {"name": "read_clock", "description": "Read the current UTC clock."},
+    {"name": "find_archived_document", "description": "Retrieve a stored document by its archive identifier, returning its text and metadata."},
+    {"name": "read_team_roster", "description": "List people assigned to a project and their responsibilities."},
+    {"name": "read_calendar_busy", "description": "Retrieve occupied calendar intervals for a person over a specified date range."},
+    {"name": "read_storage_usage", "description": "Return consumed and available byte capacity of a named storage volume."},
+    {"name": "read_tls_certificate", "description": "Inspect a server TLS certificate, returning issuer, subject and validity dates."},
+    {"name": "read_file_digest", "description": "Calculate a cryptographic checksum of an existing file without modifying it."},
+    {"name": "read_service_incidents", "description": "Retrieve recorded outages and restoration events affecting a service."},
+    {"name": "read_package_manifest", "description": "Read a software package's installed version and dependency declarations."},
+    {"name": "read_document_revisions", "description": "List changes between saved revisions of a document identified by its archive identifier."},
+    {"name": "read_audit_trail", "description": "List recorded operations, actors and timestamps from an audit log."},
+    {"name": "read_sensor_archive", "description": "Retrieve historical instrument readings with their recorded timestamps."}
+  ],
+  "domains": ["billing", "deployments", "inventory", "notifications", "routing", "sessions", "search", "analytics", "backups", "queues", "caches", "authentication"],
+  "views": ["configuration", "access_rules", "error_logs", "quota_limits", "documentation", "latency_metrics", "retention_policy"],
+  "cases": [
+    {"id": "utc", "query": "现在 UTC 时间几点了？", "expected": ["read_clock"]},
+    {"id": "storage", "query": "¿Cuánto espacio libre queda en el volumen media?", "expected": ["read_storage_usage"]},
+    {"id": "certificate", "query": "For api.example.test, find the expiration date of its HTTPS credential.", "expected": ["read_tls_certificate"]},
+    {"id": "responsibility", "query": "Who is responsible for each part of project Aurora? Consult the assignments.", "expected": ["read_team_roster"]},
+    {"id": "documents", "query": "取出归档文件 ARC42 的正文，并列出它两个已保存版本之间的变更。", "expected": ["find_archived_document", "read_document_revisions"]},
+    {"id": "direct", "query": "Explain in general why days are longer in summer. No external facts or tools are needed.", "expected": []},
+    {"id": "fingerprint", "query": "Determine the content fingerprint of /reports/notes.bin so I can compare copies.", "expected": ["read_file_digest"]},
+    {"id": "outages", "query": "查一下 checkout 服务过去记录了哪些中断，以及什么时候恢复的。", "expected": ["read_service_incidents"]}
+  ]
+}

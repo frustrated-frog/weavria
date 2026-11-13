@@ -7,6 +7,8 @@ from typing import Literal
 from weavria.context import ContextCompilerConfig
 from weavria.runtime import RunLimits
 
+from .capability_discovery import CapabilityDiscoveryConfig
+
 
 @dataclass(frozen=True)
 class HarnessConfig:
@@ -30,6 +32,7 @@ class HarnessConfig:
     project_task_view: bool = True
     adaptive_capabilities: bool = True
     work_recheck: bool = False
+    semantic_discovery: CapabilityDiscoveryConfig | None = None
 
     def __post_init__(self) -> None:
         if not self.configuration_id.strip() or len(self.configuration_id) > 128:
@@ -49,6 +52,8 @@ class HarnessConfig:
             raise ValueError("adaptive capabilities require task model projection")
         if self.working_records and not self.task_understanding:
             raise ValueError("working records require task understanding")
+        if self.semantic_discovery is not None and not self.task_understanding:
+            raise ValueError("semantic discovery requires task understanding")
         if self.work_recheck and not self.working_records:
             raise ValueError("work recheck requires working records")
         if self.working_records and not self.project_task_view:

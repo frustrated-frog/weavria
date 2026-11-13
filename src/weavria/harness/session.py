@@ -196,26 +196,28 @@ class TaskAwareSessionPreparer:
                         for name in hypothesis.capability_names
                     )
                 )
-        capability_view, _ = self._capabilities.resolve(
-            CapabilityQuery(
-                goal=discovery_goal,
-                requirements=discovery_requirements,
-                recall_seed_names=recall_seed_names,
-                allow_side_effects=True,
-            ),
-            context.tools,
-            epoch=(base.capability_epoch + 1 if base is not None else 1),
-            trigger="clarification_answer" if base is not None else "initial",
-        )
-        candidates = context.tools.select(capability_view.allowed_tool_names)
-        # Discovery metadata is input to interpretation, not the Runtime tool view.
-        # Prefer complete recall for small inventories. Understanding admits the real
-        # request before choosing between this inventory and the ranked fallback.
-        inventory = self._capabilities.preparation_catalogue(context.tools)
         fallback = None
-        if inventory is not None and inventory.descriptors != candidates.descriptors:
-            fallback = candidates
-            candidates = inventory
+        if self._understanding.has_capability_discovery:
+            # 发现模型必须能访问全部策略可见卡片,词法结果不能成为其不可见上限。
+            candidates = self._capabilities.discovery_catalogue(context.tools)
+        else:
+            capability_view, _ = self._capabilities.resolve(
+                CapabilityQuery(
+                    goal=discovery_goal,
+                    requirements=discovery_requirements,
+                    recall_seed_names=recall_seed_names,
+                    allow_side_effects=True,
+                ),
+                context.tools,
+                epoch=(base.capability_epoch + 1 if base is not None else 1),
+                trigger="clarification_answer" if base is not None else "initial",
+            )
+            candidates = context.tools.select(capability_view.allowed_tool_names)
+            # 小目录扩展仅用于理解;不直接改变 Runtime 的可调用视图。
+            inventory = self._capabilities.preparation_catalogue(context.tools)
+            if inventory is not None and inventory.descriptors != candidates.descriptors:
+                fallback = candidates
+                candidates = inventory
         preparation = await self._understanding.prepare(
             input_id=context.input_id,
             task=context.task,

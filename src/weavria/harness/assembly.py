@@ -2,6 +2,7 @@
 
 import asyncio
 import math
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Self
@@ -45,6 +46,7 @@ from weavria.sessions import (
 from weavria.tools import ToolPolicy, ToolRegistry, context_summary_tool
 
 from .capabilities import CapabilityDiscoveryPolicy, CapabilityResolver
+from .capability_discovery import CapabilityDiscoveryReport, ModelCapabilityDiscovery
 from .configuration import HarnessConfig
 from .coverage import CapabilityEvidenceProfile, ModelRequirementCoverageValidator
 from .memory_admission import ConservativeMemoryAdmission, MemoryFormationError
@@ -245,6 +247,7 @@ class AgentHarness:
         reasoning_counter: ModelRequestTokenCounter | None = None,
         evidence: HarnessEvidence | None = None,
         preparation_context: ModelRequestContextConfig | None = None,
+        discovery_reporter: Callable[[CapabilityDiscoveryReport], Awaitable[None]] | None = None,
         task_model_projector: TaskModelProjector | None = None,
         configuration_metadata: dict[str, JsonValue] | None = None,
         memory: HarnessMemory | None = None,
@@ -262,6 +265,8 @@ class AgentHarness:
         """
         understanding = None
         work_rechecker = None
+        if discovery_reporter is not None and config.semantic_discovery is None:
+            raise ValueError("discovery reporter requires semantic discovery")
         if not config.task_understanding and (
             evidence is not None or preparation_context is not None
         ):
@@ -306,6 +311,15 @@ class AgentHarness:
                 coverage_repairer=interpreter if audit else None,
                 evidence_profiles=evidence.profiles if evidence is not None else (),
                 max_duration=config.preparation_max_duration,
+                discovery=ModelCapabilityDiscovery(
+                    reasoning_model,
+                    context_compiler=compiler,
+                    configuration_id=config.configuration_id,
+                    config=config.semantic_discovery,
+                    on_report=discovery_reporter,
+                )
+                if config.semantic_discovery is not None
+                else None,
             )
         if memory is not None and (memory.extractor is not None or memory.admission is not None):
             raise ValueError(

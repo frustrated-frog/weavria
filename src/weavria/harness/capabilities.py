@@ -363,6 +363,17 @@ class CapabilityResolver:
         )
         return registry.select(names) if len(names) <= self._limit else None
 
+    def discovery_catalogue(self, registry: ToolRegistry) -> ToolRegistry:
+        """返回策略允许的完整发现集合,供有自身容量约束的异步语义发现使用。"""
+        catalogue = CatalogSnapshot.from_registry(registry)
+        return registry.select(
+            tuple(
+                item.name
+                for item in catalogue.capabilities
+                if self._policy.can_discover(item) and item.availability == "available"
+            )
+        )
+
     def resolve(
         self,
         query: CapabilityQuery,

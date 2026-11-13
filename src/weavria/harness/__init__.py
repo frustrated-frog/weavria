@@ -30,6 +30,13 @@ from .capabilities import (
     PublicCapabilityPolicy,
     SchemaAwareSelector,
 )
+from .capability_discovery import (
+    CapabilityDiscoveryConfig,
+    CapabilityDiscoveryError,
+    CapabilityDiscoveryReport,
+    CapabilityDiscoveryStep,
+    ModelCapabilityDiscovery,
+)
 from .clarification import (
     BlockingAmbiguityPolicy,
     ClarificationPlan,
@@ -205,7 +212,11 @@ __all__ = [
     "CapabilityChoice",
     "CapabilityDemand",
     "CapabilityDescriptor",
+    "CapabilityDiscoveryConfig",
+    "CapabilityDiscoveryError",
     "CapabilityDiscoveryPolicy",
+    "CapabilityDiscoveryReport",
+    "CapabilityDiscoveryStep",
     "CapabilityEpochView",
     "CapabilityEvidenceProfile",
     "CapabilityNeed",
@@ -284,6 +295,7 @@ __all__ = [
     "MemoryReviewFeatures",
     "MemoryReviewer",
     "MemoryUpdateReport",
+    "ModelCapabilityDiscovery",
     "ModelMemoryAnswerer",
     "ModelMemoryEvidenceAssessor",
     "ModelMemoryExtractor",

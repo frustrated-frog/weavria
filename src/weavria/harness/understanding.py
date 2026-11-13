@@ -42,6 +42,8 @@ from weavria.models import ModelCallError, ModelProvider, call_model
 from weavria.sessions import SessionTaskPreparationError
 from weavria.tools import ToolDescriptor, ToolRegistry
 
+from .capabilities import CatalogSnapshot
+from .capability_discovery import CapabilityDiscoveryReport, ModelCapabilityDiscovery
 from .coverage import (
     CapabilityEvidenceProfile,
     EvidenceSurface,
@@ -890,14 +892,42 @@ class TaskUnderstandingInput(BaseModel):
         return self
 
 
-class TaskUnderstandingRecord(_Contract):
+class TaskUnderstandingRecord(BaseModel):
     """Content-free request identity plus the accepted typed interpretation."""
 
+    model_config = _Contract.model_config
+    schema_version: Literal[1, 2] = 1
     interpreter_version: _Text
     request_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     available_capabilities: tuple[_CapabilityName, ...]
     selected_capabilities: tuple[_CapabilityName, ...]
     frame: TaskFrame
+    discovery: CapabilityDiscoveryReport | None = None
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def validate_version_type(cls, value: object) -> object:
+        if type(value) is not int:
+            raise ValueError("schema_version must be an integer")
+        return value
+
+    @model_serializer(mode="wrap")
+    def serialize_record(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        result = handler(self)
+        if self.schema_version == 1:
+            result.pop("discovery", None)
+        return result
+
+    @model_validator(mode="after")
+    def validate_discovery(self) -> Self:
+        if (self.schema_version == 2) != (self.discovery is not None):
+            raise ValueError("discovery report requires understanding record v2")
+        if self.discovery is not None and (
+            self.discovery.status != "completed"
+            or set(self.discovery.selected_names) != set(self.available_capabilities)
+        ):
+            raise ValueError("understanding catalogue must match completed discovery")
+        return self
 
     @property
     def specification(self) -> TaskSpecification:
@@ -1829,10 +1859,12 @@ class TaskUnderstandingEngine:
         normalize_required_needs: bool = True,
         max_duration: float = 15.0,
         max_catalogue_bytes: int = 256_000,
+        discovery: ModelCapabilityDiscovery | None = None,
     ) -> None:
         if isinstance(max_duration, bool) or not math.isfinite(max_duration) or max_duration <= 0:
             raise ValueError("task understanding duration must be positive and finite")
         self._interpreter = interpreter
+        self._discovery = discovery
         self._target_resolver = target_resolver or LiteralTargetResolver()
         self._question_selector = question_selector or ConsequenceAwareQuestionSelector()
         self._belief_updater = belief_updater or DeterministicBeliefUpdater()
@@ -1868,6 +1900,11 @@ class TaskUnderstandingEngine:
         self._max_catalogue_bytes = max_catalogue_bytes
 
     @property
+    def has_capability_discovery(self) -> bool:
+        """完整发现集合应由宿主 Policy 过滤后提供,不能先做词法裁剪。"""
+        return self._discovery is not None
+
+    @property
     def version(self) -> str:
         coverage_version = (
             self._coverage_validator.version
@@ -1892,6 +1929,7 @@ class TaskUnderstandingEngine:
             f"{coverage_version};{repairer_version};repairs={self._max_coverage_repairs};"
             f"normalize_required_needs={self._normalize_required_needs};"
             f"profiles={profiles or 'none'};targets={self._target_resolver.version}]"
+            + (f";{self._discovery.version}" if self._discovery is not None else "")
         )
 
     def _capability_views(self, tools: ToolRegistry) -> tuple[CapabilityView, ...]:
@@ -1923,6 +1961,10 @@ class TaskUnderstandingEngine:
         failure, semantic rejection, or timeout. Existing callers retain strict admission.
         """
         if fallback_tools is not None:
+            if self._discovery is not None:
+                raise ValueError(
+                    "semantic discovery cannot silently fall back to lexical candidates"
+                )
             names = {item.name for item in tools.descriptors}
             if any(
                 item.name not in names or tools.get(item.name) is not fallback_tools.get(item.name)
@@ -1949,7 +1991,10 @@ class TaskUnderstandingEngine:
                 prior_clarification_question_id = (
                     base_frame.clarification_decision.selected_question_id
                 )
-        views = self._capability_views(tools)
+        # 发现、解释和覆盖审查共用这条期限,发现不能额外获得一整份准备预算。
+        deadline = asyncio.get_running_loop().time() + self._max_duration
+        discovery_report = None
+        views = self._capability_views(tools) if self._discovery is None else ()
         request = TaskUnderstandingInput(
             schema_version=2 if context_supply is not None else 1,
             context_supply=context_supply,
@@ -1961,6 +2006,31 @@ class TaskUnderstandingEngine:
             prior_clarification_question_id=prior_clarification_question_id,
             prior_clarification_question=prior_clarification_question,
         )
+        # 原请求身份先验收,发现模型同样不能为无法提交的输入产生额外 I/O。
+        try:
+            request_anchor = OriginalRequestAnchor(
+                input_id=input_id,
+                task_revision=request.task.revision,
+                task_sha256=hashlib.sha256(request.task.model_dump_json().encode()).hexdigest(),
+            )
+        except ValidationError as exc:
+            raise ValueError("input_id cannot anchor a task frame") from exc
+        if self._discovery is not None:
+            discovery_catalogue = CatalogSnapshot.from_registry(tools)
+            discovery_report = await self._discovery.discover(
+                discovery_catalogue,
+                request.model_dump(mode="json", exclude={"capabilities"}),
+                max_duration=_remaining_understanding_duration(deadline),
+            )
+            if CatalogSnapshot.from_registry(tools) != discovery_catalogue:
+                raise TaskUnderstandingError(
+                    RunError(
+                        category=ErrorCategory.RUNTIME_INVARIANT_VIOLATION,
+                        message="Capability registrations changed during semantic discovery",
+                    )
+                )
+            tools = tools.select(discovery_report.selected_names)
+            request = request.model_copy(update={"capabilities": self._capability_views(tools)})
         if fallback_tools is not None and (
             _catalogue_bytes(views) > self._max_catalogue_bytes
             or (
@@ -1979,20 +2049,10 @@ class TaskUnderstandingEngine:
                     message="Capability catalogue exceeds the understanding input budget",
                 )
             )
-        task_json = snapshot.task.model_dump_json()
-        try:
-            request_anchor = OriginalRequestAnchor(
-                input_id=input_id,
-                task_revision=snapshot.task.revision,
-                task_sha256=hashlib.sha256(task_json.encode()).hexdigest(),
-            )
-        except ValidationError as exc:
-            raise ValueError("input_id cannot anchor a task frame") from exc
-        deadline = asyncio.get_running_loop().time() + self._max_duration
         try:
             async with asyncio.timeout_at(deadline):
                 proposed = await self._interpreter.interpret(
-                    snapshot, max_duration=self._max_duration
+                    snapshot, max_duration=_remaining_understanding_duration(deadline)
                 )
             specification = TaskSpecification.model_validate_json(
                 TaskSpecification.model_validate(proposed).model_dump_json()
@@ -2514,6 +2574,8 @@ class TaskUnderstandingEngine:
                 )
             ) from exc
         record = TaskUnderstandingRecord(
+            schema_version=2 if discovery_report is not None else 1,
+            discovery=discovery_report,
             interpreter_version=self._interpreter.version,
             request_sha256=request_sha256,
             available_capabilities=available,
