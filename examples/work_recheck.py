@@ -15,7 +15,12 @@ from pydantic import BaseModel, ConfigDict
 
 from examples.live_memory_formation import Transport
 from weavria.context import ContextCompilerConfig
-from weavria.core import SessionRunEvent, SessionSemanticCommitted, ToolRecorded
+from weavria.core import (
+    SessionRunEvent,
+    SessionSemanticCommitted,
+    ToolFailedObservation,
+    ToolRecorded,
+)
 from weavria.harness import AgentHarness, HarnessConfig
 from weavria.harness.work import WorkProposal, load_work
 from weavria.models import (
@@ -93,7 +98,7 @@ def implementation_digests() -> dict[str, str]:
     root = Path(__file__).resolve().parents[1] / "src/weavria/harness"
     return {
         name: hashlib.sha256((root / name).read_bytes()).hexdigest()
-        for name in ("work.py", "work_recheck.py", "work_recheck_contracts.py")
+        for name in ("work.py", "work_recheck.py", "work_recheck_contracts.py", "session.py")
     }
 
 
@@ -204,6 +209,8 @@ async def experiment(args: argparse.Namespace) -> None:
                                     and e.data.snapshot.working_state is not None
                                 ]
                                 statuses: list[str] = []
+                                work_errors: list[dict[str, str]] = []
+                                selectors = {"quote": 0, "range": 0, "whole": 0}
                                 work_calls = 0
                                 for event in events:
                                     if isinstance(event.data, SessionRunEvent) and isinstance(
@@ -212,6 +219,37 @@ async def experiment(args: argparse.Namespace) -> None:
                                         record = event.data.event.data.record
                                         if record.exchange.action.tool_name == "propose_work":
                                             work_calls += 1
+                                            # 记录输入定位方式与真实工具失败,区分“没有进入
+                                            # 审查”与“审查后拒绝”;不据最终答案倒推机制成功。
+                                            notes = record.exchange.action.arguments.get("notes")
+                                            if isinstance(notes, list):
+                                                for note in notes:
+                                                    if not isinstance(note, dict):
+                                                        continue
+                                                    refs = note.get("sources", [])
+                                                    if isinstance(refs, list):
+                                                        for ref in refs:
+                                                            if isinstance(ref, dict):
+                                                                kind = (
+                                                                    "quote"
+                                                                    if "quote" in ref
+                                                                    else (
+                                                                        "range"
+                                                                        if "start" in ref
+                                                                        else "whole"
+                                                                    )
+                                                                )
+                                                                selectors[kind] += 1
+                                            observation = record.exchange.observation
+                                            if isinstance(observation, ToolFailedObservation):
+                                                work_errors.append(
+                                                    {
+                                                        "category": (
+                                                            observation.error.category.value
+                                                        ),
+                                                        "diagnostic": observation.error.message,
+                                                    }
+                                                )
                                             if record.artifact is not None:
                                                 artifact = await agent.sessions.store.get(
                                                     report.execution.run_id,
@@ -234,6 +272,8 @@ async def experiment(args: argparse.Namespace) -> None:
                                     answer_correct=correct,
                                     output=report.execution.output,
                                     work_calls=work_calls,
+                                    work_errors=work_errors,
+                                    source_selectors=selectors,
                                     rechecks=statuses,
                                     observed_stale=any(s.stale_note_ids for s in states),
                                     declared_dependencies=any(

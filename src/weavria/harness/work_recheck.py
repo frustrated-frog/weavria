@@ -1,9 +1,9 @@
 """失效结论的原文重验: 工具负责读取和审查,归约器只接受绑定的执行事实。"""
 
 import json
-from typing import Literal
+from typing import Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError, model_validator
 
 from weavria.context import ModelRequestContextCompiler, ModelRequestContextError
 from weavria.core import ErrorCategory, ModelRequest, TaskInput, ToolCallAction
@@ -27,7 +27,14 @@ class _Wire(BaseModel):
 
 class _Citation(_Wire):
     evidence: int = Field(ge=0, le=35)
-    quote: str = Field(min_length=1, max_length=512)
+    first_line: int = Field(ge=1, le=65536)
+    last_line: int = Field(ge=1, le=65536)
+
+    @model_validator(mode="after")
+    def bounded_range(self) -> Self:
+        if not self.first_line <= self.last_line < self.first_line + 8:
+            raise ValueError("cite one to eight contiguous evidence lines")
+        return self
 
 
 class _Judgment(_Wire):
@@ -54,13 +61,33 @@ withdrawn = original conclusion should be explicitly withdrawn (candidate absent
 insufficient = proposed change is wrong, evidence missing, ambiguous or conditions not established.
 Changing a version number alone is not evidence. Preserve units, scope, negation and exceptions.
 Do not approve withdrawal merely because a candidate was deleted; it needs an evidential reason.
-Every positive decision must cite exact contiguous source text; include CURRENT parent evidence.
+Every positive decision must cite exact contiguous source lines; include CURRENT parent evidence.
 Use the explicit evidence_index on each evidence item (zero based), not document numbers.
 Different ranges of the same artifact are DIFFERENT evidence items. For each target, cite
 at least one item from EACH parent_evidence_groups entry. Never merge or renumber those items.
+Select first_line and last_line from that item's numbered lines (one based, inclusive, at most 8).
+Do not copy quotes or calculate character offsets. The host resolves the exact original text.
 Return one judgment per target, no omissions or extra IDs. Diagnostic is a short actionable gap or
 public factual finding, never private reasoning. Do not generate answers or execute tools.
 Return exactly one tool call named review_work with arguments matching this schema: """
+
+
+def _evidence_lines(text: str) -> list[JsonValue]:
+    """给原文分配可选择的坐标,不做摘要或语义切分。
+
+    保留换行和空白,长行每 256 个 Unicode 字符分段。每个字符恰好出现一次,
+    同样的句子可以通过不同的行号消歧。坐标相对当前授权区间,不是文件行号。
+    """
+    lines: list[JsonValue] = []
+    offset = 0
+    for original in text.splitlines(keepends=True):
+        for start in range(0, len(original), 256):
+            part = original[start : start + 256]
+            lines.append(
+                {"line": len(lines) + 1, "start": offset, "end": offset + len(part), "text": part}
+            )
+            offset += len(part)
+    return lines
 
 
 def _bound_state(context: ToolContext) -> WorkingState:
@@ -131,7 +158,7 @@ class ModelWorkRechecker:
 
     @property
     def version(self) -> str:
-        return "work-evidence-recheck/3:" + self._configuration_id
+        return "work-evidence-recheck/4:" + self._configuration_id
 
     async def review(
         self, update: WorkUpdate, context: ToolContext
@@ -240,11 +267,17 @@ class ModelWorkRechecker:
                         ErrorCategory.INVALID_TOOL_ARGUMENTS, "Invalid recheck evidence range"
                     ) from exc
                 text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+                if len(text.encode()) > 65536 - size:
+                    diagnostic = "Evidence packet exceeds 64 KiB; select exact source ranges."
+                    break
                 item: dict[str, JsonValue] = {
                     "evidence_index": len(evidence),
                     "reference": ref.model_dump(mode="json"),
                     "artifact": snapshot.reference.model_dump(mode="json"),
-                    "text": text,
+                    "lines": _evidence_lines(text),
+                    "coordinate_space": "unicode_text"
+                    if isinstance(value, str)
+                    else "json_rendering",
                 }
                 size += len(json.dumps(item).encode())
                 if size > 65536:
@@ -280,7 +313,7 @@ class ModelWorkRechecker:
                             targets
                         ):
                             raise ValueError("review target mismatch")
-                        self._validate_judgments(
+                        payload["resolved_citations"] = self._validate_judgments(
                             judgments, old, new, state, evidence, parent_evidence
                         )
                     except _GroundingError as exc:
@@ -325,19 +358,49 @@ class ModelWorkRechecker:
         state: WorkingState,
         evidence: list[dict[str, JsonValue]],
         parent_evidence: dict[str, tuple[set[int], ...]],
-    ) -> None:
-        """引文必须存在,正向接纳还必须覆盖当前父证据;这不代替模型蕴含判断。"""
+    ) -> list[JsonValue]:
+        """宿主把选中的行号还原为精确区间,正向接纳须覆盖每组当前父证据。
+
+        模型不再负责誊抄或计数字符;行号仍可能选错,这不代替语义蕴含判断。
+        返回的原文、绝对字符范围与引用身份进入材料附件,用于审计和回放。
+        """
+        resolved: list[JsonValue] = []
         for judgment in judgments:
             cited: set[int] = set()
             for citation in judgment.citations:
                 if citation.evidence >= len(evidence):
                     raise _GroundingError("Citations must use an evidence index from this packet.")
-                text = evidence[citation.evidence]["text"]
-                if not isinstance(text, str) or text.count(citation.quote) != 1:
+                item = evidence[citation.evidence]
+                lines = item["lines"]
+                assert isinstance(lines, list)
+                if citation.last_line > len(lines):
                     raise _GroundingError(
-                        "Copy exact, unique original text from each cited evidence range; "
-                        "do not paraphrase or join separate quotes."
+                        "Citations must select existing first_line/last_line "
+                        "within the evidence item."
                     )
+                selected = lines[citation.first_line - 1 : citation.last_line]
+                assert all(isinstance(line, dict) for line in selected)
+                first, last = selected[0], selected[-1]
+                assert isinstance(first, dict) and isinstance(last, dict)
+                quote = "".join(str(line["text"]) for line in selected if isinstance(line, dict))
+                if not quote.strip():
+                    raise _GroundingError("Cite substantive original text, not empty lines.")
+                reference = WorkReference.model_validate_json(json.dumps(item["reference"]))
+                offset = reference.start or 0
+                start, end = first["start"], last["end"]
+                assert isinstance(start, int) and isinstance(end, int)
+                resolved.append(
+                    {
+                        "note_id": judgment.note_id,
+                        **citation.model_dump(mode="json"),
+                        "reference": reference.model_dump(mode="json"),
+                        "artifact": item["artifact"],
+                        "start": offset + start,
+                        "end": offset + end,
+                        "quote": quote,
+                        "coordinate_space": item["coordinate_space"],
+                    }
+                )
                 cited.add(citation.evidence)
             if judgment.status == "insufficient":
                 continue
@@ -372,3 +435,4 @@ class ModelWorkRechecker:
                 raise _GroundingError(
                     "Use supported for unchanged conclusions and revised for changed conclusions."
                 )
+        return resolved

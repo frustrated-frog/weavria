@@ -71,9 +71,7 @@ from weavria.runtime import RunLimits
 from weavria.tools import ReadOnlyPolicy, ToolExecutor, ToolRegistry
 
 
-def response(
-    status: str = "revised", *, quote: str = "New total is 20.", note: str = "b"
-) -> ModelResponse:
+def response(status: str = "revised", *, line: int = 1, note: str = "b") -> ModelResponse:
     return ModelResponse(
         action=ToolCallAction(
             call_id="review",
@@ -84,7 +82,7 @@ def response(
                         "note_id": note,
                         "status": status,
                         "diagnostic": "Use the corrected total.",
-                        "citations": [{"evidence": 1, "quote": quote}]
+                        "citations": [{"evidence": 1, "first_line": line, "last_line": line}]
                         if status != "insufficient"
                         else [],
                     }
@@ -254,15 +252,15 @@ async def test_grounded_recheck_updates_frontier_and_replays_without_model(
 
 
 @pytest.mark.parametrize(
-    "status,quote",
-    [("insufficient", ""), ("revised", "invented text"), ("supported", "New total is 20.")],
+    "status,line",
+    [("insufficient", 1), ("revised", 999), ("supported", 1)],
 )
 async def test_rejected_or_invalid_review_preserves_old_state(
     session_counter: OpenAICompatibleTokenCounter,
     status: str,
-    quote: str,
+    line: int,
 ) -> None:
-    provider = FakeModelProvider((response(status, quote=quote),))
+    provider = FakeModelProvider((response(status, line=line),))
     run = RecheckRun(provider, session_counter)
     a, b, c, d = await run.prepare()
     before = run.state
@@ -669,3 +667,88 @@ async def test_nonconclusive_planning_does_not_trigger_semantic_review(
     plan = plan.model_copy(update={"depends_on": (WorkDependency(note_id="a", revision=1),)})
     await run.apply((root, plan))
     assert run.state.revision == 2 and provider.requests == ()
+
+
+@pytest.mark.parametrize("compact", [False, True])
+async def test_unknown_parent_rejected_before_commit_but_existing_missing_edges_survive(
+    session_counter: OpenAICompatibleTokenCounter, compact: bool
+) -> None:
+    provider = FakeModelProvider(())
+    run = RecheckRun(provider, session_counter, compact=compact)
+    root = WorkNote(note_id="a", kind="result", summary="Sourced root")
+    child = WorkNote(
+        note_id="b",
+        kind="hypothesis",
+        summary="Derived",
+        depends_on=(WorkDependency(note_id="invented", revision=1),),
+    )
+    rejected = await run.apply((root, child))
+    assert isinstance(rejected.exchange.observation, ToolFailedObservation)
+    assert "unknown note_id 'invented'" in rejected.exchange.observation.error.message
+    assert run.state.revision == 0 and run.state.notes == ()
+    child = child.model_copy(update={"depends_on": (WorkDependency(note_id="a", revision=1),)})
+    await run.apply((root, child))
+    assert run.state.revision == 1 and not run.state.stale_note_ids
+    # 删除已知父节点会留下可解释的缺边,不能被“拒绝新造缺边”规则误伤。
+    await run.apply((child,))
+    assert run.state.revision == 2 and run.state.dependency_issues[0].missing == ("a",)
+    await run.apply((child,))
+    assert run.state.last_notice == "accepted"
+    assert provider.requests == ()
+
+
+@pytest.mark.parametrize("text,line", [("相同\r\n相同\r\n", 2), ("🙂" * 300, 2)])
+async def test_host_resolves_numbered_evidence_to_exact_original_coordinates(
+    session_counter: OpenAICompatibleTokenCounter, text: str, line: int
+) -> None:
+    provider = FakeModelProvider((response(line=line),))
+    run = RecheckRun(provider, session_counter)
+    a, b, c, d = await run.prepare()
+    original = "前缀🙂" + text + "后缀"
+    source = await run.store.put("r", "lines", {"text": original})
+    ref = WorkReference(
+        artifact_id=source.reference.artifact_id, pointer="/text", start=3, end=3 + len(text)
+    )
+    a = a.model_copy(update={"sources": (ref,)})
+    await run.apply((a, b, c, d))
+    b = b.model_copy(
+        update={"summary": "Revised", "depends_on": (WorkDependency(note_id="a", revision=3),)}
+    )
+    record = await run.apply((a, b, c, d))
+    assert run.state.last_notice == "accepted" and record.artifact is not None
+    proposal = WorkProposal.model_validate_json(
+        (await run.store.get("r", record.artifact.artifact_id)).content_json
+    )
+    packet = (await run.store.get("r", proposal.rechecks[0].packet.artifact_id)).value
+    assert isinstance(packet, dict)
+    citations = packet["resolved_citations"]
+    assert isinstance(citations, list) and isinstance(citations[0], dict)
+    citation = citations[0]
+    start, end = citation["start"], citation["end"]
+    assert isinstance(start, int) and isinstance(end, int)
+    assert original[start:end] == citation["quote"]
+    assert citation["coordinate_space"] == "unicode_text"
+    request = json.loads(provider.requests[0].task.goal)
+    lines = request["evidence"][1]["lines"]
+    assert "".join(row["text"] for row in lines) == text
+    assert all(row["text"] == text[row["start"] : row["end"]] for row in lines)
+    assert request["evidence"][1]["reference"]["start"] == 3
+
+
+@pytest.mark.parametrize("first,last", [(0, 1), (2, 1), (1, 9), (True, 1)])
+async def test_invalid_line_ranges_leave_work_pending(
+    session_counter: OpenAICompatibleTokenCounter, first: int, last: int
+) -> None:
+    raw = response().model_dump(mode="json")
+    raw["action"]["arguments"]["judgments"][0]["citations"][0].update(
+        first_line=first, last_line=last
+    )
+    run = RecheckRun(
+        FakeModelProvider((ModelResponse.model_validate_json(json.dumps(raw)),)), session_counter
+    )
+    a, b, c, d = await run.prepare()
+    b = b.model_copy(
+        update={"summary": "Revised", "depends_on": (WorkDependency(note_id="a", revision=2),)}
+    )
+    await run.apply((a, b, c, d))
+    assert run.state.last_notice == "recheck_required" and run.state.revision == 2

@@ -107,7 +107,7 @@ class TaskAwareSessionPreparer:
     def version(self) -> str:
         return (
             f"task-aware-session/15[work={self._working_records};"
-            + ("evidence-recheck/3;" if self._work_recheck else "")
+            + ("evidence-recheck/4;" if self._work_recheck else "")
             + f"{self._outcomes.version if self._outcomes else 'no-outcomes'};"
             f"{self._understanding.version};{self._evidence.version};"
             f"{self._capabilities.version};{self._clarification.version};"

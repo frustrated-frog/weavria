@@ -4,7 +4,7 @@ import hashlib
 import json
 import re
 from collections.abc import Awaitable, Callable
-from typing import Annotated, Literal, Protocol, Self
+from typing import Annotated, Literal, Protocol, Self, cast
 
 from pydantic import (
     BaseModel,
@@ -358,6 +358,18 @@ def compact_work(state: WorkingState) -> dict[str, JsonValue]:
     return compact if len(encoded) + 64 <= len(raw) else full
 
 
+class WorkQuoteReference(_WorkBase):
+    """Select a unique source quote; ambiguity is rejected."""
+
+    # 仅用于工具输入;接受前转成 WorkReference。模型选择证据内容,宿主计算
+    # Unicode 坐标。重复、转述、跨字段拼接都不能定位;不扩大访问权限。
+    # 输入参数由 ToolRecord 与工具版本追溯;工作状态只持久化正规化引用。
+
+    artifact_id: Identity
+    pointer: Annotated[str, StringConstraints(max_length=256)]
+    quote: Annotated[str, StringConstraints(min_length=1, max_length=512, pattern=r"\S")]
+
+
 class WorkDraftNote(_VersionedWork):
     """模型负责内容与关联;省略编号时由内容摘要确定稳定编号。"""
 
@@ -365,7 +377,7 @@ class WorkDraftNote(_VersionedWork):
     kind: Literal["plan", "hypothesis", "result", "rejected", "issue"]
     summary: Text
     need_ids: tuple[Identity, ...] = Field(default=(), max_length=4)
-    sources: tuple[WorkReference, ...] = Field(default=(), max_length=2)
+    sources: tuple[WorkReference | WorkQuoteReference, ...] = Field(default=(), max_length=2)
     depends_on: tuple[WorkDependency, ...] = Field(
         default=(), max_length=5, exclude_if=lambda value: not value
     )
@@ -390,7 +402,11 @@ class WorkDraft(_VersionedWork):
     next_query: str = Field(default="", max_length=240)
 
 
-def _bind_draft(draft: WorkDraft, context: ToolContext) -> WorkUpdate:
+def _bind_draft(
+    draft: WorkDraft,
+    context: ToolContext,
+    resolved: dict[WorkReference | WorkQuoteReference, WorkReference],
+) -> WorkUpdate:
     view = context.task_view
     raw = view.progress.get("working_state") if view else None
     # 两种投影共用 CAS 标识。只读取宿主随本次请求绑定的版本, 不用摘要重建状态。
@@ -409,6 +425,11 @@ def _bind_draft(draft: WorkDraft, context: ToolContext) -> WorkUpdate:
         )
     if draft.schema_version == 1 and any(n.depends_on for n in draft.notes):
         raise ValueError("work dependencies require schema v2")
+    # 先正规化再生成自动 ID: 同一原文用短句或坐标提交应取得相同身份。
+    normalized = tuple(
+        n.model_copy(update={"sources": tuple(resolved[ref] for ref in n.sources)})
+        for n in draft.notes
+    )
     notes = tuple(
         WorkNote(
             note_id=n.note_id
@@ -417,10 +438,10 @@ def _bind_draft(draft: WorkDraft, context: ToolContext) -> WorkUpdate:
             kind=n.kind,
             summary=n.summary,
             need_ids=n.need_ids,
-            sources=n.sources,
+            sources=cast(tuple[WorkReference, ...], n.sources),
             depends_on=n.depends_on,
         )
-        for n in draft.notes
+        for n in normalized
     )
     return WorkUpdate(
         task_revision=task_revision,
@@ -431,14 +452,71 @@ def _bind_draft(draft: WorkDraft, context: ToolContext) -> WorkUpdate:
     )
 
 
+def _check_draft_dependencies(update: WorkUpdate, context: ToolContext) -> None:
+    """拒绝新造的悬空边,保留原图因删除父节点产生的失效事实。
+
+    自动编号无法推断模型写的 n1 到底指谁。只检查声明的身份关系,不猜测
+    漏边或改写依赖。旧缺边必须允许原样带回,否则全量替换无法逐步修复。
+    """
+    view = context.task_view
+    raw = view.progress.get("working_state") if view else None
+    # 直接工具调用可能只传显式版本而没有宿主状态;无法判定边是否已存在。
+    # 保留这条旧接入路径的缺边语义,推荐 Harness 路径始终绑定工作视图。
+    if not isinstance(raw, dict):
+        return
+    previous: JsonValue = raw.get("notes", [])
+    old_edges: set[tuple[str, str, int]] = set()
+    if isinstance(previous, list):
+        for note in previous:
+            if not isinstance(note, dict):
+                continue
+            identity = note.get("note_id")
+            if not isinstance(identity, str):
+                continue
+            edges = note.get("depends_on", [])
+            if isinstance(edges, list):
+                for edge in edges:
+                    if isinstance(edge, dict):
+                        parent, revision = edge.get("note_id"), edge.get("revision")
+                        if isinstance(parent, str) and type(revision) is int:
+                            old_edges.add((identity, parent, revision))
+    identities = {n.note_id for n in update.notes}
+    for index, note in enumerate(update.notes):
+        for edge in note.depends_on:
+            if (
+                edge.note_id not in identities
+                and (
+                    note.note_id,
+                    edge.note_id,
+                    edge.revision,
+                )
+                not in old_edges
+            ):
+                raise ToolFault(
+                    ErrorCategory.INVALID_TOOL_ARGUMENTS,
+                    f"notes[{index}] depends on unknown note_id {edge.note_id!r}. "
+                    "Assign explicit note_id to the referenced notes in this proposal; "
+                    "omitted IDs are generated and are not positional aliases. "
+                    "No work update was committed.",
+                )
+
+
 class _WorkTool(TypedTool[WorkDraft, WorkProposal]):
     def validate_arguments(self, arguments: dict[str, JsonValue]) -> WorkDraft:
         # 模型工具参数来自 JSON;通过 JSON 校验允许数组表示不可变 tuple,
         # 同时保留数字/字符串等字段的严格类型,不关闭整个 Schema 的 strict。
-        return WorkDraft.model_validate_json(json.dumps(arguments))
+        try:
+            return WorkDraft.model_validate_json(json.dumps(arguments))
+        except ValueError as exc:
+            raise ToolFault(
+                ErrorCategory.INVALID_TOOL_ARGUMENTS,
+                "Invalid work draft: sources need artifact_id and original pointer; "
+                "use either an exact quote or a paired start/end source "
+                "range, with valid note fields and bounded values.",
+            ) from exc
 
 
-_SOURCE_HEADING = re.compile(r"^={3,} +([^\r\n]{1,240}?) +={3,} *$", re.MULTILINE)
+_SOURCE_HEADING = re.compile(r"^={3,} +([^\r\n]{1,240}?) +={3,} *\r?$", re.MULTILINE)
 
 
 def _source_label(value: str, start: int, end: int) -> str | None:
@@ -502,25 +580,71 @@ def recheck_targets(state: WorkingState, update: WorkUpdate) -> tuple[str, ...]:
 
 def work_tool(*, rechecker: WorkRechecker | None = None) -> TypedTool[WorkDraft, WorkProposal]:
     async def propose(draft: WorkDraft, context: ToolContext) -> WorkProposal:
-        try:
-            update = _bind_draft(draft, context)
-        except ValueError as exc:
-            raise ToolFault(
-                ErrorCategory.INVALID_TOOL_ARGUMENTS, "Invalid bounded work update"
-            ) from exc
         sources: list[WorkSource] = []
-        for note in update.notes:
-            for ref in note.sources:
-                if any(s.reference == ref for s in sources):
+        resolved: dict[WorkReference | WorkQuoteReference, WorkReference] = {}
+        for note_index, note in enumerate(draft.notes):
+            for source_index, selector in enumerate(note.sources):
+                if selector in resolved:
                     continue
-                snapshot = await context.read_artifact(ref.artifact_id)
+                # 必须先授权再定位;诊断只涉及已授权字段,不泄露另一个 Artifact。
+                snapshot = await context.read_artifact(selector.artifact_id)
+                location = f"notes[{note_index}].sources[{source_index}]"
+                document = snapshot.value
                 try:
-                    document = snapshot.value
-                    value = resolve_pointer(document, ref.pointer)
+                    value = resolve_pointer(document, selector.pointer)
+                except (KeyError, IndexError, ValueError) as exc:
+                    # 不猜测 /data/text 到 /text 的映射。只给可复制的顶层地址,
+                    # 后续仍由模型决定引用哪个字段,并经过同一权限边界。
+                    pointers = (
+                        ["/" + k.replace("~", "~0").replace("/", "~1") for k in document][:8]
+                        if isinstance(document, dict)
+                        else [""]
+                    )
+                    raise ToolFault(
+                        ErrorCategory.INVALID_TOOL_ARGUMENTS,
+                        f"{location}: invalid Artifact pointer. Available root pointers: "
+                        + json.dumps(pointers, ensure_ascii=False)[:400]
+                        + ". Use the Artifact itself, without the observation wrapper.",
+                    ) from exc
+                try:
+                    if isinstance(selector, WorkQuoteReference):
+                        if not isinstance(value, str):
+                            pointers = (
+                                [
+                                    selector.pointer + "/" + k.replace("~", "~0").replace("/", "~1")
+                                    for k, v in value.items()
+                                    if isinstance(v, str)
+                                ][:8]
+                                if isinstance(value, dict)
+                                else []
+                            )
+                            raise ValueError(
+                                "quote requires a text field; available text pointers: "
+                                + json.dumps(pointers, ensure_ascii=False)[:400]
+                            )
+                        start = value.find(selector.quote)
+                        if start < 0 or value.find(selector.quote, start + 1) >= 0:
+                            # 第二次从 start+1 搜索,包含 aaa 中 aa 这样的重叠歧义。
+                            raise ValueError(
+                                "quote must occur exactly once; copy a longer exact phrase"
+                            )
+                        ref = WorkReference(
+                            artifact_id=selector.artifact_id,
+                            pointer=selector.pointer,
+                            start=start,
+                            end=start + len(selector.quote),
+                        )
+                    else:
+                        ref = selector
                     label = None
                     if ref.start is not None and ref.end is not None:
                         if not isinstance(value, str) or ref.end > len(value):
-                            raise ValueError("work range outside source text")
+                            length = len(value) if isinstance(value, str) else 0
+                            raise ValueError(
+                                f"text range requires 0 <= start < end <= {length} characters; "
+                                "Artifact size_bytes is not a character offset. "
+                                "Use a unique quote instead of guessed offsets"
+                            )
                         label = _source_label(value, ref.start, ref.end)
                     if (
                         label is None
@@ -532,20 +656,27 @@ def work_tool(*, rechecker: WorkRechecker | None = None) -> TypedTool[WorkDraft,
                         path = document.get("path")
                         if isinstance(path, str) and 0 < len(path) <= 240:
                             label = path
-                except (KeyError, IndexError, ValueError) as exc:
+                except ValueError as exc:
                     raise ToolFault(
                         ErrorCategory.INVALID_TOOL_ARGUMENTS,
-                        "Invalid work source pointer or range. Use the original Artifact JSON "
-                        "pointer from its excerpt, without the observation wrapper, "
-                        "and copy the exact start/end.",
+                        f"{location}: {exc}.",
                     ) from exc
-                sources.append(
-                    WorkSource(
-                        reference=ref,
-                        artifact=snapshot.reference,
-                        source_label=label,
+                resolved[selector] = ref
+                if not any(s.reference == ref for s in sources):
+                    sources.append(
+                        WorkSource(
+                            reference=ref,
+                            artifact=snapshot.reference,
+                            source_label=label,
+                        )
                     )
-                )
+        try:
+            update = _bind_draft(draft, context, resolved)
+        except ValueError as exc:
+            raise ToolFault(
+                ErrorCategory.INVALID_TOOL_ARGUMENTS, "Invalid bounded work update"
+            ) from exc
+        _check_draft_dependencies(update, context)
         # 这里只生成提议 Artifact,不写隐藏状态。Runtime 接受结果后才做归约;
         # 同批业务工具的新结果尚未接受,不能被工作提议提前引用。
         receipts = await rechecker.review(update, context) if rechecker is not None else ()
@@ -574,23 +705,21 @@ def work_tool(*, rechecker: WorkRechecker | None = None) -> TypedTool[WorkDraft,
 
     return _WorkTool(
         name=WORK_TOOL,
-        # 输出 Schema 新增可选收据,即使策略关闭也更新描述版本,避免旧目录缓存
-        # 把新 Schema 误认为旧 v5。默认生成的提案仍为无收据的 v2。
-        version="6:" + rechecker.version if rechecker is not None else "6",
+        # v7 增加输入短句定位与悬空边准入;持久化仍使用原有精确坐标和版本。
+        version="7:" + rechecker.version if rechecker is not None else "7",
         timeout_seconds=60 if rechecker is not None else 10,
         input_type=WorkDraft,
         output_type=WorkProposal,
         description=(
-            "Replace up to six fallible working notes; retain useful notes. Sources use accepted "
-            "artifact_id/pointer without observation wrapper; copy exact start/end for text spans. "
-            "Omitted task/base revisions and note_id are host-bound. Stable note_id plus "
-            "depends_on [{note_id,revision}] binds conclusions to working_state.note_revisions. "
-            "New/changed notes get base_revision+1. Recheck conclusions before rebinding versions. "
-            "dependency_issues reports changed/missing parents and blocked_by stale parents; "
-            "recheck upstream first or retire obsolete notes. Stale results block final delivery. "
-            "Sourced results lower exploration priority; issues/next_need_ids raise it. "
-            "Check working_state.last_notice for acceptance. Notes are not proof or private "
-            "reasoning. Honor requested working notes even for short answers."
+            "Replace <=6 working notes; retain useful ones. Sources: accepted artifact_id, "
+            "original pointer, unique exact quote OR character start/end (not size_bytes). "
+            "Omitted revisions/"
+            "IDs are host-bound. Referenced parents need explicit note_id, never guessed IDs. "
+            "depends_on {note_id,revision} uses working_state.note_revisions; "
+            "changed/new notes get "
+            "base_revision+1. Recheck upstream before rebinding: stale results block Finish. "
+            "Inspect dependency_issues and last_notice. Honor requested notes; they are inference, "
+            "not proof or private reasoning."
             + (
                 " Evidence recheck is enabled: submit one dependency frontier at a time. "
                 "Changes to stale notes are reviewed against authorized original sources. "
