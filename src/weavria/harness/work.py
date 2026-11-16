@@ -146,9 +146,17 @@ class WorkProposal(_VersionedWork):
         return self
 
 
-class WorkingState(_VersionedWork):
+class WorkingState(_WorkBase):
     """可重建的工作投影。游标防止重复应用,CAS 防止同批更新相互覆盖。"""
 
+    schema_version: Literal[1, 2, 3, 4] = 2
+    # 每个活跃笔记一个宿主摘要;失效单独锁存,避免证据 ABA 自动恢复。
+    evidence_heads: dict[Identity, Annotated[str, Field(pattern=r"^[a-f0-9]{64}$")]] = Field(
+        default_factory=dict, max_length=6, exclude_if=lambda value: not value
+    )
+    evidence_invalidated: tuple[Identity, ...] = Field(
+        default=(), max_length=6, exclude_if=lambda value: not value
+    )
     trust: Literal["model_inference"] = "model_inference"
     task_revision: int = Field(ge=1)
     revision: int = Field(default=0, ge=0)
@@ -179,8 +187,18 @@ class WorkingState(_VersionedWork):
     def bounded(self) -> Self:
         if (
             self.recheck_required or self.last_notice == "recheck_required"
-        ) and self.schema_version != 3:
+        ) and self.schema_version < 3:
             raise ValueError("evidence recheck state requires schema v3")
+        identities = {n.note_id for n in self.notes}
+        if self.schema_version < 4 and (self.evidence_heads or self.evidence_invalidated):
+            raise ValueError("evidence tracking requires working state v4")
+        if self.schema_version == 4 and (
+            not self.recheck_required
+            or set(self.evidence_heads) != identities
+            or not set(self.evidence_invalidated) <= identities
+            or len(set(self.evidence_invalidated)) != len(self.evidence_invalidated)
+        ):
+            raise ValueError("evidence tracking must cover the current work notes")
         _dependency_order(self.notes)
         if self.schema_version == 1:
             if (
@@ -210,7 +228,9 @@ class WorkingState(_VersionedWork):
                 for edge in note.depends_on
             ):
                 raise ValueError("work dependencies cannot bind future revisions")
-            if self.dependency_issues != _dependency_issues(self.notes, self.note_revisions):
+            if self.dependency_issues != _dependency_issues(
+                self.notes, self.note_revisions, self.evidence_invalidated
+            ):
                 raise ValueError("working dependency issues must match the versioned graph")
         if len(self.model_dump_json().encode()) > MAX_WORK_BYTES:
             raise ValueError("working state exceeds its fixed byte budget")
@@ -264,7 +284,7 @@ def _dependency_order(notes: tuple[WorkNote, ...]) -> tuple[str, ...]:
 
 
 def _dependency_issues(
-    notes: tuple[WorkNote, ...], versions: dict[str, int]
+    notes: tuple[WorkNote, ...], versions: dict[str, int], invalidated: tuple[str, ...] = ()
 ) -> tuple[WorkDependencyIssue, ...]:
     by_id = {note.note_id: note for note in notes}
     issues: dict[str, WorkDependencyIssue] = {}
@@ -279,7 +299,7 @@ def _dependency_issues(
                 blocked.append(edge.note_id)
             elif edge.revision != versions[edge.note_id]:
                 changed.append(edge.note_id)
-        if changed or missing or blocked:
+        if changed or missing or blocked or identity in invalidated:
             issues[identity] = WorkDependencyIssue(
                 note_id=identity,
                 changed=tuple(changed),
@@ -572,7 +592,8 @@ def recheck_targets(state: WorkingState, update: WorkUpdate) -> tuple[str, ...]:
             or (note.note_id in proposed and proposed[note.note_id].kind == "result")
         )
         and (
-            note.note_id not in proposed
+            (note.note_id in state.evidence_invalidated and note.note_id in state.recheck_note_ids)
+            or note.note_id not in proposed
             or _note_content(note) != _note_content(proposed[note.note_id])
         )
     )
@@ -699,14 +720,43 @@ def work_tool(*, rechecker: WorkRechecker | None = None) -> TypedTool[WorkDraft,
             ],
         }
         reserve = len(json.dumps(overhead, ensure_ascii=False, separators=(",", ":")).encode())
+        if rechecker is not None:
+            # 为每个节点的证据摘要与锁存身份预留最坏空间,不等归约时才超限。
+            reserve += (
+                len(
+                    json.dumps(
+                        {
+                            "evidence_heads": {n.note_id: "f" * 64 for n in update.notes},
+                            "evidence_invalidated": [n.note_id for n in update.notes],
+                        },
+                        ensure_ascii=False,
+                    ).encode()
+                )
+                + 128
+            )
+            # 来源匹配可能补上模型省略的 need_ids。按本次宿主需求目录的最长
+            # 四个 ID 为每条笔记预留,防止工具成功后归约才因新增关联超出预算。
+            definition = context.task_view.definition if context.task_view else {}
+            declared_needs = definition.get("needs")
+            identities = (
+                [
+                    item["id"]
+                    for item in declared_needs
+                    if isinstance(item, dict) and isinstance(item.get("id"), str)
+                ]
+                if isinstance(declared_needs, list)
+                else ["x" * 128] * 4
+            )
+            largest = sorted(identities, key=lambda i: len(str(i).encode()), reverse=True)[:4]
+            reserve += len(json.dumps(largest, ensure_ascii=False).encode()) * len(update.notes)
         if len(proposal.model_dump_json().encode()) + reserve > MAX_WORK_BYTES - 512:
             raise ToolFault(ErrorCategory.INVALID_TOOL_ARGUMENTS, "Work proposal is too large")
         return proposal
 
     return _WorkTool(
         name=WORK_TOOL,
-        # v7 增加输入短句定位与悬空边准入;持久化仍使用原有精确坐标和版本。
-        version="7:" + rechecker.version if rechecker is not None else "7",
+        # 开启审查时 v8 接入 Ledger 驱动的根失效;关闭时保留 v7 协议。
+        version="8:" + rechecker.version if rechecker is not None else "7",
         timeout_seconds=60 if rechecker is not None else 10,
         input_type=WorkDraft,
         output_type=WorkProposal,
@@ -725,12 +775,176 @@ def work_tool(*, rechecker: WorkRechecker | None = None) -> TypedTool[WorkDraft,
                 "Changes to stale notes are reviewed against authorized original sources. "
                 "Read rechecks diagnostics; failed reviews leave ALL notes unchanged. "
                 "Keep source ranges and parent dependencies; fetch missing evidence before retry."
+                " evidence_invalidated lists roots whose accepted need evidence changed. "
+                "Refresh those roots with current sources first, then recheck descendants. "
+                "Do not drop need_ids to hide changed evidence. An unchanged root conclusion "
+                "can be resubmitted for review; accepted review advances its version."
                 if rechecker is not None
                 else ""
             )
         ),
         execute=propose,
     )
+
+
+def work_evidence_heads(notes: tuple[WorkNote, ...], ledger: NeedLedger) -> dict[str, str]:
+    """只摘要笔记关联的接受证据;全局版本或无关工具失败不触发重算。
+
+    排序消除绑定排列差异。保留 freshness/作用域/证明强度,不能只比较 binding_id:
+    同一个绑定的时效判定可以改变而身份不变。摘要不暴露原始证据正文。
+    """
+    bindings = {b.binding_id: b for b in ledger.bindings}
+    needs: dict[str, object] = {}
+    for need in ledger.states:
+        needs[need.need_id] = {
+            "status": need.status.value,
+            "missing": sorted(need.missing_fields),
+            "bindings": [
+                bindings[i].model_dump(mode="json")
+                for i in sorted(set(need.evidence_binding_ids))
+                if i in bindings
+            ],
+        }
+    return {
+        note.note_id: hashlib.sha256(
+            json.dumps(
+                {i: needs.get(i) for i in sorted(note.need_ids)},
+                sort_keys=True,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+        for note in notes
+    }
+
+
+def associate_work_needs(proposal: WorkProposal, ledger: NeedLedger) -> tuple[WorkNote, ...]:
+    """按已接受原文地址补充依赖,不要求模型复制内部 Need ID。
+
+    这里只建立“引用了该需求的材料”的保守依赖,不声称摘要被材料蕴含。
+    保留模型显式声明;新关联超过原有四需求上限时拒绝整个提议,不截断关系。
+    """
+    sources = {s.reference: s.artifact for s in proposal.sources}
+    notes: list[WorkNote] = []
+    for note in proposal.update.notes:
+        associated = set(note.need_ids)
+        for binding in ledger.bindings:
+            if any(
+                (artifact := sources.get(ref)) is not None
+                and any(
+                    address.artifact_id == artifact.artifact_id
+                    and address.artifact_sha256 == artifact.sha256
+                    and address.producer_run_id == artifact.run_id
+                    and address.producer_call_id == artifact.call_id
+                    and (
+                        ref.pointer == address.json_pointer
+                        or ref.pointer.startswith(address.json_pointer + "/")
+                        or address.json_pointer.startswith(ref.pointer + "/")
+                    )
+                    for address in binding.addresses
+                )
+                for ref in note.sources
+            ):
+                associated.add(binding.need_id)
+        notes.append(
+            WorkNote.model_validate(
+                note.model_copy(
+                    update={
+                        "need_ids": tuple(sorted(associated)),
+                    }
+                )
+            )
+        )
+    return tuple(notes)
+
+
+def reconcile_work_evidence(state: WorkingState, ledger: NeedLedger) -> WorkingState:
+    """将 Ledger 变化原子投影到既有工作图;不改写原文或调用模型。
+
+    失效锁存到显式重验,新变化推进 CAS,同一输入重放幂等。独立节点的版本
+    保持不变。先同步再消费提案,防止同批工具的新事实与旧审查收据混用。
+    """
+    if state.task_revision != ledger.task_revision:
+        raise ValueError("work evidence belongs to another task revision")
+    if state.schema_version != 4:
+        return state
+    heads = work_evidence_heads(state.notes, ledger)
+    changed = {i for i, digest in heads.items() if state.evidence_heads[i] != digest}
+    if not changed:
+        return state
+    invalidated = tuple(
+        n.note_id for n in state.notes if n.note_id in changed | set(state.evidence_invalidated)
+    )
+    return WorkingState.model_validate(
+        state.model_copy(
+            update={
+                "revision": state.revision + 1,
+                "evidence_heads": heads,
+                "evidence_invalidated": invalidated,
+                "dependency_issues": _dependency_issues(
+                    state.notes, state.note_revisions, invalidated
+                ),
+                "last_notice": "recheck_required",
+                "next_need_ids": (),
+                "next_query": "",
+            }
+        )
+    )
+
+
+def evidence_refresh_allowed(
+    state: WorkingState, proposal: WorkProposal, ledger: NeedLedger
+) -> bool:
+    """模型重验之外再核对当前来源;旧根的 need_ids 不能被删改以逃避检查。"""
+    proposed = {n.note_id: n for n in proposal.update.notes}
+    sources = {s.reference: s.artifact for s in proposal.sources}
+    reviewed = {r.note_id for r in proposal.rechecks}
+    for old in state.notes:
+        candidate = proposed.get(old.note_id)
+        if (
+            old.note_id not in state.evidence_invalidated
+            or candidate is None
+            or (candidate.kind == "rejected")
+        ):
+            continue
+        if old.kind != "result" and candidate.kind != "result":
+            continue
+        if old.note_id not in reviewed:
+            # 非前沿节点原样保留,仍在失效集合中,不能冒充已重新绑定。
+            continue
+        for identity in old.need_ids:
+            try:
+                need = ledger.state_for(identity)
+            except KeyError:
+                return False
+            if not need.acquisition_complete:
+                return False
+            addresses = [
+                a
+                for b in ledger.bindings
+                if b.binding_id in need.evidence_binding_ids
+                and b.relation in {"supports", "partially_supports"}
+                and b.freshness != "stale"
+                for a in b.addresses
+            ]
+            if not any(
+                (artifact := sources.get(ref)) is not None
+                and any(
+                    a.artifact_id == artifact.artifact_id
+                    and a.artifact_sha256 == artifact.sha256
+                    and a.producer_run_id == artifact.run_id
+                    and a.producer_call_id == artifact.call_id
+                    and (
+                        ref.pointer == a.json_pointer
+                        or ref.pointer.startswith(a.json_pointer + "/")
+                        or a.json_pointer.startswith(ref.pointer + "/")
+                    )
+                    for a in addresses
+                )
+                for ref in candidate.sources
+            ):
+                return False
+    return True
 
 
 def revise_work(state: WorkingState, before: TaskFrame, after: TaskFrame) -> WorkingState:
@@ -751,14 +965,20 @@ def revise_work(state: WorkingState, before: TaskFrame, after: TaskFrame) -> Wor
     refs = {ref.model_dump_json() for n in notes for ref in n.sources}
     # 下一步意图是当前整体目标下的决定,即使局部笔记保留也必须重新提出。
     return WorkingState(
-        schema_version=3 if state.recheck_required else 2,
+        schema_version=state.schema_version if state.schema_version >= 3 else 2,
         recheck_required=state.recheck_required,
         task_revision=after.request_anchor.task_revision,
         revision=state.revision + 1,
         processed_records=state.processed_records,
         notes=notes,
         note_revisions=versions,
-        dependency_issues=_dependency_issues(notes, versions),
+        evidence_heads={n.note_id: state.evidence_heads[n.note_id] for n in notes}
+        if state.schema_version == 4
+        else {},
+        evidence_invalidated=tuple(i for i in state.evidence_invalidated if i in versions),
+        dependency_issues=_dependency_issues(
+            notes, versions, tuple(i for i in state.evidence_invalidated if i in versions)
+        ),
         sources=tuple(s for s in state.sources if s.reference.model_dump_json() in refs),
         invalidated_note_ids=tuple(n.note_id for n in state.notes if n not in notes),
         last_notice="revised",
@@ -770,12 +990,18 @@ async def reduce_work(
     frame: TaskFrame,
     records: tuple[ToolRecord, ...],
     read_artifact: Callable[[str], Awaitable[ArtifactSnapshot]],
+    *,
+    ledger: NeedLedger | None = None,
 ) -> WorkingState:
     """按 Runtime 接受顺序归约,从游标后读取提议,无需再调用规划模型。"""
     if state.task_revision != frame.request_anchor.task_revision or state.processed_records > len(
         records
     ):
         raise ValueError("working state belongs to another task or record stream")
+    if state.schema_version == 4:
+        if ledger is None:
+            raise ValueError("evidence-aware reduction requires the accepted ledger")
+        state = reconcile_work_evidence(state, ledger)
     need_ids = {n.need_id for n in frame.requirements}
     for record in records[state.processed_records :]:
         if record.exchange.action.tool_name != WORK_TOOL or not isinstance(
@@ -795,7 +1021,15 @@ async def reduce_work(
         if not mentioned <= need_ids:
             state = state.model_copy(update={"last_notice": "unknown_need"})
             continue
-        versions = _next_note_versions(state, update.notes)
+        notes = update.notes
+        if state.schema_version == 4:
+            assert ledger is not None
+            try:
+                notes = associate_work_needs(proposal, ledger)
+            except ValueError:
+                state = state.model_copy(update={"last_notice": "invalid_dependency"})
+                continue
+        versions = _next_note_versions(state, notes)
         if any(
             edge.note_id in versions and edge.revision > versions[edge.note_id]
             for note in update.notes
@@ -808,15 +1042,39 @@ async def reduce_work(
         if state.recheck_required and not _rechecks_accept(state, proposal, artifact.reference):
             state = state.model_copy(update={"last_notice": "recheck_required"})
             continue
+        remaining_invalidated: tuple[str, ...] = ()
+        if state.schema_version == 4:
+            assert ledger is not None
+            if not evidence_refresh_allowed(state, proposal, ledger):
+                state = state.model_copy(update={"last_notice": "recheck_required"})
+                continue
+            # 原文重验后文字可能不变,但这仍是新的结论版本,后继必须单独重验。
+            refreshed = {r.note_id for r in proposal.rechecks}
+            refreshed.update(
+                n.note_id
+                for n in notes
+                if n.kind != "result"
+                and all(old.kind != "result" for old in state.notes if old.note_id == n.note_id)
+            )
+            remaining_invalidated = tuple(
+                i for i in state.evidence_invalidated if i in versions and i not in refreshed
+            )
+            for identity in set(state.evidence_invalidated) & refreshed:
+                if identity in versions:
+                    versions[identity] = state.revision + 1
         state = WorkingState(
-            schema_version=3 if state.recheck_required else 2,
+            schema_version=state.schema_version if state.schema_version >= 3 else 2,
             recheck_required=state.recheck_required,
             task_revision=state.task_revision,
             revision=state.revision + 1,
             processed_records=state.processed_records,
-            notes=update.notes,
+            notes=notes,
             note_revisions=versions,
-            dependency_issues=_dependency_issues(update.notes, versions),
+            evidence_heads=work_evidence_heads(notes, ledger)
+            if state.schema_version == 4 and ledger is not None
+            else {},
+            evidence_invalidated=remaining_invalidated,
+            dependency_issues=_dependency_issues(notes, versions, remaining_invalidated),
             sources=proposal.sources,
             next_need_ids=update.next_need_ids,
             next_query=update.next_query,

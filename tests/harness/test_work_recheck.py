@@ -9,7 +9,7 @@ import pytest
 from pydantic import JsonValue, ValidationError
 
 from examples.working_records import problem
-from weavria.artifacts import InMemoryArtifactStore
+from weavria.artifacts import ArtifactSnapshot, InMemoryArtifactStore
 from weavria.context import (
     ContextCompilerConfig,
     ModelRequestContextCompiler,
@@ -45,6 +45,9 @@ from weavria.harness import (
     HarnessConfig,
     InformationNeed,
     ModelWorkRechecker,
+    NeedLedger,
+    NeedState,
+    NeedStatus,
     TaskSpecification,
     WorkDependency,
     WorkingState,
@@ -56,6 +59,7 @@ from weavria.harness.work import (
     WorkUpdate,
     compact_work,
     load_work,
+    reconcile_work_evidence,
     reduce_work,
     revise_work,
     work_tool,
@@ -117,6 +121,7 @@ class RecheckRun:
         self.state = WorkingState(schema_version=3, recheck_required=True, task_revision=1)
         self.records: tuple[ToolRecord, ...] = ()
         self.compact = compact
+        self.ledger: NeedLedger | None = None
 
     def view(self) -> TaskModelView:
         definition: dict[str, JsonValue] = {
@@ -166,7 +171,11 @@ class RecheckRun:
         )
         self.records = (*self.records, record)
         self.state = await reduce_work(
-            self.state, self.frame, self.records, lambda aid: self.store.get("r", aid)
+            self.state,
+            self.frame,
+            self.records,
+            lambda aid: self.store.get("r", aid),
+            ledger=self.ledger,
         )
         return record
 
@@ -752,3 +761,368 @@ async def test_invalid_line_ranges_leave_work_pending(
     )
     await run.apply((a, b, c, d))
     assert run.state.last_notice == "recheck_required" and run.state.revision == 2
+
+
+def evidence_ledger(run: RecheckRun, artifact: ArtifactSnapshot) -> NeedLedger:
+    from weavria.harness.requirements import EvidenceAddress, EvidenceBinding
+
+    _, ledger, _ = problem()
+    binding = EvidenceBinding(
+        binding_id="binding-current",
+        need_id="alpha",
+        relation="supports",
+        evaluator_key="fixture",
+        evaluator_version="1",
+        freshness="valid",
+        scope_identity_sha256="0" * 64,
+        addresses=(
+            EvidenceAddress(
+                producer_run_id=artifact.reference.run_id,
+                producer_call_id=artifact.reference.call_id,
+                artifact_id=artifact.reference.artifact_id,
+                artifact_sha256=artifact.reference.sha256,
+                json_pointer="/text",
+            ),
+        ),
+    )
+    return ledger.model_copy(
+        update={
+            "bindings": (binding,),
+            "states": (
+                NeedState(
+                    need_id="alpha",
+                    status=NeedStatus.ACQUIRED,
+                    evidence_binding_ids=(binding.binding_id,),
+                ),
+                ledger.state_for("beta"),
+            ),
+        }
+    )
+
+
+@pytest.mark.parametrize("compact", [False, True])
+async def test_ledger_change_rechecks_root_then_descendant_with_current_sources(
+    session_counter: OpenAICompatibleTokenCounter,
+    compact: bool,
+) -> None:
+    # 审查模型只承担可错语义判断。宿主另外检查根的当前来源,保持独立分支。
+    provider = FakeModelProvider((response(note="a"), response(note="b")))
+    run = RecheckRun(provider, session_counter, compact=compact)
+    run.state = WorkingState(schema_version=4, task_revision=1, recheck_required=True)
+    old = await run.store.put("r", "old", {"text": "Total is 10"})
+    new = await run.store.put("r", "new", {"text": "Total is 20"})
+    old_ref = WorkReference(artifact_id=old.reference.artifact_id, pointer="/text")
+    new_ref = WorkReference(artifact_id=new.reference.artifact_id, pointer="/text")
+    a = WorkNote(
+        note_id="a", kind="result", summary="Total 10", need_ids=("alpha",), sources=(old_ref,)
+    )
+    b = WorkNote(
+        note_id="b",
+        kind="result",
+        summary="Double 20",
+        sources=(old_ref,),
+        depends_on=(WorkDependency(note_id="a", revision=1),),
+    )
+    d = WorkNote(note_id="d", kind="result", summary="Independent")
+    run.ledger = evidence_ledger(run, old)
+    await run.apply((a, b, d))
+    a, b, d = run.state.notes
+    assert b.need_ids == ("alpha",)  # 原文地址补上模型省略的需求关系。
+    run.ledger = evidence_ledger(run, new)
+    run.state = reconcile_work_evidence(run.state, run.ledger)
+    assert run.state.stale_note_ids == ("a", "b")
+    a = a.model_copy(update={"summary": "Total 20", "sources": (new_ref,)})
+    await run.apply((a, b, d))
+    assert run.state.last_notice == "accepted"
+    assert run.state.evidence_invalidated == ("b",)
+    assert run.state.stale_note_ids == ("b",)
+    assert run.state.note_revisions == {"a": 3, "b": 1, "d": 1}
+    b = b.model_copy(
+        update={
+            "summary": "Double 40",
+            "sources": (new_ref,),
+            "depends_on": (WorkDependency(note_id="a", revision=3),),
+        }
+    )
+    await run.apply((a, b, d))
+    assert not run.state.stale_note_ids
+    assert run.state.note_revisions["d"] == 1
+    assert len(provider.requests) == 2
+    assert (
+        await reduce_work(
+            run.state,
+            run.frame,
+            run.records,
+            lambda aid: run.store.get("r", aid),
+            ledger=run.ledger,
+        )
+        == run.state
+    )
+
+
+async def test_same_batch_new_evidence_rejects_old_work_cas(
+    session_counter: OpenAICompatibleTokenCounter,
+) -> None:
+    run = RecheckRun(FakeModelProvider(()), session_counter)
+    run.state = WorkingState(schema_version=4, task_revision=1, recheck_required=True)
+    old = await run.store.put("r", "old", {"text": "Total 10"})
+    new = await run.store.put("r", "new", {"text": "Total 20"})
+    note = WorkNote(note_id="a", kind="result", summary="Total 10", need_ids=("alpha",))
+    run.ledger = evidence_ledger(run, old)
+    await run.apply((note,))
+    run.ledger = evidence_ledger(run, new)
+    # 工具拿到旧视图,归约前 Ledger 已变化。不能把同批提议当作已看过新证据。
+    await run.apply((note.model_copy(update={"summary": "Invented update"}),))
+    assert run.state.last_notice == "stale_revision"
+    assert run.state.notes == (note,)
+    assert run.state.evidence_invalidated == ("a",)
+
+
+async def test_semantic_approval_cannot_reuse_stale_root_source(
+    session_counter: OpenAICompatibleTokenCounter,
+) -> None:
+    answer = response(status="supported", note="a").action
+    assert isinstance(answer, ToolCallAction)
+    args = json.loads(json.dumps(answer.arguments))
+    args["judgments"][0]["citations"][0]["evidence"] = 0
+    provider = FakeModelProvider(
+        (ModelResponse(action=answer.model_copy(update={"arguments": args})),)
+    )
+    run = RecheckRun(provider, session_counter)
+    run.state = WorkingState(schema_version=4, task_revision=1, recheck_required=True)
+    old = await run.store.put("r", "old", {"text": "Total 10"})
+    new = await run.store.put("r", "new", {"text": "Total 20"})
+    note = WorkNote(
+        note_id="a",
+        kind="result",
+        summary="Total 10",
+        need_ids=("alpha",),
+        sources=(WorkReference(artifact_id=old.reference.artifact_id, pointer="/text"),),
+    )
+    run.ledger = evidence_ledger(run, old)
+    await run.apply((note,))
+    run.ledger = evidence_ledger(run, new)
+    run.state = reconcile_work_evidence(run.state, run.ledger)
+    await run.apply((note,))
+    assert run.state.last_notice == "recheck_required"
+    assert run.state.stale_note_ids == ("a",)
+    assert run.state.note_revisions["a"] == 1
+
+
+async def test_ledger_invalidates_real_session_before_finish_and_survives_reopen(
+    tmp_path: Path,
+    session_counter: OpenAICompatibleTokenCounter,
+) -> None:
+    spec = TaskSpecification(
+        route="execute",
+        intent="Compute",
+        goal="Correct a derived finding",
+        information_needs=(
+            InformationNeed(
+                description="Read totals", source="external", capability_names=("read_alpha",)
+            ),
+        ),
+        capability_needs=(
+            CapabilityNeed(name="read_alpha", purpose="Read totals", necessity="required"),
+        ),
+        completion_criteria=(
+            CompletionCriterion(kind="response", description="Correct the answer"),
+            CompletionCriterion(
+                kind="capability_result", description="Read", capability="read_alpha"
+            ),
+        ),
+    )
+    reasoner = FakeModelProvider(
+        (
+            ModelResponse(
+                action=ToolCallAction(
+                    call_id="interpret",
+                    tool_name="declare_task_specification",
+                    arguments=spec.model_dump(mode="json"),
+                )
+            ),
+            response(note="a"),
+            response(note="b"),
+        )
+    )
+
+    class Actor(FakeSessionProvider):
+        phase = 0
+
+        async def generate_session(self, request: SessionRequest) -> ModelTurn:
+            view = request.current.task_model_view
+            assert view is not None
+            raw = view.progress["working_state"]
+            assert isinstance(raw, dict)
+            state = load_work(raw)
+            phase = self.phase
+            self.phase += 1
+            if phase in {0, 2}:
+                return ModelTurn(
+                    decision=ToolBatch(
+                        calls=(
+                            ToolCallAction(
+                                call_id=f"read{phase}",
+                                tool_name="read_alpha",
+                                arguments={"key": "Total is 10" if phase == 0 else "Total is 20"},
+                            ),
+                        )
+                    )
+                )
+            if phase == 3:
+                assert state.evidence_invalidated == ("a", "b")
+                assert state.stale_note_ids == ("a", "b")
+                return ModelTurn(decision=FinishAction(output="Double is 20"))
+            if phase == 6:
+                assert not state.stale_note_ids
+                assert state.note_revisions["independent"] == 1
+                return ModelTurn(decision=FinishAction(output="Double is 40"))
+            observations = [
+                e.observation
+                for e in request.current.history
+                if isinstance(e, ToolExchange) and e.action.tool_name == "read_alpha"
+            ]
+            latest = observations[-1]
+            assert isinstance(latest, ToolSucceededObservation)
+            output = latest.output
+            assert isinstance(output, dict) and isinstance(output["artifact_id"], str)
+            ref = WorkReference(artifact_id=output["artifact_id"], pointer="/value")
+            if phase == 1:
+                needs = view.definition["needs"]
+                assert isinstance(needs, list) and isinstance(needs[0], dict)
+                need_id = needs[0]["id"]
+                assert isinstance(need_id, str)
+                notes = (
+                    WorkNote(
+                        note_id="a",
+                        kind="result",
+                        summary="Total 10",
+                        need_ids=(need_id,),
+                        sources=(ref,),
+                    ),
+                    WorkNote(
+                        note_id="b",
+                        kind="result",
+                        summary="Double is 20",
+                        sources=(ref,),
+                        depends_on=(WorkDependency(note_id="a", revision=1),),
+                    ),
+                    WorkNote(
+                        note_id="independent", kind="result", summary="Retain independent finding"
+                    ),
+                )
+            elif phase == 4:
+                a, b, d = state.notes
+                notes = (a.model_copy(update={"summary": "Total 20", "sources": (ref,)}), b, d)
+            else:
+                assert phase == 5
+                a, b, d = state.notes
+                notes = (
+                    a,
+                    b.model_copy(
+                        update={
+                            "summary": "Double is 40",
+                            "sources": (ref,),
+                            "depends_on": (
+                                WorkDependency(note_id="a", revision=state.note_revisions["a"]),
+                            ),
+                        }
+                    ),
+                    d,
+                )
+            return ModelTurn(
+                decision=ToolBatch(
+                    calls=(
+                        ToolCallAction(
+                            call_id=f"work{phase}",
+                            tool_name="propose_work",
+                            arguments=WorkUpdate(
+                                task_revision=1, base_revision=state.revision, notes=notes
+                            ).model_dump(mode="json"),
+                        ),
+                    )
+                )
+            )
+
+    def open_agent() -> AgentHarness:
+        return AgentHarness.from_config(
+            tmp_path / "session.db",
+            config=HarnessConfig(
+                configuration_id="recheck-test",
+                working_records=True,
+                work_recheck=True,
+                context=ContextCompilerConfig(window_tokens=128000, output_tokens=256),
+                limits=RunLimits(max_request_bytes=128000, max_model_calls=10),
+            ),
+            model=Actor(()),
+            tools=problem()[2],
+            token_counter=session_counter,
+            reasoning_model=reasoner,
+            reasoning_counter=session_counter,
+        )
+
+    async with open_agent() as agent:
+        await agent.create("s")
+        result = await agent.send("s", "Correct findings", input_id="input")
+        assert result.session.report.status is RunStatus.COMPLETED, result.session.report
+        events = await agent.sessions.store.events("s")
+        assert any(
+            isinstance(e.data, SessionRunEvent)
+            and isinstance(e.data.event.data, CompletionChecked)
+            and isinstance(e.data.event.data.assessment.decision, CompletionRepair)
+            and "work_dependency_stale" in e.data.event.data.assessment.decision.issue_codes
+            for e in events
+        )
+        heads = [e.data.snapshot for e in events if isinstance(e.data, SessionSemanticCommitted)]
+        final = heads[-1]
+        assert final.working_state is not None
+        assert load_work(final.working_state).notes[1].summary == "Double is 40"
+    async with open_agent() as reopened:
+        assert await reopened.sessions.store.semantic_head("s", final.work_id) == final
+        repeated = await reopened.send("s", "Correct findings", input_id="input")
+        assert repeated.session.report == result.session.report
+    assert len(reasoner.requests) == 3
+
+
+async def test_unchanged_root_requires_new_review_version(
+    session_counter: OpenAICompatibleTokenCounter,
+) -> None:
+    answer = response(status="supported", note="a").action
+    assert isinstance(answer, ToolCallAction)
+    args = json.loads(json.dumps(answer.arguments))
+    args["judgments"][0]["citations"][0]["evidence"] = 0
+    run = RecheckRun(
+        FakeModelProvider((ModelResponse(action=answer.model_copy(update={"arguments": args})),)),
+        session_counter,
+    )
+    run.state = WorkingState(schema_version=4, task_revision=1, recheck_required=True)
+    source = await run.store.put("r", "source", {"text": "Total 10"})
+    a = WorkNote(
+        note_id="a",
+        kind="result",
+        summary="Total 10",
+        need_ids=("alpha",),
+        sources=(WorkReference(artifact_id=source.reference.artifact_id, pointer="/text"),),
+    )
+    b = WorkNote(
+        note_id="b",
+        kind="result",
+        summary="Double 20",
+        depends_on=(WorkDependency(note_id="a", revision=1),),
+    )
+    run.ledger = evidence_ledger(run, source)
+    await run.apply((a, b))
+    # 相同来源换了证据判定版本,结论文字可以仍正确,但旧依赖不能自动恢复。
+    run.ledger = run.ledger.model_copy(
+        update={
+            "bindings": tuple(
+                binding.model_copy(update={"evaluator_version": "2"})
+                for binding in run.ledger.bindings
+            )
+        }
+    )
+    run.state = reconcile_work_evidence(run.state, run.ledger)
+    await run.apply((a, b))
+    assert run.state.last_notice == "accepted"
+    assert run.state.note_revisions == {"a": 3, "b": 1}
+    assert run.state.stale_note_ids == ("b",)

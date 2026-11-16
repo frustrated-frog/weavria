@@ -308,6 +308,12 @@ async def experiment(args: argparse.Namespace) -> None:
                                     work_errors=work_errors,
                                     source_selectors=selectors,
                                     rechecks=statuses,
+                                    observed_evidence_invalidated=any(
+                                        s.evidence_invalidated for s in states
+                                    ),
+                                    evidence_invalidated_states=sum(
+                                        bool(s.evidence_invalidated) for s in states
+                                    ),
                                     observed_stale=any(s.stale_note_ids for s in states),
                                     declared_dependencies=any(
                                         n.depends_on for s in states for n in s.notes

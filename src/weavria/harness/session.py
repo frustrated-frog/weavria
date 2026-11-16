@@ -51,7 +51,7 @@ from .understanding import (
     reduce_frame_patch,
     task_frame_observation,
 )
-from .work import WorkingState, load_work, reduce_work, revise_work
+from .work import WorkingState, load_work, reconcile_work_evidence, reduce_work, revise_work
 from .working_set import CapabilityWorkingSetPolicy
 
 
@@ -107,7 +107,7 @@ class TaskAwareSessionPreparer:
     def version(self) -> str:
         return (
             f"task-aware-session/15[work={self._working_records};"
-            + ("evidence-recheck/4;" if self._work_recheck else "")
+            + ("evidence-recheck/5;" if self._work_recheck else "")
             + f"{self._outcomes.version if self._outcomes else 'no-outcomes'};"
             f"{self._understanding.version};{self._evidence.version};"
             f"{self._capabilities.version};{self._clarification.version};"
@@ -291,7 +291,7 @@ class TaskAwareSessionPreparer:
             observation = task_frame_observation(frame)
         working = (
             WorkingState(
-                schema_version=3 if self._work_recheck else 2,
+                schema_version=4 if self._work_recheck else 2,
                 recheck_required=self._work_recheck,
                 task_revision=context.task.revision,
             )
@@ -306,6 +306,8 @@ class TaskAwareSessionPreparer:
             and base is not None
         ):
             working = revise_work(load_work(context.base_semantic.working_state), base, frame)
+        if working is not None:
+            working = reconcile_work_evidence(working, ledger)
         visible_names = preparation.record.selected_capabilities
         if self._working_set is not None:
             visible_names = self._working_set.select(
@@ -494,6 +496,7 @@ class TaskAwareSessionPreparer:
                 base,
                 context.records,
                 context.read_artifact,
+                ledger=ledger,
             )
         uncovered_targets: tuple[str, ...] = ()
         if self._working_set is not None:

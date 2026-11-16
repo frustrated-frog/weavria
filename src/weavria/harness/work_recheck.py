@@ -122,7 +122,9 @@ def _bound_state(context: ToolContext) -> WorkingState:
     return WorkingState.model_validate_json(
         json.dumps(
             {
-                "schema_version": 3,
+                "schema_version": 4 if "evidence_heads" in raw else 3,
+                "evidence_heads": raw.get("evidence_heads", {}),
+                "evidence_invalidated": raw.get("evidence_invalidated", []),
                 "recheck_required": True,
                 "task_revision": raw.get("task_revision"),
                 "revision": raw.get("revision"),
@@ -158,7 +160,7 @@ class ModelWorkRechecker:
 
     @property
     def version(self) -> str:
-        return "work-evidence-recheck/4:" + self._configuration_id
+        return "work-evidence-recheck/5:" + self._configuration_id
 
     async def review(
         self, update: WorkUpdate, context: ToolContext
@@ -209,6 +211,9 @@ class ModelWorkRechecker:
             "base_revision": state.revision,
             "update_sha256": work_update_sha256(update),
             "requirements": context.task_view.definition if context.task_view else {},
+            "current_need_states": context.task_view.progress.get("needs", [])
+            if context.task_view
+            else [],
             "targets": [],
             "evidence": [],
         }
@@ -235,6 +240,11 @@ class ModelWorkRechecker:
             parent_evidence[identity] = tuple(
                 {references.index(ref) for ref in parent.sources} for parent in parents
             )
+            if identity in state.evidence_invalidated:
+                # 根失效由 Ledger 驱动,没有父笔记也必须引用重新选择的原文。
+                # 保留结果的候选来源还会在归约时与当前 Ledger 再次比对。
+                current = candidate if candidate is not None else note
+                parent_evidence[identity] += ({references.index(ref) for ref in current.sources},)
             entry = target_payloads[-1]
             assert isinstance(entry, dict)
             groups: list[JsonValue] = []

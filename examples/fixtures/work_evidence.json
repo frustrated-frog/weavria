@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "version": "work-evidence-probe/1",
+  "source_commit": "synthetic-fixed-20261116",
+  "cases": [
+    {
+      "id": "capacity_changed",
+      "original": "Workers: 3\nJobs per worker: 4\nAudit logging: required\n",
+      "current": "Workers: 2\nJobs per worker: 4\nAudit logging: required\n",
+      "question": "Based on the CURRENT configuration, can all 10 jobs run simultaneously? Is audit logging required? Explain the capacity calculation in working notes, and keep the independent logging finding. Do not assume original settings are current.",
+      "expected": {
+        "all_jobs_fit": false,
+        "audit_required": true
+      },
+      "original_sha256": "4c0b8921aed76ae771fe843748adf9fec13f26b86193c08c3d8a50c752635f81",
+      "current_sha256": "1e80c71c93459fc79f895fde989451fcdf1519105a0c79425052cc2f779ac56c"
+    },
+    {
+      "id": "capacity_unchanged",
+      "original": "Workers: 3\nJobs per worker: 4\nAudit logging: required\n",
+      "current": "Workers: 3\nJobs per worker: 4\nAudit logging: required\n",
+      "question": "Based on the CURRENT configuration, can all 10 jobs run simultaneously? Is audit logging required? Explain the capacity calculation in working notes, and keep the independent logging finding. Do not assume original settings are current.",
+      "expected": {
+        "all_jobs_fit": true,
+        "audit_required": true
+      },
+      "original_sha256": "4c0b8921aed76ae771fe843748adf9fec13f26b86193c08c3d8a50c752635f81",
+      "current_sha256": "4c0b8921aed76ae771fe843748adf9fec13f26b86193c08c3d8a50c752635f81"
+    }
+  ]
+}
