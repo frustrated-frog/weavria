@@ -1,0 +1,83 @@
+{
+  "schema_version": 1,
+  "version": "capability-composition-holdout/1",
+  "environment_sha256": "a9d51fe86ea613baeb92fb8b62befe2719802348a5cb2b82a380bbf0e5c62960",
+  "cases": [
+    {
+      "id": "compare_lengths",
+      "query": "Compare the byte lengths of /work/build.bin and /work/notes.txt. Return only JSON {\"same_length\":true or false}. Do not compare their contents.",
+      "expected": {
+        "same_length": false
+      },
+      "evidence_paths": [
+        [
+          {
+            "name": "read_file_metadata",
+            "arguments": {
+              "path": "/work/build.bin"
+            }
+          },
+          {
+            "name": "read_file_metadata",
+            "arguments": {
+              "path": "/work/notes.txt"
+            }
+          }
+        ]
+      ]
+    },
+    {
+      "id": "supplied_revision",
+      "query": "The full original record is \"color=blue\" and the full revised record is \"color=green\". Compare only these supplied records; no external data is needed. Return only JSON {\"changed\":true or false}.",
+      "expected": {
+        "changed": true
+      }
+    },
+    {
+      "id": "archive_and_digest",
+      "query": "Retrieve the current full text of ARC-204 and compute the SHA-256 of /work/build.bin. Return only JSON with keys text and sha256.",
+      "expected": {
+        "text": "Owner: Mira\nBatch size: 96\nTransport: HTTPS\n",
+        "sha256": "a3693cb6fb00555c7138b6fb08a4b3a17556a1d6a3ebd6c9df15e1600a107549"
+      },
+      "evidence_paths": [
+        [
+          {
+            "name": "read_archived_text",
+            "arguments": {
+              "archive_id": "ARC-204"
+            }
+          },
+          {
+            "name": "compute_file_checksum",
+            "arguments": {
+              "path": "/work/build.bin"
+            }
+          }
+        ],
+        [
+          {
+            "name": "read_document_history",
+            "arguments": {
+              "archive_id": "ARC-204"
+            }
+          },
+          {
+            "name": "compute_file_checksum",
+            "arguments": {
+              "path": "/work/build.bin"
+            }
+          }
+        ]
+      ]
+    },
+    {
+      "id": "invitation_unavailable",
+      "query": "Send Lee a calendar invitation for 2026-11-16T10:00:00Z. If no capability can send it, return only JSON {\"status\":\"unavailable\"}; otherwise return {\"status\":\"sent\"}.",
+      "expected": {
+        "status": "unavailable"
+      },
+      "unavailable": true
+    }
+  ]
+}

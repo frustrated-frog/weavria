@@ -4,14 +4,23 @@ import hashlib
 import json
 from typing import Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    JsonValue,
+    SerializerFunctionWrapHandler,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 from weavria.core import ModelRequest, TaskInput
 
 from .capabilities import CapabilityDescriptor
 
 
-class _Value(BaseModel):
+class FitValue(BaseModel):
     model_config = ConfigDict(
         frozen=True,
         strict=True,
@@ -22,22 +31,30 @@ class _Value(BaseModel):
     )
 
 
-class CapabilityFitConfig(_Value):
+class CapabilityFitConfig(FitValue):
     """补搜轮次不包含首轮;模型调用与 Token 继续使用发现器的共享账本。"""
 
     max_repairs: int = Field(default=2, ge=0, le=4)
     max_queries_per_round: int = Field(default=2, ge=1, le=4)
     max_expanded_tools: int = Field(default=24, ge=1, le=32)
+    composition: bool = False
+
+    @model_serializer(mode="wrap")
+    def legacy_config(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        data = handler(self)
+        if not self.composition:
+            data.pop("composition", None)
+        return data
 
 
-class RequestQuote(_Value):
+class RequestQuote(FitValue):
     """当前任务原文锚点;引用存在不证明模型对动作的解释正确。"""
 
     quote: str = Field(min_length=1, max_length=4096)
     constraint_index: int | None = Field(default=None, ge=0)
 
 
-class ProtocolQuote(_Value):
+class ProtocolQuote(FitValue):
     """描述符上的 JSON Pointer,仅允许 description/input_schema/output_schema。"""
 
     pointer: str = Field(min_length=1, max_length=1024)
@@ -49,19 +66,19 @@ type FitDecision = Literal[
 ]
 
 
-class CapabilityFitJudgment(_Value):
+class CapabilityFitJudgment(FitValue):
     name: str = Field(min_length=1, max_length=160)
     decision: FitDecision
     source: RequestQuote
     support: tuple[ProtocolQuote, ...] = Field(default=(), max_length=4)
 
 
-class CapabilitySearchGap(_Value):
+class CapabilitySearchGap(FitValue):
     source: RequestQuote
     query: str = Field(min_length=1, max_length=1024)
 
 
-class CapabilityFitProposal(_Value):
+class CapabilityFitProposal(FitValue):
     """模型提议仅在调用内存在;报告只保留它的内容摘要。"""
 
     outcome: Literal["ready", "no_tools", "search"]
@@ -85,8 +102,34 @@ class CapabilityFitProposal(_Value):
         return self
 
 
-class CapabilityFitReport(_Value):
-    """发现报告 v3 的子记录;无正文,不形成任务事实或授权。"""
+class CompositionNodeReceipt(FitValue):
+    """可归档的结构见证;没有用户原文、协议正文或模型私有推理。"""
+
+    node_id: str = Field(pattern=r"^[a-z][a-z0-9_]{0,31}$")
+    kind: Literal["tool", "given", "derive", "missing"]
+    dependencies: tuple[str, ...] = Field(max_length=16)
+    capability: str | None = None
+    operation: Literal["compare", "summarize", "extract", "format", "explain"] | None = None
+    feasible: bool
+    source_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+
+    @model_validator(mode="after")
+    def validate_node(self) -> Self:
+        if len(set(self.dependencies)) != len(self.dependencies):
+            raise ValueError("duplicate composition dependencies")
+        if (self.kind == "tool") != (self.capability is not None) or (self.kind == "derive") != (
+            self.operation is not None
+        ):
+            raise ValueError("composition node fields disagree with kind")
+        if (self.kind == "given" and self.dependencies) or (
+            self.kind == "derive" and self.operation != "explain" and not self.dependencies
+        ):
+            raise ValueError("composition input dependencies are invalid")
+        return self
+
+
+class CapabilityFitReport(FitValue):
+    """v1 随发现报告 v3,v2 随 v4;无正文,不形成任务事实或授权。"""
 
     step_index: int = Field(ge=0)
     outcome: Literal["ready", "no_tools", "search"]
@@ -96,6 +139,70 @@ class CapabilityFitReport(_Value):
     support_sha256: tuple[str, ...]
     gap_source_sha256: tuple[str, ...]
     query_sha256: tuple[str, ...]
+    schema_version: Literal[1, 2] = 1
+    composition: tuple[CompositionNodeReceipt, ...] = Field(default=(), max_length=32)
+    deliverables: tuple[str, ...] = Field(default=(), max_length=32)
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def integer_version(cls, value: object) -> object:
+        if type(value) is not int:
+            raise ValueError("schema_version must be an integer")
+        return value
+
+    @model_serializer(mode="wrap")
+    def legacy_report(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        data = handler(self)
+        if self.schema_version == 1:
+            for key in ("schema_version", "composition", "deliverables"):
+                data.pop(key, None)
+        return data
+
+    @model_validator(mode="after")
+    def validate_composition(self) -> Self:
+        if self.schema_version == 1:
+            if self.composition or self.deliverables:
+                raise ValueError("composition requires fit report v2")
+            return self
+        seen: dict[str, CompositionNodeReceipt] = {}
+        depths: dict[str, int] = {}
+        for node in self.composition:
+            if node.node_id in seen or any(d not in seen for d in node.dependencies):
+                raise ValueError("composition report must be topologically ordered")
+            feasible = node.kind != "missing" and all(seen[d].feasible for d in node.dependencies)
+            if feasible != node.feasible or (node.kind == "tool") != (node.capability is not None):
+                raise ValueError("composition feasibility or tool identity mismatch")
+            seen[node.node_id] = node
+            depths[node.node_id] = 1 + max((depths[d] for d in node.dependencies), default=0)
+            if depths[node.node_id] > 16:
+                raise ValueError("composition report depth exceeded")
+        if (
+            not seen
+            or not self.deliverables
+            or not set(self.deliverables) <= seen.keys()
+            or len(set(self.deliverables)) != len(self.deliverables)
+        ):
+            raise ValueError("composition report requires known deliverables")
+        used = set(self.deliverables)
+        for node in reversed(self.composition):
+            if node.node_id in used:
+                used.update(node.dependencies)
+        if used != seen.keys() or {
+            n.capability for n in self.composition if n.kind == "tool"
+        } != set(self.accepted_names):
+            raise ValueError("composition report contains unused nodes or capabilities")
+        expected = (
+            "search"
+            if any(not seen[d].feasible for d in self.deliverables)
+            else "ready"
+            if self.accepted_names
+            else "no_tools"
+        )
+        if expected != self.outcome or sum(n.kind == "missing" for n in self.composition) != len(
+            self.query_sha256
+        ):
+            raise ValueError("composition report disagrees with outcome or gaps")
+        return self
 
 
 FIT_INSTRUCTIONS = """Check whether the offered FULL capability protocols actually support the
@@ -152,13 +259,13 @@ def fit_request(
     )
 
 
-def _digest(value: object) -> str:
+def fit_digest(value: object) -> str:
     return hashlib.sha256(
         json.dumps(value, sort_keys=True, ensure_ascii=False).encode()
     ).hexdigest()
 
 
-def _validate_source(source: RequestQuote, task: TaskInput) -> None:
+def validate_request_quote(source: RequestQuote, task: TaskInput) -> None:
     if source.constraint_index is None:
         text = task.goal
     elif source.constraint_index < len(task.constraints):
@@ -216,11 +323,11 @@ def validate_fit(
     if len(proposal.selected_names) > max_selected or len(proposal.gaps) > max_queries:
         raise ValueError("fit_selection_capacity")
     for judgment in proposal.judgments:
-        _validate_source(judgment.source, task)
+        validate_request_quote(judgment.source, task)
         for support in judgment.support:
             _validate_support(support, by_name[judgment.name])
     for gap in proposal.gaps:
-        _validate_source(gap.source, task)
+        validate_request_quote(gap.source, task)
         if not gap.query.strip():
             raise ValueError("fit_empty_query")
     # 报告各列跟随实际 offered_names 的确定性顺序,不信任模型返回的排列。
@@ -231,10 +338,12 @@ def validate_fit(
         outcome=proposal.outcome,
         accepted_names=proposal.selected_names,
         decisions=tuple(j.decision for j in ordered),
-        request_quote_sha256=tuple(_digest(j.source.model_dump(mode="json")) for j in ordered),
+        request_quote_sha256=tuple(fit_digest(j.source.model_dump(mode="json")) for j in ordered),
         support_sha256=tuple(
-            _digest([q.model_dump(mode="json") for q in j.support]) for j in ordered
+            fit_digest([q.model_dump(mode="json") for q in j.support]) for j in ordered
         ),
-        gap_source_sha256=tuple(_digest(g.source.model_dump(mode="json")) for g in proposal.gaps),
-        query_sha256=tuple(_digest(g.query) for g in proposal.gaps),
+        gap_source_sha256=tuple(
+            fit_digest(g.source.model_dump(mode="json")) for g in proposal.gaps
+        ),
+        query_sha256=tuple(fit_digest(g.query) for g in proposal.gaps),
     )

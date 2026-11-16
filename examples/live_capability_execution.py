@@ -60,7 +60,7 @@ from weavria.models import (
 from weavria.runtime import RunLimits
 from weavria.sessions import SessionTaskPreparationError, SQLiteSessionStore
 
-type Variant = Literal["hybrid", "fit_only", "fit_repair", "all_tools"]
+type Variant = Literal["hybrid", "fit_only", "fit_repair", "all_tools", "composition"]
 type EvidenceMode = Literal["structural", "local_snapshot"]
 VARIANTS: tuple[Variant, ...] = ("hybrid", "fit_only", "fit_repair", "all_tools")
 FIXTURES = Path(__file__).with_name("fixtures")
@@ -94,8 +94,10 @@ def harness_config(variant: Variant, output_tokens: int, max_duration: float) ->
         semantic_discovery=None
         if full
         else CapabilityDiscoveryConfig(
-            fit=CapabilityFitConfig(max_repairs=0 if variant == "fit_only" else 2)
-            if variant in {"fit_only", "fit_repair"}
+            fit=CapabilityFitConfig(
+                max_repairs=0 if variant == "fit_only" else 2, composition=variant == "composition"
+            )
+            if variant in {"fit_only", "fit_repair", "composition"}
             else None
         ),
     )
@@ -273,6 +275,13 @@ def implementation_digests() -> dict[str, str]:
 
 
 async def experiment(args: argparse.Namespace) -> None:
+    variants: tuple[Variant, ...] = tuple(getattr(args, "variants", None) or VARIANTS)
+    if (
+        not variants
+        or len(set(variants)) != len(variants)
+        or not set(variants) <= {*VARIANTS, "composition"}
+    ):
+        raise ValueError("choose unique known experiment variants")
     dataset, seed = load_fixtures(args.dataset, args.environment)
     with local_environment(seed) as environment:
         catalogue = CatalogSnapshot.from_registry(environment.registry())
@@ -326,7 +335,7 @@ async def experiment(args: argparse.Namespace) -> None:
                 variant: TypeAdapter(HarnessConfig).dump_python(
                     harness_config(variant, 4096, 180), mode="json"
                 )
-                for variant in VARIANTS
+                for variant in variants
             },
             "rows": rows,
         }
@@ -350,8 +359,8 @@ async def experiment(args: argparse.Namespace) -> None:
                 counter = OpenAICompatibleTokenCounter(config, encoding="cl100k_base")
                 for repeat in range(args.repeats):
                     for position, case in enumerate(dataset.cases):
-                        offset = (position + repeat) % len(VARIANTS)
-                        for variant in (*VARIANTS[offset:], *VARIANTS[:offset]):
+                        offset = (position + repeat) % len(variants)
+                        for variant in (*variants[offset:], *variants[:offset]):
                             start, call_offset = time.monotonic(), transport.calls
                             row: dict[str, object] = {
                                 "case": case.id,
@@ -425,6 +434,7 @@ def main() -> None:
     parser.add_argument("--model", type=Path)
     parser.add_argument("--tokenizer", type=Path)
     parser.add_argument("--live", action="store_true")
+    parser.add_argument("--variants", nargs="+", choices=(*VARIANTS, "composition"))
     parser.add_argument(
         "--evidence-mode", choices=("structural", "local_snapshot"), default="local_snapshot"
     )

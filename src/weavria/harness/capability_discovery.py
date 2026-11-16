@@ -25,6 +25,13 @@ from weavria.models import ModelCallError, ModelProvider, call_model
 from weavria.sessions import SessionTaskPreparationError
 
 from .capabilities import CapabilityDescriptor, CatalogSnapshot
+from .capability_composition import (
+    COMPOSITION_INSTRUCTIONS,
+    CompositionCapacity,
+    CompositionProposal,
+    composition_request,
+    validate_composition,
+)
 from .capability_fit import (
     FIT_INSTRUCTIONS,
     CapabilityFitConfig,
@@ -89,7 +96,7 @@ class CapabilityDiscoveryStep(_Value):
 class CapabilityDiscoveryReport(_Value):
     """可归档的内容无关报告;完整扫描不代表模型没有遗漏。"""
 
-    schema_version: Literal[1, 2, 3] = 1
+    schema_version: Literal[1, 2, 3, 4] = 1
     policy_version: str
     catalogue_sha256: str
     context_sha256: str
@@ -162,7 +169,11 @@ class CapabilityDiscoveryReport(_Value):
             or any(s.stage == "inspect" for s in self.steps)
         ):
             raise ValueError("fit review requires discovery report v3")
-        if self.schema_version == 3:
+        if self.schema_version < 4 and any(r.schema_version == 2 for r in self.reviews):
+            raise ValueError("composition requires discovery report v4")
+        if self.schema_version == 4 and any(r.schema_version != 2 for r in self.reviews):
+            raise ValueError("composition discovery requires fit report v2")
+        if self.schema_version >= 3:
             nominated_before: set[str] = set()
             for step in self.steps:
                 if step.stage == "inspect" and not set(step.offered_names) <= nominated_before:
@@ -222,7 +233,7 @@ class CapabilityDiscoveryReport(_Value):
                 or (review.outcome == "no_tools" and review.accepted_names)
             ):
                 raise ValueError("fit review accounting is inconsistent")
-        if self.status == "completed" and self.schema_version == 3:
+        if self.status == "completed" and self.schema_version >= 3:
             if (
                 not self.reviews
                 or self.reviews[-1].outcome not in {"ready", "no_tools"}
@@ -347,7 +358,18 @@ class ModelCapabilityDiscovery:
             }
         )
         if self.config.fit is not None:
-            self.version += ";fit/1:" + _digest(FIT_INSTRUCTIONS)
+            self.version += (
+                ";composition/1:"
+                + _digest(
+                    {
+                        "instructions": COMPOSITION_INSTRUCTIONS,
+                        "schema": CompositionProposal.model_json_schema(),
+                        "references": "description-leaves/1-sha256-64bit",
+                    }
+                )
+                if self.config.fit.composition
+                else ";fit/1:" + _digest(FIT_INSTRUCTIONS)
+            )
         if candidate_index is not None:
             self.version += ";query=task-goal-constraints/1;" + candidate_index.version
 
@@ -381,7 +403,7 @@ class ModelCapabilityDiscovery:
 
         def report(status: str, failure_code: str | None = None) -> CapabilityDiscoveryReport:
             return CapabilityDiscoveryReport(
-                schema_version=3
+                schema_version=(4 if self.config.fit.composition else 3)
                 if self.config.fit is not None
                 else (1 if self._index is None else 2),
                 policy_version=self.version,
@@ -527,39 +549,57 @@ class ModelCapabilityDiscovery:
                 if len(pool) > fit.max_expanded_tools:
                     raise _Capacity("fit expansion capacity exceeded")
                 expanded = tuple(descriptors[n] for n in sorted(pool))
-                encoded = await invoke(
-                    fit_request(
+                request_builder = composition_request if fit.composition else fit_request
+                try:
+                    payload = request_builder(
                         context,
                         expanded,
                         max_selected=self.config.max_candidates,
                         max_queries=fit.max_queries_per_round,
-                    ),
+                    )
+                except CompositionCapacity as exc:
+                    raise _Capacity(str(exc)) from exc
+                encoded = await invoke(
+                    payload,
                     tuple(c.name for c in expanded),
                     "inspect",
                     "inspect_capability_fit",
                 )
-                proposal = CapabilityFitProposal.model_validate_json(encoded)
                 try:
-                    review = validate_fit(
-                        proposal,
-                        expanded,
-                        task,
-                        step_index=len(steps) - 1,
-                        max_selected=self.config.max_candidates,
-                        max_queries=fit.max_queries_per_round,
+                    review = (
+                        validate_composition(
+                            CompositionProposal.model_validate_json(encoded),
+                            expanded,
+                            task,
+                            step_index=len(steps) - 1,
+                            max_selected=self.config.max_candidates,
+                            max_queries=fit.max_queries_per_round,
+                        )
+                        if fit.composition
+                        else validate_fit(
+                            CapabilityFitProposal.model_validate_json(encoded),
+                            expanded,
+                            task,
+                            step_index=len(steps) - 1,
+                            max_selected=self.config.max_candidates,
+                            max_queries=fit.max_queries_per_round,
+                        )
                     )
+                except ValidationError:
+                    # 校验异常可含模型原文;外层只记录异常类型,不复制到失败报告。
+                    raise
                 except ValueError as exc:
                     raise _InvalidNomination(str(exc)) from exc
                 steps[-1] = steps[-1].model_copy(
                     update={
                         "status": "accepted",
-                        "selected_names": proposal.selected_names,
+                        "selected_names": review.accepted_names,
                     }
                 )
                 reviews.append(review)
-                if proposal.outcome != "search":
-                    stop_reason = proposal.outcome
-                    return proposal.selected_names
+                if review.outcome != "search":
+                    stop_reason = review.outcome
+                    return review.accepted_names
                 if len(by_name) == len(descriptors):
                     stop_reason = "catalogue_examined"
                 elif round_number == fit.max_repairs:
@@ -570,7 +610,16 @@ class ModelCapabilityDiscovery:
                     raise _NoProgress(stop_reason)
                 assert self._index is not None
                 unseen: set[str] = set()
-                for gap in proposal.gaps:
+                gaps = (
+                    tuple(
+                        node
+                        for node in CompositionProposal.model_validate_json(encoded).nodes
+                        if node.kind == "missing"
+                    )
+                    if fit.composition
+                    else CapabilityFitProposal.model_validate_json(encoded).gaps
+                )
+                for gap in gaps:
                     # 排除发生在通道 top-k 之前;同轮多个缺口也不重复消费候选名额。
                     result = await self._index.retrieve(
                         catalogue,
@@ -585,7 +634,7 @@ class ModelCapabilityDiscovery:
                     raise _NoProgress(stop_reason)
                 new_names = await scan(tuple(descriptors[n] for n in sorted(unseen)))
                 # 保留已支持操作,但每轮联合复查,允许撤销此前的错误判断。
-                pool = tuple(sorted(set(proposal.selected_names) | set(new_names)))
+                pool = tuple(sorted(set(review.accepted_names) | set(new_names)))
             raise AssertionError("bounded fit loop must terminate")
 
         try:
