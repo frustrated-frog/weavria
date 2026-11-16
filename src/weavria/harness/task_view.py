@@ -61,13 +61,13 @@ def _continuation_observation(
 class TaskModelViewProjector:
     """Project accepted state without authorizing actions or manufacturing evidence."""
 
-    version = "task-model-view/12"
+    version = "task-model-view/14"
     working_records_version = 1
 
     def __init__(self, *, compact_work_summary: bool = False) -> None:
         self._compact_work_summary = compact_work_summary
         if compact_work_summary:
-            self.version = "task-model-view/13"
+            self.version = "task-model-view/15"
 
     def project(
         self,
@@ -245,7 +245,7 @@ class TaskModelViewProjector:
             "interpretation": (
                 "acquired=material available, analysis pending; satisfied=semantic coverage, "
                 "not answer verification. Recover omitted text by query or read_artifact. "
-                "Preserve useful findings/issues with propose_work; revisions/IDs are automatic. "
+                "Preserve useful findings/issues with propose_work; use stable note IDs. "
                 "Notes are model inference. Cite resolved source_label or original paths, "
                 "not archive wrappers. Follow the original user request."
             ),

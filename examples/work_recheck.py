@@ -120,6 +120,9 @@ def implementation_digests() -> dict[str, str]:
         name: hashlib.sha256((root / name).read_bytes()).hexdigest()
         for name in (
             "work.py",
+            "work_patch.py",
+            "configuration.py",
+            "assembly.py",
             "work_recheck.py",
             "work_recheck_contracts.py",
             "session.py",
@@ -164,6 +167,7 @@ async def experiment(args: argparse.Namespace) -> None:
         "implementation_sha256": await asyncio.to_thread(implementation_digests),
         "options": options,
         "repeats": args.repeats,
+        "comparison": "work_updates" if getattr(args, "compare_updates", False) else "work_recheck",
         "limits": {"max_model_calls": 16, "max_tool_calls": 24, "max_duration": 180},
         "note": "模型自行形成依赖;未形成或未触发重验也保留,不得当作重验成功。",
     }
@@ -175,15 +179,21 @@ async def experiment(args: argparse.Namespace) -> None:
                     if args.case and case.id not in args.case:
                         continue
                     # 交替顺序减小固定先后偏差;两个策略采用相同任务、模型和预算。
-                    for enabled in (False, True) if repeat % 2 == 0 else (True, False):
+                    profiles: tuple[tuple[bool, Literal["replace", "patch"]], ...] = (
+                        ((True, "replace"), (True, "patch"))
+                        if getattr(args, "compare_updates", False)
+                        else ((False, "replace"), (True, "replace"))
+                    )
+                    for enabled, update_mode in profiles if repeat % 2 == 0 else profiles[::-1]:
                         captured = CapturingActor(actor) if args.capture_requests else None
                         started = time.monotonic()
                         calls = transport.calls
-                        key = f"{case.id}-{repeat}-{enabled}"
+                        key = f"{case.id}-{repeat}-{enabled}-{update_mode}"
                         row: dict[str, object] = {
                             "case": case.id,
                             "repeat": repeat,
                             "review": enabled,
+                            "work_updates": update_mode,
                         }
                         try:
                             async with AgentHarness.from_config(
@@ -195,6 +205,7 @@ async def experiment(args: argparse.Namespace) -> None:
                                     ),
                                     working_records=True,
                                     work_recheck=enabled,
+                                    work_updates=update_mode,
                                     limits=RunLimits(
                                         max_model_calls=16,
                                         max_tool_calls=24,
@@ -245,6 +256,7 @@ async def experiment(args: argparse.Namespace) -> None:
                                 work_errors: list[dict[str, str]] = []
                                 selectors = {"quote": 0, "range": 0, "whole": 0}
                                 work_calls = 0
+                                work_argument_bytes: list[int] = []
                                 for event in events:
                                     if isinstance(event.data, SessionRunEvent) and isinstance(
                                         event.data.event.data, ToolRecorded
@@ -252,9 +264,21 @@ async def experiment(args: argparse.Namespace) -> None:
                                         record = event.data.event.data.record
                                         if record.exchange.action.tool_name == "propose_work":
                                             work_calls += 1
+                                            arguments = record.exchange.action.arguments
+                                            work_argument_bytes.append(
+                                                len(
+                                                    json.dumps(
+                                                        arguments,
+                                                        ensure_ascii=False,
+                                                        separators=(",", ":"),
+                                                    ).encode()
+                                                )
+                                            )
                                             # 记录输入定位方式与真实工具失败,区分“没有进入
                                             # 审查”与“审查后拒绝”;不据最终答案倒推机制成功。
-                                            notes = record.exchange.action.arguments.get("notes")
+                                            notes = arguments.get(
+                                                "upsert" if update_mode == "patch" else "notes"
+                                            )
                                             if isinstance(notes, list):
                                                 for note in notes:
                                                     if not isinstance(note, dict):
@@ -305,6 +329,7 @@ async def experiment(args: argparse.Namespace) -> None:
                                     answer_correct=correct,
                                     output=report.execution.output,
                                     work_calls=work_calls,
+                                    work_argument_bytes=work_argument_bytes,
                                     work_errors=work_errors,
                                     source_selectors=selectors,
                                     rechecks=statuses,
@@ -378,6 +403,9 @@ def main() -> None:
         default=Path(__file__).resolve().parents[1] / "tests/fixtures/work_recheck/tasks.json",
     )
     parser.add_argument("--live", action="store_true")
+    parser.add_argument(
+        "--compare-updates", action="store_true", help="固定开启证据重验,仅比较全量替换与局部补丁"
+    )
     parser.add_argument(
         "--capture-requests", action="store_true", help="本地保存模型实际收到的公开上下文"
     )

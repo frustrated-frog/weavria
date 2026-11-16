@@ -67,6 +67,7 @@ from .task_continuation import TaskContinuation
 from .task_view import TaskModelViewProjector
 from .understanding import ModelTaskInterpreter, TaskUnderstandingEngine
 from .work import WorkRechecker, work_tool
+from .work_patch import work_patch_tool
 from .work_recheck import ModelWorkRechecker
 from .working_set import AdaptiveCapabilityPolicy, CapabilityWorkingSetPolicy
 
@@ -368,6 +369,7 @@ class AgentHarness:
             outcome_verifiers=evidence.outcome_verifiers if evidence is not None else (),
             discovery_policy=evidence.discovery_policy if evidence is not None else None,
             working_records=config.working_records,
+            work_updates=config.work_updates,
             work_rechecker=work_rechecker,
             adaptive_capabilities=config.adaptive_capabilities,
             memory=memory,
@@ -408,6 +410,7 @@ class AgentHarness:
         outcome_verifiers: tuple[CapabilityOutcomeVerifier, ...] = (),
         discovery_policy: CapabilityDiscoveryPolicy | None = None,
         working_records: bool = False,
+        work_updates: Literal["replace", "patch"] = "replace",
         work_rechecker: WorkRechecker | None = None,
         working_set: CapabilityWorkingSetPolicy | None = None,
         adaptive_capabilities: bool = True,
@@ -428,6 +431,10 @@ class AgentHarness:
             raise ValueError("working records require task understanding")
         if work_rechecker is not None and not working_records:
             raise ValueError("work rechecker requires working records")
+        if work_updates not in {"replace", "patch"}:
+            raise ValueError("unknown work update mode")
+        if work_updates == "patch" and not working_records:
+            raise ValueError("work patches require working records")
         if working_records:
             for component in (working_set, task_model_projector):
                 if (
@@ -506,7 +513,15 @@ class AgentHarness:
             else None,
             context_source=source,
             support_tools=(
-                *((work_tool(rechecker=work_rechecker),) if working_records else ()),
+                *(
+                    (
+                        (work_patch_tool if work_updates == "patch" else work_tool)(
+                            rechecker=work_rechecker
+                        ),
+                    )
+                    if working_records
+                    else ()
+                ),
                 *((context_summary_tool(),) if context.semantic_compaction else ()),
             ),
             history_retrieval=history_retrieval,
@@ -517,9 +532,10 @@ class AgentHarness:
             configuration_metadata=configuration_metadata
             if configuration_metadata is not None
             else {
-                "harness_version": "unified-harness/8",
+                "harness_version": "unified-harness/9",
                 "configuration_id": configuration_id,
                 "working_records": working_records,
+                "work_updates": work_updates,
                 "work_recheck_version": work_rechecker.version if work_rechecker else None,
                 "harness_max_request_duration": duration,
                 "memory_catchup_fraction": memory_catchup_fraction,

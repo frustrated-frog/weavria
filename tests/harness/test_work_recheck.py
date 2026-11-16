@@ -64,6 +64,7 @@ from weavria.harness.work import (
     revise_work,
     work_tool,
 )
+from weavria.harness.work_patch import work_patch_tool
 from weavria.models import (
     FakeModelProvider,
     FakeSessionProvider,
@@ -909,9 +910,11 @@ async def test_semantic_approval_cannot_reuse_stale_root_source(
     assert run.state.note_revisions["a"] == 1
 
 
+@pytest.mark.parametrize("patch", [False, True])
 async def test_ledger_invalidates_real_session_before_finish_and_survives_reopen(
     tmp_path: Path,
     session_counter: OpenAICompatibleTokenCounter,
+    patch: bool,
 ) -> None:
     spec = TaskSpecification(
         route="execute",
@@ -1036,7 +1039,30 @@ async def test_ledger_invalidates_real_session_before_finish_and_survives_reopen
                         ToolCallAction(
                             call_id=f"work{phase}",
                             tool_name="propose_work",
-                            arguments=WorkUpdate(
+                            arguments={
+                                "upsert": [
+                                    {
+                                        "note_id": n.note_id,
+                                        "kind": n.kind,
+                                        "summary": n.summary,
+                                        "need_ids": list(n.need_ids),
+                                        "sources": [
+                                            {
+                                                "artifact_id": s.artifact_id,
+                                                "quote": "Total is 10"
+                                                if phase == 1
+                                                else "Total is 20",
+                                            }
+                                            for s in n.sources
+                                        ],
+                                        "depends_on": [e.note_id for e in n.depends_on],
+                                    }
+                                    for n in notes
+                                    if n not in state.notes
+                                ]
+                            }
+                            if patch
+                            else WorkUpdate(
                                 task_revision=1, base_revision=state.revision, notes=notes
                             ).model_dump(mode="json"),
                         ),
@@ -1051,6 +1077,7 @@ async def test_ledger_invalidates_real_session_before_finish_and_survives_reopen
                 configuration_id="recheck-test",
                 working_records=True,
                 work_recheck=True,
+                work_updates="patch" if patch else "replace",
                 context=ContextCompilerConfig(window_tokens=128000, output_tokens=256),
                 limits=RunLimits(max_request_bytes=128000, max_model_calls=10),
             ),
@@ -1126,3 +1153,384 @@ async def test_unchanged_root_requires_new_review_version(
     assert run.state.last_notice == "accepted"
     assert run.state.note_revisions == {"a": 3, "b": 1}
     assert run.state.stale_note_ids == ("b",)
+
+
+async def apply_patch(
+    run: RecheckRun,
+    arguments: dict[str, JsonValue],
+    *,
+    allowed: bool = True,
+    duration: float = 2,
+) -> ToolRecord:
+    """真实工具边界编译补丁;只共用测试驱动,不调用私有编译器绕过执行链。"""
+    run.executor = ToolExecutor(
+        "r", ToolRegistry((work_patch_tool(rechecker=run.checker),)), run.store, ReadOnlyPolicy()
+    )
+    record = await run.executor.execute(
+        ToolCallAction(
+            call_id=f"p{len(run.records)}", tool_name="propose_work", arguments=arguments
+        ),
+        max_duration=duration,
+        task_view=run.view(),
+        accepted_artifacts=None if allowed else (),
+    )
+    run.records = (*run.records, record)
+    run.state = await reduce_work(
+        run.state, run.frame, run.records, lambda aid: run.store.get("r", aid), ledger=run.ledger
+    )
+    return record
+
+
+@pytest.mark.parametrize("compact", [False, True])
+async def test_patch_rebinds_only_selected_frontier_and_preserves_other_notes(
+    session_counter: OpenAICompatibleTokenCounter,
+    compact: bool,
+) -> None:
+    provider = FakeModelProvider((response(), response(note="c")))
+    run = RecheckRun(provider, session_counter, compact=compact)
+    a, _b, c, d = await run.prepare()
+    await apply_patch(run, {"next_query": "check facts", "next_need_ids": ["alpha"]})
+    before = run.state
+    record = await apply_patch(
+        run,
+        {
+            "upsert": [
+                {
+                    "note_id": "b",
+                    "summary": "Double is 40",
+                    "sources": [
+                        {"artifact_id": a.sources[0].artifact_id, "quote": "New total is 20."}
+                    ],
+                }
+            ]
+        },
+    )
+    assert isinstance(record.exchange.observation, ToolSucceededObservation)
+    assert run.state.last_notice == "accepted"
+    assert run.state.notes[0] == a and run.state.notes[2:] == (c, d)
+    assert run.state.notes[1].depends_on == (WorkDependency(note_id="a", revision=2),)
+    assert run.state.note_revisions["d"] == before.note_revisions["d"]
+    assert run.state.next_query == "check facts" and run.state.next_need_ids == ("alpha",)
+    assert run.state.stale_note_ids == ("c",)
+    await apply_patch(
+        run,
+        {
+            "upsert": [{"note_id": "c", "summary": "Recommendation uses 40"}],
+            "next_query": "",
+            "next_need_ids": [],
+        },
+    )
+    assert run.state.last_notice == "accepted" and not run.state.stale_note_ids
+    assert not run.state.next_query and not run.state.next_need_ids
+    assert len(provider.requests) == 2
+    assert (
+        await reduce_work(run.state, run.frame, run.records, lambda aid: run.store.get("r", aid))
+        == run.state
+    )
+    # 同一事实从空状态重放,不再调用模型或重新解释补丁。
+    replay = await reduce_work(
+        WorkingState(schema_version=3, recheck_required=True, task_revision=1),
+        run.frame,
+        run.records,
+        lambda aid: run.store.get("r", aid),
+    )
+    assert replay == run.state
+    assert len(provider.requests) == 2
+
+
+async def test_patch_independent_update_does_not_review_or_clear_invalidated_roots(
+    session_counter: OpenAICompatibleTokenCounter,
+) -> None:
+    provider = FakeModelProvider(())
+    run = RecheckRun(provider, session_counter)
+    run.state = WorkingState(schema_version=4, recheck_required=True, task_revision=1)
+    source = await run.store.put("r", "old", {"text": "Total 10"})
+    run.ledger = evidence_ledger(run, source)
+    await run.apply(
+        (
+            WorkNote(note_id="a", kind="result", summary="Total 10", need_ids=("alpha",)),
+            WorkNote(note_id="d", kind="plan", summary="Independent"),
+        )
+    )
+    run.ledger = run.ledger.model_copy(
+        update={
+            "bindings": tuple(
+                b.model_copy(update={"evaluator_version": "2"}) for b in run.ledger.bindings
+            )
+        }
+    )
+    run.state = reconcile_work_evidence(run.state, run.ledger)
+    before = run.state
+    await apply_patch(run, {"upsert": [{"note_id": "d", "summary": "Continue independent"}]})
+    assert run.state.last_notice == "accepted"
+    assert run.state.evidence_invalidated == ("a",) and run.state.stale_note_ids == ("a",)
+    assert run.state.notes[0] == before.notes[0]
+    assert run.state.note_revisions["a"] == before.note_revisions["a"]
+    assert provider.requests == ()
+    # 空显式选择只能保留未触及根;删除旧结果仍自动成为重验目标。
+    from weavria.harness.work import recheck_targets
+
+    update = WorkUpdate(
+        schema_version=4,
+        task_revision=1,
+        base_revision=run.state.revision,
+        notes=run.state.notes[1:],
+        recheck_note_ids=(),
+    )
+    assert recheck_targets(run.state, update) == ("a",)
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"remove": ["missing"]},
+        {"review": ["missing"]},
+        {"upsert": [{"note_id": "new"}]},
+        {"upsert": [{"note_id": "a", "depends_on": ["missing"]}]},
+        {"upsert": [{"note_id": "a", "depends_on": ["a"]}]},
+        {"upsert": [{"note_id": "a", "summary": "Changed"}, {"note_id": "b"}]},
+        {"review": ["a", "b"]},
+        {"review": ["c"]},  # b 仍失效,不能先重验 c。
+    ],
+)
+async def test_patch_rejects_unknown_ids_and_nonfrontier_updates_atomically(
+    session_counter: OpenAICompatibleTokenCounter,
+    arguments: dict[str, JsonValue],
+) -> None:
+    provider = FakeModelProvider(())
+    run = RecheckRun(provider, session_counter)
+    await run.prepare()
+    before = run.state
+    record = await apply_patch(run, arguments)
+    assert isinstance(record.exchange.observation, ToolFailedObservation)
+    assert record.exchange.observation.error.category is ErrorCategory.INVALID_TOOL_ARGUMENTS
+    assert run.state.notes == before.notes and run.state.revision == before.revision
+    assert provider.requests == ()
+
+
+async def test_patch_initial_dag_delete_parent_and_competing_cas(
+    session_counter: OpenAICompatibleTokenCounter,
+) -> None:
+    run = RecheckRun(FakeModelProvider(()), session_counter)
+    record = await apply_patch(
+        run,
+        {
+            "upsert": [
+                {"note_id": "child", "kind": "plan", "summary": "Derived", "depends_on": ["root"]},
+                {"note_id": "root", "kind": "plan", "summary": "Original"},
+            ]
+        },
+    )
+    assert isinstance(record.exchange.observation, ToolSucceededObservation)
+    assert run.state.note_revisions == {"root": 1, "child": 1}
+    # 相同绑定视图产生的两个独立补丁仍受 CAS 约束,不在后台猜测合并。
+    view = run.view()
+    records = tuple(
+        await asyncio.gather(
+            *(
+                run.executor.execute(
+                    ToolCallAction(
+                        call_id=f"cas{i}",
+                        tool_name="propose_work",
+                        arguments={"next_query": f"query{i}"},
+                    ),
+                    max_duration=2,
+                    task_view=view,
+                )
+                for i in range(2)
+            )
+        )
+    )
+    run.records = (*run.records, *records)
+    run.state = await reduce_work(
+        run.state, run.frame, run.records, lambda aid: run.store.get("r", aid)
+    )
+    assert run.state.revision == 2 and run.state.last_notice == "stale_revision"
+    assert run.state.next_query == "query0"
+    await apply_patch(run, {"remove": ["root"]})
+    assert run.state.last_notice == "accepted" and run.state.stale_note_ids == ("child",)
+    assert run.state.notes[0].depends_on == (WorkDependency(note_id="root", revision=1),)
+
+
+async def test_patch_cycle_and_capacity_leave_work_unchanged(
+    session_counter: OpenAICompatibleTokenCounter,
+) -> None:
+    run = RecheckRun(FakeModelProvider(()), session_counter)
+    record = await apply_patch(
+        run,
+        {
+            "upsert": [
+                {"note_id": "x", "kind": "plan", "summary": "X", "depends_on": ["y"]},
+                {"note_id": "y", "kind": "plan", "summary": "Y", "depends_on": ["x"]},
+            ]
+        },
+    )
+    assert isinstance(record.exchange.observation, ToolFailedObservation)
+    assert run.state.revision == 0
+    await apply_patch(
+        run,
+        {
+            "upsert": [
+                {"note_id": f"n{i}", "kind": "plan", "summary": f"Plan {i}"} for i in range(6)
+            ]
+        },
+    )
+    assert run.state.revision == 1
+    record = await apply_patch(
+        run, {"upsert": [{"note_id": "n7", "kind": "plan", "summary": "Seven"}]}
+    )
+    assert isinstance(record.exchange.observation, ToolFailedObservation)
+    assert len(run.state.notes) == 6 and run.state.revision == 1
+
+
+async def test_patch_quote_authorization_disambiguation_and_offsets(
+    session_counter: OpenAICompatibleTokenCounter,
+) -> None:
+    run = RecheckRun(FakeModelProvider(()), session_counter)
+    source = await run.store.put("r", "doc", {"a/b~": ["前缀。唯一原文。尾部"], "other": "别处"})
+    args: dict[str, JsonValue] = {
+        "upsert": [
+            {
+                "note_id": "a",
+                "kind": "result",
+                "summary": "Finding",
+                "sources": [{"artifact_id": source.reference.artifact_id, "quote": "唯一原文"}],
+            }
+        ]
+    }
+    denied = await apply_patch(run, args, allowed=False)
+    assert isinstance(denied.exchange.observation, ToolFailedObservation)
+    assert denied.exchange.observation.error.category is ErrorCategory.POLICY_DENIED
+    await apply_patch(run, args)
+    assert run.state.notes[0].sources == (
+        WorkReference(
+            artifact_id=source.reference.artifact_id, pointer="/a~1b~0/0", start=3, end=7
+        ),
+    )
+    source = await run.store.put("r", "ambiguous", {"a": "match", "b": "match"})
+    ref: dict[str, JsonValue] = {"artifact_id": source.reference.artifact_id, "quote": "match"}
+    denied = await apply_patch(run, {"upsert": [{"note_id": "a", "sources": [ref]}]})
+    assert isinstance(denied.exchange.observation, ToolFailedObservation)
+    await apply_patch(run, {"upsert": [{"note_id": "a", "sources": [{**ref, "pointer": "/b"}]}]})
+    assert run.state.last_notice == "accepted" and run.state.notes[0].sources[0].pointer == "/b"
+
+
+async def test_patch_source_read_timeout_and_cancellation_cleanup(
+    session_counter: OpenAICompatibleTokenCounter,
+) -> None:
+    started, cleaned = asyncio.Event(), asyncio.Event()
+
+    class SlowStore(InMemoryArtifactStore):
+        async def get(self, run_id: str, artifact_id: str) -> ArtifactSnapshot:
+            if artifact_id == "slow":
+                started.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    cleaned.set()
+            return await super().get(run_id, artifact_id)
+
+    run = RecheckRun(FakeModelProvider(()), session_counter)
+    run.store = SlowStore()
+    args: dict[str, JsonValue] = {
+        "upsert": [
+            {
+                "note_id": "a",
+                "kind": "result",
+                "summary": "A",
+                "sources": [{"artifact_id": "slow", "quote": "Text"}],
+            }
+        ]
+    }
+    record = await apply_patch(run, args, duration=0.02)
+    assert isinstance(record.exchange.observation, ToolFailedObservation)
+    assert record.exchange.observation.error.category is ErrorCategory.TIMEOUT
+    assert cleaned.is_set() and run.state.revision == 0
+    started.clear()
+    cleaned.clear()
+    task = asyncio.create_task(apply_patch(run, args))
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert cleaned.is_set() and run.state.revision == 0
+
+
+@pytest.mark.parametrize("redundant_upsert", [False, True])
+async def test_patch_explicit_root_review_advances_version_without_reviving_descendant(
+    session_counter: OpenAICompatibleTokenCounter,
+    redundant_upsert: bool,
+) -> None:
+    action = response(status="supported", note="a").action
+    assert isinstance(action, ToolCallAction)
+    args = json.loads(json.dumps(action.arguments))
+    args["judgments"][0]["citations"][0]["evidence"] = 0
+    provider = FakeModelProvider(
+        (ModelResponse(action=action.model_copy(update={"arguments": args})),)
+    )
+    run = RecheckRun(provider, session_counter)
+    run.state = WorkingState(schema_version=4, recheck_required=True, task_revision=1)
+    source = await run.store.put("r", "old", {"text": "Total 10"})
+    run.ledger = evidence_ledger(run, source)
+    await run.apply(
+        (
+            WorkNote(
+                note_id="a",
+                kind="result",
+                summary="Total 10",
+                need_ids=("alpha",),
+                sources=(WorkReference(artifact_id=source.reference.artifact_id, pointer="/text"),),
+            ),
+            WorkNote(
+                note_id="b",
+                kind="result",
+                summary="Double 20",
+                depends_on=(WorkDependency(note_id="a", revision=1),),
+            ),
+        )
+    )
+    run.ledger = run.ledger.model_copy(
+        update={
+            "bindings": tuple(
+                b.model_copy(update={"evaluator_version": "2"}) for b in run.ledger.bindings
+            )
+        }
+    )
+    run.state = reconcile_work_evidence(run.state, run.ledger)
+    # 同一节点同时 upsert/review 与单独 review 等价,只允许一次审查。
+    await apply_patch(
+        run, {"upsert": [{"note_id": "a"}] if redundant_upsert else [], "review": ["a"]}
+    )
+    assert run.state.last_notice == "accepted" and not run.state.evidence_invalidated
+    assert run.state.stale_note_ids == ("b",)
+    assert run.state.note_revisions == {"a": 3, "b": 1}
+    assert len(provider.requests) == 1
+
+
+@pytest.mark.parametrize("bound", [False, True])
+async def test_patch_without_recheck_uses_bound_state_and_does_not_enable_policy(
+    session_counter: OpenAICompatibleTokenCounter,
+    bound: bool,
+) -> None:
+    run = RecheckRun(FakeModelProvider(()), session_counter)
+    run.state = WorkingState(task_revision=1)
+    executor = ToolExecutor("r", ToolRegistry((work_patch_tool(),)), run.store, ReadOnlyPolicy())
+    record = await executor.execute(
+        ToolCallAction(
+            call_id="patch",
+            tool_name="propose_work",
+            arguments={
+                "upsert": [{"note_id": "plan", "kind": "plan", "summary": "Inspect source"}]
+            },
+        ),
+        max_duration=2,
+        task_view=run.view() if bound else None,
+    )
+    state = await reduce_work(run.state, run.frame, (record,), lambda aid: run.store.get("r", aid))
+    assert state.schema_version == 2 and not state.recheck_required
+    if bound:
+        assert state.revision == 1 and state.notes[0].summary == "Inspect source"
+    else:
+        assert isinstance(record.exchange.observation, ToolFailedObservation)
+        assert record.exchange.observation.error.category is ErrorCategory.INVALID_TOOL_ARGUMENTS
+        assert state.revision == 0

@@ -15,6 +15,7 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+from pydantic.json_schema import SkipJsonSchema
 
 from weavria.artifacts import ArtifactSnapshot
 from weavria.core import ArtifactRef, ErrorCategory, ToolRecord, ToolSucceededObservation
@@ -101,9 +102,13 @@ class WorkNote(_VersionedWork):
         return self
 
 
-class WorkUpdate(_VersionedWork):
+class WorkUpdate(_WorkBase):
     """全量替换有界工作集;原始工具事件保留全部旧版本,不靠无限追加维持状态。"""
 
+    schema_version: Literal[1, 2, 3, 4] = 2
+    recheck_note_ids: tuple[Identity, ...] | None = Field(
+        default=None, max_length=6, exclude_if=lambda value: value is None
+    )
     task_revision: int = Field(ge=1)
     base_revision: int = Field(ge=0)
     notes: tuple[WorkNote, ...] = Field(default=(), max_length=6)
@@ -112,8 +117,17 @@ class WorkUpdate(_VersionedWork):
 
     @model_validator(mode="after")
     def bounded(self) -> Self:
+        if self.recheck_note_ids is not None and (
+            self.schema_version != 4
+            or len(set(self.recheck_note_ids)) != len(self.recheck_note_ids)
+        ):
+            raise ValueError("explicit recheck selection requires v4 and unique IDs")
         if len({n.note_id for n in self.notes}) != len(self.notes):
             raise ValueError("work note IDs must be unique")
+        if self.recheck_note_ids is not None and not set(self.recheck_note_ids) <= {
+            n.note_id for n in self.notes
+        }:
+            raise ValueError("explicit recheck selection must name candidate notes")
         _dependency_order(self.notes)
         if any(edge.revision > self.base_revision + 1 for n in self.notes for edge in n.depends_on):
             raise ValueError("work dependencies cannot bind future revisions")
@@ -415,6 +429,12 @@ class WorkDraftNote(_VersionedWork):
 class WorkDraft(_VersionedWork):
     """简化的输入协议;接受后仍持久化带明确版本的 WorkUpdate。"""
 
+    # 宿主补丁编译元数据,不应进入全量工具的模型输入 Schema。实际持久化
+    # WorkUpdate v4 仍公开完整字段,并把选择绑定到提案摘要和审查收据。
+    recheck_note_ids: SkipJsonSchema[tuple[Identity, ...] | None] = Field(
+        default=None, max_length=6, exclude_if=lambda value: value is None
+    )
+
     task_revision: int | None = Field(default=None, ge=1)
     base_revision: int | None = Field(default=None, ge=0)
     notes: tuple[WorkDraftNote, ...] = Field(default=(), max_length=6)
@@ -464,6 +484,8 @@ def _bind_draft(
         for n in normalized
     )
     return WorkUpdate(
+        schema_version=4 if draft.recheck_note_ids is not None else 2,
+        recheck_note_ids=draft.recheck_note_ids,
         task_revision=task_revision,
         base_revision=base_revision,
         notes=notes,
@@ -526,6 +548,8 @@ class _WorkTool(TypedTool[WorkDraft, WorkProposal]):
         # 模型工具参数来自 JSON;通过 JSON 校验允许数组表示不可变 tuple,
         # 同时保留数字/字符串等字段的严格类型,不关闭整个 Schema 的 strict。
         try:
+            if "recheck_note_ids" in arguments:
+                raise ValueError("recheck selection is host-owned patch metadata")
             return WorkDraft.model_validate_json(json.dumps(arguments))
         except ValueError as exc:
             raise ToolFault(
@@ -592,7 +616,11 @@ def recheck_targets(state: WorkingState, update: WorkUpdate) -> tuple[str, ...]:
             or (note.note_id in proposed and proposed[note.note_id].kind == "result")
         )
         and (
-            (note.note_id in state.evidence_invalidated and note.note_id in state.recheck_note_ids)
+            (
+                note.note_id in state.evidence_invalidated
+                and note.note_id in state.recheck_note_ids
+                and (update.recheck_note_ids is None or note.note_id in update.recheck_note_ids)
+            )
             or note.note_id not in proposed
             or _note_content(note) != _note_content(proposed[note.note_id])
         )
@@ -755,8 +783,8 @@ def work_tool(*, rechecker: WorkRechecker | None = None) -> TypedTool[WorkDraft,
 
     return _WorkTool(
         name=WORK_TOOL,
-        # 开启审查时 v8 接入 Ledger 驱动的根失效;关闭时保留 v7 协议。
-        version="8:" + rechecker.version if rechecker is not None else "7",
+        # v9 输出允许 WorkUpdate v4 的显式局部重验意图;旧输入仍按原语义处理。
+        version="9:" + rechecker.version if rechecker is not None else "9",
         timeout_seconds=60 if rechecker is not None else 10,
         input_type=WorkDraft,
         output_type=WorkProposal,
@@ -1199,3 +1227,55 @@ def work_need_weights(
 def load_work(value: dict[str, JsonValue]) -> WorkingState:
     """在 JSON 边界读取持久化工作状态,保留严格类型校验。"""
     return WorkingState.model_validate_json(json.dumps(value))
+
+
+def bound_work_state(context: ToolContext) -> WorkingState:
+    """读取宿主绑定的完整/压缩视图;只正规化展示字段,不从模型参数恢复旧状态。
+
+    原文身份随后通过 ToolContext 重新核验。压缩视图中的来源标签不是权限,
+    也不是需要信任的文本;本步骤保留笔记、版本与失效图的精确语义。
+    """
+    view = context.task_view
+    raw = view.progress.get("working_state") if view else None
+    if not isinstance(raw, dict):
+        raise ValueError("work update requires a bound working state")
+    notes = raw.get("notes")
+    if not isinstance(notes, list):
+        raise ValueError("bound work notes are missing")
+    normalized: list[dict[str, JsonValue]] = []
+    for value in notes:
+        if not isinstance(value, dict):
+            raise ValueError("invalid bound work note")
+        note = dict(value)
+        sources = note.get("sources", [])
+        if not isinstance(sources, list):
+            raise ValueError("invalid bound work references")
+        note["sources"] = [
+            {key: item for key, item in ref.items() if key != "source_label"}
+            for ref in sources
+            if isinstance(ref, dict)
+        ]
+        if len(note["sources"]) != len(sources):
+            raise ValueError("invalid bound work reference")
+        normalized.append(note)
+    return WorkingState.model_validate_json(
+        json.dumps(
+            {
+                "schema_version": 4
+                if "evidence_heads" in raw or raw.get("schema_version") == 4
+                else 3
+                if raw.get("recheck_required")
+                else 2,
+                "evidence_heads": raw.get("evidence_heads", {}),
+                "evidence_invalidated": raw.get("evidence_invalidated", []),
+                "recheck_required": raw.get("recheck_required", False),
+                "next_query": raw.get("next_query", ""),
+                "next_need_ids": raw.get("next_need_ids", []),
+                "task_revision": raw.get("task_revision"),
+                "revision": raw.get("revision"),
+                "notes": normalized,
+                "note_revisions": raw.get("note_revisions", {}),
+                "dependency_issues": raw.get("dependency_issues", []),
+            }
+        )
+    )

@@ -32,6 +32,7 @@ class HarnessConfig:
     project_task_view: bool = True
     adaptive_capabilities: bool = True
     work_recheck: bool = False
+    work_updates: Literal["replace", "patch"] = "replace"
     semantic_discovery: CapabilityDiscoveryConfig | None = None
 
     def __post_init__(self) -> None:
@@ -56,6 +57,10 @@ class HarnessConfig:
             raise ValueError("semantic discovery requires task understanding")
         if self.work_recheck and not self.working_records:
             raise ValueError("work recheck requires working records")
+        if self.work_updates not in {"replace", "patch"}:
+            raise ValueError("unknown work update mode")
+        if self.work_updates == "patch" and not self.working_records:
+            raise ValueError("work patches require working records")
         if self.working_records and not self.project_task_view:
             raise ValueError("working records require task model projection")
         if self.context.semantic_compaction and not self.context_recovery:

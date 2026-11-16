@@ -204,6 +204,7 @@ from .work import (
     WorkReference,
     WorkUpdate,
 )
+from .work_patch import PatchNote, PatchSource, WorkPatch
 from .work_recheck import ModelWorkRechecker
 from .work_recheck_contracts import WorkRecheckReceipt
 from .working_set import AdaptiveCapabilityPolicy, CapabilityWorkingSet, CapabilityWorkingSetPolicy
@@ -333,6 +334,8 @@ __all__ = [
     "OutcomeRepairFeedbackProvider",
     "OutcomeRepairIssue",
     "OutcomeRepairStrategyProvider",
+    "PatchNote",
+    "PatchSource",
     "ProposedTaskAction",
     "PublicCapabilityPolicy",
     "RepairSelection",
@@ -376,6 +379,7 @@ __all__ = [
     "WorkDependency",
     "WorkDependencyIssue",
     "WorkNote",
+    "WorkPatch",
     "WorkQuoteReference",
     "WorkRecheckReceipt",
     "WorkRechecker",

@@ -15,6 +15,7 @@ from .work import (
     WorkNote,
     WorkReference,
     WorkUpdate,
+    bound_work_state,
     recheck_targets,
     work_update_sha256,
 )
@@ -90,52 +91,6 @@ def _evidence_lines(text: str) -> list[JsonValue]:
     return lines
 
 
-def _bound_state(context: ToolContext) -> WorkingState:
-    """读取宿主绑定的完整/压缩视图;只正规化展示字段,不从模型参数恢复旧状态。
-
-    原文身份随后通过 ToolContext 重新核验。压缩视图中的来源标签不是权限,
-    也不是需要信任的文本;本步骤保留笔记、版本与失效图的精确语义。
-    """
-    view = context.task_view
-    raw = view.progress.get("working_state") if view else None
-    if not isinstance(raw, dict) or raw.get("recheck_required") is not True:
-        raise ValueError("recheck requires an enabled bound working state")
-    notes = raw.get("notes")
-    if not isinstance(notes, list):
-        raise ValueError("bound work notes are missing")
-    normalized: list[dict[str, JsonValue]] = []
-    for value in notes:
-        if not isinstance(value, dict):
-            raise ValueError("invalid bound work note")
-        note = dict(value)
-        sources = note.get("sources", [])
-        if not isinstance(sources, list):
-            raise ValueError("invalid bound work references")
-        note["sources"] = [
-            {key: item for key, item in ref.items() if key != "source_label"}
-            for ref in sources
-            if isinstance(ref, dict)
-        ]
-        if len(note["sources"]) != len(sources):
-            raise ValueError("invalid bound work reference")
-        normalized.append(note)
-    return WorkingState.model_validate_json(
-        json.dumps(
-            {
-                "schema_version": 4 if "evidence_heads" in raw else 3,
-                "evidence_heads": raw.get("evidence_heads", {}),
-                "evidence_invalidated": raw.get("evidence_invalidated", []),
-                "recheck_required": True,
-                "task_revision": raw.get("task_revision"),
-                "revision": raw.get("revision"),
-                "notes": normalized,
-                "note_revisions": raw.get("note_revisions", {}),
-                "dependency_issues": raw.get("dependency_issues", []),
-            }
-        )
-    )
-
-
 class ModelWorkRechecker:
     """一次提案至多一次批量审查,完整请求先准入;外层工具负责总期限与取消。
 
@@ -166,7 +121,9 @@ class ModelWorkRechecker:
         self, update: WorkUpdate, context: ToolContext
     ) -> tuple[WorkRecheckReceipt, ...]:
         try:
-            state = _bound_state(context)
+            state = bound_work_state(context)
+            if not state.recheck_required:
+                raise ValueError("work recheck requires enabled bound state")
         except ValueError as exc:
             raise ToolFault(
                 ErrorCategory.INVALID_TOOL_ARGUMENTS, "Missing bound recheck state"
