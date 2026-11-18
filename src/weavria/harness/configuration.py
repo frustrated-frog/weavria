@@ -34,6 +34,7 @@ class HarnessConfig:
     work_recheck: bool = False
     work_updates: Literal["replace", "patch"] = "replace"
     semantic_discovery: CapabilityDiscoveryConfig | None = None
+    work_material_handoff: bool = False
 
     def __post_init__(self) -> None:
         if not self.configuration_id.strip() or len(self.configuration_id) > 128:
@@ -46,6 +47,7 @@ class HarnessConfig:
             self.context_recovery,
             self.working_records,
             self.work_recheck,
+            self.work_material_handoff,
         ):
             if type(enabled) is not bool:
                 raise ValueError("Harness feature switches must be booleans")
@@ -57,6 +59,8 @@ class HarnessConfig:
             raise ValueError("semantic discovery requires task understanding")
         if self.work_recheck and not self.working_records:
             raise ValueError("work recheck requires working records")
+        if self.work_material_handoff and not self.working_records:
+            raise ValueError("material handoff requires working records")
         if self.work_updates not in {"replace", "patch"}:
             raise ValueError("unknown work update mode")
         if self.work_updates == "patch" and not self.working_records:

@@ -72,6 +72,7 @@ class TaskAwareSessionPreparer:
         working_set: CapabilityWorkingSetPolicy | None = None,
         working_records: bool = False,
         work_recheck: bool = False,
+        material_handoff: bool = False,
         outcomes: CapabilityOutcomeResolver | None = None,
     ) -> None:
         self._outcomes = outcomes
@@ -79,6 +80,9 @@ class TaskAwareSessionPreparer:
         if work_recheck and not working_records:
             raise ValueError("work recheck requires working records")
         self._work_recheck = work_recheck
+        if material_handoff and not working_records:
+            raise ValueError("material handoff requires working records")
+        self._material_handoff = material_handoff
         self._working_set = working_set
         self._understanding = understanding
         self._evidence = evidence or EvidenceResolver()
@@ -108,6 +112,7 @@ class TaskAwareSessionPreparer:
         return (
             f"task-aware-session/15[work={self._working_records};"
             + ("evidence-recheck/6;" if self._work_recheck else "")
+            + ("material-handoff/1;" if self._material_handoff else "")
             + f"{self._outcomes.version if self._outcomes else 'no-outcomes'};"
             f"{self._understanding.version};{self._evidence.version};"
             f"{self._capabilities.version};{self._clarification.version};"
@@ -120,7 +125,7 @@ class TaskAwareSessionPreparer:
 
     def context_focus(self, snapshot: SemanticSnapshot) -> ContextFocus:
         """Project the current accepted ledger into soft retrieval hints."""
-        return project_context_focus(snapshot)
+        return project_context_focus(snapshot, material_handoff=self._material_handoff)
 
     def replan_needs(self, snapshot: SemanticSnapshot, tool_name: str) -> tuple[ReplanNeed, ...]:
         frame = load_task_frame(snapshot.observation.payload)

@@ -5,12 +5,14 @@ from pathlib import Path
 import pytest
 
 from examples.work_context_probe import full_source_view
-from examples.work_recheck import load_dataset, registry
+from examples.work_recheck import PairedPreparation, load_dataset, registry
 from examples.work_recheck_diagnosis import with_version_scope
 from weavria.artifacts import InMemoryArtifactStore
 from weavria.core import (
     ControlRequest,
     ConversationView,
+    ModelRequest,
+    ModelResponse,
     SessionRequest,
     TaskInput,
     ToolCallAction,
@@ -18,7 +20,31 @@ from weavria.core import (
     ToolSucceededObservation,
 )
 from weavria.harness.requirements import EvidenceResolver, InformationRequirement, NeedStatus
+from weavria.models import FakeModelProvider
 from weavria.tools import ReadOnlyPolicy, ToolExecutor
+
+
+async def test_pair_replays_only_matching_preparation_and_calls_the_reviewer_again() -> None:
+    spec = ModelResponse(
+        action=ToolCallAction(call_id="prep", tool_name="declare_task_specification", arguments={})
+    )
+    review = ModelResponse(
+        action=ToolCallAction(call_id="review", tool_name="review_work", arguments={})
+    )
+    # 即使审查模型误发准备动作,下一次审查仍须独立生成。
+    provider = FakeModelProvider((spec, spec, spec, review))
+    pair = PairedPreparation(provider)
+    request = ModelRequest(
+        instructions="Return one call named declare_task_specification", task=TaskInput(goal="A")
+    )
+    assert await pair.generate(request) == spec
+    assert await pair.generate(request) == spec
+    assert await pair.generate(request.model_copy(update={"task": TaskInput(goal="B")})) == spec
+    work = request.model_copy(update={"instructions": "Return one call named review_work"})
+    assert await pair.generate(work) == spec
+    assert await pair.generate(work) == review
+    assert pair.hits == 1
+    assert len(provider.requests) == 4
 
 
 async def test_freshness_and_source_version_are_independent_diagnostic_axes() -> None:

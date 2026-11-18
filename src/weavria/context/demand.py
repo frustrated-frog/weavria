@@ -69,6 +69,8 @@ class ContextFocus:
 
     task_revision: int
     demands: tuple[ContextDemand, ...] = ()
+    # 只在这些已绑定来源的完整表示不增加预算时替换摘录。锚点不产生读取权限。
+    prefer_complete: tuple[EvidenceAnchor, ...] = ()
 
     def __post_init__(self) -> None:
         if type(self.task_revision) is not int or self.task_revision < 1:
@@ -77,6 +79,8 @@ class ContextFocus:
             raise ValueError("demands must be an immutable tuple")
         if len(self.demands) > 128 or len({d.demand_id for d in self.demands}) != len(self.demands):
             raise ValueError("focus must contain at most 128 unique demands")
+        if not _typed_tuple(self.prefer_complete, EvidenceAnchor) or len(self.prefer_complete) > 2:
+            raise ValueError("prefer_complete requires at most two evidence anchors")
 
 
 def _typed_tuple(value: object, kind: type) -> bool:

@@ -7,6 +7,8 @@ from typing import Literal
 
 from weavria.core import EvidenceDelivery
 
+from .demand import EvidenceAnchor
+
 
 @dataclass(frozen=True, slots=True)
 class Representation:
@@ -157,6 +159,37 @@ class ContextAllocator:
         # 联合替换先于单来源局部修复,并只使用剩余搜索预算的一半。
         selected = await self._group_exchange(selected, minimum)
         return await self._exchange(selected, minimum)
+
+    async def prefer_complete_sources(
+        self, selected: dict[int, int], anchors: tuple[EvidenceAnchor, ...]
+    ) -> dict[int, int]:
+        """对已选摘录试算整份原文。保留其他单元、依赖闭包和既有预算预留。"""
+        origins = {(a.run_id, a.call_id, a.sha256) for a in anchors}
+        for index, level in sorted(selected.items()):
+            variants = self.units[index].variants
+            excerpt = variants[level].delivery
+            if excerpt is None or excerpt.representation != "excerpt":
+                continue
+            if (excerpt.run_id, excerpt.call_id, excerpt.artifact_sha256) not in origins:
+                continue
+            raw = next(
+                (
+                    i
+                    for i, v in enumerate(variants)
+                    if v.delivery is not None and v.delivery.representation == "raw"
+                ),
+                None,
+            )
+            if raw is None:
+                continue
+            if not await self._step(self.max_steps):
+                break
+            proposal = {**selected, index: raw}
+            before, after = await self.cost(selected), await self.cost(proposal)
+            # BPE 与 JSON 字节成本都可能受周围上下文影响。只能用完整请求试算。
+            if after.tokens <= before.tokens and after.bytes <= before.bytes and self.fits(after):
+                selected = proposal
+        return selected
 
     async def _group_exchange(
         self, selected: dict[int, int], minimum: dict[int, int]

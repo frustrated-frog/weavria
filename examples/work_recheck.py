@@ -16,10 +16,13 @@ from pydantic import BaseModel, ConfigDict
 from examples.live_memory_formation import Transport
 from weavria.context import ContextCompilerConfig
 from weavria.core import (
+    ModelRequest,
+    ModelResponse,
     ModelTurn,
     SessionRequest,
     SessionRunEvent,
     SessionSemanticCommitted,
+    ToolCallAction,
     ToolFailedObservation,
     ToolRecorded,
 )
@@ -33,10 +36,13 @@ from weavria.harness import (
     HarnessEvidence,
     TaskUnderstandingError,
     load_need_ledger,
+    load_task_frame,
+    task_specification_sha256,
 )
-from weavria.harness.work import WorkProposal, load_work
+from weavria.harness.work import WorkProposal, load_work, work_analysis_status
 from weavria.models import (
     ModelCapabilities,
+    ModelProvider,
     OpenAICompatibleConfig,
     OpenAICompatibleProvider,
     OpenAICompatibleSessionProvider,
@@ -89,6 +95,39 @@ class CapturingActor:
     async def generate_session(self, request: SessionRequest) -> ModelTurn:
         self.requests.append(request.model_copy(deep=True))
         return await self.provider.generate_session(request)
+
+
+class PairedPreparation:
+    """仅在一对实验内按完整请求摘要复用准备动作。执行和工作重验继续调用真实模型。"""
+
+    def __init__(self, provider: ModelProvider) -> None:
+        self.provider = provider
+        self.responses: dict[str, str] = {}
+        self.hits = 0
+
+    @property
+    def capabilities(self) -> ModelCapabilities:
+        return self.provider.capabilities
+
+    async def generate(self, request: ModelRequest) -> ModelResponse:
+        key = hashlib.sha256(request.model_dump_json().encode()).hexdigest()
+        if key in self.responses:
+            self.hits += 1
+            return ModelResponse.model_validate_json(self.responses[key])
+        response = await self.provider.generate(request)
+        if (
+            isinstance(response.action, ToolCallAction)
+            and response.action.tool_name
+            in {
+                "declare_task_specification",
+                "declare_requirement_coverage",
+                "repair_task_specification",
+                "review_disputed_obligations",
+            }
+            and f"call named {response.action.tool_name}" in request.instructions
+        ):
+            self.responses[key] = response.model_dump_json()
+        return response
 
 
 def registry(case: Case) -> ToolRegistry:
@@ -166,6 +205,10 @@ def implementation_digests() -> dict[str, str]:
             "work_patch.py",
             "configuration.py",
             "targets.py",
+            "context.py",
+            "../context/allocation.py",
+            "../context/compiler.py",
+            "../context/demand.py",
             "../../../examples/work_recheck.py",
             "assembly.py",
             "work_recheck.py",
@@ -212,7 +255,10 @@ async def experiment(args: argparse.Namespace) -> None:
         "implementation_sha256": await asyncio.to_thread(implementation_digests),
         "options": options,
         "repeats": args.repeats,
-        "comparison": "versioned_material"
+        "share_preparation": getattr(args, "share_preparation", False),
+        "comparison": "material_handoff"
+        if getattr(args, "compare_handoff", False)
+        else "versioned_material"
         if getattr(args, "compare_material", False)
         else "work_updates"
         if getattr(args, "compare_updates", False)
@@ -227,28 +273,42 @@ async def experiment(args: argparse.Namespace) -> None:
                 for case in dataset.cases:
                     if args.case and case.id not in args.case:
                         continue
+                    paired = (
+                        PairedPreparation(reasoner)
+                        if getattr(args, "share_preparation", False)
+                        else None
+                    )
                     # 交替顺序减小固定先后偏差;两个策略采用相同任务、模型和预算。
-                    profiles: tuple[tuple[bool, Literal["replace", "patch"], bool], ...]
-                    if getattr(args, "compare_material", False):
-                        profiles = ((True, "patch", False), (True, "patch", True))
+                    profiles: tuple[tuple[bool, Literal["replace", "patch"], bool, bool], ...]
+                    if getattr(args, "compare_handoff", False):
+                        profiles = ((True, "patch", True, False), (True, "patch", True, True))
+                    elif getattr(args, "compare_material", False):
+                        profiles = ((True, "patch", False, False), (True, "patch", True, False))
                     elif getattr(args, "compare_updates", False):
-                        profiles = ((True, "replace", False), (True, "patch", False))
+                        profiles = ((True, "replace", False, False), (True, "patch", False, False))
                     else:
-                        profiles = ((False, "replace", False), (True, "replace", False))
-                    for enabled, update_mode, material in (
+                        profiles = (
+                            (False, "replace", False, False),
+                            (True, "replace", False, False),
+                        )
+                    for enabled, update_mode, material, handoff in (
                         profiles if repeat % 2 == 0 else profiles[::-1]
                     ):
                         captured = CapturingActor(actor) if args.capture_requests else None
                         started = time.monotonic()
                         calls = transport.calls
+                        hits_before = paired.hits if paired else 0
                         key = f"{case.id}-{repeat}-{enabled}-{update_mode}"
                         if material:
                             key += "-edition"
+                        if handoff:
+                            key += "-handoff"
                         row: dict[str, object] = {
                             "case": case.id,
                             "repeat": repeat,
                             "review": enabled,
                             "versioned_material": material,
+                            "material_handoff": handoff,
                             "work_updates": update_mode,
                         }
                         try:
@@ -262,6 +322,7 @@ async def experiment(args: argparse.Namespace) -> None:
                                     working_records=True,
                                     work_recheck=enabled,
                                     work_updates=update_mode,
+                                    work_material_handoff=handoff,
                                     limits=RunLimits(
                                         max_model_calls=16,
                                         max_tool_calls=24,
@@ -273,7 +334,7 @@ async def experiment(args: argparse.Namespace) -> None:
                                 model=captured or actor,
                                 tools=registry(case),
                                 token_counter=counter,
-                                reasoning_model=reasoner,
+                                reasoning_model=paired or reasoner,
                                 reasoning_counter=counter,
                             ) as agent:
                                 await agent.create("s")
@@ -315,6 +376,15 @@ async def experiment(args: argparse.Namespace) -> None:
                                     if isinstance(e.data, SessionSemanticCommitted)
                                 ]
                                 if heads:
+                                    first_frame = load_task_frame(heads[0].observation.payload)
+                                    row["specification_sha256"] = task_specification_sha256(
+                                        first_frame.specification
+                                    )
+                                    row["coverage_sha256"] = (
+                                        first_frame.requirement_coverage.assessment_sha256
+                                        if first_frame.requirement_coverage
+                                        else None
+                                    )
                                     ledger = load_need_ledger(heads[-1].need_ledger)
                                     row["remaining_gaps"] = [
                                         s.missing_fields for s in ledger.states
@@ -323,16 +393,45 @@ async def experiment(args: argparse.Namespace) -> None:
                                         b.proof_strength == "scoped_structural"
                                         for b in ledger.bindings
                                     )
+                                    if states:
+                                        row["final_findings"] = sum(
+                                            v == "finding_recorded"
+                                            for v in work_analysis_status(
+                                                ledger, states[-1]
+                                            ).values()
+                                        )
+                                        row["final_stale_results"] = states[-1].has_stale_results
                                 statuses: list[str] = []
                                 work_errors: list[dict[str, str]] = []
                                 selectors = {"quote": 0, "range": 0, "whole": 0}
                                 work_calls = 0
+                                artifact_reads = 0
+                                current_read = False
+                                original_work_committed = False
                                 work_argument_bytes: list[int] = []
                                 for event in events:
+                                    if (
+                                        isinstance(event.data, SessionSemanticCommitted)
+                                        and not current_read
+                                    ):
+                                        payload = event.data.snapshot.working_state
+                                        if payload and any(
+                                            n.kind == "result" and n.sources
+                                            for n in load_work(payload).notes
+                                        ):
+                                            original_work_committed = True
                                     if isinstance(event.data, SessionRunEvent) and isinstance(
                                         event.data.event.data, ToolRecorded
                                     ):
                                         record = event.data.event.data.record
+                                        if (
+                                            record.exchange.action.tool_name == "read_source"
+                                            and record.exchange.action.arguments.get("version")
+                                            == "current"
+                                        ):
+                                            current_read = True
+                                        if record.exchange.action.tool_name == "read_artifact":
+                                            artifact_reads += 1
                                         if record.exchange.action.tool_name == "propose_work":
                                             work_calls += 1
                                             arguments = record.exchange.action.arguments
@@ -400,6 +499,8 @@ async def experiment(args: argparse.Namespace) -> None:
                                     answer_correct=correct,
                                     output=report.execution.output,
                                     work_calls=work_calls,
+                                    artifact_reads=artifact_reads,
+                                    finding_before_current=original_work_committed,
                                     work_argument_bytes=work_argument_bytes,
                                     work_errors=work_errors,
                                     source_selectors=selectors,
@@ -437,6 +538,7 @@ async def experiment(args: argparse.Namespace) -> None:
                                 answer_correct=False,
                             )
                         row.update(
+                            preparation_cache_hits=(paired.hits - hits_before if paired else 0),
                             calls=transport.calls - calls,
                             elapsed_seconds=round(time.monotonic() - started, 2),
                             provider_observations=transport.observations[calls:],
@@ -486,6 +588,9 @@ def main() -> None:
     parser.add_argument("--live", action="store_true")
     comparisons = parser.add_mutually_exclusive_group()
     comparisons.add_argument(
+        "--compare-handoff", action="store_true", help="固定版本取证与工作补丁,只切换资料分析交接"
+    )
+    comparisons.add_argument(
         "--compare-material", action="store_true", help="固定使用补丁,对照指定版本资料的获取"
     )
     comparisons.add_argument(
@@ -495,6 +600,11 @@ def main() -> None:
         "--capture-requests", action="store_true", help="本地保存模型实际收到的公开上下文"
     )
     parser.add_argument("--repeats", type=int, choices=range(1, 6), default=1)
+    parser.add_argument(
+        "--share-preparation",
+        action="store_true",
+        help="一对运行共享相同准备请求的模型声明,分别走宿主校验与后续执行",
+    )
     parser.add_argument("--case", action="append")
     parser.add_argument("--output", type=Path, default=Path(".weavria/work-recheck/results.json"))
     asyncio.run(experiment(parser.parse_args()))

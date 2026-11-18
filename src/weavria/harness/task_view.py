@@ -16,6 +16,7 @@ from weavria.core import (
     task_view_digest,
 )
 
+from .context import MATERIAL_HINT_BYTES, pending_material
 from .continuation_evidence import requirement_digest
 from .outcomes import capability_outcome_scope
 from .requirements import EvidenceProbe, InformationRequirement, NeedStatus, load_need_ledger
@@ -64,10 +65,15 @@ class TaskModelViewProjector:
     version = "task-model-view/14"
     working_records_version = 1
 
-    def __init__(self, *, compact_work_summary: bool = False) -> None:
+    def __init__(
+        self, *, compact_work_summary: bool = False, material_handoff: bool = False
+    ) -> None:
         self._compact_work_summary = compact_work_summary
+        self._material_handoff = material_handoff
         if compact_work_summary:
             self.version = "task-model-view/15"
+        if material_handoff:
+            self.version += "+material-handoff/1"
 
     def project(
         self,
@@ -251,6 +257,22 @@ class TaskModelViewProjector:
             ),
         }
         progress_payload: dict[str, JsonValue] = {"needs": progress}
+        handoff_active = (
+            work is not None
+            and self._material_handoff
+            and any(need.minimum_proof == "scoped_structural" for need in frame.requirements)
+        )
+        if handoff_active:
+            definition["material_analysis"] = (
+                "material_for_analysis links acquired originals to needs awaiting a finding. "
+                "Use the text delivered in this request. If it supports a judgment, record it "
+                "with propose_work, its need_id and an exact quote from the original artifact. "
+                "Read a missing passage only when it is needed to decide."
+            )
+            if phase == "decision":
+                candidates = pending_material(frame.requirements, ledger, analysis, snapshot.run_id)
+                if candidates:
+                    progress_payload["material_for_analysis"] = [c.view() for c in candidates]
         outcome_progress: list[JsonValue] = []
         for item in ledger.capability_outcomes:
             current = item.scope_sha256 == capability_outcome_scope(frame)
@@ -327,6 +349,7 @@ class TaskModelViewProjector:
                 for item in ledger.capability_outcomes
                 if item.repair_feedback_bytes
             )
-            + (MAX_WORK_BYTES + 32 if work is not None else 0),
+            + (MAX_WORK_BYTES + 32 if work is not None else 0)
+            + (MATERIAL_HINT_BYTES if handoff_active else 0),
             max_instruction_bytes=max_instruction_bytes,
         )

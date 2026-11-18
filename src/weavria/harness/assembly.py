@@ -370,6 +370,7 @@ class AgentHarness:
             discovery_policy=evidence.discovery_policy if evidence is not None else None,
             working_records=config.working_records,
             work_updates=config.work_updates,
+            work_material_handoff=config.work_material_handoff,
             work_rechecker=work_rechecker,
             adaptive_capabilities=config.adaptive_capabilities,
             memory=memory,
@@ -380,7 +381,8 @@ class AgentHarness:
             task_model_projector=(
                 task_model_projector
                 or TaskModelViewProjector(
-                    compact_work_summary=config.context.work_summary_compaction
+                    compact_work_summary=config.context.work_summary_compaction,
+                    material_handoff=config.work_material_handoff,
                 )
                 if config.task_understanding and config.project_task_view
                 else None
@@ -411,6 +413,7 @@ class AgentHarness:
         discovery_policy: CapabilityDiscoveryPolicy | None = None,
         working_records: bool = False,
         work_updates: Literal["replace", "patch"] = "replace",
+        work_material_handoff: bool = False,
         work_rechecker: WorkRechecker | None = None,
         working_set: CapabilityWorkingSetPolicy | None = None,
         adaptive_capabilities: bool = True,
@@ -429,6 +432,8 @@ class AgentHarness:
             raise ValueError("outcome verifiers require understanding and adaptive capabilities")
         if working_records and understanding is None:
             raise ValueError("working records require task understanding")
+        if work_material_handoff and not working_records:
+            raise ValueError("material handoff requires working records")
         if work_rechecker is not None and not working_records:
             raise ValueError("work rechecker requires working records")
         if work_updates not in {"replace", "patch"}:
@@ -446,7 +451,8 @@ class AgentHarness:
                     )
         if working_records and task_model_projector is None:
             task_model_projector = TaskModelViewProjector(
-                compact_work_summary=context.work_summary_compaction
+                compact_work_summary=context.work_summary_compaction,
+                material_handoff=work_material_handoff,
             )
         if working_set is not None and not adaptive_capabilities:
             raise ValueError("a custom working set requires adaptive capabilities")
@@ -505,6 +511,7 @@ class AgentHarness:
                 else None,
                 working_records=working_records,
                 work_recheck=work_rechecker is not None,
+                material_handoff=work_material_handoff,
                 outcomes=CapabilityOutcomeResolver(outcome_verifiers)
                 if outcome_verifiers
                 else None,
@@ -536,6 +543,7 @@ class AgentHarness:
                 "configuration_id": configuration_id,
                 "working_records": working_records,
                 "work_updates": work_updates,
+                **({"work_material_handoff": True} if work_material_handoff else {}),
                 "work_recheck_version": work_rechecker.version if work_rechecker else None,
                 "harness_max_request_duration": duration,
                 "memory_catchup_fraction": memory_catchup_fraction,

@@ -1,14 +1,107 @@
 """Translate accepted task semantics into soft, domain-neutral retrieval demands."""
 
+import json
+from dataclasses import dataclass
+
+from pydantic import JsonValue
+
 from weavria.context import ContextDemand, ContextFocus, EvidenceAnchor, EvidenceSpanAnchor
 from weavria.core import SemanticSnapshot
 
-from .requirements import InformationRequirement, NeedLedger, NeedStatus, load_need_ledger
+from .requirements import (
+    EvidenceAddress,
+    InformationRequirement,
+    NeedLedger,
+    NeedStatus,
+    load_need_ledger,
+)
 from .understanding import load_task_frame
-from .work import load_work, work_need_weights
+from .work import AnalysisStatus, load_work, work_analysis_status, work_need_weights
+
+MATERIAL_HINT_BYTES = 768
 
 
-def project_context_focus(snapshot: SemanticSnapshot) -> ContextFocus:
+@dataclass(frozen=True, slots=True)
+class MaterialForAnalysis:
+    """同一个账本地址产生工作引用提示与编译器软锚点。"""
+
+    need_id: str
+    address: EvidenceAddress
+
+    def anchor(self) -> EvidenceAnchor:
+        a = self.address
+        return EvidenceAnchor(
+            a.producer_run_id, a.producer_call_id, a.artifact_sha256, a.json_pointer
+        )
+
+    def view(self) -> dict[str, JsonValue]:
+        return {
+            "need_id": self.need_id,
+            "artifact_id": self.address.artifact_id,
+            "pointer": self.address.json_pointer,
+        }
+
+
+def pending_material(
+    requirements: tuple[InformationRequirement, ...],
+    ledger: NeedLedger,
+    analysis: dict[str, AnalysisStatus],
+    run_id: str,
+) -> tuple[MaterialForAnalysis, ...]:
+    """从账本挑选已取得、还未记录判断的必需材料。每个需求最多一个示例来源。"""
+    bindings = {b.binding_id: b for b in ledger.bindings}
+    chosen: list[MaterialForAnalysis] = []
+    used = len(',"material_for_analysis":[]')
+    for need in requirements:
+        if not need.required or analysis.get(need.need_id) != "analysis_pending":
+            continue
+        material_plans = {
+            p.plan_id: p
+            for p in need.evidence_match_plans
+            if p.minimum_proof == "scoped_structural"
+        }
+        if not material_plans:
+            continue
+        for identity in ledger.state_for(need.need_id).evidence_binding_ids:
+            binding = bindings.get(identity)
+            if binding is None or binding.match_plan_id is None:
+                continue
+            plan = material_plans.get(binding.match_plan_id)
+            if plan is None or not need.supports_binding(binding):
+                continue
+            # 只提示实际匹配的字段。不可把同一 Artifact 的任意旁支当作结论来源。
+            address = next(
+                (
+                    a
+                    for a in binding.addresses
+                    if a.producer_run_id == run_id
+                    and a.json_pointer in plan.required_fields
+                    and len(a.json_pointer) <= 256
+                    and len(a.artifact_id) <= 128
+                ),
+                None,
+            )
+            if address is None:
+                continue
+            candidate = MaterialForAnalysis(need.need_id, address)
+            size = (
+                len(
+                    json.dumps(candidate.view(), ensure_ascii=False, separators=(",", ":")).encode()
+                )
+                + 1
+            )
+            if used + size <= MATERIAL_HINT_BYTES:
+                used += size
+                chosen.append(candidate)
+                break
+        if len(chosen) == 2:
+            break
+    return tuple(chosen)
+
+
+def project_context_focus(
+    snapshot: SemanticSnapshot, *, material_handoff: bool = False
+) -> ContextFocus:
     """Keep original task authority; ledger state changes allocation priority only."""
     frame = load_task_frame(snapshot.observation.payload)
     ledger = load_need_ledger(snapshot.need_ledger)
@@ -132,7 +225,15 @@ def project_context_focus(snapshot: SemanticSnapshot) -> ContextFocus:
                     anchors=spans,
                 )
             )
-    return ContextFocus(snapshot.version.task_revision, tuple(demands))
+    whole = ()
+    if material_handoff and working is not None:
+        whole = tuple(
+            candidate.anchor()
+            for candidate in pending_material(
+                frame.requirements, ledger, work_analysis_status(ledger, working), snapshot.run_id
+            )
+        )
+    return ContextFocus(snapshot.version.task_revision, tuple(demands), whole)
 
 
 def need_priority_weights(

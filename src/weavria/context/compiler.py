@@ -759,6 +759,9 @@ class SessionContextCompiler:
                 max_steps=self.config.max_allocation_steps,
             )
         selected = await allocator.allocate(minimum)
+        preferred = focus.prefer_complete if focus is not None else ()
+        if preferred:
+            selected = await allocator.prefer_complete_sources(selected, preferred)
         cost = await allocator.cost(selected)
         require(cost, selected)
         compaction_status: Literal["no_candidate", "budget_omitted", "delivered"] | None = None
@@ -988,6 +991,7 @@ class SessionContextCompiler:
         report = ContextCompilation(
             schema_version=report_version,
             policy_version=f"context-compiler/{report_version}[{self.config.policy}]"
+            + ("+complete-source/1" if preferred else "")
             + (
                 "+source-relevance/1"
                 if supply is not None and supply.report.retrieval is not None
@@ -1000,7 +1004,17 @@ class SessionContextCompiler:
             counter_version=self.counter.version,
             task_revision=base.task.revision,
             source_sha256=digest(json.dumps([(u.identity, u.digest) for u in units])),
-            demand_sha256=digest(json.dumps([asdict(d) for d in demands], sort_keys=True)),
+            demand_sha256=digest(
+                json.dumps(
+                    {
+                        "demands": [asdict(d) for d in demands],
+                        "prefer_complete": [asdict(a) for a in preferred],
+                    }
+                    if preferred
+                    else [asdict(d) for d in demands],
+                    sort_keys=True,
+                )
+            ),
             request_sha256=request_sha256,
             request_bytes=len(encoded.encode()),
             budget_bytes=max_request_bytes,

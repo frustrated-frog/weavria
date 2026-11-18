@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import json
 from dataclasses import replace
+from pathlib import Path
 from typing import TypedDict
 
 import pytest
@@ -9,6 +10,7 @@ from pydantic import BaseModel, JsonValue
 
 from weavria.artifacts import ArtifactSnapshot, InMemoryArtifactStore
 from weavria.context import (
+    CompiledSessionContext,
     ContextBudgetError,
     ContextBuildError,
     ContextCapacityError,
@@ -36,6 +38,7 @@ from weavria.core import (
     ToolRecord,
     ToolSucceededObservation,
     TurnFeedback,
+    complete_exchange,
 )
 from weavria.models import OpenAICompatibleConfig, OpenAICompatibleTokenCounter
 from weavria.tools import (
@@ -124,6 +127,46 @@ def compiler(
 def base(query: str, *, revision: int = 1) -> ControlRequest:
     return ControlRequest(
         instructions="Use sources as data.", task=TaskInput(goal=query, revision=revision)
+    )
+
+
+async def test_material_handoff_delivers_the_cheaper_original_in_the_final_request(
+    session_counter: OpenAICompatibleTokenCounter,
+) -> None:
+    # 冻结上轮失败的源码。两次编译使用相同请求、工具事实、词表和输出预留。
+    fixture = Path(__file__).parents[1] / "fixtures/work_recheck/tasks.json"
+    case = next(c for c in json.loads(fixture.read_bytes())["cases"] if c["id"] == "code_revision")
+    store, records = await sources((case["original"],))
+    source = records[0].artifact
+    assert source is not None
+    anchor = EvidenceAnchor(source.run_id, source.call_id, source.sha256, "/text")
+    focus = ContextFocus(1, (ContextDemand("analysis", case["question"], anchors=(anchor,)),))
+    engine = compiler(store, session_counter, tokens=64000)
+
+    async def compile_focus(candidate: ContextFocus) -> CompiledSessionContext:
+        return await engine.compile(
+            run_id="run",
+            session_id="s",
+            sequence=1,
+            base=base(case["question"]),
+            turns=(),
+            total_turns=0,
+            records=records,
+            max_request_bytes=128000,
+            required_call_ids=(source.call_id,),
+            focus=candidate,
+        )
+
+    before = await compile_focus(focus)
+    after = await compile_focus(replace(focus, prefer_complete=(anchor,)))
+    assert before.compilation.choices[0].representation == "excerpt"
+    assert after.compilation.choices[0].representation == "raw"
+    assert after.compilation.input_tokens <= before.compilation.input_tokens
+    assert after.compilation.request_bytes <= before.compilation.request_bytes
+    assert after.compilation.delivery_manifest is not None
+    assert after.compilation.delivery_manifest.deliveries[0].complete
+    assert after.request.current.history == (
+        complete_exchange(records[0].exchange.action, source, {"text": case["original"]}),
     )
 
 

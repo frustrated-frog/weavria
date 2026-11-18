@@ -4,7 +4,14 @@ import pytest
 from pydantic import BaseModel, ValidationError
 
 from weavria.artifacts import ArtifactSnapshot, InMemoryArtifactStore
-from weavria.core import ModelResponse, TaskInput, ToolCallAction, ToolRecord
+from weavria.core import (
+    ModelResponse,
+    SemanticSnapshot,
+    SemanticVersion,
+    TaskInput,
+    ToolCallAction,
+    ToolRecord,
+)
 from weavria.harness import (
     CapabilityEvidenceProfile,
     CapabilityNeed,
@@ -23,10 +30,18 @@ from weavria.harness import (
     SemanticObligation,
     TargetResolution,
     TargetSelection,
+    TaskModelViewProjector,
     TaskPreparation,
     TaskSpecification,
     TaskUnderstandingEngine,
+    WorkingState,
+    WorkNote,
+    WorkReference,
+    canonicalize_task_frame,
 )
+from weavria.harness.context import project_context_focus
+from weavria.harness.understanding import task_frame_observation
+from weavria.harness.work import WorkSource
 from weavria.models import FakeModelProvider
 from weavria.tools import ReadOnlyPolicy, ToolContext, ToolExecutor, ToolRegistry, TypedTool
 
@@ -424,6 +439,100 @@ async def test_compiled_edition_acquisition(
         )
         binding = ledger.bindings[0].model_copy(update={"match_plan_id": "semantic"})
         assert not mixed.covered_by((binding,))
+
+
+@pytest.mark.parametrize(
+    "version,freshness,offer",
+    [("v1", "stable", True), ("v2", "stable", False), ("v1", "current", False)],
+)
+async def test_material_handoff_joins_the_exact_source_to_the_unanalysed_need(
+    version: str,
+    freshness: Literal["stable", "current"],
+    offer: bool,
+) -> None:
+    prepared, registry = await prepare(material=True, freshness=freshness)
+    frame = prepared.record.frame
+    store = InMemoryArtifactStore()
+    record = await ToolExecutor("run", registry, store, ReadOnlyPolicy()).execute(
+        ToolCallAction(
+            call_id="read", tool_name="read_record", arguments={"subject": "A", "version": version}
+        ),
+        max_duration=1,
+    )
+    ledger = await EvidenceResolver().resolve(
+        work_id=frame.work_id,
+        task_revision=1,
+        frame_revision=frame.revision,
+        requirements=frame.requirements,
+        records=(record,),
+        read_artifact=lambda aid: store.get("run", aid),
+    )
+    frame = canonicalize_task_frame(
+        frame.model_copy(
+            update={
+                "need_state_sha256": ledger.progress_sha256(),
+                "evidence_revision": ledger.evidence_revision,
+            }
+        )
+    )
+    state = WorkingState(task_revision=1)
+    snapshot = SemanticSnapshot(
+        schema_version=2,
+        input_id="input",
+        session_id="s",
+        run_id="run",
+        work_id=frame.work_id,
+        observation=task_frame_observation(frame),
+        version=SemanticVersion(
+            task_revision=1,
+            frame_revision=frame.revision,
+            capability_epoch=frame.capability_epoch,
+            evidence_revision=ledger.evidence_revision,
+            semantic_sequence=1,
+        ),
+        need_ledger=ledger.model_dump(mode="json"),
+        working_state=state.model_dump(mode="json"),
+    )
+    projector = TaskModelViewProjector(material_handoff=True)
+    view = projector.project(prepared.task, snapshot, phase="decision", max_instruction_bytes=1024)
+    focus = project_context_focus(snapshot, material_handoff=True)
+    assert not project_context_focus(snapshot).prefer_complete
+    assert bool(focus.prefer_complete) is offer
+    assert ("material_for_analysis" in view.progress) is offer
+    if offer:
+        source = record.artifact
+        assert source is not None
+        need_id = frame.requirements[0].need_id
+        assert view.progress["material_for_analysis"] == [
+            {"need_id": need_id, "artifact_id": source.artifact_id, "pointer": "/value"}
+        ]
+        assert focus.prefer_complete[0].sha256 == source.sha256
+        other_run = snapshot.model_copy(update={"run_id": "next-run"})
+        assert not project_context_focus(other_run, material_handoff=True).prefer_complete
+        # 结论已记录后撤下建议。重新投影只消费已接受的快照,不改变账本或扩容。
+        ref = WorkReference(artifact_id=source.artifact_id, pointer="/value")
+        state = WorkingState(
+            task_revision=1,
+            revision=1,
+            notes=(
+                WorkNote(
+                    note_id="fact",
+                    kind="result",
+                    summary="Found",
+                    need_ids=(need_id,),
+                    sources=(ref,),
+                ),
+            ),
+            sources=(WorkSource(reference=ref, artifact=source),),
+        )
+        updated = snapshot.model_copy(update={"working_state": state.model_dump(mode="json")})
+        after = projector.project(
+            prepared.task, updated, phase="decision", max_instruction_bytes=1024
+        )
+        assert not project_context_focus(updated, material_handoff=True).prefer_complete
+        assert "material_for_analysis" not in after.progress
+        assert after.max_progress_bytes == view.max_progress_bytes
+        assert updated.need_ledger == snapshot.need_ledger
 
 
 def test_material_acquisition_requires_versioned_target_contract() -> None:

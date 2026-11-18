@@ -1,12 +1,67 @@
 import itertools
 from dataclasses import replace
 
+import pytest
+
+from weavria.context import EvidenceAnchor
 from weavria.context.allocation import (
     AllocationCost,
     ContextAllocator,
     ContextUnit,
     Representation,
 )
+from weavria.core import EvidenceDelivery, EvidenceDeliveryRange
+
+
+@pytest.mark.parametrize(
+    "raw_cost,digest,expected",
+    [
+        (AllocationCost(9, 10), "a", 2),
+        (AllocationCost(9, 11), "a", 1),
+        (AllocationCost(11, 9), "a", 1),
+        (AllocationCost(9, 9), "b", 1),
+    ],
+)
+async def test_exact_original_only_replaces_its_own_cost_dominated_excerpt(
+    raw_cost: AllocationCost, digest: str, expected: int
+) -> None:
+    raw = EvidenceDelivery(
+        run_id="r",
+        call_id="source",
+        artifact_id="doc",
+        artifact_sha256="a" * 64,
+        artifact_size_bytes=32,
+        representation="raw",
+    )
+    excerpt = raw.model_copy(
+        update={
+            "representation": "excerpt",
+            "ranges": (EvidenceDeliveryRange(pointer="/text", kind="text", end=1),),
+        }
+    )
+    unit = ContextUnit(
+        "call:source",
+        "c",
+        "current",
+        (
+            Representation("reference", "{}", ()),
+            Representation("excerpt", "{}", (), excerpt),
+            Representation("raw", "{}", (), raw),
+        ),
+    )
+
+    # 计量的是含既有兄弟来源的请求。单一维度更便宜、来源摘要不同均应保留摘录。
+    def measure(selection: dict[int, int]) -> AllocationCost:
+        assert selection[1] == 0
+        return raw_cost if selection[0] == 2 else AllocationCost(10, 10)
+
+    sibling = ContextUnit("other", "d", "current", (Representation("reference", "{}", ()),))
+    allocator = ContextAllocator(
+        (unit, sibling), measure, token_limit=30, byte_limit=30, policy="coverage"
+    )
+    anchor = EvidenceAnchor("r", "source", digest * 64, "/text")
+    assert await allocator.prefer_complete_sources({0: 1, 1: 0}, (anchor,)) == {0: expected, 1: 0}
+    assert await allocator.prefer_complete_sources({0: 0, 1: 0}, (anchor,)) == {0: 0, 1: 0}
 
 
 async def test_absolute_gain_path_escapes_density_trap_and_matches_small_exact_oracle() -> None:
