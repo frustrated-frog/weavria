@@ -3,11 +3,13 @@ import json
 from typing import Literal
 
 import pytest
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, JsonValue, ValidationError
 
+from weavria.context import ModelRequestContextCompiler, ModelRequestContextConfig
 from weavria.core import (
     ApplicationObservation,
     ErrorCategory,
+    FinishAction,
     Message,
     MessageRole,
     ModelOutputDiagnostic,
@@ -40,7 +42,13 @@ from weavria.harness import (
     TaskUnderstandingInput,
     compile_requirement_coverage,
 )
-from weavria.models import FakeModelProvider, ModelCapabilities, ModelOutputError
+from weavria.models import (
+    FakeModelProvider,
+    ModelCapabilities,
+    ModelOutputError,
+    OpenAICompatibleConfig,
+    OpenAICompatibleTokenCounter,
+)
 from weavria.tools import ToolContext, ToolRegistry, TypedTool
 
 
@@ -1401,3 +1409,169 @@ async def test_grouped_coverage_binds_each_need_only_to_its_own_surfaces(
     assert [
         (p.producer_name, p.surface_id, p.required_fields) for p in details.evidence_match_plans
     ] == [("read_details" if separate_producers else "read_report", detail_surface, ("/details",))]
+
+
+def _audit_response(payload: dict[str, JsonValue]) -> ModelResponse:
+    return ModelResponse(
+        action=ToolCallAction(
+            call_id="audit", tool_name="declare_requirement_coverage", arguments=payload
+        )
+    )
+
+
+def _audit_input(*, history: tuple[Message, ...] = ()) -> TaskUnderstandingInput:
+    return TaskUnderstandingInput(
+        task=TaskInput(goal="Summarize the report and explain its detailed findings"),
+        capabilities=(_capability_view(),),
+        history=history,
+    )
+
+
+@pytest.mark.parametrize("frozen", [False, True])
+async def test_audit_repairs_only_after_rechecking_the_complete_declaration(frozen: bool) -> None:
+    expected = _assessment(covered=True)
+    good = expected.model_dump(mode="json", exclude={"obligations"} if frozen else set())
+    bad = json.loads(json.dumps(good))
+    # 两个字段单独都是合法枚举;失败来自它们的组合。首答不可自动改成 covered。
+    bad["findings"][1]["status"] = "missing"
+    provider = FakeModelProvider((_audit_response(bad), _audit_response(good)))
+    result = await ModelRequirementCoverageValidator(provider).assess(
+        _audit_input(),
+        _repaired_specification(),
+        obligations=expected.obligations if frozen else None,
+        max_duration=2,
+    )
+    assert result == expected
+    first, retry = provider.requests
+    assert "Host field checks:" not in first.instructions
+    assert retry.task == first.task
+    assert (
+        "$.findings[1]: Previously status=missing with reason_code=covered_by_need"
+        in retry.instructions
+    )
+    assert "requires status=covered" in retry.instructions
+    assert "missing_need, missing_completion" in retry.instructions
+
+
+async def test_audit_schema_checks_are_bounded_and_do_not_echo_rejected_data() -> None:
+    wire = json.loads(_assessment(covered=True).model_dump_json())
+    secret = "PRIVATE_bad_field_and_value"
+    wire["findings"][0]["status"] = secret
+    wire["findings"][0][secret] = secret
+    wire["findings"][0]["quote"] = secret  # 合法的引文字段名, 却不属于 finding。
+    del wire["findings"][1]["reason_code"]
+    wire["findings"][2]["completion_criterion_indices"] = [secret]
+    wire["obligations"][0]["description"] = ""
+    provider = FakeModelProvider((_audit_response(wire), _audit_response(wire)))
+    with pytest.raises(RequirementCoverageError) as raised:
+        await ModelRequirementCoverageValidator(provider).assess(
+            _audit_input(), _repaired_specification(), max_duration=2
+        )
+    suffix = provider.requests[1].instructions.split("Host field checks: ")[1]
+    assert suffix.count("$") == 4
+    assert (
+        "$.findings[0].status: Use one of: covered, missing, underspecified, unsupported." in suffix
+    )
+    assert suffix.count("$.findings[0]: Remove undeclared fields") == 1
+    assert "$.findings[1].reason_code: Supply this required field." in suffix
+    assert "$.findings[2].completion_criterion_indices[0]" in suffix
+    assert "quote" not in suffix
+    assert secret not in provider.requests[1].model_dump_json()
+    assert len(raised.value.attempts) == 2
+    for attempt in raised.value.attempts:
+        assert secret not in attempt.model_dump_json()
+        assert suffix in attempt.error.message
+        assert attempt.error.cause_type == "CoverageValidation:assessment_schema_mismatch"
+
+
+async def test_audit_locates_nullable_quote_and_does_not_blame_it_for_later_finish() -> None:
+    wire = json.loads(_assessment(covered=True).model_dump_json())
+    wire["obligations"][1]["source"] = {"quote": "PRIVATE", "occurrence": -1}
+    provider = FakeModelProvider(
+        (_audit_response(wire), ModelResponse(action=FinishAction(output="PRIVATE")))
+    )
+    with pytest.raises(RequirementCoverageError) as raised:
+        await ModelRequirementCoverageValidator(provider).assess(
+            _audit_input(), _repaired_specification(), max_duration=2
+        )
+    first, final = raised.value.attempts
+    assert "$.obligations[1].source.occurrence" in first.error.message
+    assert "minimum=0" in first.error.message
+    assert "PRIVATE" not in first.model_dump_json()
+    assert final.error.cause_type is None and "finish" in final.error.message
+    assert "assessment_schema_mismatch" not in final.model_dump_json()
+
+
+async def test_optional_checks_yield_to_audit_history_and_transport_budget() -> None:
+    expected = _assessment(covered=True)
+    good = expected.model_dump(mode="json")
+    bad = json.loads(json.dumps(good))
+    del bad["findings"][0]["status"]
+    del bad["findings"][1]["reason_code"]
+    history = (Message(role=MessageRole.USER, content="Earlier clarification. " * 30),)
+    request = _audit_input(history=history)
+    spec = _repaired_specification()
+    counter = OpenAICompatibleTokenCounter(
+        OpenAICompatibleConfig(model="audit", max_output_tokens=256), encoding="cl100k_base"
+    )
+
+    async def run(*, limit: int | None = None, field: bool = True) -> ModelRequest:
+        provider = FakeModelProvider((_audit_response(bad), _audit_response(good)))
+        compiler = (
+            ModelRequestContextCompiler(
+                ModelRequestContextConfig(
+                    window_tokens=64000, output_tokens=256, max_request_bytes=limit
+                ),
+                counter,
+            )
+            if limit is not None
+            else None
+        )
+        result = await ModelRequirementCoverageValidator(
+            provider, field_feedback=field, context_compiler=compiler
+        ).assess(request, spec, max_duration=4)
+        assert result == expected
+        return provider.requests[1]
+
+    # 用真实适配器测量两个可复现的预算边界。允许删掉旧消息时两条都能塞下,
+    # 但可选反馈须为已经保留的澄清让路。等于基线预算时仍能重试。
+    baseline = await run(field=False)
+    all_checks = await run()
+    prefix = all_checks.instructions.split(" $.findings[1]")[0]
+    one_check = all_checks.model_copy(update={"instructions": prefix})
+    assert one_check.instructions != baseline.instructions and one_check != all_checks
+    assert await run(limit=counter.model_request_bytes(one_check)) == one_check
+    assert await run(limit=counter.model_request_bytes(baseline)) == baseline
+
+
+async def test_invalid_legacy_reaudit_points_to_findings_without_reopening_obligations() -> None:
+    expected = _assessment(covered=True)
+    legacy = json.loads(expected.model_dump_json())
+    del legacy["obligations"][0]["kind"]
+    provider = FakeModelProvider(
+        (
+            _audit_response(legacy),
+            _audit_response(expected.model_dump(mode="json", include={"findings"})),
+        )
+    )
+    accepted = await ModelRequirementCoverageValidator(provider).assess(
+        _audit_input(), _repaired_specification(), obligations=expected.obligations, max_duration=2
+    )
+    assert accepted == expected
+    assert provider.requests[1].instructions.endswith(
+        "$: Omit obligations; return findings for the frozen obligation IDs."
+    )
+
+
+async def test_duplicate_finding_ids_cannot_be_repaired_by_merely_changing_status() -> None:
+    wire = json.loads(_assessment(covered=True).model_dump_json())
+    wire["findings"][1]["obligation_id"] = wire["findings"][0]["obligation_id"]
+    provider = FakeModelProvider((_audit_response(wire), _audit_response(wire)))
+    with pytest.raises(RequirementCoverageError) as raised:
+        await ModelRequirementCoverageValidator(provider).assess(
+            _audit_input(), _repaired_specification(), max_duration=2
+        )
+    assert provider.requests[1].instructions.endswith(
+        "$: Use a unique obligation_id for each finding."
+    )
+    assert len(raised.value.attempts) == 2

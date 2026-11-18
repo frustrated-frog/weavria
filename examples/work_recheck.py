@@ -217,6 +217,7 @@ def implementation_digests() -> dict[str, str]:
             "requirements.py",
             "completion.py",
             "coverage.py",
+            "_coverage_feedback.py",
             "task_view.py",
             "understanding.py",
             "../models/openai_compatible.py",

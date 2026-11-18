@@ -27,12 +27,21 @@ from weavria.core import (
     FinishAction,
     ModelOutputDiagnostic,
     ModelRequest,
+    ModelRequestDiagnostic,
     RunError,
     TaskPreparationAttemptDiagnostic,
     ToolCallAction,
 )
 from weavria.models import ModelCallError, ModelProvider, call_model
 
+from ._coverage_feedback import (
+    CoverageReason,
+    CoverageRule,
+    CoverageRuleViolation,
+    CoverageStatus,
+    coverage_field_checks,
+    validate_finding_status,
+)
 from .targets import EvidenceTargetRule, MaterialContract
 
 if TYPE_CHECKING:
@@ -182,53 +191,37 @@ class ObligationCoverage(_CoverageContract):
     """How one semantic obligation is represented by a candidate specification."""
 
     obligation_id: _Identifier
-    status: Literal["covered", "missing", "underspecified", "unsupported"]
+    status: CoverageStatus
     information_need_indices: tuple[int, ...] = Field(default=(), max_length=16)
     completion_criterion_indices: tuple[int, ...] = Field(default=(), max_length=16)
     evidence_surface_ids: tuple[_Identifier, ...] = Field(default=(), max_length=16)
-    reason_code: Literal[
-        "covered_by_need",
-        "covered_by_completion",
-        "missing_need",
-        "missing_completion",
-        "missing_selector",
-        "unsupported_source",
-    ]
+    reason_code: CoverageReason
 
     @model_validator(mode="after")
     def validate_finding(self) -> Self:
         if any(index < 0 for index in self.information_need_indices):
-            raise ValueError("information-need references must be nonnegative")
+            raise CoverageRuleViolation(CoverageRule.NEED_NONNEGATIVE)
         if any(index < 0 for index in self.completion_criterion_indices):
-            raise ValueError("completion-criterion references must be nonnegative")
+            raise CoverageRuleViolation(CoverageRule.COMPLETION_NONNEGATIVE)
         if len(set(self.information_need_indices)) != len(self.information_need_indices):
-            raise ValueError("information-need references must be unique")
+            raise CoverageRuleViolation(CoverageRule.NEED_UNIQUE)
         if len(set(self.completion_criterion_indices)) != len(self.completion_criterion_indices):
-            raise ValueError("completion-criterion references must be unique")
+            raise CoverageRuleViolation(CoverageRule.COMPLETION_UNIQUE)
         if len(set(self.evidence_surface_ids)) != len(self.evidence_surface_ids):
-            raise ValueError("evidence-surface references must be unique")
-        expected_status = {
-            "covered_by_need": "covered",
-            "covered_by_completion": "covered",
-            "missing_need": "missing",
-            "missing_completion": "missing",
-            "missing_selector": "underspecified",
-            "unsupported_source": "unsupported",
-        }[self.reason_code]
-        if self.status != expected_status:
-            raise ValueError("coverage status and reason code disagree")
+            raise CoverageRuleViolation(CoverageRule.SURFACE_UNIQUE)
+        validate_finding_status(self.status, self.reason_code)
         if self.reason_code == "covered_by_need" and not self.information_need_indices:
-            raise ValueError("need coverage must reference an information need")
+            raise CoverageRuleViolation(CoverageRule.NEED_REFERENCE)
         if self.reason_code == "covered_by_completion" and not self.completion_criterion_indices:
-            raise ValueError("completion coverage must reference a completion criterion")
+            raise CoverageRuleViolation(CoverageRule.COMPLETION_REFERENCE)
         if self.status == "missing" and (
             self.information_need_indices or self.completion_criterion_indices
         ):
-            raise ValueError("a missing obligation cannot cite specification coverage")
+            raise CoverageRuleViolation(CoverageRule.MISSING_REFERENCES)
         if self.status == "underspecified" and not (
             self.information_need_indices or self.completion_criterion_indices
         ):
-            raise ValueError("an underspecified obligation must identify its partial coverage")
+            raise CoverageRuleViolation(CoverageRule.PARTIAL_REFERENCE)
         return self
 
 
@@ -257,11 +250,11 @@ class RequirementCoverageAssessment(_CoverageContract):
         obligation_ids = [item.obligation_id for item in self.obligations]
         finding_ids = [item.obligation_id for item in self.findings]
         if len(obligation_ids) != len(set(obligation_ids)):
-            raise ValueError("semantic obligation identities must be unique")
+            raise CoverageRuleViolation(CoverageRule.OBLIGATION_IDS)
         if len(finding_ids) != len(set(finding_ids)):
-            raise ValueError("coverage findings must be unique")
+            raise CoverageRuleViolation(CoverageRule.FINDING_IDS)
         if set(obligation_ids) != set(finding_ids):
-            raise ValueError("coverage findings must cover every semantic obligation exactly once")
+            raise CoverageRuleViolation(CoverageRule.MATCH_IDS)
         return self
 
 
@@ -537,17 +530,48 @@ class TaskSpecificationRepairer(Protocol):
     ) -> TaskSpecification: ...
 
 
+def _field_suffix(checks: tuple[str, ...]) -> str:
+    return " Host field checks: " + " ".join(checks) if checks else ""
+
+
+def _audit_dispatch(
+    request: ModelRequest, checks: tuple[str, ...], compiler: ModelRequestContextCompiler | None
+) -> tuple[ModelRequest, ModelRequestDiagnostic | None]:
+    def enriched(count: int) -> ModelRequest:
+        return request.model_copy(
+            update={"instructions": request.instructions + _field_suffix(checks[:count])}
+        )
+
+    if compiler is None:
+        return (enriched(len(checks)) if checks else request), None
+    baseline = compiler.compile(request)
+    # 类别反馈原本能保留的历史不能被可选字段提示挤掉。最多四条提示,
+    # 用最终请求的真实计量从长到短尝试;连一条都放不下时沿用类别反馈。
+    for count in range(len(checks), 0, -1):
+        try:
+            plan = compiler.compile(enriched(count))
+        except ModelRequestContextError:
+            continue
+        if plan.selected_history_indices == baseline.selected_history_indices:
+            return plan.request, plan.diagnostic
+    return baseline.request, baseline.diagnostic
+
+
 class ModelRequirementCoverageValidator:
     """Use a separate structured model pass to audit semantic task coverage."""
 
-    version = "model-requirement-coverage/10"
+    version = "model-requirement-coverage/11"
 
     def __init__(
         self,
         provider: ModelProvider,
         *,
         context_compiler: ModelRequestContextCompiler | None = None,
+        field_feedback: bool = True,
     ) -> None:
+        self._field_feedback = field_feedback
+        if not field_feedback:
+            self.version = "model-requirement-coverage/11-category-only"
         self._provider = provider
         self._context_compiler = context_compiler
 
@@ -629,13 +653,10 @@ class ModelRequirementCoverageValidator:
                     message="Requirement coverage validator requires structured tool-call output",
                 )
             )
-        schema = json.dumps(
-            (
-                _QuotedCoverageAssessment if obligations is None else _FrozenCoverageFindings
-            ).model_json_schema(),
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
+        wire_schema = (
+            _QuotedCoverageAssessment if obligations is None else _FrozenCoverageFindings
+        ).model_json_schema()
+        schema = json.dumps(wire_schema, ensure_ascii=False, separators=(",", ":"))
         capabilities = json.dumps(
             [item.model_dump(mode="json") for item in request.capabilities],
             ensure_ascii=False,
@@ -775,6 +796,7 @@ class ModelRequirementCoverageValidator:
         failure: ValidationError | ValueError | None = None
         last_action_kind = "invalid_action"
         attempts: list[TaskPreparationAttemptDiagnostic] = []
+        retry_checks: tuple[str, ...] = ()
         for attempt in range(2):
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
@@ -795,11 +817,9 @@ class ModelRequirementCoverageValidator:
                 )
             request_diagnostic = None
             try:
-                dispatched = model_request
-                if self._context_compiler is not None:
-                    plan = self._context_compiler.compile(model_request)
-                    dispatched = plan.request
-                    request_diagnostic = plan.diagnostic
+                dispatched, request_diagnostic = _audit_dispatch(
+                    model_request, retry_checks, self._context_compiler
+                )
             except ModelRequestContextError as exc:
                 error = RunError(
                     category=ErrorCategory.CONTEXT_BUDGET_EXCEEDED,
@@ -819,7 +839,7 @@ class ModelRequirementCoverageValidator:
                 response = await call_model(
                     self._provider,
                     dispatched,
-                    max_duration=remaining,
+                    max_duration=max(0.0, deadline - asyncio.get_running_loop().time()),
                 )
             except ModelCallError as exc:
                 attempts.append(
@@ -842,6 +862,7 @@ class ModelRequirementCoverageValidator:
                     )
                     continue
                 raise RequirementCoverageError(exc.error, attempts=tuple(attempts)) from exc
+            failure = None  # 诊断只归属于本次返回, 不继承上一轮的字段错误。
             action = response.action
             last_action_kind = "finish" if isinstance(action, FinishAction) else "invalid_action"
             if isinstance(action, ToolCallAction) and action.tool_name == _COVERAGE_TOOL:
@@ -884,18 +905,25 @@ class ModelRequirementCoverageValidator:
                     return assessment
                 except (ValidationError, ValueError) as exc:
                     failure = exc
+            feedback = (
+                _coverage_retry_feedback(failure)
+                if failure is not None
+                else "expected_coverage_action"
+            )
+            checks = (
+                coverage_field_checks(failure, wire_schema)
+                if self._field_feedback and isinstance(failure, ValidationError)
+                else ()
+            )
+            detail = _field_suffix(checks)
             validation_error = RunError(
                 category=ErrorCategory.INVALID_MODEL_RESPONSE,
                 message=(
-                    f"Requirement coverage validation failed ({_coverage_retry_feedback(failure)})"
+                    f"Requirement coverage validation failed ({feedback}).{detail}"
                     if failure is not None
                     else f"Requirement coverage validator returned {last_action_kind}"
                 ),
-                cause_type=(
-                    f"CoverageValidation:{_coverage_retry_feedback(failure)}"
-                    if failure is not None
-                    else None
-                ),
+                cause_type=f"CoverageValidation:{feedback}" if failure is not None else None,
             )
             attempts.append(
                 TaskPreparationAttemptDiagnostic(
@@ -907,7 +935,7 @@ class ModelRequirementCoverageValidator:
                 )
             )
             if attempt == 0:
-                feedback = _coverage_retry_feedback(failure)
+                retry_checks = checks
                 model_request = model_request.model_copy(
                     update={
                         "instructions": (

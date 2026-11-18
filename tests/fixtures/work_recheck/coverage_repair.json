@@ -1,0 +1,308 @@
+{
+  "version": "work-recheck-coverage-repair/1",
+  "capability": {
+    "name": "read_source",
+    "version": "1",
+    "description": "Read the original or current source document.",
+    "input_schema": {
+      "properties": {
+        "version": {
+          "enum": [
+            "original",
+            "current"
+          ],
+          "title": "Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "version"
+      ],
+      "title": "Read",
+      "type": "object"
+    },
+    "behavior": "read_only",
+    "risk": "low",
+    "approval_required": false,
+    "output_schema": {
+      "properties": {
+        "version": {
+          "title": "Version",
+          "type": "string"
+        },
+        "text": {
+          "title": "Text",
+          "type": "string"
+        }
+      },
+      "required": [
+        "version",
+        "text"
+      ],
+      "title": "Document",
+      "type": "object"
+    },
+    "evidence_profile_version": "edition/1",
+    "evidence_surfaces": [
+      {
+        "schema_version": 3,
+        "surface_id": "source.edition",
+        "description": "Document text from one named edition in the provided dataset.",
+        "required_fields": [
+          "/text"
+        ],
+        "parameter_constraints": [
+          {
+            "input_pointer": "/version",
+            "allowed_values": [
+              "original",
+              "current"
+            ]
+          }
+        ],
+        "acquisition": "material",
+        "target_rules": [
+          {
+            "key": "edition",
+            "input_pointer": "/version",
+            "output_pointer": "/version"
+          }
+        ]
+      }
+    ]
+  },
+  "cases": [
+    {
+      "case": "code_revision",
+      "goal": "根据前后源码，判断启用 recheck_required 的新实现能否接受没有重验收据的失效结论换绑，以及重放归约器本身是否会调用审查模型。\n这是一次分阶段资料复核任务:先读取 original,用 propose_work 记录有来源的事实、依赖事实的判断及建议,并显式声明你发现的依赖。完成记录后读取 current。先更新直接事实,保留待重验的下游;随后按当前证据逐层复核、修正或撤回下游,保留独立发现。不要把工具成功或版本更新当作语义正确。最终只输出 JSON 对象,以下键的值必须为 boolean:[\"bare_rebind_allowed\", \"replay_calls_reviewer\"]",
+      "specification": {
+        "route": "execute",
+        "intent": "根据 original 与 current 两版源码，判断启用 recheck_required 的新实现是否允许在没有重验收据的情况下换绑失效结论，以及重放归约器本身是否会调用审查模型；按分阶段复核流程先记录 original 事实与依赖，再读取 current 逐层复核。",
+        "goal": "读取 original 与 current 源码，判断 (1) 启用 recheck_required 的新实现能否接受没有重验收据的失效结论换绑，(2) 重放归约器本身是否会调用审查模型；最终输出仅含 boolean 键 bare_rebind_allowed 与 replay_calls_reviewer 的 JSON 对象。",
+        "information_needs": [
+          {
+            "schema_version": 2,
+            "description": "original 版源码中关于 recheck_required 启用后失效结论换绑是否要求重验收据的规定，以及重放归约器是否调用审查模型的规定。",
+            "source": "external",
+            "freshness": "stable",
+            "required_fields": [
+              "/text"
+            ],
+            "capability_names": [
+              "read_source"
+            ],
+            "targets": [
+              {
+                "key": "edition",
+                "start": 89,
+                "end": 97
+              }
+            ]
+          },
+          {
+            "schema_version": 2,
+            "description": "current 版源码中关于 recheck_required 启用后失效结论换绑是否要求重验收据的规定，以及重放归约器是否调用审查模型的规定。",
+            "source": "external",
+            "freshness": "stable",
+            "required_fields": [
+              "/text"
+            ],
+            "capability_names": [
+              "read_source"
+            ],
+            "targets": [
+              {
+                "key": "edition",
+                "start": 153,
+                "end": 160
+              }
+            ]
+          }
+        ],
+        "capability_needs": [
+          {
+            "name": "read_source",
+            "purpose": "读取 original 与 current 两版源码文本，作为判断换绑与重放归约器行为的依据。",
+            "necessity": "required"
+          }
+        ],
+        "completion_criteria": [
+          {
+            "kind": "response",
+            "description": "最终输出为 JSON 对象，且 bare_rebind_allowed 与 replay_calls_reviewer 两个键的值均为 boolean。"
+          },
+          {
+            "kind": "response",
+            "description": "结论基于 original 与 current 两版源码证据，并区分直接事实与依赖事实的下游判断。"
+          },
+          {
+            "kind": "capability_result",
+            "description": "Obtain the required result from read_source",
+            "capability": "read_source"
+          }
+        ]
+      },
+      "source_specification_sha256": "8c5d4fa629c0279ead24fc0c974f6f0974d5c7a1b1d22d10cfce4190ba06fb6f"
+    },
+    {
+      "case": "document_revision",
+      "goal": "根据原有设计和补充设计，判断新机制是否要求修改失效结论时重验，以及模型审查通过是否代表结论获得不可错的事实证明。\n这是一次分阶段资料复核任务:先读取 original,用 propose_work 记录有来源的事实、依赖事实的判断及建议,并显式声明你发现的依赖。完成记录后读取 current。先更新直接事实,保留待重验的下游;随后按当前证据逐层复核、修正或撤回下游,保留独立发现。不要把工具成功或版本更新当作语义正确。最终只输出 JSON 对象,以下键的值必须为 boolean:[\"requires_evidence_review\", \"review_proves_truth\"]",
+      "specification": {
+        "route": "execute",
+        "intent": "按分阶段流程复核 original 与 current 两份资料，判断新机制是否要求修改失效结论时重验，以及模型审查通过是否代表结论获得不可错的事实证明。",
+        "goal": "先读取 original 并用 propose_work 记录有来源的事实、依赖事实的判断及建议，显式声明依赖；再读取 current，先更新直接事实、保留待重验的下游，随后按当前证据逐层复核、修正或撤回下游并保留独立发现；最终只输出 JSON 对象，其中 requires_evidence_review 与 review_proves_truth 为 boolean。",
+        "information_needs": [
+          {
+            "schema_version": 2,
+            "description": "original 版本文档的全文内容，用于提取有来源的事实、依赖事实的判断及建议，并识别其中的依赖关系。",
+            "source": "external",
+            "freshness": "stable",
+            "required_fields": [
+              "/text"
+            ],
+            "capability_names": [
+              "read_source"
+            ],
+            "targets": [
+              {
+                "key": "edition",
+                "start": 75,
+                "end": 83
+              }
+            ]
+          },
+          {
+            "schema_version": 2,
+            "description": "current 版本文档的全文内容，用于更新直接事实并逐层复核、修正或撤回下游判断。",
+            "source": "external",
+            "freshness": "stable",
+            "required_fields": [
+              "/text"
+            ],
+            "capability_names": [
+              "read_source"
+            ],
+            "targets": [
+              {
+                "key": "edition",
+                "start": 139,
+                "end": 146
+              }
+            ]
+          }
+        ],
+        "capability_needs": [
+          {
+            "name": "read_source",
+            "purpose": "读取 original 与 current 两个版本的源文档文本，作为分阶段复核的事实材料。",
+            "necessity": "required"
+          }
+        ],
+        "completion_criteria": [
+          {
+            "kind": "response",
+            "description": "最终输出为单个 JSON 对象，且 requires_evidence_review 与 review_proves_truth 两个键的值均为 boolean。"
+          },
+          {
+            "kind": "response",
+            "description": "通过 propose_work 记录有来源的事实、依赖事实的判断及建议，并显式声明发现的依赖关系。"
+          },
+          {
+            "kind": "response",
+            "description": "在更新直接事实后保留待重验的下游，随后按当前证据逐层复核、修正或撤回下游判断，并保留独立发现。"
+          },
+          {
+            "kind": "response",
+            "description": "判断新机制是否要求修改失效结论时重验（requires_evidence_review），结论基于两版本文档的逐层复核而非工具成功或版本更新。"
+          },
+          {
+            "kind": "response",
+            "description": "判断模型审查通过是否代表结论获得不可错的事实证明（review_proves_truth），结论基于两版本文档的逐层复核而非工具成功或版本更新。"
+          },
+          {
+            "kind": "capability_result",
+            "description": "Obtain the required result from read_source",
+            "capability": "read_source"
+          }
+        ]
+      },
+      "source_specification_sha256": "b36e90614eb9f550d9038258df8c6620f283b0d8f085e2dc1d9e362f4553c1c3"
+    },
+    {
+      "case": "unchanged_contract",
+      "goal": "两次材料相同。判断显式依赖机制是否自动发现漏声明的依赖，以及独立分支是否必须重做。保持仍然成立的已有结论。\n这是一次分阶段资料复核任务:先读取 original,用 propose_work 记录有来源的事实、依赖事实的判断及建议,并显式声明你发现的依赖。完成记录后读取 current。先更新直接事实,保留待重验的下游;随后按当前证据逐层复核、修正或撤回下游,保留独立发现。不要把工具成功或版本更新当作语义正确。最终只输出 JSON 对象,以下键的值必须为 boolean:[\"discovers_missing_edges\", \"redo_independent_branch\"]",
+      "specification": {
+        "route": "execute",
+        "intent": "分阶段复核:先读取 original 并用 propose_work 记录有来源的事实、依赖判断与建议,再读取 current 逐层复核下游依赖,最终判断显式依赖机制是否自动发现漏声明的依赖,以及独立分支是否必须重做。",
+        "goal": "读取 original 与 current 两份材料,记录有来源的事实与依赖判断,逐层复核下游依赖,最终输出 JSON 对象,其中 discovers_missing_edges 与 redo_independent_branch 为 boolean。",
+        "information_needs": [
+          {
+            "schema_version": 2,
+            "description": "original 版本文档的完整文本内容,用于记录有来源的事实与依赖判断。",
+            "source": "external",
+            "freshness": "stable",
+            "required_fields": [
+              "/text"
+            ],
+            "capability_names": [
+              "read_source"
+            ],
+            "targets": [
+              {
+                "key": "edition",
+                "start": 72,
+                "end": 80
+              }
+            ]
+          },
+          {
+            "schema_version": 2,
+            "description": "current 版本文档的完整文本内容,用于更新直接事实并逐层复核下游依赖。",
+            "source": "external",
+            "freshness": "stable",
+            "required_fields": [
+              "/text"
+            ],
+            "capability_names": [
+              "read_source"
+            ],
+            "targets": [
+              {
+                "key": "edition",
+                "start": 136,
+                "end": 143
+              }
+            ]
+          }
+        ],
+        "capability_needs": [
+          {
+            "name": "read_source",
+            "purpose": "读取 original 与 current 两个版本的源文档文本。",
+            "necessity": "required"
+          }
+        ],
+        "completion_criteria": [
+          {
+            "kind": "response",
+            "description": "用 propose_work 记录有来源的事实、依赖事实的判断及建议,并显式声明发现的依赖。"
+          },
+          {
+            "kind": "response",
+            "description": "按当前证据逐层复核、修正或撤回下游,保留独立发现,不把工具成功或版本更新当作语义正确。"
+          },
+          {
+            "kind": "response",
+            "description": "最终输出单个 JSON 对象,包含 boolean 键 discovers_missing_edges 与 redo_independent_branch,且结论基于两版本文档证据而非工具成功或版本更新。"
+          },
+          {
+            "kind": "capability_result",
+            "description": "Obtain the required result from read_source",
+            "capability": "read_source"
+          }
+        ]
+      },
+      "source_specification_sha256": "1dfb74cfcf4e61d9f702717e6bd36b8b75b594bcf15038108967cc930255ff21"
+    }
+  ]
+}
