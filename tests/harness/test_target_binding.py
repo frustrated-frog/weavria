@@ -1,3 +1,5 @@
+from typing import Literal
+
 import pytest
 from pydantic import BaseModel, ValidationError
 
@@ -51,7 +53,11 @@ class AliasResolver:
 
 
 async def prepare(
-    *, goal: str = "Read A v1", resolver: AliasResolver | None = None
+    *,
+    goal: str = "Read A v1",
+    resolver: AliasResolver | None = None,
+    material: bool = False,
+    freshness: Literal["stable", "current"] = "stable",
 ) -> tuple[TaskPreparation, ToolRegistry]:
     task = TaskInput(goal=goal)
     subject = "Alpha" if "Alpha" in goal else "A"
@@ -63,6 +69,7 @@ async def prepare(
             InformationNeed(
                 schema_version=2,
                 description="Requested object and version",
+                freshness=freshness,
                 source="external",
                 required_fields=("/value",),
                 capability_names=("read_record",),
@@ -110,7 +117,8 @@ async def prepare(
         profile_version="records/2",
         surfaces=(
             EvidenceSurface(
-                schema_version=2,
+                schema_version=3 if material else 2,
+                acquisition="material" if material else "semantic",
                 surface_id="record.value",
                 description="One requested record",
                 required_fields=("/value",),
@@ -144,6 +152,15 @@ async def prepare(
             ),
         ),
     )
+    declaration = specification.model_dump(mode="json")
+    if material:
+        declared_need = declaration["information_needs"][0]
+        declared_need.pop("freshness")
+        declared_need["time_requirement"] = (
+            "independent_wall_clock_recency"
+            if freshness == "current"
+            else "stable_or_named_edition"
+        )
     engine = TaskUnderstandingEngine(
         ModelTaskInterpreter(
             FakeModelProvider(
@@ -152,7 +169,7 @@ async def prepare(
                         action=ToolCallAction(
                             call_id="spec",
                             tool_name="declare_task_specification",
-                            arguments=specification.model_dump(mode="json"),
+                            arguments=declaration,
                         )
                     ),
                 )
@@ -232,8 +249,9 @@ async def test_actual_compiler_binds_request_subject_and_version(
     assert len(frame.requirements[0].evidence_match_plans[0].target_bindings) == 2
 
 
-async def test_correct_call_with_wrong_returned_identity_is_rejected() -> None:
-    prepared, registry = await prepare()
+@pytest.mark.parametrize("material", [False, True])
+async def test_correct_call_with_wrong_returned_identity_is_rejected(material: bool) -> None:
+    prepared, registry = await prepare(material=material)
 
     async def wrong(arguments: Input, context: ToolContext) -> Output:
         return Output(subject="B", version=arguments.version, value="wrong object")
@@ -347,3 +365,86 @@ def test_target_aware_contracts_preserve_v1_wire_shapes() -> None:
     assert "targets" not in need.model_dump(mode="json")
     assert "target_rules" not in surface.model_dump(mode="json")
     assert "target_bindings" not in plan.model_dump(mode="json")
+
+
+@pytest.mark.parametrize(
+    "material, version, freshness, expected",
+    [
+        (False, "v1", "stable", NeedStatus.PARTIAL),
+        (True, "v1", "stable", NeedStatus.ACQUIRED),
+        (True, "v2", "stable", NeedStatus.PENDING),
+        (True, "v1", "current", NeedStatus.PARTIAL),
+    ],
+)
+async def test_compiled_edition_acquisition(
+    material: bool, version: str, freshness: Literal["stable", "current"], expected: NeedStatus
+) -> None:
+    # 同一请求、同一工具、同一份文本。只有取证配置、选择的版本、时间条件发生变化。
+    prepared, registry = await prepare(material=material, freshness=freshness)
+    frame = prepared.record.frame
+    req = InformationRequirement.model_validate_json(frame.requirements[0].model_dump_json())
+    store = InMemoryArtifactStore()
+    record = await ToolExecutor("run", registry, store, ReadOnlyPolicy()).execute(
+        ToolCallAction(
+            call_id="read", tool_name="read_record", arguments={"subject": "A", "version": version}
+        ),
+        max_duration=1,
+    )
+    ledger = await EvidenceResolver().resolve(
+        work_id=frame.work_id,
+        task_revision=1,
+        frame_revision=frame.revision,
+        requirements=(req,),
+        records=(record,),
+        read_artifact=lambda aid: store.get("run", aid),
+    )
+    assert ledger.states[0].status is expected
+    assert req.covered_by(ledger.bindings) == (expected is NeedStatus.ACQUIRED)
+    if freshness == "current":
+        assert ledger.states[0].missing_fields == ("$freshness",)
+        # 插件即使返回完整字段和语义支持,未知时效也不能取得交付资格。
+        binding = ledger.bindings[0].model_copy(
+            update={
+                "proof_strength": "scoped_semantic",
+                "relation": "supports",
+                "missing_fields": (),
+                "result_kind": "found",
+            }
+        )
+        assert not req.covered_by((binding,))
+        assert req.covered_by((binding.model_copy(update={"freshness": "valid"}),))
+    if material and version == "v1":
+        # 同一需求含两种计划时,材料门槛只属于声明它的计划。
+        plan = req.evidence_match_plans[0]
+        sibling = plan.model_copy(
+            update={"plan_id": "semantic", "minimum_proof": "scoped_semantic"}
+        )
+        mixed = req.model_copy(
+            update={"evidence_match_plans": (plan, sibling), "freshness": "stable"}
+        )
+        binding = ledger.bindings[0].model_copy(update={"match_plan_id": "semantic"})
+        assert not mixed.covered_by((binding,))
+
+
+def test_material_acquisition_requires_versioned_target_contract() -> None:
+    with pytest.raises(ValidationError):
+        EvidenceSurface(
+            schema_version=3,
+            acquisition="material",
+            surface_id="doc",
+            description="Doc",
+            required_fields=("/text",),
+        )
+    with pytest.raises(ValidationError):
+        EvidenceSurface(
+            schema_version=2,
+            acquisition="material",
+            surface_id="doc",
+            description="Doc",
+            required_fields=("/text",),
+            target_rules=(
+                EvidenceTargetRule(
+                    key="edition", input_pointer="/version", output_pointer="/version"
+                ),
+            ),
+        )

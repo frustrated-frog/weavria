@@ -33,18 +33,27 @@ class _Contract(BaseModel):
     schema_version: Literal[1] = 1
 
 
-class TargetedContract(BaseModel):
+class _VersionCheckedContract(BaseModel):
     """Versioned envelope for additive target-aware contract extensions."""
 
     model_config = _Contract.model_config
-    schema_version: Literal[1, 2] = 1
 
-    @field_validator("schema_version", mode="before")
+    @field_validator("schema_version", mode="before", check_fields=False)
     @classmethod
     def validate_version(cls, value: object) -> object:
         if type(value) is not int:
             raise ValueError("schema_version must be an integer")
         return value
+
+
+class TargetedContract(_VersionCheckedContract):
+    schema_version: Literal[1, 2] = 1
+
+
+class MaterialContract(_VersionCheckedContract):
+    """资料获取扩展使用 v3,独立于只支持 v1/v2 的任务目标协议。"""
+
+    schema_version: Literal[1, 2, 3] = 1
 
 
 class TargetSelection(_Contract):

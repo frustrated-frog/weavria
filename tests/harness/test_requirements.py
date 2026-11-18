@@ -716,6 +716,41 @@ async def test_current_data_is_not_claimed_fresh_by_structural_coverage() -> Non
     assert "$freshness" in ledger.state_for("need-a").missing_fields
 
 
+@pytest.mark.parametrize("value_freshness", ["unknown", "valid"])
+async def test_current_requirement_needs_fresh_evidence_for_each_field(
+    value_freshness: Literal["unknown", "valid"],
+) -> None:
+    class TimedFragments(_ProgressiveExtractor):
+        async def evaluate(
+            self,
+            requirement: InformationRequirement,
+            record: ToolRecord,
+            snapshot: ArtifactSnapshot,
+        ) -> EvidenceEvaluation:
+            fragment = await super().evaluate(requirement, record, snapshot)
+            if fragment.pointers == ("/value",):
+                return fragment.model_copy(update={"freshness": value_freshness})
+            return fragment
+
+    # 两次调用属于同一对象。时间字段来自新鲜来源。另一次调用提供的值仍须独立满足时效。
+    store, records = await _success_records()
+    requirement = _requirement(required_fields=("/value", "/source_time"), freshness="current")
+    resolver = EvidenceResolver((TimedFragments(complete_second=False, shared_scope=True),))
+    ledger = await resolver.resolve(
+        work_id="work-a",
+        task_revision=1,
+        frame_revision=1,
+        requirements=(requirement,),
+        records=records,
+        read_artifact=lambda aid: store.get("run-1", aid),
+    )
+    state = ledger.state_for(requirement.need_id)
+    complete = value_freshness == "valid"
+    assert state.status is (NeedStatus.SATISFIED if complete else NeedStatus.PARTIAL)
+    assert state.missing_fields == (() if complete else ("$freshness",))
+    assert requirement.covered_by(ledger.bindings) == complete
+
+
 async def test_progress_digest_advances_for_a_new_structural_query_scope() -> None:
     store, records = await _success_records()
     resolver = EvidenceResolver()

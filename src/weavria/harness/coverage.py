@@ -33,7 +33,7 @@ from weavria.core import (
 )
 from weavria.models import ModelCallError, ModelProvider, call_model
 
-from .targets import EvidenceTargetRule, TargetedContract
+from .targets import EvidenceTargetRule, MaterialContract
 
 if TYPE_CHECKING:
     from .understanding import CapabilityView, TaskSpecification, TaskUnderstandingInput
@@ -85,7 +85,7 @@ class EvidenceParameterConstraint(_CoverageContract):
         return self
 
 
-class EvidenceSurface(TargetedContract):
+class EvidenceSurface(MaterialContract):
     """One versioned semantic fact family exposed by a capability adapter."""
 
     surface_id: _Identifier
@@ -93,7 +93,10 @@ class EvidenceSurface(TargetedContract):
     demand_policy: Literal["broad_or_explicit", "explicit_only"] = "explicit_only"
     required_fields: tuple[str, ...] = Field(min_length=1, max_length=16)
     parameter_constraints: tuple[EvidenceParameterConstraint, ...] = Field(default=(), max_length=8)
-    schema_version: Literal[1, 2] = 1
+    schema_version: Literal[1, 2, 3] = 1
+    acquisition: Literal["semantic", "material"] = Field(
+        default="semantic", exclude_if=lambda value: value == "semantic"
+    )
     target_rules: tuple[EvidenceTargetRule, ...] = Field(default=(), max_length=8)
 
     @model_serializer(mode="wrap")
@@ -105,7 +108,9 @@ class EvidenceSurface(TargetedContract):
 
     @model_validator(mode="after")
     def validate_surface(self) -> Self:
-        if self.target_rules and self.schema_version != 2:
+        if self.acquisition == "material" and (self.schema_version != 3 or not self.target_rules):
+            raise ValueError("material acquisition requires a v3 surface with target rules")
+        if self.target_rules and self.schema_version < 2:
             raise ValueError("target rules require EvidenceSurface v2")
         if len({rule.key for rule in self.target_rules}) != len(self.target_rules):
             raise ValueError("evidence target keys must be unique")

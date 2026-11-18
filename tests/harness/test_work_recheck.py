@@ -879,8 +879,10 @@ async def test_same_batch_new_evidence_rejects_old_work_cas(
     assert run.state.evidence_invalidated == ("a",)
 
 
+@pytest.mark.parametrize("unknown_time", [False, True])
 async def test_semantic_approval_cannot_reuse_stale_root_source(
     session_counter: OpenAICompatibleTokenCounter,
+    unknown_time: bool,
 ) -> None:
     answer = response(status="supported", note="a").action
     assert isinstance(answer, ToolCallAction)
@@ -890,6 +892,11 @@ async def test_semantic_approval_cannot_reuse_stale_root_source(
         (ModelResponse(action=answer.model_copy(update={"arguments": args})),)
     )
     run = RecheckRun(provider, session_counter)
+    if unknown_time:
+        alpha, beta = run.frame.requirements
+        run.frame = run.frame.model_copy(
+            update={"requirements": (alpha.model_copy(update={"freshness": "current"}), beta)}
+        )
     run.state = WorkingState(schema_version=4, task_revision=1, recheck_required=True)
     old = await run.store.put("r", "old", {"text": "Total 10"})
     new = await run.store.put("r", "new", {"text": "Total 20"})
@@ -903,6 +910,25 @@ async def test_semantic_approval_cannot_reuse_stale_root_source(
     run.ledger = evidence_ledger(run, old)
     await run.apply((note,))
     run.ledger = evidence_ledger(run, new)
+    if unknown_time:
+        # 账本已有新鲜的另一份材料。单独引用时效未知的旧原文仍不能恢复结论。
+        historical = (
+            evidence_ledger(run, old)
+            .bindings[0]
+            .model_copy(update={"binding_id": "old", "freshness": "unknown"})
+        )
+        alpha_state, beta_state = run.ledger.states
+        run.ledger = run.ledger.model_copy(
+            update={
+                "bindings": (*run.ledger.bindings, historical),
+                "states": (
+                    alpha_state.model_copy(
+                        update={"evidence_binding_ids": (*alpha_state.evidence_binding_ids, "old")}
+                    ),
+                    beta_state,
+                ),
+            }
+        )
     run.state = reconcile_work_evidence(run.state, run.ledger)
     await run.apply((note,))
     assert run.state.last_notice == "recheck_required"

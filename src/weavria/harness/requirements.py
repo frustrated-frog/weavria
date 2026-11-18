@@ -22,7 +22,7 @@ from weavria.core import ErrorCategory, ToolFailedObservation, ToolRecord
 from weavria.tools import resolve_pointer
 
 from .outcome_contracts import CapabilityOutcome
-from .targets import EvidenceTargetBinding, TargetedContract, same_target_value
+from .targets import EvidenceTargetBinding, MaterialContract, TargetedContract, same_target_value
 
 _Identifier = Annotated[
     str,
@@ -72,7 +72,7 @@ class EvidenceParameterMatch(_SemanticContract):
         return self
 
 
-class EvidenceMatchPlan(TargetedContract):
+class EvidenceMatchPlan(MaterialContract):
     """Executable applicability contract derived from a trusted capability profile."""
 
     plan_id: _Identifier
@@ -82,8 +82,8 @@ class EvidenceMatchPlan(TargetedContract):
     surface_id: _Identifier
     required_fields: tuple[str, ...] = Field(min_length=1, max_length=16)
     parameter_matches: tuple[EvidenceParameterMatch, ...] = Field(default=(), max_length=8)
-    minimum_proof: Literal["scoped_semantic"] = "scoped_semantic"
-    schema_version: Literal[1, 2] = 1
+    minimum_proof: Literal["scoped_semantic", "scoped_structural"] = "scoped_semantic"
+    schema_version: Literal[1, 2, 3] = 1
     target_bindings: tuple[EvidenceTargetBinding, ...] = Field(default=(), max_length=8)
 
     @model_serializer(mode="wrap")
@@ -95,7 +95,11 @@ class EvidenceMatchPlan(TargetedContract):
 
     @model_validator(mode="after")
     def validate_plan(self) -> Self:
-        if self.target_bindings and self.schema_version != 2:
+        if self.minimum_proof == "scoped_structural" and (
+            self.schema_version != 3 or not self.target_bindings
+        ):
+            raise ValueError("material evidence requires a v3 request-bound plan")
+        if self.target_bindings and self.schema_version < 2:
             raise ValueError("target bindings require EvidenceMatchPlan v2")
         if len(set(self.required_fields)) != len(self.required_fields):
             raise ValueError("evidence match fields must be unique")
@@ -107,9 +111,10 @@ class EvidenceMatchPlan(TargetedContract):
         return self
 
 
-class InformationRequirement(_SemanticContract):
+class InformationRequirement(TargetedContract):
     """Stable definition of a fact dependency; mutable state lives in the ledger."""
 
+    schema_version: Literal[1, 2] = 1
     need_id: _Identifier
     description: _Text
     source: Literal["available_context", "model_knowledge", "external"]
@@ -121,23 +126,33 @@ class InformationRequirement(_SemanticContract):
         "positive_value_required", "report_findings", "exhaust_bounded_scope"
     ] = "positive_value_required"
     evidence_match_plans: tuple[EvidenceMatchPlan, ...] = Field(default=(), max_length=16)
-    minimum_proof: Literal["structural", "semantic", "scoped_semantic"] = "structural"
+    minimum_proof: Literal["structural", "semantic", "scoped_semantic", "scoped_structural"] = (
+        "structural"
+    )
     depends_on: tuple[_Identifier, ...] = Field(default=(), max_length=16)
     origin_ref: _Identifier
 
+    def supports_binding(self, binding: "EvidenceBinding") -> bool:
+        """单条来源能否参与本需求的覆盖或重验。全需求的字段覆盖另行归约。"""
+        if (
+            binding.need_id != self.need_id
+            or binding.relation not in {"supports", "partially_supports"}
+            or binding.freshness == "stale"
+            or (self.freshness == "current" and binding.freshness != "valid")
+            or not _proof_at_least(binding.proof_strength, self.minimum_proof)
+        ):
+            return False
+        if not self.evidence_match_plans:
+            return binding.match_plan_id is None
+        return any(
+            plan.plan_id == binding.match_plan_id
+            and binding.proof_strength in {plan.minimum_proof, "scoped_semantic"}
+            for plan in self.evidence_match_plans
+        )
+
     def covered_by(self, bindings: tuple["EvidenceBinding", ...]) -> bool:
         """Apply this requirement's scope, proof and result contract to selected evidence."""
-        return _scope_coverage(
-            self,
-            [
-                binding
-                for binding in bindings
-                if binding.need_id == self.need_id
-                and binding.relation in {"supports", "partially_supports"}
-                and binding.freshness != "stale"
-                and _proof_at_least(binding.proof_strength, self.minimum_proof)
-            ],
-        )[0]
+        return _coverage_in_scope(self, [b for b in bindings if self.supports_binding(b)])[0]
 
     @model_validator(mode="after")
     def validate_requirement(self) -> Self:
@@ -158,7 +173,13 @@ class InformationRequirement(_SemanticContract):
             plan.producer_name not in self.capability_names for plan in self.evidence_match_plans
         ):
             raise ValueError("evidence match plan producer must be a capability candidate")
-        if self.evidence_match_plans and self.minimum_proof != "scoped_semantic":
+        material = any(p.minimum_proof == "scoped_structural" for p in self.evidence_match_plans)
+        if material or self.minimum_proof == "scoped_structural":
+            if not (
+                material and self.schema_version == 2 and self.minimum_proof == "scoped_structural"
+            ):
+                raise ValueError("scoped material requires a v2 requirement and material plan")
+        elif self.evidence_match_plans and self.minimum_proof != "scoped_semantic":
             raise ValueError("profile-bound evidence requires scoped semantic proof")
         if self.need_id in self.depends_on or len(set(self.depends_on)) != len(self.depends_on):
             raise ValueError("requirement dependencies must be unique and cannot be self edges")
@@ -631,7 +652,7 @@ class EvidenceResolver:
     @property
     def version(self) -> str:
         strategies = ",".join(f"{item.key}@{item.version}" for item in self._extractors)
-        return f"evidence-resolver/6[{strategies}]"
+        return f"evidence-resolver/7[{strategies}]"
 
     async def resolve(
         self,
@@ -1237,12 +1258,34 @@ def _scope_coverage(
     """Cover fields only inside host-declared compatible applicability groups."""
     if not bindings:
         return False, requirement.required_fields
+    if requirement.freshness == "current":
+        # 逐条验证时效。一个新鲜但字段不全的来源不能为另一份旧材料担保。
+        valid = [item for item in bindings if item.freshness == "valid"]
+        if len(valid) < len(bindings):
+            if _coverage_in_scope(requirement, valid)[0]:
+                return True, ()
+            # 原文存在但采集时间未知时,补读同一字段无助于恢复。保留真实字段缺口。
+            _, missing = _coverage_in_scope(requirement, bindings)
+            return False, tuple(dict.fromkeys((*missing, "$freshness")))
+    return _coverage_in_scope(requirement, bindings)
+
+
+def _coverage_in_scope(
+    requirement: InformationRequirement, bindings: list[EvidenceBinding]
+) -> tuple[bool, tuple[str, ...]]:
     plans = requirement.evidence_match_plans
     if plans:
         all_missing: list[str] = []
         scopes_by_plan: list[set[str]] = []
         for plan in plans:
-            plan_bindings = [item for item in bindings if item.match_plan_id == plan.plan_id]
+            # 同一需求可以有不同来源。材料计划可以证明获取原文,其较低门槛
+            # 不得使兄弟计划的结构结果成为语义证据。
+            plan_bindings = [
+                item
+                for item in bindings
+                if item.match_plan_id == plan.plan_id
+                and item.proof_strength in {plan.minimum_proof, "scoped_semantic"}
+            ]
             scopes_by_plan.append({item.scope_identity_sha256 for item in plan_bindings})
             complete, missing = _one_scope_covers(
                 plan.required_fields,
@@ -1268,6 +1311,7 @@ def _scope_coverage(
                         item
                         for item in bindings
                         if item.match_plan_id == plan.plan_id
+                        and item.proof_strength in {plan.minimum_proof, "scoped_semantic"}
                         and item.scope_identity_sha256 == scope_identity
                     ],
                     completion_mode=requirement.completion_mode,
@@ -1317,7 +1361,7 @@ def _one_scope_covers(
 
 def _proof_at_least(
     actual: Literal["structural", "scoped_structural", "semantic", "scoped_semantic"],
-    required: Literal["structural", "semantic", "scoped_semantic"],
+    required: Literal["structural", "scoped_structural", "semantic", "scoped_semantic"],
 ) -> bool:
     ranks = {
         "structural": 0,

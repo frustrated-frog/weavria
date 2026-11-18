@@ -921,9 +921,10 @@ def reconcile_work_evidence(state: WorkingState, ledger: NeedLedger) -> WorkingS
 
 
 def evidence_refresh_allowed(
-    state: WorkingState, proposal: WorkProposal, ledger: NeedLedger
+    state: WorkingState, proposal: WorkProposal, ledger: NeedLedger, frame: TaskFrame
 ) -> bool:
     """模型重验之外再核对当前来源;旧根的 need_ids 不能被删改以逃避检查。"""
+    requirements = {r.need_id: r for r in frame.requirements}
     proposed = {n.note_id: n for n in proposal.update.notes}
     sources = {s.reference: s.artifact for s in proposal.sources}
     reviewed = {r.note_id for r in proposal.rechecks}
@@ -942,6 +943,7 @@ def evidence_refresh_allowed(
             continue
         for identity in old.need_ids:
             try:
+                requirement = requirements[identity]
                 need = ledger.state_for(identity)
             except KeyError:
                 return False
@@ -950,9 +952,7 @@ def evidence_refresh_allowed(
             addresses = [
                 a
                 for b in ledger.bindings
-                if b.binding_id in need.evidence_binding_ids
-                and b.relation in {"supports", "partially_supports"}
-                and b.freshness != "stale"
+                if b.binding_id in need.evidence_binding_ids and requirement.supports_binding(b)
                 for a in b.addresses
             ]
             if not any(
@@ -1073,7 +1073,7 @@ async def reduce_work(
         remaining_invalidated: tuple[str, ...] = ()
         if state.schema_version == 4:
             assert ledger is not None
-            if not evidence_refresh_allowed(state, proposal, ledger):
+            if not evidence_refresh_allowed(state, proposal, ledger, frame):
                 state = state.model_copy(update={"last_notice": "recheck_required"})
                 continue
             # 原文重验后文字可能不变,但这仍是新的结论版本,后继必须单独重验。

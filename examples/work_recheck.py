@@ -23,7 +23,17 @@ from weavria.core import (
     ToolFailedObservation,
     ToolRecorded,
 )
-from weavria.harness import AgentHarness, HarnessConfig
+from weavria.harness import (
+    AgentHarness,
+    CapabilityEvidenceProfile,
+    EvidenceParameterConstraint,
+    EvidenceSurface,
+    EvidenceTargetRule,
+    HarnessConfig,
+    HarnessEvidence,
+    TaskUnderstandingError,
+    load_need_ledger,
+)
 from weavria.harness.work import WorkProposal, load_work
 from weavria.models import (
     ModelCapabilities,
@@ -100,6 +110,39 @@ def registry(case: Case) -> ToolRegistry:
     )
 
 
+def versioned_documents() -> HarnessEvidence:
+    """适配器声明请求和响应中资料版本的位置,模型自行选择所需版本。"""
+    return HarnessEvidence(
+        audit_requirements=True,
+        profiles=(
+            CapabilityEvidenceProfile(
+                capability_name="read_source",
+                capability_version="1",
+                profile_version="edition/1",
+                surfaces=(
+                    EvidenceSurface(
+                        schema_version=3,
+                        acquisition="material",
+                        surface_id="source.edition",
+                        description="Document text from one named edition in the provided dataset.",
+                        required_fields=("/text",),
+                        target_rules=(
+                            EvidenceTargetRule(
+                                key="edition", input_pointer="/version", output_pointer="/version"
+                            ),
+                        ),
+                        parameter_constraints=(
+                            EvidenceParameterConstraint(
+                                input_pointer="/version", allowed_values=("original", "current")
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+
+
 def load_dataset(path: Path) -> Dataset:
     dataset = Dataset.model_validate_json(path.read_bytes())
     if len({case.id for case in dataset.cases}) != len(dataset.cases):
@@ -122,6 +165,8 @@ def implementation_digests() -> dict[str, str]:
             "work.py",
             "work_patch.py",
             "configuration.py",
+            "targets.py",
+            "../../../examples/work_recheck.py",
             "assembly.py",
             "work_recheck.py",
             "work_recheck_contracts.py",
@@ -167,7 +212,11 @@ async def experiment(args: argparse.Namespace) -> None:
         "implementation_sha256": await asyncio.to_thread(implementation_digests),
         "options": options,
         "repeats": args.repeats,
-        "comparison": "work_updates" if getattr(args, "compare_updates", False) else "work_recheck",
+        "comparison": "versioned_material"
+        if getattr(args, "compare_material", False)
+        else "work_updates"
+        if getattr(args, "compare_updates", False)
+        else "work_recheck",
         "limits": {"max_model_calls": 16, "max_tool_calls": 24, "max_duration": 180},
         "note": "模型自行形成依赖;未形成或未触发重验也保留,不得当作重验成功。",
     }
@@ -179,20 +228,27 @@ async def experiment(args: argparse.Namespace) -> None:
                     if args.case and case.id not in args.case:
                         continue
                     # 交替顺序减小固定先后偏差;两个策略采用相同任务、模型和预算。
-                    profiles: tuple[tuple[bool, Literal["replace", "patch"]], ...] = (
-                        ((True, "replace"), (True, "patch"))
-                        if getattr(args, "compare_updates", False)
-                        else ((False, "replace"), (True, "replace"))
-                    )
-                    for enabled, update_mode in profiles if repeat % 2 == 0 else profiles[::-1]:
+                    profiles: tuple[tuple[bool, Literal["replace", "patch"], bool], ...]
+                    if getattr(args, "compare_material", False):
+                        profiles = ((True, "patch", False), (True, "patch", True))
+                    elif getattr(args, "compare_updates", False):
+                        profiles = ((True, "replace", False), (True, "patch", False))
+                    else:
+                        profiles = ((False, "replace", False), (True, "replace", False))
+                    for enabled, update_mode, material in (
+                        profiles if repeat % 2 == 0 else profiles[::-1]
+                    ):
                         captured = CapturingActor(actor) if args.capture_requests else None
                         started = time.monotonic()
                         calls = transport.calls
                         key = f"{case.id}-{repeat}-{enabled}-{update_mode}"
+                        if material:
+                            key += "-edition"
                         row: dict[str, object] = {
                             "case": case.id,
                             "repeat": repeat,
                             "review": enabled,
+                            "versioned_material": material,
                             "work_updates": update_mode,
                         }
                         try:
@@ -213,6 +269,7 @@ async def experiment(args: argparse.Namespace) -> None:
                                         max_request_bytes=128000,
                                     ),
                                 ),
+                                evidence=versioned_documents() if material else None,
                                 model=captured or actor,
                                 tools=registry(case),
                                 token_counter=counter,
@@ -252,6 +309,20 @@ async def experiment(args: argparse.Namespace) -> None:
                                     if isinstance(e.data, SessionSemanticCommitted)
                                     and e.data.snapshot.working_state is not None
                                 ]
+                                heads = [
+                                    e.data.snapshot
+                                    for e in events
+                                    if isinstance(e.data, SessionSemanticCommitted)
+                                ]
+                                if heads:
+                                    ledger = load_need_ledger(heads[-1].need_ledger)
+                                    row["remaining_gaps"] = [
+                                        s.missing_fields for s in ledger.states
+                                    ]
+                                    row["bound_material"] = sum(
+                                        b.proof_strength == "scoped_structural"
+                                        for b in ledger.bindings
+                                    )
                                 statuses: list[str] = []
                                 work_errors: list[dict[str, str]] = []
                                 selectors = {"quote": 0, "range": 0, "whole": 0}
@@ -349,6 +420,16 @@ async def experiment(args: argparse.Namespace) -> None:
                                     else None,
                                 )
                         except Exception as exc:
+                            if isinstance(exc, TaskUnderstandingError):
+                                row["preparation_category"] = exc.error.category.value
+                                row["preparation_attempts"] = [
+                                    (
+                                        attempt.stage,
+                                        attempt.error.category.value,
+                                        attempt.error.cause_type,
+                                    )
+                                    for attempt in exc.attempts
+                                ]
                             # 评测记录异常类型,不泄露可能带凭据或原文的异常字符串。
                             row.update(
                                 status="evaluation_failed",
@@ -403,7 +484,11 @@ def main() -> None:
         default=Path(__file__).resolve().parents[1] / "tests/fixtures/work_recheck/tasks.json",
     )
     parser.add_argument("--live", action="store_true")
-    parser.add_argument(
+    comparisons = parser.add_mutually_exclusive_group()
+    comparisons.add_argument(
+        "--compare-material", action="store_true", help="固定使用补丁,对照指定版本资料的获取"
+    )
+    comparisons.add_argument(
         "--compare-updates", action="store_true", help="固定开启证据重验,仅比较全量替换与局部补丁"
     )
     parser.add_argument(
