@@ -1,0 +1,2 @@
+Closing sheet convention: units eligible at period close = physical count minus quarantined units for the selected SKU and warehouse.
+The archive stores period-close counts. It is not a running feed of later reservations, shipments, releases or receipts.

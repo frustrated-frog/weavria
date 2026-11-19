@@ -5,6 +5,7 @@ import hashlib
 import json
 import math
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Annotated, Literal, Protocol, Self, runtime_checkable
 
 from pydantic import (
@@ -968,7 +969,7 @@ class TaskUnderstandingInputAdmission(Protocol):
 class ModelTaskInterpreter:
     """Compile validated declarations with one shared, deadline-bound correction path."""
 
-    version = "model-task-understanding/16"
+    version = "model-task-understanding/17"
 
     def __init__(
         self,
@@ -1241,7 +1242,21 @@ def _has_material_surface(request: TaskUnderstandingInput) -> bool:
     )
 
 
-def _bind_time_requirement(arguments: dict[str, JsonValue]) -> dict[str, JsonValue]:
+# 时间坐标由用户要确定的事实决定, 与连接器是否注册了版本化材料无关。
+# 期间修订可以推翻旧结论, 但不等于要求证明此刻的外部状态。
+_TIME_REQUIREMENTS = MappingProxyType(
+    {
+        "as_of_closed_period": "stable",
+        "stable_or_named_edition": "stable",
+        "independent_wall_clock_recency": "current",
+        "not_applicable": "not_applicable",
+    }
+)
+
+
+def _bind_time_requirement(
+    arguments: dict[str, JsonValue], *, material: bool
+) -> dict[str, JsonValue]:
     """映射模型声明的时间条件。对旧声明保留原有时效强度,拒绝同时提供两种条件。"""
     needs = arguments.get("information_needs")
     if not isinstance(needs, list):
@@ -1249,20 +1264,24 @@ def _bind_time_requirement(arguments: dict[str, JsonValue]) -> dict[str, JsonVal
     normalized: list[JsonValue] = []
     for item in needs:
         if not isinstance(item, dict) or "time_requirement" not in item:
-            if isinstance(item, dict) and item.get("targets") and "freshness" not in item:
+            if (
+                material
+                and isinstance(item, dict)
+                and item.get("targets")
+                and "freshness" not in item
+            ):
                 raise ValueError("targeted sources require an explicit time requirement")
             normalized.append(item)
             continue
         need = dict(item)
         condition = need.pop("time_requirement")
-        choices = {
-            "stable_or_named_edition": "stable",
-            "independent_wall_clock_recency": "current",
-            "not_applicable": "not_applicable",
-        }
-        if "freshness" in need or not isinstance(condition, str) or condition not in choices:
+        if (
+            "freshness" in need
+            or not isinstance(condition, str)
+            or condition not in _TIME_REQUIREMENTS
+        ):
             raise ValueError("select exactly one declared time requirement")
-        need["freshness"] = choices[condition]
+        need["freshness"] = _TIME_REQUIREMENTS[condition]
         normalized.append(need)
     return {**arguments, "information_needs": normalized}
 
@@ -1342,15 +1361,17 @@ def _task_specification_request(
     )
     declaration = (_SpecificationRepair if repair else TaskSpecification).model_json_schema()
     material = _has_material_surface(request)
-    if material:
-        # 给模型两个独立选择:目标字段选择资料版本,时间要求决定验收所需证明。
-        # 持久化仍由 InformationNeed 校验,此处仅调整本次声明的输入词汇。
-        properties = declaration["$defs"]["InformationNeed"]["properties"]
-        properties.pop("freshness")
-        properties["time_requirement"] = {
-            "enum": ["stable_or_named_edition", "independent_wall_clock_recency", "not_applicable"],
-            "description": "Does the user also require proof of real-world recency?",
-        }
+    # 首次解释、语义修复、澄清候选共用 InformationNeed 的模型输入词表。
+    # 持久化及证据验收仍消费原有 freshness; 不根据任务文字自动降级。
+    properties = declaration["$defs"]["InformationNeed"]["properties"]
+    properties.pop("freshness")
+    properties["time_requirement"] = {
+        "enum": list(_TIME_REQUIREMENTS),
+        "description": (
+            "Time at which this particular fact must hold, not the time a source "
+            "was published or retrieved."
+        ),
+    }
     schema = json.dumps(declaration, ensure_ascii=False, separators=(",", ":"))
     instructions = (
         "Analyze the task, not the answer. Return exactly one tool call named "
@@ -1367,7 +1388,8 @@ def _task_specification_request(
         "Use direct when no external capability is needed, clarify when "
         "missing user intent blocks safe progress, and execute only when at least one "
         "listed capability is useful. Cross-field invariants not fully expressed by the "
-        "JSON Schema: freshness=current requires source=external; direct has no selected "
+        "JSON Schema: time_requirement=independent_wall_clock_recency requires source=external; "
+        "direct has no selected "
         "capabilities, required external information or ambiguities; clarify has at least "
         "one blocking ambiguity and no selected capabilities; execute has at least one "
         "selected capability and no blocking ambiguities. Record only ambiguities that "
@@ -1448,16 +1470,18 @@ def _task_specification_request(
             "cannot prove absence. Required selected capability completion edges are "
             "host-derived; do not duplicate them. Include the response completion criterion."
         )
+    instructions += (
+        " Select time_requirement separately for each fact. Use as_of_closed_period to "
+        "reconstruct a specified past state, including later corrections to that period; "
+        "use stable_or_named_edition for stable facts or a specified source edition. "
+        "Use independent_wall_clock_recency if a claim concerns the world now, even if the "
+        "only source is historical. Proof that an archive has limits is distinct from proof "
+        "of a present value. Missing current evidence does not establish a value or its absence."
+    )
     target_hints: tuple[str, ...] = ()
     if material:
-        instructions = instructions.replace(
-            "freshness=current", "time_requirement=independent_wall_clock_recency"
-        )
         instructions += (
-            " For a material surface, bind each requested source edition separately using targets. "
-            "Use stable_or_named_edition for facts derived from a requested edition. "
-            "Choose independent_wall_clock_recency for a real-world freshness obligation such as "
-            "proving that the edition is still in force today."
+            " For a material surface, bind each requested edition separately using targets."
         )
         # 枚举名来自能力目录。提示位置与目录一起作为模型数据传递。
         target_hints = (
@@ -1517,11 +1541,14 @@ def _validate_model_specification(
         )
     try:
         arguments: dict[str, JsonValue] = action.arguments
-        if _has_material_surface(request):
-            arguments = _bind_time_requirement(arguments)
-            proposal = arguments.get("action_proposal")
-            if isinstance(proposal, dict):
-                arguments = {**arguments, "action_proposal": _bind_time_requirement(proposal)}
+        material = _has_material_surface(request)
+        arguments = _bind_time_requirement(arguments, material=material)
+        proposal = arguments.get("action_proposal")
+        if isinstance(proposal, dict):
+            arguments = {
+                **arguments,
+                "action_proposal": _bind_time_requirement(proposal, material=material),
+            }
         if base is not None:
             revision = _SpecificationRepair.model_validate_json(
                 json.dumps(arguments, ensure_ascii=False, allow_nan=False, separators=(",", ":"))

@@ -120,6 +120,54 @@ async def test_invalid_semantic_revision_gets_same_bounded_correction_as_interpr
     }
 
 
+async def test_plain_archive_can_declare_different_time_conditions_in_one_revision() -> None:
+    base, request, report = case()
+    response = revision(
+        information_needs=[
+            {
+                "description": "Count at close",
+                "source": "external",
+                "time_requirement": "as_of_closed_period",
+            },
+            {
+                "description": "Count now",
+                "source": "external",
+                "time_requirement": "independent_wall_clock_recency",
+            },
+        ]
+    )
+    provider = FakeModelProvider((response,))
+    result = await ModelTaskInterpreter(provider).repair(request, base, report, max_duration=1)
+    assert [need.freshness for need in result.information_needs] == ["stable", "current"]
+    assert all("time_requirement" not in need.model_dump() for need in result.information_needs)
+
+
+@pytest.mark.parametrize("condition", ["unknown", None, {"kind": "as_of_closed_period"}])
+async def test_invalid_time_declaration_cannot_silently_downgrade_a_current_need(
+    condition: JsonValue,
+) -> None:
+    base, request, report = case()
+    wrong = revision(
+        information_needs=[
+            {"description": "Count now", "source": "external", "time_requirement": condition},
+        ]
+    )
+    ambiguous = revision(
+        information_needs=[
+            {
+                "description": "Count now",
+                "source": "external",
+                "freshness": "current",
+                "time_requirement": "as_of_closed_period",
+            },
+        ]
+    )
+    with pytest.raises(TaskUnderstandingError):
+        await ModelTaskInterpreter(FakeModelProvider((wrong, ambiguous))).repair(
+            request, base, report, max_duration=1
+        )
+
+
 async def test_repeated_schema_failure_retains_stage_and_safe_field_diagnostic() -> None:
     base, request, report = case()
     invalid = revision(**{"PRIVATE-FIELD-NAME": "PRIVATE-FIELD-VALUE"})

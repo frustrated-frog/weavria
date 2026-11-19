@@ -1,0 +1,5 @@
+period,warehouse,sku,counted,quarantined
+D16,east,S4,81,4
+D17,east,S4,72,5
+D17,west,S4,51,6
+D17,west,U8,84,2

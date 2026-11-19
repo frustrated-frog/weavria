@@ -7,7 +7,8 @@ import json
 import os
 import sqlite3
 import tempfile
-from dataclasses import asdict
+from collections.abc import Callable
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Literal
 
@@ -36,6 +37,7 @@ from weavria.harness import (
     HarnessEvidence,
     TaskUnderstandingError,
     load_need_ledger,
+    load_task_frame,
 )
 from weavria.models import (
     OpenAICompatibleConfig,
@@ -103,7 +105,7 @@ def report_errors(output: str | None, revised: bool) -> list[str]:
 
 
 def inspect_delivery(status: str, output: str | None, revised: bool) -> list[str]:
-    return ([] if status == "completed" else ["not_completed"]) + report_errors(output, revised)
+    return UPGRADE_TASK.delivery(status, output, revised)
 
 
 def archive(revised: bool) -> dict[str, str]:
@@ -118,6 +120,27 @@ def sha(s: str) -> str:
     return hashlib.sha256(s.encode()).hexdigest()
 
 
+@dataclass(frozen=True)
+class ReviewTask:
+    """跨轮任务的用户输入、分阶段可见资料及独立内容判据。"""
+
+    initial: str
+    update: str
+    documents: Callable[[bool], dict[str, str]]
+    errors: Callable[[str | None, bool], list[str]]
+
+    def delivery(self, status: str, output: str | None, revised: bool) -> list[str]:
+        return ([] if status == "completed" else ["not_completed"]) + self.errors(output, revised)
+
+
+UPGRADE_TASK = ReviewTask(INITIAL, UPDATE, archive, report_errors)
+
+
+class RequirementTime(BaseModel):
+    description: str
+    freshness: str
+
+
 class TurnEvidence(BaseModel):
     run_id: str
     status: str = "no_terminal_event"
@@ -126,9 +149,10 @@ class TurnEvidence(BaseModel):
     actions: list[str] = []
     completion_checks: list[dict[str, object]] = []
     missing_fields: list[str] = []
+    requirement_times: list[RequirementTime] = []
 
 
-def replay(db: Path) -> dict[str, TurnEvidence]:
+def replay(db: Path, task: ReviewTask = UPGRADE_TASK) -> dict[str, TurnEvidence]:
     """Read only the frozen task's journal; an unaccepted Finish never counts as a delivery."""
     runs: dict[str, tuple[bool, TurnEvidence]] = {}
     stages: dict[str, TurnEvidence] = {}
@@ -145,7 +169,7 @@ def replay(db: Path) -> dict[str, TurnEvidence]:
                 if data.input_id not in {"original", "amendment"}:
                     continue
                 revised = data.input_id == "amendment"
-                if data.text != (UPDATE if revised else INITIAL):
+                if data.text != (task.update if revised else task.initial):
                     raise ValueError("task input mismatch")
                 trace = TurnEvidence(run_id=data.run_id)
                 runs[data.run_id] = (revised, trace)
@@ -159,9 +183,16 @@ def replay(db: Path) -> dict[str, TurnEvidence]:
                 ]
             elif isinstance(data, SessionSemanticCommitted) and data.snapshot.run_id in runs:
                 ledger = load_need_ledger(data.snapshot.need_ledger)
-                runs[data.snapshot.run_id][1].missing_fields = sorted(
+                trace = runs[data.snapshot.run_id][1]
+                trace.missing_fields = sorted(
                     {f for state in ledger.states for f in state.missing_fields}
                 )
+                # 用同一 Run 最后提交的任务帧解释账本缺口, 不把上一轮需求归到准备失败的追问。
+                frame = load_task_frame(data.snapshot.observation.payload)
+                trace.requirement_times = [
+                    RequirementTime(description=need.description, freshness=need.freshness)
+                    for need in frame.requirements
+                ]
             elif isinstance(data, SessionRunEvent) and data.event.run_id in runs:
                 run_id = data.event.run_id
                 revised, trace = runs[run_id]
@@ -173,7 +204,7 @@ def replay(db: Path) -> dict[str, TurnEvidence]:
                     event.turn.decision, FinishAction
                 ):
                     finish = event.turn.decision
-                    candidates[run_id, sha(finish.model_dump_json())] = report_errors(
+                    candidates[run_id, sha(finish.model_dump_json())] = task.errors(
                         finish.output, revised
                     )
                 elif isinstance(event, CompletionChecked):
@@ -190,7 +221,7 @@ def replay(db: Path) -> dict[str, TurnEvidence]:
                     )
                 elif isinstance(event, RunEnded):
                     trace.status = event.result.status.value
-                    trace.delivery_errors = inspect_delivery(
+                    trace.delivery_errors = task.delivery(
                         trace.status, event.result.output, revised
                     )
     finally:
@@ -205,8 +236,9 @@ async def turn(
     config: HarnessConfig,
     model: OpenAICompatibleConfig,
     transport: Transport,
+    task: ReviewTask = UPGRADE_TASK,
 ) -> dict[str, object]:
-    docs = archive(revised)
+    docs = task.documents(revised)
     corpus = SnapshotCorpus(docs)
     counter = OpenAICompatibleTokenCounter(model, encoding="cl100k_base")
     offset = transport.calls
@@ -229,7 +261,7 @@ async def turn(
         try:
             run = await agent.send(
                 "review",
-                UPDATE if revised else INITIAL,
+                task.update if revised else task.initial,
                 input_id="amendment" if revised else "original",
             )
         except TaskUnderstandingError as exc:
@@ -245,8 +277,10 @@ async def turn(
             status, output = report.status.value, report.execution.output
             if report.execution.error:
                 error = report.execution.error.category.value
-    journal = (await asyncio.to_thread(replay, db)).get("amendment" if revised else "original")
-    failures = inspect_delivery(status, output, revised)
+    journal = (await asyncio.to_thread(replay, db, task)).get(
+        "amendment" if revised else "original"
+    )
+    failures = task.delivery(status, output, revised)
     return dict(
         status=status,
         output=output,

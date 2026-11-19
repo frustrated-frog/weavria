@@ -1,0 +1,1 @@
+Adjustment A-92 to D17: replace the physical count for S4 in east with 63. Its quarantine count is unchanged. No other row was adjusted.
