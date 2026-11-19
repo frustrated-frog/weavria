@@ -1136,3 +1136,58 @@ async def test_model_replans_from_rejected_call_and_committed_evidence_gap(tmp_p
 
     assert result.report.status is RunStatus.COMPLETED, result.report.error
     assert executed == ["title", "title", "detail"]
+
+
+def test_shared_need_keeps_complementary_read_contract_in_spare_capacity() -> None:
+    class Document(BaseModel):
+        body: str
+
+    async def read(arguments: Input, context: ToolContext) -> Document:
+        return Document(body=arguments.key)
+
+    # 两个目录返回同样的字段。正文工具较贵, 初次覆盖需求后其边际收益为零。
+    # 允许它占用剩余空间, 但同形目录、未声明的替代工具和副作用不能因此进入。
+    registry = ToolRegistry(
+        (
+            tool("a_index"),
+            tool("b_index"),
+            TypedTool(
+                name="read_body",
+                version="1",
+                description="Read document content from the archive",
+                input_type=Input,
+                output_type=Document,
+                execute=read,
+            ),
+        )
+    )
+    frame, ledger = problem((need("article", "a_index", "b_index", "read_body"),))
+
+    def choose(policy: AdaptiveCapabilityPolicy, current: TaskFrame = frame) -> tuple[str, ...]:
+        return policy.select(
+            frame=current,
+            ledger=ledger,
+            tools=registry,
+            resolver=CapabilityResolver(),
+            previous=(),
+            records=(),
+            discover=False,
+        ).names
+
+    assert choose(AdaptiveCapabilityPolicy()) == ("a_index", "read_body")
+    assert choose(AdaptiveCapabilityPolicy(max_tools=1)) == ("a_index",)
+    budget = sum(model_tool_bytes(registry.get(n).descriptor) for n in ("a_index", "read_body"))
+    assert choose(AdaptiveCapabilityPolicy(max_descriptor_bytes=budget - 1)) == ("a_index",)
+    assert choose(AdaptiveCapabilityPolicy(max_descriptor_bytes=budget)) == ("a_index", "read_body")
+    optional = frame.specification.model_copy(
+        update={
+            "capability_needs": tuple(
+                n.model_copy(update={"necessity": "optional"}) if n.name == "read_body" else n
+                for n in frame.specification.capability_needs
+            )
+        }
+    )
+    assert choose(
+        AdaptiveCapabilityPolicy(),
+        canonicalize_task_frame(frame.model_copy(update={"specification": optional})),
+    ) == ("a_index",)

@@ -1,6 +1,7 @@
 """按当前工作需求分配有限工具描述空间,不改变工具执行权限。"""
 
 from dataclasses import dataclass
+from math import prod
 from typing import Protocol
 
 from weavria.core import ToolFailedObservation, ToolRecord
@@ -65,7 +66,7 @@ class AdaptiveCapabilityPolicy:
 
     @property
     def version(self) -> str:
-        return f"adaptive-capabilities/5:tools={self.max_tools}:bytes={self.max_descriptor_bytes}"
+        return f"adaptive-capabilities/6:tools={self.max_tools}:bytes={self.max_descriptor_bytes}"
 
     def select(
         self,
@@ -270,8 +271,51 @@ class AdaptiveCapabilityPolicy:
             best_utility = gain(best, dict.fromkeys(weights, 1.0))
             if best_utility > utility + 1e-12:
                 chosen, spent, utility = [best], costs[best], best_utility
+        # 主目标分配结束后才使用余量。共享 need 表示共同服务于一个目的,
+        # 不保证工具可替换:目录可能只返回路径,另一个工具才返回正文。
+        # 只比较宿主声明的顶层输出属性,不把字段名当作语义证明或执行授权。
+        primary_size = len(chosen)
+        required_reads = {
+            n.name
+            for n in frame.specification.capability_needs
+            if n.necessity == "required"
+            and n.name in costs
+            and descriptors[n.name].behavior == "read_only"
+        }
+        surfaces: dict[str, frozenset[str]] = {}
+        for name in required_reads:
+            props = descriptors[name].output_schema.get("properties")
+            if isinstance(props, dict):
+                surfaces[name] = frozenset(props)
+        for need in sorted(frame.requirements, key=lambda n: -priorities.get(n.need_id, 0)):
+            if len(chosen) >= self.max_tools:
+                break
+            if (
+                not need.required
+                or need.source != "external"
+                or ledger.state_for(need.need_id).status is NeedStatus.SATISFIED
+            ):
+                continue
+            peers = set(need.capability_names).intersection(surfaces)
+            visible = peers.intersection(chosen)
+            if not visible:
+                continue
+            fields = {field for name in visible for field in surfaces[name]}
+            for name in sorted(peers.difference(chosen), key=lambda n: (costs[n], n)):
+                if len(chosen) >= self.max_tools:
+                    break
+                if spent + costs[name] <= self.max_descriptor_bytes and surfaces[name] - fields:
+                    chosen.append(name)
+                    spent += costs[name]
+                    fields.update(surfaces[name])
         # 顺序是视图身份的一部分,规范化集合顺序避免仅排序变化推进 epoch。
         names = tuple(sorted(chosen))
+        if len(names) != primary_size:
+            # 最佳单例可能替换过贪心解。按最终集合重算效用, 不沿用被替换解的残量。
+            utility = sum(
+                weight * (1 - prod(1 - coverage[name].get(target, 0) for name in names))
+                for target, weight in weights.items()
+            )
         return CapabilityWorkingSet(
             names,
             spent,
