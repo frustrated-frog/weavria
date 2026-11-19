@@ -162,9 +162,12 @@ async def run(args: argparse.Namespace) -> int:
     rows: list[dict[str, object]] = []
 
     def save() -> None:
-        (directory / "results.json").write_text(
+        # 写完再替换, 中途退出也能读取上一轮的完整记录。
+        pending = directory / "results.json.tmp"
+        pending.write_text(
             json.dumps(dict(metadata=meta, rows=rows), ensure_ascii=False, indent=2) + "\n"
         )
+        pending.replace(directory / "results.json")
 
     async def measure(repeat: int, path: Path, branch: str, current: bool) -> dict[str, object]:
         row = await turn(
