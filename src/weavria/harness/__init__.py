@@ -15,6 +15,7 @@ from .assembly import (
     HarnessResult,
     MemoryUpdateReport,
 )
+from .bounded_fact import BoundedFactContract, FactFinding, FactSourceAdapter, FactValue
 from .capabilities import (
     BM25CapabilityRetriever,
     CapabilityCandidate,
@@ -216,6 +217,7 @@ __all__ = [
     "BM25CapabilityRetriever",
     "BeliefUpdater",
     "BlockingAmbiguityPolicy",
+    "BoundedFactContract",
     "CandidateAnswerVerifier",
     "CapabilityCandidate",
     "CapabilityChoice",
@@ -276,6 +278,9 @@ __all__ = [
     "EvidenceSurface",
     "EvidenceTargetBinding",
     "EvidenceTargetRule",
+    "FactFinding",
+    "FactSourceAdapter",
+    "FactValue",
     "HarnessConfig",
     "HarnessEvidence",
     "HarnessMemory",

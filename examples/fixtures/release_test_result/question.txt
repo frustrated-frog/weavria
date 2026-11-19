@@ -1,0 +1,1 @@
+请根据提供的 W17 发布运行归档，确认构建 c071 在 linux-x64 上执行 io-roundtrip 的记录结果。仅返回 JSON 对象。status 取 passed、failed 或 unreported；run_id 填这次匹配记录的编号。若本次提供的完整归档没有该记录，status 填 unreported，run_id 填 null。

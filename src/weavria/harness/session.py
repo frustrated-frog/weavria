@@ -27,6 +27,7 @@ from weavria.sessions import (
     SessionTaskPreparation,
 )
 
+from .bounded_fact import BoundedFactContract
 from .capabilities import CapabilityQuery, CapabilityResolver
 from .clarification import BlockingAmbiguityPolicy, ClarificationPolicy
 from .completion import TaskCompletionEvaluator, TaskObligationCompletionPolicy
@@ -67,6 +68,7 @@ class TaskAwareSessionPreparer:
         understanding: TaskUnderstandingEngine,
         *,
         evidence: EvidenceResolver | None = None,
+        bounded_fact: BoundedFactContract | None = None,
         capabilities: CapabilityResolver | None = None,
         clarification: ClarificationPolicy | None = None,
         working_set: CapabilityWorkingSetPolicy | None = None,
@@ -90,7 +92,7 @@ class TaskAwareSessionPreparer:
         self._clarification = clarification or BlockingAmbiguityPolicy()
         self._progress = NeedProgressEvaluator()
         self._completion = TaskObligationCompletionPolicy(
-            TaskCompletionEvaluator(evidence=self._evidence)
+            TaskCompletionEvaluator(evidence=self._evidence, bounded_fact=bounded_fact)
         )
 
     @property

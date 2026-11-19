@@ -1,5 +1,6 @@
 """Task-aware completion decisions grounded in Need and obligation state."""
 
+import hashlib
 from typing import Annotated, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, StringConstraints
@@ -14,6 +15,7 @@ from weavria.core import (
 )
 from weavria.runtime import CompletionContext
 
+from .bounded_fact import BoundedFactContract
 from .outcomes import capability_outcome_scope, outcome_is_current
 from .requirements import EvidenceResolver, NeedLedger, NeedStatus, load_need_ledger
 from .understanding import TaskFrame, load_task_frame
@@ -73,11 +75,16 @@ class TaskCompletionEvaluator:
         *,
         evidence: EvidenceResolver | None = None,
         answer: CandidateAnswerVerifier | None = None,
+        bounded_fact: BoundedFactContract | None = None,
     ) -> None:
+        self._fact = bounded_fact
+        if bounded_fact is not None:
+            self.version = f"{self.version}[{bounded_fact.version}]"
         self._evidence = evidence or EvidenceResolver()
         self._answer = answer
 
     async def evaluate(self, context: CompletionContext) -> CompletionEvaluation:
+        fact = self._fact if self._fact is not None and self._fact.task == context.task else None
         observation = context.task_observation
         if observation is None or observation.payload_schema not in {
             "weavria.task-frame/2",
@@ -87,24 +94,36 @@ class TaskCompletionEvaluator:
             "weavria.task-frame/6",
         }:
             return CompletionEvaluation(
-                disposition="degraded_answer",
+                disposition="repair" if fact else "degraded_answer",
+                next_required_actions=("Restore the bound task frame",) if fact else (),
                 verdicts=(),
                 outcome="unverifiable",
                 reason_code="task_frame_missing",
             )
         frame = load_task_frame(observation.payload)
+        snapshot = context.semantic_snapshot
+        if fact is not None and (
+            frame.request_anchor.task_sha256
+            != hashlib.sha256(context.task.model_dump_json().encode()).hexdigest()
+            or frame.request_anchor.task_revision != context.task.revision
+            or observation.task_revision != context.task.revision
+            or observation.frame_revision != frame.revision
+            or observation.input_id != frame.request_anchor.input_id
+            or (snapshot is not None and observation != snapshot.observation)
+            or (snapshot is not None and context.semantic_state != snapshot.need_ledger)
+        ):
+            return _fact_repair("fact_frame_mismatch", ())
         if frame.specification.route == "clarify":
             decision = frame.clarification_decision
-            if (
-                decision is not None
-                and context.candidate.output.strip() != decision.question_text.strip()
-            ):
+            question = decision.question_text if decision is not None else None
+            if fact is not None and question is None:
+                # 旧 Frame 用规格中的目标保存已选问题, 与 BlockingAmbiguityPolicy 一致。
+                question = frame.specification.goal
+            if question is not None and context.candidate.output.strip() != question.strip():
                 return CompletionEvaluation(
                     disposition="repair",
                     verdicts=(),
-                    next_required_actions=(
-                        f"Ask exactly this selected clarification: {decision.question_text}",
-                    ),
+                    next_required_actions=(f"Ask exactly this selected clarification: {question}",),
                     outcome="unverifiable",
                     reason_code="clarification_question_mismatch",
                 )
@@ -121,12 +140,14 @@ class TaskCompletionEvaluator:
                 outcome="unverifiable",
                 reason_code="waiting_for_clarification",
             )
-        snapshot = context.semantic_snapshot
         if snapshot is not None and snapshot.working_state is not None:
             work = load_work(snapshot.working_state)
             if work.task_revision != context.task.revision:
                 return CompletionEvaluation(
-                    disposition="cannot_proceed",
+                    disposition="repair" if fact else "cannot_proceed",
+                    next_required_actions=("Restore the current committed task state",)
+                    if fact
+                    else (),
                     verdicts=(),
                     outcome="unverifiable",
                     reason_code="working_state_stale",
@@ -146,7 +167,7 @@ class TaskCompletionEvaluator:
                     ),
                     reason_code="work_dependency_stale",
                 )
-        if frame.specification.route == "direct":
+        if frame.specification.route == "direct" and fact is None:
             return CompletionEvaluation(
                 disposition="accept",
                 verdicts=tuple(
@@ -166,7 +187,10 @@ class TaskCompletionEvaluator:
                 ledger = load_need_ledger(context.semantic_state)
             except ValueError:
                 return CompletionEvaluation(
-                    disposition="cannot_proceed",
+                    disposition="repair" if fact else "cannot_proceed",
+                    next_required_actions=("Restore the current committed task state",)
+                    if fact
+                    else (),
                     verdicts=(),
                     outcome="unverifiable",
                     reason_code="semantic_evidence_invalid",
@@ -179,7 +203,10 @@ class TaskCompletionEvaluator:
                 or ledger.progress_sha256() != frame.need_state_sha256
             ):
                 return CompletionEvaluation(
-                    disposition="cannot_proceed",
+                    disposition="repair" if fact else "cannot_proceed",
+                    next_required_actions=("Restore the current committed task state",)
+                    if fact
+                    else (),
                     verdicts=(),
                     outcome="unverifiable",
                     reason_code="semantic_evidence_stale",
@@ -238,7 +265,17 @@ class TaskCompletionEvaluator:
         # 综合作答,但下方 verdict 保持 unknown,默认 outcome 仍是 unverified;
         # 缺资料/冲突/独立动作和应用校验继续约束交付。
         incomplete = tuple(item for item in required_states if not item.acquisition_complete)
-        if incomplete:
+        proof = None
+        if fact is not None:
+            proof = await fact.check(context)
+            if proof not in {"value", "scope_empty"}:
+                return _fact_repair(proof, verdicts)
+            if not _required_actions_observed(frame, ledger, context.records):
+                return _fact_repair("missing_capability_result", verdicts)
+            # 范围证明只替代这份单事实契约内的取值要求。原账本仍然缺少具体值。
+            if incomplete and (proof != "scope_empty" or not _scope_can_close(fact, frame, ledger)):
+                return _fact_repair("missing_evidence", verdicts)
+        if incomplete and proof is None:
             limited_finalization = (
                 context.finalization is not None and context.finalization.mode == "limited"
             )
@@ -302,7 +339,7 @@ class TaskCompletionEvaluator:
                 for obligation in frame.obligations
             )
         )
-        if missing_capabilities:
+        if missing_capabilities and not (incomplete and proof == "scope_empty"):
             return CompletionEvaluation(
                 disposition="repair",
                 verdicts=verdicts,
@@ -310,7 +347,9 @@ class TaskCompletionEvaluator:
                 outcome="unverifiable",
                 reason_code="missing_capability_result",
             )
-        answer_outcome: Literal["verified", "unverified", "reject"] = "unverified"
+        answer_outcome: Literal["verified", "unverified", "reject"] = (
+            "verified" if proof is not None else "unverified"
+        )
         if self._answer is not None:
             answer_outcome = await self._answer.verify_answer(context, frame, ledger)
         if answer_outcome == "reject":
@@ -321,17 +360,78 @@ class TaskCompletionEvaluator:
                 outcome="unverifiable",
                 reason_code="answer_conflicts_with_evidence",
             )
+        reason_code = "mandatory_obligations_satisfied"
+        if proof == "scope_empty":
+            reason_code = "bounded_scope_empty"
+        elif proof == "value":
+            reason_code = "bounded_value_matched"
+        elif answer_outcome == "unverified" and any(
+            item.status is NeedStatus.ACQUIRED for item in required_states
+        ):
+            reason_code = "source_material_acquired_answer_unverified"
         return CompletionEvaluation(
-            disposition="accept",
-            verdicts=verdicts,
-            outcome=answer_outcome,
-            reason_code=(
-                "source_material_acquired_answer_unverified"
-                if answer_outcome == "unverified"
-                and any(item.status is NeedStatus.ACQUIRED for item in required_states)
-                else "mandatory_obligations_satisfied"
-            ),
+            disposition="accept", verdicts=verdicts, outcome=answer_outcome, reason_code=reason_code
         )
+
+
+def _fact_repair(code: str, verdicts: tuple[ObligationVerdict, ...]) -> CompletionEvaluation:
+    guidance = {
+        "invalid_fact_answer": "Provide the complete response in the requested format.",
+        "missing_fact_source": "Read a value source or a complete index for the target.",
+        "fact_source_budget": "The bound sources exceed the verification read limit.",
+        "conflicting_fact_sources": "Resolve the conflicting evidence for this target and scope.",
+        "fact_answer_mismatch": "Match the value or the proven source boundary.",
+        "missing_evidence": "Complete the remaining required evidence and capability checks.",
+        "missing_capability_result": "Obtain the required capability result.",
+    }
+    return CompletionEvaluation(
+        disposition="repair",
+        verdicts=verdicts,
+        outcome="unverifiable",
+        reason_code=code,
+        next_required_actions=(guidance.get(code, "Recheck the bound task and source limits."),),
+    )
+
+
+def _scope_can_close(fact: BoundedFactContract, frame: TaskFrame, ledger: NeedLedger) -> bool:
+    for need in frame.requirements:
+        if (
+            not need.required
+            or need.source != "external"
+            or ledger.state_for(need.need_id).acquisition_complete
+        ):
+            continue
+        if (
+            not need.capability_names
+            or not set(need.capability_names) <= fact.source_tools
+            or need.evidence_match_plans
+            or need.depends_on
+            or need.minimum_proof != "structural"
+        ):
+            return False
+    return True
+
+
+def _required_actions_observed(
+    frame: TaskFrame, ledger: NeedLedger, records: tuple[ToolRecord, ...]
+) -> bool:
+    # 证据足以判定事实, 也不能替用户完成额外动作或替应用的成果验证器签字。
+    executed = {r.exchange.action.tool_name for r in records if r.artifact is not None}
+    for item in frame.obligations:
+        if not item.required or item.kind != "capability_result":
+            continue
+        if item.capability_name not in executed:
+            return False
+        outcomes = [
+            o for o in ledger.capability_outcomes if o.capability_name == item.capability_name
+        ]
+        if item.verifier_key and not any(o.verifier_key == item.verifier_key for o in outcomes):
+            return False
+        if any(
+            o.status != "verified" or not outcome_is_current(o, frame, records) for o in outcomes
+        ):
+            return False
+    return True
 
 
 class TaskObligationCompletionPolicy:
@@ -351,7 +451,15 @@ class TaskObligationCompletionPolicy:
             # 复用当前已提交诊断,不再次执行验收或向模型授权工具。完整条目在 Task
             # Model View 中保留,CompletionRepair 仍服从 Runtime 原有短反馈上限。
             if (
-                evaluation.reason_code != "work_dependency_stale"
+                evaluation.reason_code
+                not in {
+                    "work_dependency_stale",
+                    "working_state_stale",
+                    "task_frame_missing",
+                    "fact_frame_mismatch",
+                    "semantic_evidence_invalid",
+                    "semantic_evidence_stale",
+                }
                 and context.semantic_state is not None
                 and context.task_observation is not None
             ):

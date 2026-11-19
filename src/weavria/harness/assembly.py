@@ -45,6 +45,7 @@ from weavria.sessions import (
 )
 from weavria.tools import ToolPolicy, ToolRegistry, context_summary_tool
 
+from .bounded_fact import BoundedFactContract
 from .capabilities import CapabilityDiscoveryPolicy, CapabilityResolver
 from .capability_discovery import CapabilityDiscoveryReport, ModelCapabilityDiscovery
 from .capability_index import HybridCapabilityIndex
@@ -81,6 +82,7 @@ class HarnessEvidence:
     discovery_policy: CapabilityDiscoveryPolicy | None = None
     audit_requirements: bool = False
     outcome_verifiers: tuple[CapabilityOutcomeVerifier, ...] = ()
+    bounded_fact: BoundedFactContract | None = None
 
 
 @dataclass(frozen=True)
@@ -367,6 +369,7 @@ class AgentHarness:
             understanding=understanding,
             evidence_extractors=evidence.extractors if evidence is not None else (),
             outcome_verifiers=evidence.outcome_verifiers if evidence is not None else (),
+            bounded_fact=evidence.bounded_fact if evidence is not None else None,
             discovery_policy=evidence.discovery_policy if evidence is not None else None,
             working_records=config.working_records,
             work_updates=config.work_updates,
@@ -410,6 +413,7 @@ class AgentHarness:
         understanding: TaskUnderstandingEngine | None = None,
         evidence_extractors: tuple[EvidenceExtractor, ...] = (),
         outcome_verifiers: tuple[CapabilityOutcomeVerifier, ...] = (),
+        bounded_fact: BoundedFactContract | None = None,
         discovery_policy: CapabilityDiscoveryPolicy | None = None,
         working_records: bool = False,
         work_updates: Literal["replace", "patch"] = "replace",
@@ -428,6 +432,12 @@ class AgentHarness:
     ) -> None:
         if context.semantic_compaction and context_recovery is None:
             raise ValueError("semantic compaction requires context recovery")
+        if bounded_fact is not None:
+            read_tools = {t.name for t in tools.descriptors if t.behavior == "read_only"}
+            if understanding is None or not bounded_fact.source_tools <= read_tools:
+                raise ValueError(
+                    "bounded fact requires task understanding and registered read-only sources"
+                )
         if outcome_verifiers and (understanding is None or not adaptive_capabilities):
             raise ValueError("outcome verifiers require understanding and adaptive capabilities")
         if working_records and understanding is None:
@@ -502,6 +512,7 @@ class AgentHarness:
             token_counter=token_counter,
             task_preparation=TaskAwareSessionPreparer(
                 understanding,
+                bounded_fact=bounded_fact,
                 evidence=EvidenceResolver(evidence_extractors) if evidence_extractors else None,
                 capabilities=CapabilityResolver(policy=discovery_policy)
                 if discovery_policy
