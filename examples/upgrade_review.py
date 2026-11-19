@@ -28,6 +28,7 @@ from weavria.core import (
     SessionRunEvent,
     SessionSemanticCommitted,
     SessionTaskPreparationFailed,
+    ToolRecord,
     ToolRecorded,
     TurnDecided,
 )
@@ -128,6 +129,7 @@ class ReviewTask:
     update: str
     documents: Callable[[bool], dict[str, str]]
     errors: Callable[[str | None, bool], list[str]]
+    source_check: Callable[[tuple[ToolRecord, ...]], list[str]] | None = None
 
     def delivery(self, status: str, output: str | None, revised: bool) -> list[str]:
         return ([] if status == "completed" else ["not_completed"]) + self.errors(output, revised)
@@ -139,6 +141,7 @@ UPGRADE_TASK = ReviewTask(INITIAL, UPDATE, archive, report_errors)
 class RequirementTime(BaseModel):
     description: str
     freshness: str
+    completion_mode: str | None = None
 
 
 class TurnEvidence(BaseModel):
@@ -150,13 +153,15 @@ class TurnEvidence(BaseModel):
     completion_checks: list[dict[str, object]] = []
     missing_fields: list[str] = []
     requirement_times: list[RequirementTime] = []
+    source_errors: list[str] | None = None
 
 
 def replay(db: Path, task: ReviewTask = UPGRADE_TASK) -> dict[str, TurnEvidence]:
     """Read only the frozen task's journal; an unaccepted Finish never counts as a delivery."""
     runs: dict[str, tuple[bool, TurnEvidence]] = {}
     stages: dict[str, TurnEvidence] = {}
-    candidates: dict[tuple[str, str], list[str]] = {}
+    candidates: dict[tuple[str, str], dict[str, object]] = {}
+    records: dict[str, list[ToolRecord]] = {}
     # 只读地流式遍历所有页。以持久化的 input_id/run_id 分轮, 不能把第二轮的
     # 事件序号当成列表下标, 也不能用上轮的成功候选解释本轮宿主的拒绝。
     con = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True)
@@ -190,7 +195,11 @@ def replay(db: Path, task: ReviewTask = UPGRADE_TASK) -> dict[str, TurnEvidence]
                 # 用同一 Run 最后提交的任务帧解释账本缺口, 不把上一轮需求归到准备失败的追问。
                 frame = load_task_frame(data.snapshot.observation.payload)
                 trace.requirement_times = [
-                    RequirementTime(description=need.description, freshness=need.freshness)
+                    RequirementTime(
+                        description=need.description,
+                        freshness=need.freshness,
+                        completion_mode=need.completion_mode,
+                    )
                     for need in frame.requirements
                 ]
             elif isinstance(data, SessionRunEvent) and data.event.run_id in runs:
@@ -200,23 +209,38 @@ def replay(db: Path, task: ReviewTask = UPGRADE_TASK) -> dict[str, TurnEvidence]
                 if isinstance(event, ToolRecorded):
                     exchange = event.record.exchange
                     trace.actions.append(f"{exchange.action.tool_name}:{exchange.observation.kind}")
+                    if (
+                        task.source_check is not None
+                        and event.record.artifact is not None
+                        and event.record.artifact.run_id == run_id
+                    ):
+                        records.setdefault(run_id, []).append(event.record)
                 elif isinstance(event, TurnDecided) and isinstance(
                     event.turn.decision, FinishAction
                 ):
                     finish = event.turn.decision
-                    candidates[run_id, sha(finish.model_dump_json())] = task.errors(
-                        finish.output, revised
-                    )
+                    key = (run_id, sha(finish.model_dump_json()))
+                    scores: dict[str, object] = {
+                        "candidate_errors": task.errors(finish.output, revised)
+                    }
+                    if task.source_check is not None:
+                        # 同一答案在重试前后可以有不同的取证记录。每次 Finish 都重新冻结。
+                        scores["candidate_source_errors"] = task.source_check(
+                            tuple(records.get(run_id, ()))
+                        )
+                    candidates[key] = scores
                 elif isinstance(event, CompletionChecked):
                     check = event.assessment
                     trace.completion_checks.append(
                         dict(
                             candidate_sha256=check.candidate_sha256,
-                            candidate_errors=candidates.get((run_id, check.candidate_sha256)),
                             decision=check.decision.kind,
                             issues=list(check.decision.issue_codes)
                             if isinstance(check.decision, CompletionRepair)
                             else [],
+                        )
+                        | candidates.get(
+                            (run_id, check.candidate_sha256), {"candidate_errors": None}
                         )
                     )
                 elif isinstance(event, RunEnded):
@@ -224,6 +248,9 @@ def replay(db: Path, task: ReviewTask = UPGRADE_TASK) -> dict[str, TurnEvidence]
                     trace.delivery_errors = task.delivery(
                         trace.status, event.result.output, revised
                     )
+                    if task.source_check is not None:
+                        # 回执只在产生它的 Run 内有效; 离线打分绝不影响宿主发布。
+                        trace.source_errors = task.source_check(tuple(records.get(run_id, ())))
     finally:
         con.close()
     return stages
@@ -237,6 +264,7 @@ async def turn(
     model: OpenAICompatibleConfig,
     transport: Transport,
     task: ReviewTask = UPGRADE_TASK,
+    evidence: HarnessEvidence | None = None,
 ) -> dict[str, object]:
     docs = task.documents(revised)
     corpus = SnapshotCorpus(docs)
@@ -253,7 +281,7 @@ async def turn(
         token_counter=counter,
         reasoning_counter=counter,
         tools=corpus.registry(documents=True),
-        evidence=HarnessEvidence(audit_requirements=True),
+        evidence=evidence if evidence is not None else HarnessEvidence(audit_requirements=True),
     ) as agent:
         if not revised:
             await agent.create("review")
@@ -281,6 +309,12 @@ async def turn(
         "amendment" if revised else "original"
     )
     failures = task.delivery(status, output, revised)
+    if task.source_check is not None:
+        failures += (
+            journal.source_errors
+            if journal and journal.source_errors is not None
+            else ["no_source_audit"]
+        )
     return dict(
         status=status,
         output=output,

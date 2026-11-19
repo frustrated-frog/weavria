@@ -2,13 +2,16 @@
 
 import json
 import sqlite3
+from dataclasses import replace
 from pathlib import Path
 
+from examples.m1_corpus import SnapshotCorpus
 from examples.upgrade_review import (
     AMENDMENT,
     INITIAL,
     ORIGINAL_FILES,
     UPDATE,
+    UPGRADE_TASK,
     archive,
     inspect_delivery,
     reference,
@@ -16,7 +19,9 @@ from examples.upgrade_review import (
     report_errors,
     sha,
 )
-from weavria.core import FinishAction
+from weavria.artifacts import InMemoryArtifactStore
+from weavria.core import FinishAction, ToolCallAction, ToolRecord
+from weavria.tools import ReadOnlyPolicy, ToolExecutor
 
 
 def test_archive_only_releases_the_amendment_to_the_second_turn() -> None:
@@ -39,11 +44,22 @@ def test_revision_rejects_stale_receipt_and_collateral_change() -> None:
     assert report_errors('{"ferrite":{},' + first[1:], False) == ["invalid_report"]
 
 
-def test_replay_joins_repair_with_candidate_but_not_across_turns(tmp_path: Path) -> None:
+async def test_replay_joins_repair_with_candidate_but_not_across_turns(tmp_path: Path) -> None:
     # 同一份 JSON 在首轮正确,在更正后已过期。没有本 Run 的 Finish 记录时不能
     # 借用先前的评分,也不能把通过内容评分的候选计为已发布的最终报告。
     answer = reference(False).model_dump_json()
     finish = FinishAction(output=answer)
+    decision = {"kind": "turn_decided", "turn": {"decision": finish.model_dump(mode="json")}}
+    tool = ToolExecutor(
+        "a",
+        SnapshotCorpus({"receipt": "checked"}).registry(documents=True),
+        InMemoryArtifactStore(),
+        ReadOnlyPolicy(),
+    )
+    record = await tool.execute(
+        ToolCallAction(call_id="read", tool_name="read_document", arguments={"path": "receipt"}),
+        max_duration=1,
+    )
     check = {
         "kind": "completion_checked",
         "assessment": {
@@ -70,10 +86,10 @@ def test_replay_joins_repair_with_candidate_but_not_across_turns(tmp_path: Path)
             for i, event in enumerate(
                 (
                     (
-                        {
-                            "kind": "turn_decided",
-                            "turn": {"decision": finish.model_dump(mode="json")},
-                        },
+                        decision,
+                        check,
+                        {"kind": "tool_recorded", "record": record.model_dump(mode="json")},
+                        decision,
                         check,
                     )
                     if run == "a"
@@ -106,3 +122,13 @@ def test_replay_joins_repair_with_candidate_but_not_across_turns(tmp_path: Path)
     assert by_turn["original"].completion_checks[0]["candidate_errors"] == []
     assert by_turn["amendment"].completion_checks[0]["candidate_errors"] is None
     assert all(trace.delivery_errors is None for trace in by_turn.values())
+
+    # 两次答案逐字相同, 只有第二次 Finish 之前真的读到了原文。
+    def required_read(records: tuple[ToolRecord, ...]) -> list[str]:
+        return [] if records else ["not_read"]
+
+    audited = replay(db, replace(UPGRADE_TASK, source_check=required_read))
+    assert [c["candidate_source_errors"] for c in audited["original"].completion_checks] == [
+        ["not_read"],
+        [],
+    ]

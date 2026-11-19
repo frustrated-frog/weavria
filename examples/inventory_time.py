@@ -103,16 +103,9 @@ def clone(source: Path, target: Path) -> None:
         src.backup(dst)
 
 
-async def run(args: argparse.Namespace) -> int:
-    if args.replay:
-        stages = await asyncio.to_thread(replay, args.replay, task(args.branch == "current"))
-        print(
-            json.dumps({k: v.model_dump() for k, v in stages.items()}, ensure_ascii=False, indent=2)
-        )
-        expected = {"original"} if args.branch == "original" else {"original", "amendment"}
-        return int(set(stages) != expected or any(v.delivery_errors != [] for v in stages.values()))
-    cfg = HarnessConfig(
-        configuration_id="inventory-time/1",
+def inventory_config(configuration_id: str) -> HarnessConfig:
+    return HarnessConfig(
+        configuration_id=configuration_id,
         context=ContextCompilerConfig(window_tokens=64000, output_tokens=4096),
         limits=RunLimits(
             max_model_calls=16, max_tool_calls=24, max_duration=150, max_request_bytes=128000
@@ -123,6 +116,37 @@ async def run(args: argparse.Namespace) -> int:
         preparation_max_duration=60,
         max_request_duration=210,
     )
+
+
+def live_provider() -> tuple[OpenAICompatibleConfig, Transport]:
+    model = OpenAICompatibleConfig(
+        model=os.environ["WEAVRIA_MODEL_NAME"],
+        temperature=0,
+        max_output_tokens=4096,
+        max_request_bytes=128000,
+        context_window_tokens=64000,
+    )
+    options: dict[str, object] = {}
+    if effort := os.environ.get("WEAVRIA_MODEL_REASONING_EFFORT"):
+        options["reasoning_effort"] = effort
+    transport = Transport(
+        os.environ["WEAVRIA_MODEL_BASE_URL"],
+        os.environ.get("WEAVRIA_MODEL_API_KEY", ""),
+        60,
+        options=options,
+    )
+    return model, transport
+
+
+async def run(args: argparse.Namespace) -> int:
+    if args.replay:
+        stages = await asyncio.to_thread(replay, args.replay, task(args.branch == "current"))
+        print(
+            json.dumps({k: v.model_dump() for k, v in stages.items()}, ensure_ascii=False, indent=2)
+        )
+        expected = {"original"} if args.branch == "original" else {"original", "amendment"}
+        return int(set(stages) != expected or any(v.delivery_errors != [] for v in stages.values()))
+    cfg = inventory_config("inventory-time/1")
     meta: dict[str, object] = dict(
         version="inventory-time/1",
         interpreter=ModelTaskInterpreter.version,
@@ -139,26 +163,11 @@ async def run(args: argparse.Namespace) -> int:
     if not args.live:
         print(json.dumps(meta, ensure_ascii=False))
         return 0
-    model = OpenAICompatibleConfig(
-        model=os.environ["WEAVRIA_MODEL_NAME"],
-        temperature=0,
-        max_output_tokens=4096,
-        max_request_bytes=128000,
-        context_window_tokens=64000,
-    )
-    options: dict[str, object] = {}
-    if effort := os.environ.get("WEAVRIA_MODEL_REASONING_EFFORT"):
-        options["reasoning_effort"] = effort
-    meta.update(model=asdict(model), options=options)
     args.state.mkdir(parents=True, exist_ok=True)
     directory = Path(tempfile.mkdtemp(prefix="run-", dir=args.state))
     print(directory, flush=True)
-    transport = Transport(
-        os.environ["WEAVRIA_MODEL_BASE_URL"],
-        os.environ.get("WEAVRIA_MODEL_API_KEY", ""),
-        60,
-        options=options,
-    )
+    model, transport = live_provider()
+    meta.update(model=asdict(model), options=transport.options)
     rows: list[dict[str, object]] = []
 
     def save() -> None:

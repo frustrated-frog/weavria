@@ -1,0 +1,1 @@
+现在是 2026-05-14 10:00 UTC。根据本次提供的仓储资料，S4 的东仓和西仓现在分别能向客户承诺多少件？只返回 JSON 对象。status 取 confirmed 或 insufficient_evidence；east、west 为可确认的整数件数，无法确认时填 null；needed 表示作答时仍缺少的来源，资料足以确认时填 none。它取 none、closing_count 或 current_atp（当前可承诺库存）。
