@@ -1,0 +1,5 @@
+Release desk · wave W17
+The production runner is Larch-8. Candidates are pinned for this wave:
+  ferrite: build F-241, version 2.4.1
+  linden:  build L-730, version 7.3.0
+Both candidates require a supported runner and a passing cold-restore test on that runner for that exact build. Either condition failing blocks the upgrade. A newer run for a different build, runner, or suite cannot satisfy this gate.

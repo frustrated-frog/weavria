@@ -1,0 +1,6 @@
+receipt,build,runner,suite,outcome
+T-641,F-241,Larch-8,cold-restore,pass
+T-642,F-241,Larch-7,cold-restore,fail
+T-643,L-730,Larch-8,cold-restore,fail
+T-644,L-730,Larch-8,smoke,pass
+T-645,L-731,Larch-8,cold-restore,pass

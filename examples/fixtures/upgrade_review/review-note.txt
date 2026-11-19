@@ -1,0 +1,4 @@
+Release QA amendment, signed Q-19 (wave W17)
+T-643 was linked to a run on a staging image. Discard that receipt for the production gate.
+Replacement receipt T-697: build L-730, runner Larch-8, suite cold-restore, outcome pass.
+No other test result, target build or compatibility entry is amended.
