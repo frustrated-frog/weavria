@@ -33,6 +33,7 @@ from weavria.core import (
     ConversationTurn,
     EvidenceDeliveryRange,
     PastCall,
+    ReadRetryOutcome,
     RecoveryResolved,
     RunEnded,
     RunReport,
@@ -89,6 +90,7 @@ from .history_index import (
 from .history_search import search_history
 from .history_validation import validate_history_item, validate_history_request
 from .preparation import SemanticTransitionReducer
+from .read_retry import create_read_retry_schema, project_read_retry, recall_read_retries
 from .task_continuation import TaskRun, TaskVersion
 
 
@@ -285,7 +287,7 @@ class SQLiteSessionStore:
         conn = sqlite3.connect(self.path, timeout=2.0)
         self._connection = conn
         version = conn.execute("PRAGMA user_version").fetchone()[0]
-        if version not in (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10):
+        if version not in (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11):
             raise SessionConflictError("unsupported session database schema")
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA journal_mode=WAL")
@@ -357,6 +359,10 @@ class SQLiteSessionStore:
                 migration.execute("PRAGMA user_version=9")
         if version < 10:
             self._migrate_v10()
+        if version < 11:
+            with self._transaction() as migration:
+                create_read_retry_schema(migration)
+                migration.execute("PRAGMA user_version=11")
         # Only the exclusive DB owner can classify an old live run as interrupted.
         active = conn.execute("SELECT id FROM runs WHERE status='running'").fetchall()
         for row in active:
@@ -1055,6 +1061,8 @@ class SQLiteSessionStore:
                 conn.execute(
                     "UPDATE runs SET last_sequence=? WHERE id=?", (fact.sequence, fact.run_id)
                 )
+                if state is not None:
+                    project_read_retry(conn, fact, state, row[0], row[4])
                 self._session_event(conn, row[0], SessionRunEvent(event=fact))
                 if update is not None:
                     conn.execute(
@@ -1836,6 +1844,27 @@ class SQLiteSessionStore:
                         )
 
         await self._submit(rebuild)
+
+    async def uses_read_retry_experience(self, session_id: str, run_id: str) -> bool:
+        """恢复时按原 Run 冻结的策略执行, 包括升级前没有此字段的配置。"""
+
+        def read() -> bool:
+            row = (
+                self._conn()
+                .execute(
+                    "SELECT json_extract(config,'$.read_retry_experience') FROM runs "
+                    "WHERE session_id=? AND id=?",
+                    (session_id, run_id),
+                )
+                .fetchone()
+            )
+            return row is not None and row[0] == "delivery/1"
+
+        return await self._submit(read)
+
+    async def read_retry_outcomes(self, run_id: str, scene: str) -> tuple[ReadRetryOutcome, ...]:
+        """按当前 Run 的会话与冻结配置检索最多十六条已核验的交付。"""
+        return await self._submit(lambda: recall_read_retries(self._conn(), run_id, scene))
 
     async def prepare_request(
         self,

@@ -35,6 +35,8 @@ class HarnessConfig:
     work_updates: Literal["replace", "patch"] = "replace"
     semantic_discovery: CapabilityDiscoveryConfig | None = None
     work_material_handoff: bool = False
+    # 同一会话重遇反馈预算拒绝时, 以先前实际交付的原文指导单读顺序。
+    read_retry_experience: bool = True
 
     def __post_init__(self) -> None:
         if not self.configuration_id.strip() or len(self.configuration_id) > 128:
@@ -48,6 +50,7 @@ class HarnessConfig:
             self.working_records,
             self.work_recheck,
             self.work_material_handoff,
+            self.read_retry_experience,
         ):
             if type(enabled) is not bool:
                 raise ValueError("Harness feature switches must be booleans")

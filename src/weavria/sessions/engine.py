@@ -7,6 +7,7 @@ import uuid
 from collections.abc import Callable
 from dataclasses import asdict, replace
 from datetime import timedelta
+from functools import partial
 from pathlib import Path
 from typing import Literal, Protocol, Self, cast
 
@@ -953,6 +954,7 @@ class SessionEngine:
         history_retrieval: HistoryRetrievalConfig | None = None,
         context_recovery: RecoveryLimits | None = None,
         configuration_metadata: dict[str, JsonValue] | None = None,
+        read_retry_experience: bool = False,
         task_model_projector: TaskModelProjector | None = None,
         context_source: ContextSource | None = None,
         extensions: HarnessExtensions | None = None,
@@ -973,6 +975,9 @@ class SessionEngine:
             )
         if task_model_projector is not None and not isinstance(token_counter, SessionRequestSizer):
             raise ValueError("task model projection requires complete transport byte accounting")
+        if type(read_retry_experience) is not bool:
+            raise ValueError("read_retry_experience must be a boolean")
+        self._read_retry_experience = read_retry_experience
         self._task_model_projector = task_model_projector
         self._recovery_limits = (
             RecoveryLimits.model_validate_json(context_recovery.model_dump_json())
@@ -1210,10 +1215,16 @@ class SessionEngine:
             contributes_context = any("before_compile" in item.descriptor.hooks for item in chain)
             if contributes_context and self._compiler_config is None:
                 raise ValueError("context extensions require the context compiler")
+            read_retry_experience = self._read_retry_experience and (
+                resume_run_id is None
+                or await self.store.uses_read_retry_experience(session_id, resume_run_id)
+            )
             config = json.dumps(
                 {
                     "schema_version": (
-                        8
+                        9
+                        if read_retry_experience
+                        else 8
                         if plan
                         else 7
                         if chain
@@ -1233,6 +1244,7 @@ class SessionEngine:
                         if self._compiler_config is not None
                         else 1
                     ),
+                    **({"read_retry_experience": "delivery/1"} if read_retry_experience else {}),
                     **({"extension_plan": plan.model_dump(mode="json")} if plan else {}),
                     **(
                         {"extensions": [item.descriptor.model_dump(mode="json") for item in chain]}
@@ -1612,6 +1624,9 @@ class SessionEngine:
                 mode=self._mode,
                 clock=self._clock,
                 journal=adapter,
+                read_retry_lookup=partial(self.store.read_retry_outcomes, run_id)
+                if read_retry_experience
+                else None,
                 preparation=adapter,
                 task_observation=task_observation,
                 progress=(

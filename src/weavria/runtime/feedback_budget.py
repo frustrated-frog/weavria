@@ -1,7 +1,11 @@
 """从同一决策的可见证据和字节预算计算只读调用的反馈预留。"""
 
 import hashlib
+import json
+from collections import Counter
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from fractions import Fraction
 
 from weavria.context import FeedbackReservation, reserve_feedback
 from weavria.core import (
@@ -9,6 +13,8 @@ from weavria.core import (
     EvidenceAccessView,
     FeedbackBounds,
     ModelTurn,
+    ReadRetryOutcome,
+    ReadRetryPrediction,
     TaskInput,
     TaskObservation,
     ToolBatch,
@@ -16,6 +22,8 @@ from weavria.core import (
     ToolRecord,
 )
 from weavria.tools import ToolActionIdentity, ToolRegistry
+
+type ReadRetryLookup = Callable[[str], Awaitable[tuple[ReadRetryOutcome, ...]]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,6 +127,14 @@ class ReadFeedbackBudget:
         reservation, _ = self.measure(ToolBatch(calls=(call,)), (identity,))
         return reservation.fits
 
+    def _can_suggest_whole_read(self, call: ToolCallAction) -> bool:
+        # 大提案不能截成另一个动作。相同入口服务于原始顺序与经验排序的预算试算。
+        return (
+            self.tools.get(call.tool_name).descriptor.sensitivity == "public"
+            and len(call.model_dump_json().encode()) <= 384
+            and self._single_fits(call)
+        )
+
     def retry(
         self,
         batch: ToolBatch,
@@ -145,12 +161,7 @@ class ReadFeedbackBudget:
             if declared and self._read_scope(call) is None:
                 continue
             if parameter is None:
-                # 通知只复用模型已给出的公开参数。大提案不截断为另一个动作。
-                if (
-                    descriptor.sensitivity == "public"
-                    and len(call.model_dump_json().encode()) <= 384
-                    and self._single_fits(call)
-                ):
+                if self._can_suggest_whole_read(call):
                     return ReadRetry(call=call)
                 continue
             props = descriptor.input_schema.get("properties")
@@ -174,6 +185,56 @@ class ReadFeedbackBudget:
                 return ReadRetry(page=(index, parameter, feasible))
             blocked = ReadRetry(page=(index, parameter, 0))
         return blocked
+
+    async def experienced_retry(
+        self,
+        batch: ToolBatch,
+        visible: set[str],
+        identities: tuple[ToolActionIdentity, ...],
+        lookup: ReadRetryLookup,
+    ) -> tuple[ReadRetry, ReadRetryPrediction] | None:
+        """只在同一层级的外部单读之间选择。分页、依赖原文或未知操作沿用原策略。"""
+        if self.access is None or len(batch.calls) < 2:
+            return None
+        candidates: dict[str, ToolCallAction] = {}
+        for call, identity in zip(batch.calls, identities, strict=True):
+            if call.tool_name not in visible or identity.normalization != "validated":
+                return None
+            descriptor = self.tools.get(call.tool_name).descriptor
+            if (
+                descriptor.artifact_read_inputs != ()
+                or descriptor.feedback_page_parameter is not None
+                or descriptor.behavior != "read_only"
+                or descriptor.idempotency != "replay_safe"
+                or descriptor.risk != "low"
+                or descriptor.sensitivity != "public"
+                or descriptor.approval_required
+            ):
+                return None
+            # 复用发布建议时的预算与作用域检查。历史成功也不能使本次不合格的调用入选。
+            key = identity.canonical_action_sha256
+            if key not in candidates and self._can_suggest_whole_read(call):
+                candidates[key] = call
+        if len(candidates) < 2:
+            return None
+        scene = hashlib.sha256(
+            json.dumps(
+                [self.task.goal, self.task.constraints, sorted(candidates)],
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+        observations = await lookup(scene)
+        # Beta(1,1) 平滑。没有观测为 1/2, 同分保留原提案顺序。
+        attempts = Counter(item.action_sha256 for item in observations)
+        complete = Counter(item.action_sha256 for item in observations if item.delivery == "full")
+        selected = max(candidates, key=lambda key: Fraction(1 + complete[key], 2 + attempts[key]))
+        return ReadRetry(call=candidates[selected]), ReadRetryPrediction(
+            scene_sha256=scene,
+            candidate_sha256s=tuple(candidates),
+            selected_sha256=selected,
+            observations=observations,
+        )
 
     def retry_alone(self, batch: ToolBatch, visible: set[str]) -> ModelTurn | None:
         """为带嵌套来源的提案提供按旧参数单提的选择,不在通知中复制笔记正文。"""

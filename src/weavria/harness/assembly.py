@@ -373,6 +373,7 @@ class AgentHarness:
             outcome_verifiers=evidence.outcome_verifiers if evidence is not None else (),
             bounded_fact=evidence.bounded_fact if evidence is not None else None,
             discovery_policy=evidence.discovery_policy if evidence is not None else None,
+            read_retry_experience=config.read_retry_experience,
             working_records=config.working_records,
             work_updates=config.work_updates,
             work_material_handoff=config.work_material_handoff,
@@ -418,6 +419,7 @@ class AgentHarness:
         outcome_verifiers: tuple[CapabilityOutcomeVerifier, ...] = (),
         bounded_fact: BoundedFactContract | None = None,
         discovery_policy: CapabilityDiscoveryPolicy | None = None,
+        read_retry_experience: bool = False,
         working_records: bool = False,
         work_updates: Literal["replace", "patch"] = "replace",
         work_material_handoff: bool = False,
@@ -506,6 +508,7 @@ class AgentHarness:
         )
         self.sessions = SessionEngine(
             path,
+            read_retry_experience=read_retry_experience,
             model=model,
             tools=tools,
             instructions=instructions,

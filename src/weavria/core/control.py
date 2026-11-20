@@ -37,6 +37,7 @@ from .lifecycle import RunStatus
 from .model_io import HistoryEntry, TaskInput, TaskObservation, validate_task_observation
 from .outcomes import AgentResult
 from .progress import ProgressAssessment
+from .read_retry import ReadRetryPrediction
 from .recovery import RecoveryNotice, RecoveryResolved
 from .task_view import TaskModelView
 from .turns import (
@@ -647,9 +648,34 @@ class BatchAdmitted(BaseModel):
         return self
 
 
-class BatchRejected(ContractModel):
+class BatchRejected(BaseModel):
+    model_config = ContractModel.model_config
+    schema_version: Literal[1, 2] = 1
     kind: Literal["batch_rejected"] = "batch_rejected"
     notice: AdmissionNotice
+    read_prediction: ReadRetryPrediction | None = None
+
+    @model_serializer(mode="wrap")
+    def preserve_v1(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        data = handler(self)
+        if self.schema_version == 1:
+            data.pop("read_prediction", None)
+        return data
+
+    @model_validator(mode="after")
+    def validate_prediction(self) -> Self:
+        if (self.schema_version == 2) != (self.read_prediction is not None):
+            raise ValueError("read prediction requires rejection v2")
+        if self.read_prediction is not None and (
+            self.notice.reason != "feedback_budget" or self.notice.retry_read is None
+        ):
+            raise ValueError("read prediction requires a concrete budget retry")
+        return self
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def validate_version_type(cls, value: object) -> object:
+        return ContractModel.validate_version_type(value)
 
 
 class ModelOutputRejected(ContractModel):

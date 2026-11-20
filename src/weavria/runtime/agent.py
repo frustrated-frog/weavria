@@ -153,7 +153,7 @@ from .controller import (
     resolve_turn,
 )
 from .delivery import artifact_page_source_ranges
-from .feedback_budget import ReadFeedbackBudget
+from .feedback_budget import ReadFeedbackBudget, ReadRetryLookup
 from .finalization import FinalizationAssessment, FinalizationPolicy
 from .intervention import (
     ACTION_VALUE_LEDGER_VERSION,
@@ -416,12 +416,14 @@ class _AgentKernel:
         intervention: ActionInterventionPolicy | None = None,
         context_builder: ControlContextBuilder | None = None,
         context_recovery: RecoveryLimits | None = None,
+        read_retry_lookup: ReadRetryLookup | None = None,
         finalization: FinalizationPolicy | None = None,
     ) -> None:
         if context_recovery is not None and (
             journal_version != 4 or not isinstance(context_builder, RecoveryContextBuilder)
         ):
             raise ValueError("context recovery requires a recovery compiler builder")
+        self._read_retry_lookup = read_retry_lookup
         self._journal = journal
         self._preparation = preparation
         self._prepared_task_revision: int | None = None
@@ -2037,7 +2039,19 @@ class _AgentKernel:
             if progress.blocked:
                 reason = "no_progress"
         if reason is not None:
-            retry = budget.retry(batch, visible) if reason == "feedback_budget" else None
+            retry = prediction = None
+            if reason == "feedback_budget":
+                choice = (
+                    await budget.experienced_retry(
+                        batch, visible, checked_identities, self._read_retry_lookup
+                    )
+                    if self._read_retry_lookup is not None
+                    else None
+                )
+                if choice is None:
+                    retry = budget.retry(batch, visible)
+                else:
+                    retry, prediction = choice
             page_advice = retry.page if retry else None
             checked_single = retry is not None and page_advice is None
             page_retry = self._artifact_page_retry(batch, page_advice)
@@ -2207,7 +2221,14 @@ class _AgentKernel:
                             details[index] = name[:64]
                 if reason == "no_progress" and progress is not None:
                     notice = self._with_progress_replan(notice, batch, progress)
-                await self._accept_locked(BatchRejected(notice=notice), expected_revision=revision)
+                await self._accept_locked(
+                    BatchRejected(
+                        schema_version=2 if prediction else 1,
+                        notice=notice,
+                        read_prediction=prediction,
+                    ),
+                    expected_revision=revision,
+                )
                 if frontier_exhausted or replan_exhausted:
                     if reason == "no_progress":
                         raise _NoProgressExhausted
@@ -2896,6 +2917,7 @@ class AgentLoop(_AgentKernel):
         intervention: ActionInterventionPolicy | None = None,
         context_builder: ControlContextBuilder | None = None,
         context_recovery: RecoveryLimits | None = None,
+        read_retry_lookup: ReadRetryLookup | None = None,
         finalization: FinalizationPolicy | None = None,
         # 构造函数只建立依赖、初始状态和首个事件,不在初始化阶段执行模型或工具。
     ) -> None:
@@ -2960,6 +2982,7 @@ class AgentLoop(_AgentKernel):
             intervention=intervention,
             context_builder=context_builder,
             context_recovery=context_recovery,
+            read_retry_lookup=read_retry_lookup,
             finalization=finalization,
             # 完成共享内核初始化;此时实例已拥有初始状态,但尚未进入异步执行循环。
         )

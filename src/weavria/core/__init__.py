@@ -172,6 +172,7 @@ from .progress import (
     ObligationProgressSignal,
     ProgressAssessment,
 )
+from .read_retry import ReadRetryOutcome, ReadRetryPrediction
 from .retrieval import (
     HistoryMatch,
     HistoryRetrievalReport,
@@ -335,6 +336,8 @@ __all__ = [
     "ProgressAssessed",
     "ProgressAssessment",
     "ProgressNotice",
+    "ReadRetryOutcome",
+    "ReadRetryPrediction",
     "RecoverContext",
     "RecoveryLimits",
     "RecoveryNotice",

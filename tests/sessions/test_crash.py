@@ -105,6 +105,8 @@ async def main():
         config['extensions'] = HarnessExtensions((trace,))
     tool=TypedTool(name='produce',version='1',description='produce evidence',
                    input_type=In,output_type=Out,execute=produce)
+    if point=='resume' and extension_variant=='enable-retry':
+        config['read_retry_experience']=True
     engine=SessionEngine(Path(sys.argv[1]),model=Provider(),
                          tools=ToolRegistry((tool,)),
                          clock=ExpiredClock() if point=='resume-expired' else None,
@@ -368,6 +370,7 @@ async def test_uninterrupted_baseline_matches_resume_call_counts(tmp_path: Path)
     "versions",
     [
         ("original", "changed", "original"),
+        ("original", "changed", "enable-retry"),
         ("binding-original", "binding-changed", "binding-shuffled"),
         ("conditional", "changed", "conditional"),
     ],

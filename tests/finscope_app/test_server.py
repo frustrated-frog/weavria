@@ -1317,7 +1317,8 @@ async def test_startup_profile_matches_persisted_run_and_excludes_credentials(
     profile = json.loads(profile_log.split(": ", 1)[1])
     with sqlite3.connect(settings.state_path) as database:
         saved = json.loads(database.execute("SELECT config FROM runs").fetchone()[0])
-    assert saved["schema_version"] == 5
+    assert saved["schema_version"] == 9
+    assert saved["read_retry_experience"] == "delivery/1"
     assert saved["configuration_metadata"] == profile
     assert saved["limits"] == profile["configuration"]["limits"]
     assert saved["context_compiler"] == profile["configuration"]["context_compiler"]

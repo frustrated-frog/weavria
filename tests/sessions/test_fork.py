@@ -314,6 +314,7 @@ async def test_fork_retrieval_unifies_old_sources_and_survives_v9_migration(
     # 用上一版目录结构验证迁移. 旧版只有分叉事件及父会话索引, 没有继承目录行.
     with sqlite3.connect(path) as conn:
         conn.executescript("""
+            DROP TABLE read_retry_trials;
             CREATE TABLE old_catalog(
                 session_id TEXT NOT NULL REFERENCES sessions, ordinal INTEGER NOT NULL,
                 run_id TEXT NOT NULL UNIQUE REFERENCES runs, accepted_sequence INTEGER NOT NULL,
