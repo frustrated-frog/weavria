@@ -25,16 +25,23 @@ class JsonOutputContract:
 
     def __init__(self, fields: Mapping[str, JsonFieldKind]) -> None:
         self._fields = dict(fields)
-        self.version = "json-output/1:" + json.dumps(self._fields, sort_keys=True)
+        self.version = "json-output/2:" + json.dumps(self._fields, sort_keys=True)
 
     async def verify(self, context: CompletionContext) -> CompletionDecision:
+        # 只有宿主已经封闭工具的收尾轮次才签发直接交付选项。
+        fields = tuple(sorted(self._fields)) if context.finalization is not None else ()
         text = context.candidate.output
         try:
             value = _OBJECT.validate_json(text, strict=True)
         except ValueError:
-            return CompletionRepair(
+            return CompletionRepair.for_json_object(
+                fields,
                 issue_codes=("output_shape",),
-                guidance="Return a JSON object inside Finish.output, without fences.",
+                guidance=(
+                    "Return a JSON object without fences as the final answer."
+                    if fields
+                    else "Return a JSON object inside Finish.output, without fences."
+                ),
             )
         errors: list[str] = []
         for name, kind in self._fields.items():
@@ -53,7 +60,8 @@ class JsonOutputContract:
         if errors:
             issues = "; ".join(errors)
             # 先交付结构错误, 剩余反馈额度再提供旧候选, 免得为了改类型重新查证。
-            return CompletionRepair(
+            return CompletionRepair.for_json_object(
+                fields,
                 issue_codes=("output_field_contract",),
                 guidance=fit_completion_guidance(
                     f"Repair only these fields ({issues}). An expression is the value, "

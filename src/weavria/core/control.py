@@ -318,12 +318,62 @@ class AdmissionNotice(BaseModel):
         return self
 
 
-class CompletionRepair(ContractModel):
+def _can_offer_json_fields(fields: tuple[str, ...]) -> bool:
+    # 有动作协议同名键的业务对象仍可在 Finish.output 里表达。限制真实 UTF-8/转义
+    # 字节数,为已有控制通道中的原候选摘要、错误码及纠错文本留足空间。
+    return (
+        bool(fields)
+        and len(fields) == len(set(fields))
+        and all(name.strip() for name in fields)
+        and not {
+            "decision",
+            "action",
+            "schema_version",
+            "kind",
+            "reuse_arguments_from_call_id",
+        }.intersection(fields)
+        and len(TypeAdapter(tuple[str, ...]).dump_json(fields)) <= 160
+    )
+
+
+class CompletionRepair(BaseModel):
+    model_config = ContractModel.model_config
+    schema_version: Literal[1, 2] = 1
     kind: Literal["repair"] = "repair"
     issue_codes: tuple[Annotated[str, Field(pattern=r"^[a-z][a-z0-9_]{0,31}$")], ...] = Field(
         min_length=1, max_length=8
     )
     guidance: NonBlankString
+
+    json_object_fields: tuple[str, ...] = Field(default=(), exclude_if=lambda fields: not fields)
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def version_type(cls, value: object) -> object:
+        return ContractModel.validate_version_type(value)
+
+    @model_validator(mode="after")
+    def validate_object_offer(self) -> Self:
+        if self.schema_version == 2:
+            if not _can_offer_json_fields(self.json_object_fields):
+                raise ValueError("direct JSON repair needs bounded, unambiguous field names")
+        elif self.json_object_fields:
+            raise ValueError("direct JSON repair requires v2")
+        return self
+
+    @classmethod
+    def for_json_object(
+        cls, fields: tuple[str, ...], *, issue_codes: tuple[str, ...], guidance: str
+    ) -> Self:
+        """由声明输出契约的宿主签发格式选项。过大的字段集合沿用标准 Finish 协议。"""
+        if _can_offer_json_fields(fields):
+            return cls(
+                schema_version=2,
+                issue_codes=issue_codes,
+                guidance=guidance,
+                json_object_fields=fields,
+            )
+        return cls(issue_codes=issue_codes, guidance=guidance)
 
     @field_validator("guidance")
     @classmethod

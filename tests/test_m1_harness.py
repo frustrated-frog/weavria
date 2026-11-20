@@ -168,3 +168,54 @@ async def test_snapshot_resolves_unique_relative_suffix_to_canonical_source() ->
         assert corpus.reads == [("read_source", path)]
     finally:
         context.close()
+
+
+async def test_direct_json_repair_remains_bounded_and_rechecks_candidate_field_types() -> None:
+    from weavria.core import (
+        CONTROL_FEEDBACK_BYTES,
+        CompletionNotice,
+        CompletionRepair,
+        FinalizationStarted,
+        FinishAction,
+        TaskInput,
+    )
+    from weavria.runtime import CompletionContext, JsonOutputContract
+
+    task = TaskInput(goal="Report a count")
+    finish = FinalizationStarted(
+        task_revision=task.revision, policy_version="test", mode="complete", reason="evidence_ready"
+    )
+    candidate = FinishAction(output='{"count":"1"}')
+    contract = JsonOutputContract({"count": "integer"})
+    store = InMemoryArtifactStore()
+    plain = await contract.verify(CompletionContext("r", task, candidate, (), store))
+    repaired = await contract.verify(
+        CompletionContext("r", task, candidate, (), store, finalization=finish)
+    )
+    assert isinstance(plain, CompletionRepair) and plain.schema_version == 1
+    assert "json_object_fields" not in plain.model_dump_json()
+    assert isinstance(repaired, CompletionRepair) and repaired.json_object_fields == ("count",)
+    assert CompletionRepair.model_validate_json(repaired.model_dump_json()) == repaired
+    shape = await contract.verify(
+        CompletionContext("r", task, FinishAction(output="[]"), (), store, finalization=finish)
+    )
+    assert isinstance(shape, CompletionRepair) and shape.issue_codes == ("output_shape",)
+    assert shape.json_object_fields == ("count",)
+    # 最长的合法错误码和提示同时出现时,字段选项仍吃原有 1 KiB 控制预留。
+    largest = CompletionRepair.for_json_object(
+        ("x" * 156,), issue_codes=("a" * 32,) * 8, guidance="b" * 256
+    )
+    assert largest.schema_version == 2
+    assert (
+        len(
+            CompletionNotice(candidate_sha256="e" * 64, decision=largest).model_dump_json().encode()
+        )
+        <= CONTROL_FEEDBACK_BYTES
+    )
+    for fields in (("x" * 157,), ("decision",), ("field", "field"), ()):
+        fallback = CompletionRepair.for_json_object(fields, issue_codes=("field",), guidance="fix")
+        assert fallback.schema_version == 1 and not fallback.json_object_fields
+        with pytest.raises(ValueError):
+            CompletionRepair(
+                schema_version=2, issue_codes=("field",), guidance="fix", json_object_fields=fields
+            )

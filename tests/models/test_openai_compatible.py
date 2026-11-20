@@ -7,6 +7,8 @@ from pydantic import JsonValue, TypeAdapter
 
 from weavria.core import (
     AdmissionNotice,
+    CompletionNotice,
+    CompletionRepair,
     ControlRequest,
     ConversationView,
     ErrorCategory,
@@ -273,6 +275,39 @@ def _session_request(*, sequence: int = 0) -> SessionRequest:
     )
 
 
+def _with_view(request: SessionRequest, phase: Literal["decision", "synthesis"]) -> SessionRequest:
+    view = TaskModelView(
+        projector_version="test/1",
+        phase=phase,
+        source=TaskModelViewSource(
+            work_id="work",
+            version=SemanticVersion(
+                task_revision=1,
+                frame_revision=1,
+                capability_epoch=1,
+                evidence_revision=1,
+                semantic_sequence=1,
+            ),
+            task_sha256=sha256(request.current.task.model_dump_json().encode()).hexdigest(),
+            observation_sha256="0" * 64,
+            ledger_sha256="0" * 64,
+            visible_tools_sha256="0" * 64,
+        ),
+        definition={},
+        definition_sha256=task_view_digest({}),
+        progress={},
+        max_progress_bytes=1024,
+        max_instruction_bytes=4096,
+    )
+    return request.model_copy(
+        update={
+            "current": request.current.model_copy(
+                update={"schema_version": 5, "task_model_view": view}
+            )
+        }
+    )
+
+
 @pytest.mark.parametrize("mode", ("action", "session", "synthesis"))
 @pytest.mark.parametrize(
     "output",
@@ -295,36 +330,7 @@ async def test_finish_protocol_distinguishes_visible_content_from_transport_json
     else:
         request = _session_request()
         if mode == "synthesis":
-            view = TaskModelView(
-                projector_version="test/1",
-                phase="synthesis",
-                source=TaskModelViewSource(
-                    work_id="work",
-                    version=SemanticVersion(
-                        task_revision=1,
-                        frame_revision=1,
-                        capability_epoch=1,
-                        evidence_revision=1,
-                        semantic_sequence=1,
-                    ),
-                    task_sha256=sha256(request.current.task.model_dump_json().encode()).hexdigest(),
-                    observation_sha256="0" * 64,
-                    ledger_sha256="0" * 64,
-                    visible_tools_sha256="0" * 64,
-                ),
-                definition={},
-                definition_sha256=task_view_digest({}),
-                progress={},
-                max_progress_bytes=1024,
-                max_instruction_bytes=4096,
-            )
-            request = request.model_copy(
-                update={
-                    "current": request.current.model_copy(
-                        update={"schema_version": 5, "task_model_view": view}
-                    )
-                }
-            )
+            request = _with_view(request, "synthesis")
         response = await OpenAICompatibleSessionProvider(
             config, transport=transport
         ).generate_session(request)
@@ -590,3 +596,99 @@ async def test_budget_choice_round_trips_as_a_distinct_decision_and_never_as_an_
     transport.response = _response(ModelTurn(decision=ToolBatch(calls=(clear,))).model_dump_json())
     decision = (await call_session_model(provider, request)).decision
     assert isinstance(decision, ToolBatch) and decision.calls[0].arguments == {"notes": []}
+
+
+def _field_repair_request(
+    phase: Literal["decision", "synthesis"] = "synthesis", *, legacy: bool = False
+) -> SessionRequest:
+    decision = (
+        CompletionRepair(issue_codes=("field",), guidance="Return the object")
+        if legacy
+        else CompletionRepair.for_json_object(
+            ("offset", "sources"), issue_codes=("field",), guidance="Return the object"
+        )
+    )
+    request = _with_view(_session_request(), phase)
+    notice = CompletionNotice(candidate_sha256="e" * 64, decision=decision)
+    return request.model_copy(
+        update={"current": request.current.model_copy(update={"control": notice})}
+    )
+
+
+async def test_synthesis_repair_preserves_raw_json_and_still_supports_a_finish_envelope() -> None:
+    # 字段顺序、空白和原始转义属于模型交付的内容。顶层键匹配仅让它进入发布检查。
+    raw = ' { "sources": ["\\u6587"], "offset": 0 }\n'
+    transport = Transport(_response(raw))
+    config = OpenAICompatibleConfig(model="test", json_mode=True)
+    provider = OpenAICompatibleSessionProvider(config, transport=transport)
+    request = _field_repair_request()
+    turn = await provider.generate_session(request)
+    assert isinstance(turn.decision, FinishAction) and turn.decision.output == raw
+    assert (
+        "return the corrected JSON object itself" in transport.requests[0]["messages"][0]["content"]
+    )
+    assert provider.token_counter(encoding="cl100k_base").session_request_bytes(request) == len(
+        json.dumps(transport.requests[0], ensure_ascii=False, separators=(",", ":")).encode()
+    )
+    # 标准动作仍可传递包含额外业务字段的内容,校验继续由原发布策略负责。
+    nested = '{"offset":0,"sources":[],"extra":"保留"}'
+    transport.response = _response(json.dumps({"decision": {"kind": "finish", "output": nested}}))
+    assert (await provider.generate_session(request)).decision == FinishAction(output=nested)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        '{"offset":0}',
+        '{"offset":0,"sources":[],"extra":1}',
+        '{"offset":0,"sources":[],"offset":1}',
+        '{"offset":0,"sources":[{"x":1,"x":2}]}',
+        '{"offset":NaN,"sources":[]}',
+        '{"offset":0,"sources":[]',
+        '```json\n{"offset":0,"sources":[]}\n```',
+        '{"decision":{"output":{"offset":0,"sources":[]}}}',
+    ],
+)
+async def test_direct_repair_requires_complete_unambiguous_json(raw: str) -> None:
+    provider = OpenAICompatibleSessionProvider(
+        OpenAICompatibleConfig(model="test"), transport=Transport(_response(raw))
+    )
+    with pytest.raises(ModelOutputError):
+        await provider.generate_session(_field_repair_request())
+
+
+async def test_raw_answer_is_available_only_in_the_current_typed_synthesis_repair() -> None:
+    raw = '{"offset":0,"sources":[]}'
+    transport = Transport(_response(raw))
+    provider = OpenAICompatibleSessionProvider(
+        OpenAICompatibleConfig(model="test"), transport=transport
+    )
+    for request in (
+        _field_repair_request("decision"),
+        _field_repair_request(legacy=True),
+        _with_view(_session_request(), "synthesis"),
+    ):
+        with pytest.raises(ModelOutputError):
+            await provider.generate_session(request)
+        assert (
+            "return the corrected JSON object itself"
+            not in transport.requests[-1]["messages"][0]["content"]
+        )
+    transport.response = _response(raw, finish_reason="length")
+    with pytest.raises(ModelOutputError) as truncated:
+        await provider.generate_session(_field_repair_request())
+    assert truncated.value.diagnostic.code == "output_truncated"
+
+
+@pytest.mark.parametrize("http_cap", [None, 2500])
+def test_synthesis_feedback_ceiling_covers_both_repair_encodings(http_cap: int | None) -> None:
+    config = OpenAICompatibleConfig(model="test", max_request_bytes=http_cap)
+    counter = OpenAICompatibleSessionProvider(config, transport=Transport(None)).token_counter(
+        encoding="cl100k_base"
+    )
+    # 实时报文随通知变化。为下一步预留的硬容量必须能覆盖提示切回另一种格式。
+    old, new = _field_repair_request(legacy=True), _field_repair_request()
+    assert counter.session_request_bytes(old) != counter.session_request_bytes(new)
+    assert counter.request_byte_ceiling(4096, request=old) == counter.request_byte_ceiling(
+        4096, request=new
+    )

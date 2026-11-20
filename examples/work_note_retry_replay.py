@@ -6,7 +6,8 @@ import hashlib
 import json
 import sqlite3
 import tempfile
-from contextlib import closing
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager, closing
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -65,6 +66,7 @@ from weavria.models import (
     OpenAICompatibleConfig,
     OpenAICompatibleSessionProvider,
     OpenAICompatibleTokenCounter,
+    SessionModelProvider,
     call_session_model,
 )
 from weavria.sessions import SessionEngine, SessionTaskContext, SessionTaskPreparation
@@ -87,7 +89,10 @@ class Scene:
     notice: AdmissionNotice | None
 
 
-def capture(path: Path, at: int) -> Scene:
+def archived_inputs(
+    path: Path,
+) -> tuple[list[SessionEvent], SessionSemanticCommitted, str, tuple[ApplicationObservation, ...]]:
+    """从同一只读事务提取复现实验共用的事件、初始语义及宿主输入。"""
     with closing(sqlite3.connect(path.resolve(strict=True).as_uri() + "?mode=ro", uri=True)) as db:
         db.execute("BEGIN")
         events = [
@@ -105,6 +110,11 @@ def capture(path: Path, at: int) -> Scene:
     instructions, sep, _ = json.loads(config)["instructions"].partition("\nHistory is scoped data;")
     if not sep:
         raise ValueError("missing session instruction boundary")
+    return events, first, instructions, observations
+
+
+def capture(path: Path, at: int) -> Scene:
+    events, first, instructions, observations = archived_inputs(path)
     requests: dict[int, str] = {}
     turns: dict[int, ModelTurn] = {}
     index = fork = 0
@@ -294,13 +304,21 @@ class Choice(FakeSessionProvider):
         return ModelTurn(decision=ToolBatch(calls=(call,)))
 
 
-async def replay(
-    path: Path, scene: Scene, arm: Arm, dataset: Dataset, case: Case, trial: str
-) -> dict[str, object]:
-    corpus = SnapshotCorpus.load(DATA / "corpus.json", dataset.corpora[case.domain])
+@asynccontextmanager
+async def frozen_session(
+    path: Path,
+    *,
+    model: SessionModelProvider,
+    initial: SessionSemanticCommitted,
+    instructions: str,
+    dataset: Dataset,
+    case: Case,
+    trial: str,
+    corpus: SnapshotCorpus,
+) -> AsyncGenerator[SessionEngine]:
+    """在独立数据库重建试验入口。任务、工具、预算和验收器与冻结 M1 配置一致。"""
     cfg = assemble_config(dataset, "coverage" if trial.startswith("coverage") else "recent")
-    model = Choice(scene, arm)
-    head = scene.initial.snapshot
+    head = initial.snapshot
     scope = MemoryScope(tenant_id="m1", kind="project", key="project")
     async with (
         SQLiteMemoryStore(path / "memory.db") as memory,
@@ -308,11 +326,11 @@ async def replay(
             path / "session.db",
             model=model,
             tools=corpus.registry(documents=False, bundle=True),
-            instructions=scene.instructions,
+            instructions=instructions,
             limits=cfg.limits,
             max_request_duration=cfg.max_request_duration,
             id_generator=lambda: head.run_id,
-            task_preparation=FrozenUnderstanding(scene.initial),
+            task_preparation=FrozenUnderstanding(initial),
             support_tools=(work_tool(),),
             context_compiler=cfg.context,
             context_recovery=RecoveryLimits(schema_version=2, retention="chain"),
@@ -333,6 +351,25 @@ async def replay(
         ) as engine,
     ):
         await engine.create(head.session_id)
+        yield engine
+
+
+async def replay(
+    path: Path, scene: Scene, arm: Arm, dataset: Dataset, case: Case, trial: str
+) -> dict[str, object]:
+    corpus = SnapshotCorpus.load(DATA / "corpus.json", dataset.corpora[case.domain])
+    model = Choice(scene, arm)
+    head = scene.initial.snapshot
+    async with frozen_session(
+        path,
+        model=model,
+        initial=scene.initial,
+        instructions=scene.instructions,
+        dataset=dataset,
+        case=case,
+        trial=trial,
+        corpus=corpus,
+    ) as engine:
         try:
             await engine.send(
                 head.session_id,
