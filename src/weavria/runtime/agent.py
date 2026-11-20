@@ -29,7 +29,6 @@ from weavria.context import (
     TargetedSynthesisBuilder,
     TurnEvidencePlan,
     first_delivery_gap,
-    reserve_feedback,
     validate_recovery_view,
 )
 from weavria.core import (
@@ -153,6 +152,7 @@ from .controller import (
     resolve_turn,
 )
 from .delivery import artifact_page_source_ranges
+from .feedback_budget import ReadFeedbackBudget
 from .finalization import FinalizationAssessment, FinalizationPolicy
 from .intervention import (
     ACTION_VALUE_LEDGER_VERSION,
@@ -1797,55 +1797,6 @@ class _AgentKernel:
         identities = {(item.pointer, item.kind, item.start, item.end): item for item in ranges}
         return tuple(identities.values())
 
-    def _page_advice(self, batch: ToolBatch) -> tuple[int, str, int] | None:
-        """只计算建议,不改写已提出的 Action。每个候选重新校验并计量完整反馈包络。"""
-        for index, call in enumerate(batch.calls):
-            if call.tool_name not in {d.name for d in self._tool_ceiling.descriptors}:
-                continue
-            tool = self._tool_ceiling.get(call.tool_name)
-            if tool.descriptor.feedback_page_parameter is None:
-                continue
-            parameter = tool.descriptor.feedback_page_parameter
-            properties = tool.descriptor.input_schema.get("properties")
-            if not isinstance(properties, dict):
-                continue
-            field = properties.get(parameter)
-            if not isinstance(field, dict):
-                continue
-            minimum, maximum = field.get("minimum"), field.get("maximum")
-            if type(minimum) is not int or type(maximum) is not int:
-                continue
-            low, high, feasible = minimum, maximum, 0
-            while low <= high:
-                middle = (low + high) // 2
-                candidate = call.model_copy(
-                    update={"arguments": {**call.arguments, parameter: middle}}
-                )
-                identity = self._tool_ceiling.action_identity(candidate)
-                if identity.normalization != "validated":
-                    return None
-                envelope = self._tool_ceiling.feedback_envelope(
-                    candidate, identity=identity, bounds=self._bounds
-                )
-                reservation = reserve_feedback(
-                    instructions=self._instructions,
-                    task=self.state.task,
-                    task_observation=self._task_observation,
-                    records=self.state.records,
-                    batch=ToolBatch(calls=(candidate,)),
-                    bounds=self._bounds,
-                    budget_bytes=self._feedback_budget,
-                    evidence_access=self._evidence_access,
-                    feedback_envelopes=(envelope,),
-                    base_request=self._feedback_template,
-                )
-                if reservation.fits:
-                    feasible, low = middle, middle + 1
-                else:
-                    high = middle - 1
-            return index, parameter, feasible
-        return None
-
     def _artifact_page_retry(
         self, batch: ToolBatch, page_advice: tuple[int, str, int] | None
     ) -> ArtifactPageRetry | None:
@@ -1949,31 +1900,21 @@ class _AgentKernel:
         action_value_context: ActionValueContext,
     ) -> tuple[bool, tuple[ToolActionIdentity, ...]]:
         revision = self.state.model_revision
-        feedback_envelopes = tuple(
-            self._tool_ceiling.feedback_envelope(
-                call,
-                identity=identity,
-                bounds=self._bounds,
-            )
-            for call, identity in zip(batch.calls, checked_identities, strict=True)
-        )
-        reservation = reserve_feedback(
+        budget = ReadFeedbackBudget(
+            tools=self._tool_ceiling,
             instructions=self._instructions,
             task=self.state.task,
-            task_observation=(
-                self._task_observation
-                if self._task_observation is not None
-                and self._task_observation.task_revision == self.state.task.revision
-                else None
-            ),
+            observation=self._task_observation
+            if self._task_observation is not None
+            and self._task_observation.task_revision == revision
+            else None,
             records=self.state.records,
-            batch=batch,
             bounds=self._bounds,
             budget_bytes=self._feedback_budget,
-            evidence_access=self._evidence_access,
-            feedback_envelopes=feedback_envelopes,
-            base_request=self._feedback_template,
+            access=self._evidence_access,
+            template=self._feedback_template,
         )
+        reservation, admitted_access = budget.measure(batch, checked_identities)
         remaining = max(0, self._limits.max_tool_calls - self.state.tool_calls)
         visible = {descriptor.name for descriptor in self._visible_tools.descriptors}
         unavailable = tuple(
@@ -2036,7 +1977,9 @@ class _AgentKernel:
             if progress.blocked:
                 reason = "no_progress"
         if reason is not None:
-            page_advice = self._page_advice(batch) if reason == "feedback_budget" else None
+            retry = budget.retry(batch, visible) if reason == "feedback_budget" else None
+            page_advice = retry.page if retry else None
+            checked_single = retry is not None and page_advice is None
             page_retry = self._artifact_page_retry(batch, page_advice)
             async with self._commit_lock:
                 if revision != self.state.task.revision:
@@ -2107,6 +2050,8 @@ class _AgentKernel:
                     schema_version=(
                         5
                         if reason == "capability_view"
+                        else 7
+                        if checked_single
                         else 3
                         if page_retry
                         else 2
@@ -2123,6 +2068,7 @@ class _AgentKernel:
                         if reason == "capability_view"
                         else None
                     ),
+                    retry_read=retry.call if retry else None,
                     artifact_page_retry=page_retry,
                     page_call_index=page_advice[0] if page_advice else None,
                     page_parameter=page_advice[1] if page_advice else None,
@@ -2134,7 +2080,9 @@ class _AgentKernel:
                     budget_bytes=reservation.budget_bytes,
                     remaining_tool_calls=remaining,
                     recommended_max_calls=(
-                        _recommended_feedback_batch_width(
+                        int(retry.feasible)
+                        if retry is not None
+                        else _recommended_feedback_batch_width(
                             proposed_calls=len(batch.calls),
                             required_bytes=reservation.required_bytes,
                             budget_bytes=reservation.budget_bytes,
@@ -2194,13 +2142,13 @@ class _AgentKernel:
                 return False, progress.action_identities if progress is not None else ()
         accepted = await self._accept(
             BatchAdmitted(
-                schema_version=3,
+                schema_version=4 if admitted_access != self._evidence_access else 3,
                 reserved_bytes=reservation.required_bytes,
                 budget_bytes=reservation.budget_bytes,
                 readable_call_ids=reservation.readable_call_ids,
                 bounds=self._bounds,
                 action_value_context=action_value_context,
-                evidence_access=self._evidence_access,
+                evidence_access=admitted_access,
                 feedback_envelopes=reservation.feedback_envelopes,
             ),
             expected_revision=revision,

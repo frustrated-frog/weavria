@@ -289,6 +289,7 @@ def artifact_read_tool() -> TypedTool[ArtifactReadInput, ArtifactReadOutput]:
         input_type=ArtifactReadInput,
         output_type=ArtifactReadOutput,
         execute=_read,
+        artifact_read_inputs=("artifact_id",),
         context_paths=("",),
         feedback_delivery="complete",
         feedback_bound_version="artifact-read-output/2",

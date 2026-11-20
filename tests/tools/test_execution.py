@@ -226,10 +226,32 @@ def test_complete_feedback_delivery_is_an_explicit_versioned_tool_contract() -> 
 
     assert adaptive.schema_version == 2 and adaptive.feedback_delivery == "adaptive"
     assert "feedback_delivery" not in adaptive.model_dump_json()
-    assert complete.schema_version == 5 and complete.feedback_delivery == "complete"
+    assert complete.schema_version == 9 and complete.feedback_delivery == "complete"
+    assert complete.artifact_read_inputs == ("artifact_id",)
+    assert "artifact_read_inputs" not in adaptive.model_dump_json()
     assert complete.feedback_bound_version == "artifact-read-output/2"
     assert '"feedback_delivery":"complete"' in complete.model_dump_json()
     assert '"feedback_bound_version":"artifact-read-output/2"' in complete.model_dump_json()
+
+
+def test_read_scope_declaration_requires_a_replay_safe_read_and_named_string_fields() -> None:
+    descriptor = artifact_read_tool().descriptor
+    for change in (
+        {"artifact_read_inputs": ("absent",)},
+        {"artifact_read_inputs": ("length",)},
+        {"artifact_read_inputs": ("artifact_id", "artifact_id")},
+        {"behavior": "side_effect"},
+        {"idempotency": "unknown"},
+        {"poll_interval_seconds": 1},
+        {"schema_version": 5},
+    ):
+        with pytest.raises(ValueError):
+            ToolDescriptor.model_validate({**descriptor.model_dump(), **change})
+    old = ToolDescriptor.model_validate(
+        {**descriptor.model_dump(), "schema_version": 5, "artifact_read_inputs": None}
+    )
+    assert "artifact_read_inputs" not in old.model_dump_json()
+    assert ToolDescriptor.model_validate_json(old.model_dump_json()) == old
 
 
 def test_action_identity_uses_validated_defaults_and_tool_normalization() -> None:

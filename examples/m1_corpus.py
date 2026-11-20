@@ -111,6 +111,7 @@ class SnapshotCorpus:
                 input_type=ReadInput,
                 output_type=ReadOutput,
                 execute=read,
+                artifact_read_inputs=(),
                 description=(
                     "Read a complete UTF-8 file from the frozen "
                     + ("primary archive" if name == primary else "independent mirror")

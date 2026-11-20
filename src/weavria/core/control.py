@@ -16,7 +16,7 @@ from pydantic import (
 )
 
 from ._schema import ContractModel, NonBlankString
-from .actions import FinishAction
+from .actions import FinishAction, ToolCallAction
 from .delivery import EvidenceAccessProof, EvidenceNavigationProof
 from .errors import ErrorCategory, ModelOutputDiagnostic, RunError
 from .evidence_access import EvidenceAccessView
@@ -138,7 +138,7 @@ class AdmissionNotice(BaseModel):
     def version_type(cls, value: object) -> object:
         return ContractModel.validate_version_type(value)
 
-    schema_version: Literal[1, 2, 3, 4, 5, 6] = 1
+    schema_version: Literal[1, 2, 3, 4, 5, 6, 7] = 1
     # 建议只针对原提案中指定的一次调用单独重提,0 表示最低页也无法容纳。
     page_call_index: int | None = Field(default=None, ge=0, le=31)
     page_parameter: str | None = Field(default=None, min_length=1, max_length=64)
@@ -150,11 +150,14 @@ class AdmissionNotice(BaseModel):
     ] = Field(default=(), max_length=32)
     capability_epoch_changed: bool | None = None
     replan: ToolReplan | None = None
+    retry_read: ToolCallAction | None = None
 
     @model_serializer(mode="wrap")
     def preserve_legacy_wire(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
         data = handler(self)
-        if self.schema_version in {1, 5, 6}:
+        if self.schema_version != 7:
+            data.pop("retry_read", None)
+        if self.schema_version in {1, 5, 6, 7}:
             for key in ("page_call_index", "page_parameter", "page_maximum"):
                 data.pop(key, None)
         if self.schema_version != 3:
@@ -183,6 +186,15 @@ class AdmissionNotice(BaseModel):
 
     @model_validator(mode="after")
     def bound_notice(self) -> Self:
+        if self.schema_version == 7:
+            if self.reason != "feedback_budget" or self.recommended_max_calls != int(
+                self.retry_read is not None
+            ):
+                raise ValueError(
+                    "checked read advice must bind an offered singleton or report none"
+                )
+        elif self.retry_read is not None:
+            raise ValueError("checked read requires notice v7")
         if (self.schema_version == 5) != (self.capability_epoch_changed is not None):
             raise ValueError("v5 must declare whether the capability epoch changed")
         if self.schema_version == 4 and any(name is None for _, name in self.unavailable_calls):
@@ -493,10 +505,10 @@ class ControlRequest(BaseModel):
 
 
 class BatchAdmitted(BaseModel):
-    """Admit a batch with readable evidence and, in v3, per-call feedback proofs."""
+    """Admit a batch with per-call feedback proofs and, in v4, a narrower read scope."""
 
     model_config = ContractModel.model_config
-    schema_version: Literal[1, 2, 3] = 1
+    schema_version: Literal[1, 2, 3, 4] = 1
     kind: Literal["batch_admitted"] = "batch_admitted"
     reserved_bytes: int = Field(gt=0)
     budget_bytes: int = Field(gt=0)
@@ -524,12 +536,14 @@ class BatchAdmitted(BaseModel):
     def validate_budget(self) -> Self:
         if self.schema_version == 1 and self.evidence_access is not None:
             raise ValueError("admission v1 cannot carry an evidence access view")
-        if self.schema_version == 2 and self.evidence_access is None:
-            raise ValueError("admission v2 requires an evidence access view")
+        if self.schema_version in (2, 4) and self.evidence_access is None:
+            raise ValueError(f"admission v{self.schema_version} requires an evidence access view")
         if self.schema_version < 3 and self.feedback_envelopes:
             raise ValueError("legacy admission cannot carry feedback envelopes")
-        if self.schema_version == 3 and not self.feedback_envelopes:
-            raise ValueError("admission v3 requires feedback envelopes")
+        if self.schema_version >= 3 and not self.feedback_envelopes:
+            raise ValueError("admission requires feedback envelopes")
+        if self.schema_version == 4 and len(self.feedback_envelopes) != 1:
+            raise ValueError("narrowed admission requires exactly one feedback envelope")
         if self.evidence_access is not None and self.readable_call_ids != tuple(
             a.call_id for a in self.evidence_access.artifacts
         ):

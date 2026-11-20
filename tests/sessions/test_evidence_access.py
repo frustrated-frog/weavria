@@ -1,6 +1,7 @@
 """Admission, durable replay and actual reads share the same selected evidence scope."""
 
 import asyncio
+from dataclasses import replace
 from pathlib import Path
 from typing import TypedDict
 
@@ -32,6 +33,7 @@ from weavria.core import (
 )
 from weavria.models import FakeSessionProvider, ModelCapabilities, OpenAICompatibleTokenCounter
 from weavria.runtime import EventAcceptanceError, RunLimits, reduce_event
+from weavria.runtime.feedback_budget import ReadFeedbackBudget
 from weavria.sessions import SessionEngine
 from weavria.tools import (
     ReadOnlyPolicy,
@@ -40,6 +42,7 @@ from weavria.tools import (
     ToolFault,
     ToolRegistry,
     TypedTool,
+    artifact_read_tool,
 )
 
 
@@ -372,3 +375,70 @@ async def test_steering_keeps_started_read_scope_and_skips_queued_sibling(
     assert any(isinstance(e, CallSkipped) and e.call_id == "queued" for e in events)
     recorded = [e.record for e in events if isinstance(e, ToolRecorded)]
     assert recorded[-1].dependencies == ("source",)
+
+
+async def test_read_budget_prices_and_dispatches_the_same_transitive_scope() -> None:
+    # 三份可见来源中, child 引用了 root。另一份独立来源不应占用本次读页的预留。
+    store = InMemoryArtifactStore()
+    tools = ToolRegistry((registry().get("read"), artifact_read_tool()))
+    executor = ToolExecutor("r", tools, store, ReadOnlyPolicy(), feedback_bounds=FeedbackBounds())
+    root = await executor.execute(call("root"), max_duration=1)
+    assert root.artifact is not None
+    child = await executor.execute(call("child", parent=root.artifact.artifact_id), max_duration=1)
+    other = await executor.execute(call("other", value="private"), max_duration=1)
+    assert child.artifact is not None and other.artifact is not None
+    records = (root, child, other)
+    access = EvidenceAccessView.from_records(
+        records, ("root", "child", "other"), task_revision=1, request_sha256="a" * 64
+    )
+    call_page = ToolCallAction(
+        tool_name="read_artifact",
+        call_id="page",
+        arguments={"artifact_id": child.artifact.artifact_id, "pointer": "/value", "length": 30},
+    )
+    batch = ToolBatch(calls=(call_page,))
+    identity = tools.action_identity(call_page)
+    budget = ReadFeedbackBudget(
+        tools,
+        "read",
+        TaskInput(goal="inspect"),
+        None,
+        records,
+        FeedbackBounds(),
+        100000,
+        access,
+        None,
+    )
+    full, original_view = budget.measure(batch, (identity,))
+    assert full.fits and original_view == access
+    tight = replace(budget, budget_bytes=full.required_bytes - 1)
+    admitted, scope = tight.measure(batch, (identity,))
+    assert admitted.fits and scope is not None and scope.call_ids == ("root", "child")
+    assert scope.request_sha256 == access.request_sha256
+    assert admitted.readable_call_ids == scope.call_ids
+    read = await executor.execute(
+        call_page,
+        max_duration=1,
+        accepted_artifacts=scope.artifacts,
+        expected_identity=identity,
+        feedback_envelope=admitted.feedback_envelopes[0],
+    )
+    assert read.artifact is not None and read.dependencies == ("child",)
+    page = (await store.get("r", read.artifact.artifact_id)).value
+    assert isinstance(page, dict) and page["value"] == "opaque"
+    hidden = call_page.model_copy(
+        update={
+            "call_id": "hidden",
+            "arguments": {**call_page.arguments, "artifact_id": other.artifact.artifact_id},
+        }
+    )
+    denied = await executor.execute(hidden, max_duration=1, accepted_artifacts=scope.artifacts)
+    assert isinstance(denied.exchange.observation, ToolFailedObservation)
+    assert denied.exchange.observation.error.category is ErrorCategory.POLICY_DENIED
+    # 即使后端仍存有 other,持有 ID 也不能触发对不可见记录的预算优化或页建议。
+    hidden_budget = replace(tight, access=scope, budget_bytes=1)
+    invalid = ToolBatch(calls=(hidden,))
+    reservation, allowed = hidden_budget.measure(invalid, (tools.action_identity(hidden),))
+    assert not reservation.fits and allowed == scope
+    advice = hidden_budget.retry(invalid, {"read_artifact"})
+    assert advice is not None and not advice.feasible

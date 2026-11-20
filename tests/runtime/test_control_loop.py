@@ -43,6 +43,7 @@ from weavria.core import (
     ControlFeedback,
     ControlRequest,
     ErrorCategory,
+    EvidenceAccessView,
     EvidenceContinuationAccess,
     EvidenceCoverageSignal,
     EvidenceInitialAccess,
@@ -162,7 +163,14 @@ def finish(output: str = "done") -> ModelTurn:
 class _CompilerControlBuilder:
     """Exercise the production compiler without the Session persistence adapter."""
 
-    def __init__(self, store: InMemoryArtifactStore, counter: SessionTokenCounter) -> None:
+    def __init__(
+        self,
+        store: InMemoryArtifactStore,
+        counter: SessionTokenCounter,
+        *,
+        feedback_limit: int | None = None,
+    ) -> None:
+        self._feedback_limit = feedback_limit
         self._compiler = SessionContextCompiler(
             store,
             config=ContextCompilerConfig(window_tokens=24_000, output_tokens=256),
@@ -219,7 +227,9 @@ class _CompilerControlBuilder:
             max_request_bytes,
             decisions,
             compiled.compilation.model_dump_json(),
-            compiled.compilation.feedback_budget_bytes,
+            min(compiled.compilation.feedback_budget_bytes, self._feedback_limit)
+            if self._feedback_limit is not None
+            else compiled.compilation.feedback_budget_bytes,
         )
 
 
@@ -3196,3 +3206,92 @@ async def test_declared_json_output_repairs_only_delivery_after_tool_success() -
     assert "offset: integer" in notice.decision.guidance
     assert '{"offset":"12"}' in notice.decision.guidance
     replay(agent)
+
+
+async def test_narrowed_admission_enforces_the_declaration_at_dispatch_and_replay(
+    session_counter: SessionTokenCounter,
+) -> None:
+    # 一个声明不依赖旧 Artifact 的后端仍试图打开它。模型可以看到来源,
+    # 但本次预留没有覆盖它,正式执行必须拒绝后端读取。
+    store = InMemoryArtifactStore()
+    captured: list[str] = []
+
+    async def overread(arguments: Input, context: ToolContext) -> Output:
+        await context.read_artifact(captured[0])
+        return Output(value="unexpected")
+
+    tools = ToolRegistry(
+        (
+            echo_tool(),
+            TypedTool(
+                name="source",
+                version="1",
+                description="Read the source",
+                input_type=Input,
+                output_type=Output,
+                execute=overread,
+                artifact_read_inputs=(),
+            ),
+        )
+    )
+    task = TaskInput(goal="inspect source")
+    offered = call("read", "read the source using its registered backend", name="source")
+    template = AgentLoop.request_template_for(task, "inspect", tools)
+    limit = reserve_feedback(
+        task=task,
+        instructions=template.instructions,
+        records=(),
+        bounds=FeedbackBounds(),
+        budget_bytes=10000,
+        batch=ToolBatch(calls=(offered,)),
+    ).required_bytes
+
+    class Model(FakeControlProvider):
+        async def generate_turn(self, request: ControlRequest) -> ModelTurn:
+            if not request.history:
+                return batch(call("seed"))
+            last = request.history[-1]
+            assert isinstance(last, ToolExchange)
+            if last.action.call_id == "seed":
+                assert isinstance(last.observation, ToolSucceededObservation)
+                receipt = last.observation.output
+                assert isinstance(receipt, dict) and isinstance(receipt["artifact_id"], str)
+                captured.append(receipt["artifact_id"])
+                return batch(offered)
+            assert isinstance(last.observation, ToolFailedObservation)
+            assert last.observation.error.category is ErrorCategory.POLICY_DENIED
+            return finish()
+
+    agent = AgentLoop(
+        run_id="subset",
+        task=task,
+        instructions="inspect",
+        tools=tools,
+        artifacts=store,
+        model=Model(()),
+        context_builder=_CompilerControlBuilder(store, session_counter, feedback_limit=limit),
+    )
+    assert (await agent.execute()).status is RunStatus.COMPLETED
+    replay(agent)
+    state = None
+    for event in agent.events:
+        if isinstance(event.data, BatchAdmitted) and event.data.schema_version == 4:
+            assert event.data.readable_call_ids == () and event.data.reserved_bytes == limit
+            assert state is not None and state.context_call_ids == ("seed",)
+            # 即使替换成以前合法的完整视图,v4 回放也必须拒绝篡改。
+            assert state.context_request_sha256 is not None
+            whole = EvidenceAccessView.from_records(
+                state.records,
+                state.context_call_ids,
+                task_revision=task.revision,
+                request_sha256=state.context_request_sha256,
+            )
+            forged = event.data.model_copy(
+                update={"evidence_access": whole, "readable_call_ids": whole.call_ids}
+            )
+            with pytest.raises(EventAcceptanceError, match="narrow one call"):
+                reduce_event(state, event.model_copy(update={"data": forged}))
+            break
+        state = reduce_event(state, event)
+    else:
+        pytest.fail("expected a narrower single-read admission")

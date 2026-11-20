@@ -679,7 +679,7 @@ def _reduce_turn(
                     and artifact.size_bytes <= admission.bounds.max_result_bytes,
                     "artifact exceeded admitted feedback bounds",
                 )
-            if admission.schema_version == 3:
+            if admission.schema_version >= 3:
                 envelope = next(
                     (item for item in admission.feedback_envelopes if item.call_id == call_id),
                     None,
@@ -1152,9 +1152,17 @@ def _reduce_control(
             if data.evidence_access is not None:
                 _require(state.context_request_sha256 is not None, "access requires model context")
                 assert state.context_request_sha256 is not None
+                chosen = state.context_call_ids
+                if data.schema_version == 4:
+                    # v4 在试算和执行时使用同一个更小的证据闭包。持久回放也不能扩大原授权。
+                    chosen = data.evidence_access.call_ids
+                    _require(
+                        len(turn.decision.calls) == 1 and set(chosen) < set(state.context_call_ids),
+                        "scoped admission must narrow one call within the accepted model context",
+                    )
                 expected = EvidenceAccessView.from_records(
                     state.records,
-                    state.context_call_ids,
+                    chosen,
                     task_revision=state.task.revision,
                     request_sha256=state.context_request_sha256,
                 )
@@ -1167,7 +1175,7 @@ def _reduce_control(
                 data.readable_call_ids == readable,
                 "reservation must cover the complete readable view",
             )
-            if data.schema_version == 3:
+            if data.schema_version >= 3:
                 _require(
                     tuple((item.call_id, item.tool_name) for item in data.feedback_envelopes)
                     == tuple((call.call_id, call.tool_name) for call in turn.decision.calls),
@@ -1243,6 +1251,11 @@ def _reduce_control(
                     ),
                     "replan prior does not match an accepted tool outcome",
                 )
+        if notice.retry_read is not None:
+            _require(
+                notice.retry_read in turn.decision.calls,
+                "retry must match an original proposed read",
+            )
         cursor = notice.artifact_page_retry
         if cursor is not None:
             assert notice.page_call_index is not None

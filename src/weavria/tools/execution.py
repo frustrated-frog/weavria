@@ -61,7 +61,7 @@ class ToolDescriptor(BaseModel):
         validate_default=True,
         revalidate_instances="always",
     )
-    schema_version: Literal[2, 3, 4, 5, 6, 7, 8] = 2
+    schema_version: Literal[2, 3, 4, 5, 6, 7, 8, 9] = 2
     name: str = Field(min_length=1, pattern=r"^[a-zA-Z][a-zA-Z0-9_]*$")
     version: str = Field(min_length=1)
     description: str = Field(min_length=1)
@@ -85,6 +85,10 @@ class ToolDescriptor(BaseModel):
     source_group: str | None = Field(default=None, max_length=64, pattern=r"^[a-z][a-z0-9_-]*$")
     poll_interval_seconds: float | None = Field(default=None, ge=0.001, le=86400)
 
+    # 单独读取时需要的既有 Artifact ID 参数。空元组表示只访问外部来源。
+    # None 保留整个决策视图。这份声明只供宿主预算和派发使用。
+    artifact_read_inputs: tuple[str, ...] | None = Field(default=None, max_length=8)
+
     @field_validator("schema_version", "max_attempts", mode="before")
     @classmethod
     def validate_literal_integer(cls, value: object) -> object:
@@ -95,6 +99,8 @@ class ToolDescriptor(BaseModel):
     @model_serializer(mode="wrap")
     def preserve_legacy_wire(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
         data = handler(self)
+        if self.schema_version < 9:
+            data.pop("artifact_read_inputs", None)
         if self.schema_version < 7:
             data.pop("poll_interval_seconds", None)
         if self.schema_version < 6:
@@ -109,6 +115,21 @@ class ToolDescriptor(BaseModel):
 
     @model_validator(mode="after")
     def validate_feedback_delivery_version(self) -> "ToolDescriptor":
+        if (self.schema_version == 9) != (self.artifact_read_inputs is not None):
+            raise ValueError("declared read inputs require descriptor v9")
+        if self.artifact_read_inputs is not None:
+            properties = self.input_schema.get("properties")
+            if (
+                self.behavior != "read_only"
+                or self.idempotency != "replay_safe"
+                or self.poll_interval_seconds is not None
+                or len(set(self.artifact_read_inputs)) != len(self.artifact_read_inputs)
+            ):
+                raise ValueError("read scope requires a replay-safe synchronous-result lookup")
+            for name in self.artifact_read_inputs:
+                field = properties.get(name) if isinstance(properties, dict) else None
+                if not isinstance(field, dict) or field.get("type") != "string":
+                    raise ValueError("artifact read input must name a string field")
         if (self.schema_version == 8) != (self.behavior == "isolated_compute"):
             raise ValueError("isolated computation requires descriptor v8")
         if self.behavior == "isolated_compute" and (
@@ -356,6 +377,7 @@ class TypedTool[Input: BaseModel, Output: BaseModel]:
         feedback_page_parameter: str | None = None,
         source_group: str | None = None,
         poll_interval_seconds: float | None = None,
+        artifact_read_inputs: tuple[str, ...] | None = None,
     ) -> None:
         if isinstance(timeout_seconds, bool) or not math.isfinite(timeout_seconds):
             raise ValueError("tool timeout must be finite")
@@ -368,7 +390,9 @@ class TypedTool[Input: BaseModel, Output: BaseModel]:
             raise ValueError("adaptive feedback cannot declare a complete-data bound")
         adapter = TypeAdapter[dict[str, JsonValue]](dict[str, JsonValue])
         descriptor = ToolDescriptor(
-            schema_version=8
+            schema_version=9
+            if artifact_read_inputs is not None
+            else 8
             if behavior == "isolated_compute"
             else 7
             if poll_interval_seconds is not None
@@ -403,6 +427,7 @@ class TypedTool[Input: BaseModel, Output: BaseModel]:
             feedback_page_parameter=feedback_page_parameter,
             source_group=source_group,
             poll_interval_seconds=poll_interval_seconds,
+            artifact_read_inputs=artifact_read_inputs,
         )
         self._descriptor_json = descriptor.model_dump_json()
         self._input_type = input_type
