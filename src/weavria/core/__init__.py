@@ -2,7 +2,13 @@
 
 from .actions import AgentAction, FinishAction, ToolCallAction, parse_action
 from .compaction import CompactedExcerpt, ContextCompaction
-from .context import ContextChoice, ContextCompilation, SessionContextCompiled
+from .context import (
+    ContextChoice,
+    ContextCompilation,
+    MaterialSelection,
+    SelectorCandidate,
+    SessionContextCompiled,
+)
 from .context_evidence import (
     ContextEvidenceAssessment,
     ContextEvidenceCheck,
@@ -307,6 +313,7 @@ __all__ = [
     "LoopData",
     "LoopEvent",
     "LoopResult",
+    "MaterialSelection",
     "Message",
     "MessageRole",
     "ModelDecided",
@@ -342,6 +349,7 @@ __all__ = [
     "RunReport",
     "RunStarted",
     "RunStatus",
+    "SelectorCandidate",
     "SemanticSnapshot",
     "SemanticTransition",
     "SemanticVersion",

@@ -18,6 +18,7 @@ from weavria.core import (
     ConversationView,
     EvidenceDeliveryManifest,
     HistoryRetrievalReport,
+    MaterialSelection,
     RecoverContext,
     RecoveryLimits,
     RecoveryNotice,
@@ -203,6 +204,7 @@ class SessionContextCompiler:
         retrieval: HistoryRetrievalReport | None = None,
         supply: ContextSupply | None = None,
         extension_bundles: tuple[ContextBundle, ...] = (),
+        material_selections: tuple[MaterialSelection, ...] = (),
         recovery_ranges: tuple[RecoveryRange, ...] = (),
         synthesis_range: RecoveryRange | None = None,
         next_step_reserve_bytes: int = 0,
@@ -898,6 +900,7 @@ class SessionContextCompiler:
                             retrieval=retrieval,
                             supply=supply,
                             extension_bundles=extension_bundles,
+                            material_selections=material_selections,
                             recovery_ranges=prospective_ranges,
                             next_step_reserve_bytes=next_step_reserve_bytes,
                             feedback_reserve_floor_bytes=feedback_reserve_floor_bytes,
@@ -997,7 +1000,9 @@ class SessionContextCompiler:
             raise ContextBuildError("token counter returned an invalid byte ceiling")
         covered = coverage(units, selected)
         report_version = (
-            18
+            19
+            if material_selections
+            else 18
             if extension_ids
             else 17
             if summary_selection is not None
@@ -1073,6 +1078,7 @@ class SessionContextCompiler:
             retrieval=retrieval,
             supply=supply.report if supply else None,
             extension_bundle_ids=extension_ids,
+            material_selections=material_selections,
             recovery_ranges=recovery_ranges,
             delivery_manifest=delivery_manifest,
             transport_request_bytes=transport_bytes(request),

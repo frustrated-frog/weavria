@@ -69,7 +69,8 @@ class ExpiredClock(SystemClock):
 async def main():
     global crash_fork
     config={}
-    if point.startswith('fork-'):
+    composing = extension_variant and extension_variant.startswith('binding-')
+    if point.startswith('fork-') or composing:
         from weavria.context import ContextCompilerConfig, HistoryRetrievalConfig
         from weavria.models import OpenAICompatibleConfig, OpenAICompatibleTokenCounter
         config={
@@ -79,7 +80,14 @@ async def main():
                 encoding='cl100k_base'),
             'history_retrieval': HistoryRetrievalConfig() if point=='fork-resume' else None,
         }
-    if extension_variant:
+    if composing:
+        from examples.extension_composition import compose_documents
+        from weavria.harness import HarnessExtensions
+        config['extensions'] = HarnessExtensions(compose_documents(
+            {'manual': 'original request'},
+            provider='all' if extension_variant=='binding-changed' else 'unique',
+            reverse=extension_variant=='binding-shuffled'))
+    elif extension_variant:
         from examples.harness_extensions import trace_extension
         from dataclasses import replace
         from weavria.harness import HarnessExtensions
@@ -343,12 +351,21 @@ async def test_uninterrupted_baseline_matches_resume_call_counts(tmp_path: Path)
     assert result.returncode == 0, result.stderr
 
 
-async def test_resume_requires_original_extension_assembly(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "versions",
+    [
+        ("original", "changed", "original"),
+        ("binding-original", "binding-changed", "binding-shuffled"),
+    ],
+)
+async def test_resume_requires_original_extension_assembly(
+    tmp_path: Path, versions: tuple[str, str, str]
+) -> None:
     path = tmp_path / "extensions.db"
     for point, version, expected_code in (
-        ("boundary", "original", 73),
-        ("resume-different", "changed", 0),
-        ("resume", "original", 0),
+        ("boundary", versions[0], 73),
+        ("resume-different", versions[1], 0),
+        ("resume", versions[2], 0),
     ):
         result = await asyncio.to_thread(
             subprocess.run,
@@ -358,5 +375,5 @@ async def test_resume_requires_original_extension_assembly(tmp_path: Path) -> No
             timeout=10,
         )
         assert result.returncode == expected_code, result.stderr
-        if version == "changed":
+        if point == "resume-different":
             assert result.stdout.strip() == "resume_configuration_changed"

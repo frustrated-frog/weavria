@@ -31,11 +31,48 @@ class ContextChoice(ContractModel):
     dependencies: tuple[str, ...] = ()
 
 
+class SelectorCandidate(ContractModel):
+    """一个扩展材料快照及其在策略阶段的去留。"""
+
+    bundle_id: str = Field(min_length=1, max_length=256)
+    source_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    admitted: bool
+
+
+class MaterialSelection(ContractModel):
+    """一次实际策略调用。空候选也记录,以区别于本轮未调用。"""
+
+    consumer: NonBlankString
+    capability: NonBlankString
+    provider: NonBlankString
+    candidates: tuple[SelectorCandidate, ...] = Field(max_length=100)
+
+    def check_allocation(
+        self, ordered_ids: tuple[str, ...], choices: dict[str, ContextChoice]
+    ) -> int:
+        """核对同一生产者两次裁决间的身份和摘要,返回未交给编译器的条数。"""
+        prefix = f"extension:{self.consumer}:"
+        ids = [item.bundle_id for item in self.candidates]
+        if len(ids) != len(set(ids)) or not all(key.startswith(prefix) for key in ids):
+            raise ValueError("invalid selector candidate identity")
+        admitted = tuple(c.bundle_id for c in self.candidates if c.admitted)
+        if admitted != tuple(key for key in ordered_ids if key.startswith(prefix)):
+            raise ValueError("selector admissions differ from compiled material")
+        for candidate in self.candidates:
+            choice = choices.get(f"bundle:{candidate.bundle_id}")
+            if candidate.admitted:
+                if choice is None or choice.source_sha256 != candidate.source_sha256:
+                    raise ValueError("selector material digest differs from compiler source")
+            elif choice is not None:
+                raise ValueError("rejected selector candidate reached the compiler")
+        return len(ids) - len(admitted)
+
+
 class ContextCompilation(BaseModel):
     """Bind allocation diagnostics to the exact complete request sent to a provider."""
 
     model_config = ContractModel.model_config
-    schema_version: Literal[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18] = 1
+    schema_version: Literal[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19] = 1
 
     policy_version: NonBlankString
     counter_version: NonBlankString
@@ -63,6 +100,7 @@ class ContextCompilation(BaseModel):
     # 这些独立材料与记忆共享预算,但不参与记忆充分性判断。保存所有候选的身份,
     # 包括最终被裁掉的条目。choices 保存各自内容摘要与交付结果。
     extension_bundle_ids: tuple[NonBlankString, ...] = Field(default=(), max_length=100)
+    material_selections: tuple[MaterialSelection, ...] = Field(default=(), max_length=32)
     retrieval: HistoryRetrievalReport | None = None
     recovery_ranges: tuple[RecoveryRange, ...] = Field(default=(), max_length=8)
     delivery_manifest: EvidenceDeliveryManifest | None = None
@@ -82,6 +120,8 @@ class ContextCompilation(BaseModel):
     @model_serializer(mode="wrap")
     def preserve_v1_wire(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
         data = handler(self)
+        if self.schema_version < 19:
+            data.pop("material_selections", None)
         if self.schema_version < 18:
             data.pop("extension_bundle_ids", None)
         if self.schema_version == 1:
@@ -219,7 +259,7 @@ class ContextCompilation(BaseModel):
             raise ValueError("source supply requires compilation v11 and the same revision")
         bundle_choices = tuple(c for c in self.choices if c.source_id.startswith("bundle:"))
         extension_ids = {f"bundle:{key}" for key in self.extension_bundle_ids}
-        if (self.schema_version == 18) != bool(extension_ids):
+        if self.schema_version < 19 and (self.schema_version == 18) != bool(extension_ids):
             raise ValueError("extension materials require compilation v18")
         if extension_ids and (
             len(extension_ids) != len(self.extension_bundle_ids)
@@ -227,6 +267,20 @@ class ContextCompilation(BaseModel):
             or not extension_ids <= {c.source_id for c in bundle_choices}
         ):
             raise ValueError("extension materials must identify unique compiled candidates")
+        if (self.schema_version == 19) != bool(self.material_selections):
+            raise ValueError("selector decisions require compilation v19")
+        if self.material_selections:
+            choices_by_id = {choice.source_id: choice for choice in bundle_choices}
+            consumers = [item.consumer for item in self.material_selections]
+            if len(consumers) != len(set(consumers)):
+                raise ValueError("duplicate material selector decision")
+            rejected_count = 0
+            for decision in self.material_selections:
+                rejected_count += decision.check_allocation(
+                    self.extension_bundle_ids, choices_by_id
+                )
+            if rejected_count + len(extension_ids) > 100:
+                raise ValueError("selector candidates exceed material capacity")
         if any(c.representation not in ("raw", "omitted") for c in bundle_choices):
             raise ValueError("context bundles require an atomic representation")
         if len(bundle_choices) > len(extension_ids) and self.supply is None:

@@ -73,7 +73,8 @@ from weavria.core import (
 from weavria.runtime import Clock, Phase, RunState, SystemClock, reduce_event, settle_mutation
 from weavria.tools import ToolExecutionError
 
-from .extensions import ExtensionDescriptor, ExtensionScope, ExtensionTrace
+from .extension_plan import ExtensionDescriptor, ExtensionPlan
+from .extensions import ExtensionRequestExplanation, ExtensionScope, ExtensionTrace
 from .history_index import (
     MODEL_VISIBLE_RUN_PREDICATE,
     HistoryCancelled,
@@ -1722,13 +1723,79 @@ class SQLiteSessionStore:
             )
             if row is None:
                 raise KeyError("unknown run in session")
-            descriptors = json.loads(row[0]).get("extensions", [])
+            config = json.loads(row[0])
+            descriptors = config.get("extensions", [])
             return ExtensionTrace(
                 ExtensionScope(session_id, run_id),
                 tuple(ExtensionDescriptor.model_validate(d) for d in descriptors),
                 row[1],
                 row[2],
                 row[3],
+                ExtensionPlan.model_validate(config["extension_plan"])
+                if "extension_plan" in config
+                else None,
+            )
+
+        return await self._submit(read)
+
+    async def explain_extension_request(
+        self, session_id: str, run_id: str, model_call: int
+    ) -> ExtensionRequestExplanation:
+        """按模型调用序号解释已提交的编译。没有对应编译事实时抛出 KeyError。"""
+        if type(model_call) is not int or model_call < 1:
+            raise ValueError("model_call must be a positive integer")
+
+        def read() -> ExtensionRequestExplanation:
+            # 按已提交的请求和会话身份关联装配与事件。只读归档也能使用,
+            # 不依赖活跃插件或当前进程中策略的实现。
+            row = (
+                self._conn()
+                .execute(
+                    "SELECT r.config,e.data FROM runs r "
+                    "JOIN request_views v ON v.run_id=r.id AND v.model_call=? "
+                    "JOIN session_events e ON e.session_id=r.session_id "
+                    "WHERE r.id=? AND r.session_id=? "
+                    "AND json_extract(e.data,'$.data.kind')='context_compiled' "
+                    "AND json_extract(e.data,'$.data.run_id')=r.id "
+                    "AND json_extract(e.data,'$.data.model_call')=v.model_call",
+                    (model_call, run_id, session_id),
+                )
+                .fetchone()
+            )
+            if row is None:
+                raise KeyError("unknown compiled request in session")
+            config = json.loads(row[0])
+            event = SessionEvent.model_validate_json(row[1]).data
+            assert isinstance(event, SessionContextCompiled)
+            report = event.compilation
+            plan = (
+                ExtensionPlan.model_validate(config["extension_plan"])
+                if "extension_plan" in config
+                else None
+            )
+            # 最早的联合编译配置还没有 max_source_bytes。归档缺少该字段时
+            # 保留未知,避免把当前默认值误记成历史请求的实际约束。
+            compiler_config = config["context_compiler"]
+            ceiling = (
+                plan.effective_source_bytes(compiler_config["max_source_bytes"])
+                if plan
+                else compiler_config.get("max_source_bytes")
+            )
+            by_id = {choice.source_id: choice for choice in report.choices}
+            return ExtensionRequestExplanation(
+                scope=ExtensionScope(session_id, run_id),
+                model_call=model_call,
+                extensions=tuple(
+                    ExtensionDescriptor.model_validate(d) for d in config.get("extensions", ())
+                ),
+                plan=plan,
+                source_byte_limit=ceiling,
+                selections=report.material_selections,
+                choices=tuple(by_id[f"bundle:{key}"] for key in report.extension_bundle_ids),
+                policy_version=report.policy_version,
+                request_sha256=report.request_sha256,
+                input_tokens=report.input_tokens,
+                input_budget_tokens=report.input_budget_tokens,
             )
 
         return await self._submit(read)
@@ -1875,11 +1942,28 @@ class SQLiteSessionStore:
                     or state.phase is not Phase.MODEL
                 ):
                     raise SessionConflictError("model request has no active session attempt")
+                config = json.loads(row[3])
+                # 比对整组绑定,包括返回零项的策略。只验证被采用条目会让漏调、
+                # 错用实现和伪造空结果都看起来像一次正常的编译。
+                expected_bindings = [
+                    (b["consumer"], b["capability"], b["provider"])
+                    for b in config.get("extension_plan", {}).get("bindings", ())
+                ]
+                actual_bindings = (
+                    [
+                        (d.consumer, d.capability, d.provider)
+                        for d in compilation.material_selections
+                    ]
+                    if compilation
+                    else []
+                )
+                if actual_bindings != expected_bindings:
+                    raise SessionConflictError("material decisions differ from run bindings")
                 if compilation and compilation.extension_bundle_ids:
                     # 从 Run 接受时冻结的顺序核对生产者,不借当前进程的插件配置背书。
                     producers = {
                         item["name"]: index
-                        for index, item in enumerate(json.loads(row[3]).get("extensions", ()))
+                        for index, item in enumerate(config.get("extensions", ()))
                         if "before_compile" in item["hooks"]
                     }
                     ranks = [

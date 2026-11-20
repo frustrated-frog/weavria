@@ -637,13 +637,13 @@ class _SessionAdapter:
             else None
         )
 
-        extension_bundles = (
+        extension_bundles, material_selections = (
             await self._extensions.collect(
                 ExtensionQuery(task.goal, task.constraints, task.revision, phase),
                 max_bytes=compiler.config.max_source_bytes,
             )
             if self._extensions is not None
-            else ()
+            else ((), ())
         )
         retrieval = None
         if self._retrieval_config is not None and not finalizing:
@@ -685,6 +685,7 @@ class _SessionAdapter:
                 retrieval=retrieval,
                 supply=supply,
                 extension_bundles=extension_bundles,
+                material_selections=material_selections,
                 recovery_ranges=recovery_ranges,
                 synthesis_range=synthesis_range,
                 next_step_reserve_bytes=(
@@ -1204,13 +1205,16 @@ class SessionEngine:
             )
             retrieval_config = self._retrieval_config
             chain = self._extensions.for_session(session_id) if self._extensions else ()
+            plan = self._extensions.plan_for_session(session_id) if self._extensions else None
             contributes_context = any("before_compile" in item.descriptor.hooks for item in chain)
             if contributes_context and self._compiler_config is None:
                 raise ValueError("context extensions require the context compiler")
             config = json.dumps(
                 {
                     "schema_version": (
-                        7
+                        8
+                        if plan
+                        else 7
                         if chain
                         else 6
                         if self._context_source is not None
@@ -1228,6 +1232,7 @@ class SessionEngine:
                         if self._compiler_config is not None
                         else 1
                     ),
+                    **({"extension_plan": plan.model_dump(mode="json")} if plan else {}),
                     **(
                         {"extensions": [item.descriptor.model_dump(mode="json") for item in chain]}
                         if chain
@@ -1353,7 +1358,7 @@ class SessionEngine:
             if cancelled:
                 raise asyncio.CancelledError
             if chain:
-                mounted = RunExtensions()
+                mounted = RunExtensions(plan)
                 async with asyncio.timeout(root_budget.remaining(self._clock.monotonic())):
                     await mounted.open(chain, ExtensionScope(session_id, run_id))
             task = (
