@@ -29,6 +29,9 @@ async def test_pending_poll_survives_process_death_and_matches_baseline(
     tmp_path: Path, completed_after: int
 ) -> None:
     path = tmp_path / "interrupted.db"
+    # 子进程在完成两次只读轮询后强制退出, 留下真实 SQLite 事件与结算边界.
+    # 重启后的恢复必须复用原 run_id 和剩余预算, 并与不中断基线产生相同结果;
+    # 它不能从头重放前两次查询, 也不能因为换了进程就重新获得调用额度.
     child = await run_crash_fixture(path)
     assert child.returncode == 73, child.stderr
 

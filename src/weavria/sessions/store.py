@@ -1226,6 +1226,9 @@ class SQLiteSessionStore:
 
         def claim() -> ResumeClaim:
             with self._transaction() as conn:
+                # 执行权在同一事务内领取: 会话必须没有活跃请求, 目标 Run 必须确实
+                # 处于 interrupted, 并且它仍是该会话最新的 Run. 任一条件变化都说明
+                # 外部世界已经向前推进, 此时拒绝恢复比覆盖新状态更安全.
                 row = conn.execute(
                     """SELECT r.status,r.input_id,r.ordinal,r.config,r.last_sequence,s.active_run
                     FROM runs r JOIN sessions s ON s.id=r.session_id
@@ -1247,6 +1250,9 @@ class SQLiteSessionStore:
                     "FROM resume_boundaries WHERE run_id=?",
                     (run_id,),
                 ).fetchone()
+                # 只有最后一个持久化事件恰好落在已结算的接受边界上才能接续.
+                # 若进程死在工具副作用与结果落库之间, 这里没有足够事实判断是否应重放,
+                # 所以不会把一个任意快照伪装成安全 Checkpoint.
                 if boundary is None or boundary[0] != row[4]:
                     raise SessionConflictError("resume_unsafe_boundary")
                 previous, current = json.loads(row[3]), json.loads(config)

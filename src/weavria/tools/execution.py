@@ -821,6 +821,9 @@ class ToolExecutor:
                             ErrorCategory.INVALID_TOOL_OUTPUT,
                             "Status poll returned an unsupported status",
                         )
+                # 工具后端可能捕获并吞掉 CancelledError, 随后仍返回一个看似成功的结果.
+                # 因此不能只相信 invoke() 的返回路径, 还要重新读取所属任务的取消计数;
+                # 一旦调用方已经取消, 晚到结果不得进入 Artifact 或 ToolRecord 发布流程.
                 if owner is not None and owner.cancelling() > cancellations:
                     raise asyncio.CancelledError
                 if attempt_expired():
@@ -845,6 +848,8 @@ class ToolExecutor:
                 snapshot = await self._store.put(self._run_id, action.call_id, value)
             if attempt_expired():
                 raise TimeoutError("tool returned after its deadline")
+            # 存储调用本身也可能跨过取消时刻. 即使底层已完成写入, Executor 也不能
+            # 把这个快照继续包装成成功 observation, 以免取消后的事实重新进入 Agent 上下文.
             if owner is not None and owner.cancelling() > cancellations:
                 raise asyncio.CancelledError
             reference = snapshot.reference
@@ -907,6 +912,8 @@ class ToolExecutor:
             category, message, cause = ErrorCategory.TIMEOUT, "Tool call timed out", exc
             retryable = True
         except Exception as exc:
+            # 后端收到取消后可能改抛普通异常. 此时调用方取消仍然优先,
+            # 不能把它降格成 TOOL_FAILURE, 否则会污染失败率并触发错误的重试策略.
             if owner is not None and owner.cancelling() > cancellations:
                 raise asyncio.CancelledError from exc
             if attempt_expired():

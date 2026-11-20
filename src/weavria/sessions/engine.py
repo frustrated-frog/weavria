@@ -1283,6 +1283,10 @@ class SessionEngine:
                     )
                 )
             else:
+                # 恢复不是把旧输入重新执行一遍, 而是让同一个 Run 从持久化边界继续推进.
+                # 中断前已完成的调用可能在重放时再次被观察, 因此这里只接受声明为
+                # replay_safe 的只读工具; 写操作或不可重放读取必须改走状态核对、补偿
+                # 或新的 Run, 不能靠恢复协议猜测外部副作用是否已经发生.
                 if any(
                     tool.behavior != "read_only" or tool.idempotency != "replay_safe"
                     for tool in (
@@ -1310,6 +1314,8 @@ class SessionEngine:
                 if restored.legacy_fork_history:
                     retrieval_config = None
                 claim = restored.turn
+                # 存储层返回的是原 Run 扣除已耗时间后的剩余预算. 重启进程不会刷新
+                # deadline、模型调用次数或工具调用次数, 否则崩溃本身会变成绕过预算的入口.
                 root_budget = RootBudget.start(self._clock.monotonic(), restored.remaining_seconds)
             if claim.duplicate is not None:
                 if cancelled:

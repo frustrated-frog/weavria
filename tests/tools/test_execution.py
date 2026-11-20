@@ -301,6 +301,8 @@ async def test_suppressed_backend_cancel_is_not_published(raise_after_cancel: bo
     started = asyncio.Event()
 
     async def suppress(arguments: Input, context: ToolContext) -> Output:
+        # 模拟不守约的工具后端: 它吞掉取消后继续返回结果, 或改抛普通异常.
+        # 两种情况下 Executor 都应保留调用方的取消语义, 不能发布 ToolRecord.
         started.set()
         try:
             await asyncio.Event().wait()
