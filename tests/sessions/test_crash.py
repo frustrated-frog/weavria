@@ -24,6 +24,7 @@ from weavria.sessions import SessionEngine, SQLiteSessionStore
 from weavria.tools import PolicyDecision, ToolRegistry, TypedTool
 from weavria.runtime import SystemClock
 point=sys.argv[2]
+extension_variant = sys.argv[3] if len(sys.argv) > 3 else None
 crash_fork=False
 class In(BaseModel):
     value: str
@@ -78,6 +79,14 @@ async def main():
                 encoding='cl100k_base'),
             'history_retrieval': HistoryRetrievalConfig() if point=='fork-resume' else None,
         }
+    if extension_variant:
+        from examples.harness_extensions import trace_extension
+        from dataclasses import replace
+        from weavria.harness import HarnessExtensions
+        trace = trace_extension([])
+        if extension_variant == 'changed':
+            trace = replace(trace, descriptor=trace.descriptor.model_copy(update={'version': '2'}))
+        config['extensions'] = HarnessExtensions((trace,))
     tool=TypedTool(name='produce',version='1',description='produce evidence',
                    input_type=In,output_type=Out,execute=produce)
     engine=SessionEngine(Path(sys.argv[1]),model=Provider(),
@@ -332,3 +341,22 @@ async def test_uninterrupted_baseline_matches_resume_call_counts(tmp_path: Path)
         timeout=10,
     )
     assert result.returncode == 0, result.stderr
+
+
+async def test_resume_requires_original_extension_assembly(tmp_path: Path) -> None:
+    path = tmp_path / "extensions.db"
+    for point, version, expected_code in (
+        ("boundary", "original", 73),
+        ("resume-different", "changed", 0),
+        ("resume", "original", 0),
+    ):
+        result = await asyncio.to_thread(
+            subprocess.run,
+            [sys.executable, "-c", CHILD, str(path), point, version],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert result.returncode == expected_code, result.stderr
+        if version == "changed":
+            assert result.stdout.strip() == "resume_configuration_changed"

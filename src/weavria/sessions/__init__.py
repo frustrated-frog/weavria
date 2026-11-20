@@ -1,6 +1,15 @@
 """Persistent single-user conversations, accepted evidence and explicit interruption."""
 
 from .engine import SessionEngine, SessionForkAccess
+from .extensions import (
+    ExtensionDescriptor,
+    ExtensionHooks,
+    ExtensionQuery,
+    ExtensionScope,
+    ExtensionTrace,
+    HarnessExtension,
+    HarnessExtensions,
+)
 from .preparation import (
     ClarificationAssociationPolicy,
     ClarificationDeliveryPlan,
@@ -26,6 +35,13 @@ __all__ = [
     "ClarificationAssociationPolicy",
     "ClarificationDeliveryPlan",
     "ExplicitClarificationOnly",
+    "ExtensionDescriptor",
+    "ExtensionHooks",
+    "ExtensionQuery",
+    "ExtensionScope",
+    "ExtensionTrace",
+    "HarnessExtension",
+    "HarnessExtensions",
     "SQLiteSessionStore",
     "SemanticTransitionReducer",
     "SessionBusyError",

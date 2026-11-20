@@ -35,6 +35,7 @@ from weavria.runtime import (
     settle_mutation,
 )
 from weavria.sessions import (
+    HarnessExtensions,
     SessionBusyError,
     SessionEngine,
     SessionForkAccess,
@@ -255,6 +256,7 @@ class AgentHarness:
         capability_index: HybridCapabilityIndex | None = None,
         task_model_projector: TaskModelProjector | None = None,
         configuration_metadata: dict[str, JsonValue] | None = None,
+        extensions: HarnessExtensions | None = None,
         memory: HarnessMemory | None = None,
         memory_model: ModelProvider | None = None,
         instructions: str = "",
@@ -394,6 +396,7 @@ class AgentHarness:
             policy=policy,
             scheduling=scheduling,
             configuration_id=config.configuration_id,
+            extensions=extensions,
             configuration_metadata=configuration_metadata,
         )
 
@@ -429,6 +432,7 @@ class AgentHarness:
         scheduling: ToolScheduling | None = None,
         configuration_id: str | None = None,
         configuration_metadata: dict[str, JsonValue] | None = None,
+        extensions: HarnessExtensions | None = None,
     ) -> None:
         if context.semantic_compaction and context_recovery is None:
             raise ValueError("semantic compaction requires context recovery")
@@ -547,6 +551,7 @@ class AgentHarness:
             task_model_projector=task_model_projector,
             policy=policy,
             scheduling=scheduling,
+            extensions=extensions,
             configuration_metadata=configuration_metadata
             if configuration_metadata is not None
             else {

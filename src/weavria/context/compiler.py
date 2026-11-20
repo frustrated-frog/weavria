@@ -7,6 +7,7 @@ from typing import Literal, Protocol, runtime_checkable
 from weavria.artifacts import ArtifactStore
 from weavria.core import (
     CONTROL_FEEDBACK_BYTES,
+    ContextBundle,
     ContextChoice,
     ContextCompaction,
     ContextCompilation,
@@ -201,6 +202,7 @@ class SessionContextCompiler:
         focus: ContextFocus | None = None,
         retrieval: HistoryRetrievalReport | None = None,
         supply: ContextSupply | None = None,
+        extension_bundles: tuple[ContextBundle, ...] = (),
         recovery_ranges: tuple[RecoveryRange, ...] = (),
         synthesis_range: RecoveryRange | None = None,
         next_step_reserve_bytes: int = 0,
@@ -225,6 +227,24 @@ class SessionContextCompiler:
             # 条件未知/冲突仍带完整族,主模型可据此澄清或寻找其他证据。
             allowed = evidence.allowed_bundle_ids()
             bundles = tuple(b for b in bundles if b.bundle_id in allowed)
+        extension_ids = tuple(b.bundle_id for b in extension_bundles)
+        if extension_ids:
+            if (
+                len(set(extension_ids)) != len(extension_ids)
+                or any(not key.startswith("extension:") for key in extension_ids)
+                or (supply and set(extension_ids).intersection(b.bundle_id for b in supply.bundles))
+            ):
+                raise ContextBuildError(
+                    "extension material identity collision or missing namespace"
+                )
+            if len(bundles) + len(extension_bundles) > 100:
+                raise ContextCapacityError(
+                    "candidate_units", len(bundles) + len(extension_bundles), 100
+                )
+            bundles += tuple(
+                ContextBundle.model_validate_json(b.model_dump_json()) for b in extension_bundles
+            )
+        has_bundle_channel = supply is not None or bool(extension_ids)
         if recovery_ranges and not base.recovery_enabled:
             raise ContextBuildError("recovery requires control request v4")
         if synthesis_range is not None and synthesis_range.value_bytes > MAX_SYNTHESIS_RANGE_BYTES:
@@ -460,7 +480,7 @@ class SessionContextCompiler:
             else 14
             if summaries is not None
             else 12
-            if supply is not None
+            if has_bundle_channel
             else 10
             if view_receipt is not None
             else 8
@@ -519,7 +539,7 @@ class SessionContextCompiler:
             else 8
             if summaries is not None
             else 6
-            if supply is not None
+            if has_bundle_channel
             else 5,
             conversation=empty,
             current=base,
@@ -621,7 +641,7 @@ class SessionContextCompiler:
                             if units[i].channel == "bundle"
                         ]
                     }
-                    if supply is not None
+                    if has_bundle_channel
                     else {}
                 ),
                 **(
@@ -877,6 +897,7 @@ class SessionContextCompiler:
                             focus=focus,
                             retrieval=retrieval,
                             supply=supply,
+                            extension_bundles=extension_bundles,
                             recovery_ranges=prospective_ranges,
                             next_step_reserve_bytes=next_step_reserve_bytes,
                             feedback_reserve_floor_bytes=feedback_reserve_floor_bytes,
@@ -976,7 +997,9 @@ class SessionContextCompiler:
             raise ContextBuildError("token counter returned an invalid byte ceiling")
         covered = coverage(units, selected)
         report_version = (
-            17
+            18
+            if extension_ids
+            else 17
             if summary_selection is not None
             else 16
             if self.config.summary_preparation
@@ -1049,6 +1072,7 @@ class SessionContextCompiler:
             ),
             retrieval=retrieval,
             supply=supply.report if supply else None,
+            extension_bundle_ids=extension_ids,
             recovery_ranges=recovery_ranges,
             delivery_manifest=delivery_manifest,
             transport_request_bytes=transport_bytes(request),

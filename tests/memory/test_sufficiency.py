@@ -421,6 +421,7 @@ async def test_timeout_and_cancel_join_provider(
 
 @pytest.mark.parametrize("padding", [0, 12000])
 @pytest.mark.parametrize("variant", ["reviewed", "joint"])
+@pytest.mark.parametrize("with_extension", [False, True])
 async def test_compilation_downgrades_evicted_evidence_and_persists_source_report(
     tmp_path: Path,
     assertion: MemoryAssertion,
@@ -428,7 +429,11 @@ async def test_compilation_downgrades_evicted_evidence_and_persists_source_repor
     session_counter: OpenAICompatibleTokenCounter,
     padding: int,
     variant: str,
+    with_extension: bool,
 ) -> None:
+    from examples.harness_extensions import document_extension
+    from weavria.harness import HarnessExtensions
+
     supply = make_supply(assertion, source, padding=padding)
     assessment = await assessor(variant).assess(supply, DEMANDS)
     assert assessment.failure is None
@@ -455,6 +460,11 @@ async def test_compilation_downgrades_evicted_evidence_and_persists_source_repor
         model=provider,
         tools=ToolRegistry(()),
         context_source=Source(),
+        extensions=HarnessExtensions(
+            (document_extension({"guide": "completion date instructions"}),)
+        )
+        if with_extension
+        else None,
         context_compiler=ContextCompilerConfig(window_tokens=16000, output_tokens=256),
         token_counter=session_counter,
         limits=RunLimits(max_request_bytes=24000),
@@ -467,7 +477,11 @@ async def test_compilation_downgrades_evicted_evidence_and_persists_source_repor
     status = "omitted" if padding else "supported"
     assert request.evidence.demands[0].needs[0].status == status
     assert request.evidence.demands[0].needs[1].status == "missing"
-    assert bool(request.bundles) == (padding == 0)
+    memory_ids = {b.bundle_id for b in request.bundles if b.bundle_id.startswith("memory:")}
+    assert bool(memory_ids) == (padding == 0)
+    assert (
+        "extension:project-docs:guide#1" in {b.bundle_id for b in request.bundles}
+    ) == with_extension
     if not padding:
         with pytest.raises(ValidationError, match="outlives"):
             SessionRequest.model_validate({**request.model_dump(), "bundles": ()})

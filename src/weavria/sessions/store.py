@@ -73,6 +73,7 @@ from weavria.core import (
 from weavria.runtime import Clock, Phase, RunState, SystemClock, reduce_event, settle_mutation
 from weavria.tools import ToolExecutionError
 
+from .extensions import ExtensionDescriptor, ExtensionScope, ExtensionTrace
 from .history_index import (
     MODEL_VISIBLE_RUN_PREDICATE,
     HistoryCancelled,
@@ -1705,6 +1706,33 @@ class SQLiteSessionStore:
             )
         )
 
+    async def extension_trace(self, session_id: str, run_id: str) -> ExtensionTrace:
+        """只读重建指定 Run 的扩展装配与已提交计数。旧 Run 的装配为空。"""
+
+        def read() -> ExtensionTrace:
+            row = (
+                self._conn()
+                .execute(
+                    "SELECT config,status,(SELECT count(*) FROM request_views WHERE run_id=r.id),"
+                    "(SELECT count(*) FROM outcomes WHERE run_id=r.id) "
+                    "FROM runs r WHERE session_id=? AND id=?",
+                    (session_id, run_id),
+                )
+                .fetchone()
+            )
+            if row is None:
+                raise KeyError("unknown run in session")
+            descriptors = json.loads(row[0]).get("extensions", [])
+            return ExtensionTrace(
+                ExtensionScope(session_id, run_id),
+                tuple(ExtensionDescriptor.model_validate(d) for d in descriptors),
+                row[1],
+                row[2],
+                row[3],
+            )
+
+        return await self._submit(read)
+
     async def rebuild(self, session_id: str) -> None:
         """Rebuild reports and conversation indexes from accepted execution events."""
 
@@ -1763,7 +1791,7 @@ class SQLiteSessionStore:
 
         if (
             compilation is not None
-            and compilation.supply is not None
+            and (compilation.supply is not None or compilation.extension_bundle_ids)
             and request.schema_version < 6
         ):
             raise SessionConflictError("source supply requires a bundle-capable request")
@@ -1817,7 +1845,9 @@ class SQLiteSessionStore:
         ):
             # 供给报告描述召回全集,choices 描述本次实际选择。落库前逐组复核
             # 身份与完整内容摘要,避免模型收到未记录或被二次截断的记忆正文。
-            if compilation is None or compilation.supply is None:
+            if compilation is None or (
+                compilation.supply is None and not compilation.extension_bundle_ids
+            ):
                 raise SessionConflictError("bundle request requires its source supply report")
             choices = {
                 c.source_id: c
@@ -1835,7 +1865,7 @@ class SQLiteSessionStore:
             with self._transaction() as conn:
                 state = self._state(run_id)
                 row = conn.execute(
-                    "SELECT session_id,status,ordinal FROM runs WHERE id=?", (run_id,)
+                    "SELECT session_id,status,ordinal,config FROM runs WHERE id=?", (run_id,)
                 ).fetchone()
                 if (
                     row is None
@@ -1845,6 +1875,19 @@ class SQLiteSessionStore:
                     or state.phase is not Phase.MODEL
                 ):
                     raise SessionConflictError("model request has no active session attempt")
+                if compilation and compilation.extension_bundle_ids:
+                    # 从 Run 接受时冻结的顺序核对生产者,不借当前进程的插件配置背书。
+                    producers = {
+                        item["name"]: index
+                        for index, item in enumerate(json.loads(row[3]).get("extensions", ()))
+                        if "before_compile" in item["hooks"]
+                    }
+                    ranks = [
+                        producers.get(key.split(":", 2)[1], -1)
+                        for key in compilation.extension_bundle_ids
+                    ]
+                    if -1 in ranks or ranks != sorted(ranks):
+                        raise SessionConflictError("extension materials differ from run assembly")
                 selection = compilation.summary_selection if compilation else None
                 if request.summaries or request.summary_advice or selection:
                     accepted = {

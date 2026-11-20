@@ -35,7 +35,7 @@ class ContextCompilation(BaseModel):
     """Bind allocation diagnostics to the exact complete request sent to a provider."""
 
     model_config = ContractModel.model_config
-    schema_version: Literal[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17] = 1
+    schema_version: Literal[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18] = 1
 
     policy_version: NonBlankString
     counter_version: NonBlankString
@@ -60,6 +60,9 @@ class ContextCompilation(BaseModel):
     choices: tuple[ContextChoice, ...]
     uncovered_demand_ids: tuple[str, ...] = ()
     supply: ContextSupplyReport | None = None
+    # 这些独立材料与记忆共享预算,但不参与记忆充分性判断。保存所有候选的身份,
+    # 包括最终被裁掉的条目。choices 保存各自内容摘要与交付结果。
+    extension_bundle_ids: tuple[NonBlankString, ...] = Field(default=(), max_length=100)
     retrieval: HistoryRetrievalReport | None = None
     recovery_ranges: tuple[RecoveryRange, ...] = Field(default=(), max_length=8)
     delivery_manifest: EvidenceDeliveryManifest | None = None
@@ -79,6 +82,8 @@ class ContextCompilation(BaseModel):
     @model_serializer(mode="wrap")
     def preserve_v1_wire(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
         data = handler(self)
+        if self.schema_version < 18:
+            data.pop("extension_bundle_ids", None)
         if self.schema_version == 1:
             data.pop("allocation_steps", None)
             data.pop("allocation_exhausted", None)
@@ -153,9 +158,11 @@ class ContextCompilation(BaseModel):
             (self.compaction_status is not None) != (self.schema_version == 13)
         ):
             raise ValueError("compaction diagnostics require compilation v13")
-        if (self.summaries is not None) != (self.schema_version >= 14):
+        if self.schema_version < 18 and (self.summaries is not None) != (self.schema_version >= 14):
             raise ValueError("semantic summary diagnostics require compilation v14")
-        if (self.summary_selection is not None) != (self.schema_version >= 17):
+        if self.schema_version < 18 and (self.summary_selection is not None) != (
+            self.schema_version >= 17
+        ):
             raise ValueError("summary token selection requires compilation v17")
         if self.summary_selection is not None:
             allowed = {
@@ -211,11 +218,27 @@ class ContextCompilation(BaseModel):
         ):
             raise ValueError("source supply requires compilation v11 and the same revision")
         bundle_choices = tuple(c for c in self.choices if c.source_id.startswith("bundle:"))
-        if bundle_choices and self.supply is None:
+        extension_ids = {f"bundle:{key}" for key in self.extension_bundle_ids}
+        if (self.schema_version == 18) != bool(extension_ids):
+            raise ValueError("extension materials require compilation v18")
+        if extension_ids and (
+            len(extension_ids) != len(self.extension_bundle_ids)
+            or not all(key.startswith("extension:") for key in self.extension_bundle_ids)
+            or not extension_ids <= {c.source_id for c in bundle_choices}
+        ):
+            raise ValueError("extension materials must identify unique compiled candidates")
+        if any(c.representation not in ("raw", "omitted") for c in bundle_choices):
+            raise ValueError("context bundles require an atomic representation")
+        if len(bundle_choices) > len(extension_ids) and self.supply is None:
             raise ValueError("bundle choices require a source supply report")
-        if self.supply is not None and (
-            len(bundle_choices) != self.supply.supplied_groups
-            or any(c.representation not in ("raw", "omitted") for c in bundle_choices)
+        if extension_ids and self.supply is not None and self.supply.evidence is not None:
+            # 只有通过记忆审查的组可以参与分配。扩展材料不得占用审查通过的身份。
+            allowed = {f"bundle:{key}" for key in self.supply.evidence.allowed_bundle_ids()}
+            if {c.source_id for c in bundle_choices} - extension_ids != allowed:
+                raise ValueError("memory candidates differ from their evidence assessment")
+        elif (
+            self.supply is not None
+            and len(bundle_choices) - len(extension_ids) != self.supply.supplied_groups
         ):
             raise ValueError("supplied bundles must be accounted for without lossy representations")
         choices = {c.source_id: c for c in self.choices}
