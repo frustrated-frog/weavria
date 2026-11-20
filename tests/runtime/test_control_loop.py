@@ -3,6 +3,7 @@
 import asyncio
 import hashlib
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Literal, cast
 
@@ -74,6 +75,7 @@ from weavria.core import (
     ToolRecord,
     ToolStarted,
     ToolSucceededObservation,
+    TurnDecided,
     TurnFeedback,
     TurnResolution,
     VerificationStarted,
@@ -3295,3 +3297,77 @@ async def test_narrowed_admission_enforces_the_declaration_at_dispatch_and_repla
         state = reduce_event(state, event)
     else:
         pytest.fail("expected a narrower single-read admission")
+
+
+async def test_model_can_copy_singleton_offer_and_reducer_restores_original_arguments(
+    session_counter: SessionTokenCounter,
+) -> None:
+    saved: list[str] = []
+
+    async def save(args: Input, context: ToolContext) -> Output:
+        saved.append(args.value)
+        return Output(value="accepted")
+
+    tool = TypedTool(
+        name="draft",
+        version="1",
+        description="Save a draft",
+        input_type=Input,
+        output_type=Output,
+        execute=save,
+        artifact_read_resolver_version="draft/1",
+        artifact_read_resolver=lambda args: (),
+    )
+    tools = ToolRegistry((echo_tool(), tool))
+    note = call("prior", "private contents " * 90, name="draft")
+    mixed = batch(call("sibling", "x" * 1200), note)
+    task = TaskInput(goal="record a finding")
+    template = AgentLoop.request_template_for(task, "inspect", tools)
+    limit = (
+        reserve_feedback(
+            instructions=template.instructions,
+            task=task,
+            records=(),
+            batch=ToolBatch(calls=(note,)),
+            bounds=FeedbackBounds(),
+            budget_bytes=20000,
+        ).required_bytes
+        + 150
+    )
+
+    class Model(FakeControlProvider):
+        async def generate_turn(self, request: ControlRequest) -> ModelTurn:
+            if request.control is not None:
+                assert isinstance(request.control, AdmissionNotice)
+                choice = request.control.return_to_retry_alone
+                assert choice is not None and choice.reuse_arguments_from_call_id == "prior"
+                assert "private contents" not in request.control.model_dump_json()
+                assert "copy return_to_retry_alone" in request.instructions
+                return choice
+            return finish() if request.history else mixed
+
+    store = InMemoryArtifactStore()
+    agent = AgentLoop(
+        run_id="carry",
+        tools=tools,
+        model=Model(()),
+        task=task,
+        instructions="inspect",
+        artifacts=store,
+        limits=RunLimits(max_request_bytes=16000),
+        context_builder=_CompilerControlBuilder(store, session_counter, feedback_limit=limit),
+    )
+    assert (await agent.execute()).status is RunStatus.COMPLETED
+    assert saved == [note.arguments["value"]] and agent.state.tool_calls == 1
+    replay(agent)
+    state = None
+    for event in agent.events:
+        if isinstance(event.data, TurnDecided) and event.data.turn.reuse_arguments_from_call_id:
+            assert state is not None
+            wrong = event.data.turn.model_copy(update={"reuse_arguments_from_call_id": "sibling"})
+            with pytest.raises(EventAcceptanceError, match="active offer"):
+                reduce_event(state, event.model_copy(update={"data": TurnDecided(turn=wrong)}))
+            # 控制通知一旦被替换或任务修订,残留的旧 ID 不再指向可执行选择。
+            with pytest.raises(EventAcceptanceError, match="active offer"):
+                replace(state, control_json=None).resolve_offered_turn(event.data.turn)
+        state = reduce_event(state, event)

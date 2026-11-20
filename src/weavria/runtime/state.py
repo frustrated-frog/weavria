@@ -13,6 +13,7 @@ from weavria.core import (
     ActionInterventionChecked,
     ActionValueProfile,
     ActionValueScope,
+    AdmissionNotice,
     AgentAction,
     AgentResult,
     BatchAdmitted,
@@ -123,6 +124,7 @@ class RunState:
     feedback_call_ids: tuple[str, ...] = ()
     feedback_json: str | None = None
     control_json: str | None = None
+    offered_call_json: str | None = None
     admission_json: str | None = None
     verification_version: str | None = None
     assessment_json: str | None = None
@@ -195,6 +197,23 @@ class RunState:
             if self.control_json
             else None
         )
+
+    def resolve_offered_turn(self, turn: ModelTurn) -> ModelTurn:
+        """只解开当前控制通知绑定的提案。恢复、回放与实际派发共用这一步。"""
+        if turn.reuse_arguments_from_call_id is None:
+            return turn
+        notice = self.control
+        if not (
+            self.offered_call_json
+            and isinstance(notice, AdmissionNotice)
+            and notice.offers_turn(turn)
+            and isinstance(turn.decision, ToolBatch)
+            and self.finalization is None
+        ):
+            raise EventAcceptanceError("argument reuse does not match the active offer")
+        original = ToolCallAction.model_validate_json(self.offered_call_json)
+        call = original.model_copy(update={"call_id": turn.decision.calls[0].call_id})
+        return ModelTurn(decision=ToolBatch(calls=(call,)))
 
     @property
     def assessment(self) -> CompletionAssessment | None:
@@ -299,6 +318,7 @@ def reduce_event(state: RunState | None, event: JournalEvent) -> RunState:
         next_state = replace(
             next_state,
             control_json=None,
+            offered_call_json=None,
             finalization_json=None,
             progress_assessment_json=None,
             pending_progress_sequence=None,
@@ -549,12 +569,14 @@ def _reduce_turn(
             state.phase is Phase.MODEL and state.model_revision == state.task.revision,
             "turn is out of phase or belongs to an obsolete task",
         )
-        decision = data.turn.decision
+        turn = state.resolve_offered_turn(data.turn)
+        decision = turn.decision
         keep = state.recovery_limits is not None and state.recovery_limits.retention == "chain"
         next_state = replace(
             next_state,
             recovery_ranges_json=state.recovery_ranges_json if keep else (),
             model_output_failures=0,
+            offered_call_json=None,
         )
         if isinstance(decision, RecoverContext):
             _require(
@@ -564,7 +586,7 @@ def _reduce_turn(
             return replace(
                 next_state,
                 phase=Phase.RECOVERY,
-                turn_json=data.turn.model_dump_json(),
+                turn_json=turn.model_dump_json(),
                 recovery_rounds=state.recovery_rounds + 1,
                 control_json=None,
             )
@@ -590,7 +612,7 @@ def _reduce_turn(
         return replace(
             next_state,
             phase=Phase.ACTION,
-            turn_json=data.turn.model_dump_json(),
+            turn_json=turn.model_dump_json(),
             active_call_ids=(),
             settled_call_ids=(),
             skipped_call_ids=(),
@@ -1251,6 +1273,20 @@ def _reduce_control(
                     ),
                     "replan prior does not match an accepted tool outcome",
                 )
+        offered_call = None
+        if notice.return_to_retry_alone is not None:
+            choice = notice.return_to_retry_alone
+            assert isinstance(choice.decision, ToolBatch)
+            offered_call = next(
+                (
+                    c
+                    for c in turn.decision.calls
+                    if c.call_id == choice.reuse_arguments_from_call_id
+                    and c.tool_name == choice.decision.calls[0].tool_name
+                ),
+                None,
+            )
+            _require(offered_call is not None, "argument offer must bind a rejected call")
         if notice.retry_read is not None:
             _require(
                 notice.retry_read in turn.decision.calls,
@@ -1281,6 +1317,7 @@ def _reduce_control(
             phase=Phase.READY,
             turn_json=None,
             control_json=notice.model_dump_json(),
+            offered_call_json=offered_call.model_dump_json() if offered_call else None,
             pending_progress_sequence=None,
             intervention_json=None,
         )

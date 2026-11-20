@@ -39,7 +39,15 @@ from .outcomes import AgentResult
 from .progress import ProgressAssessment
 from .recovery import RecoveryNotice, RecoveryResolved
 from .task_view import TaskModelView
-from .turns import CallSkipped, TurnDecided, TurnFeedback, TurnSettled, validate_turn_feedback
+from .turns import (
+    CallSkipped,
+    ModelTurn,
+    ToolBatch,
+    TurnDecided,
+    TurnFeedback,
+    TurnSettled,
+    validate_turn_feedback,
+)
 
 CONTROL_FEEDBACK_BYTES = 1024
 COMPLETION_GUIDANCE_JSON_BYTES = 258
@@ -138,7 +146,7 @@ class AdmissionNotice(BaseModel):
     def version_type(cls, value: object) -> object:
         return ContractModel.validate_version_type(value)
 
-    schema_version: Literal[1, 2, 3, 4, 5, 6, 7] = 1
+    schema_version: Literal[1, 2, 3, 4, 5, 6, 7, 8] = 1
     # 建议只针对原提案中指定的一次调用单独重提,0 表示最低页也无法容纳。
     page_call_index: int | None = Field(default=None, ge=0, le=31)
     page_parameter: str | None = Field(default=None, min_length=1, max_length=64)
@@ -151,16 +159,20 @@ class AdmissionNotice(BaseModel):
     capability_epoch_changed: bool | None = None
     replan: ToolReplan | None = None
     retry_read: ToolCallAction | None = None
+    # 完整可复制的模型选择。原参数仍在被拒的事件中,控制通道只携带引用。
+    return_to_retry_alone: ModelTurn | None = None
 
     @model_serializer(mode="wrap")
     def preserve_legacy_wire(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
         data = handler(self)
+        if self.schema_version != 8:
+            data.pop("return_to_retry_alone", None)
         if self.schema_version != 7:
             data.pop("retry_read", None)
         if self.schema_version in {1, 5, 6, 7}:
             for key in ("page_call_index", "page_parameter", "page_maximum"):
                 data.pop(key, None)
-        if self.schema_version != 3:
+        if self.schema_version not in {3, 8}:
             data.pop("artifact_page_retry", None)
         if self.schema_version not in {4, 5}:
             data.pop("unavailable_calls", None)
@@ -184,8 +196,29 @@ class AdmissionNotice(BaseModel):
     action_family_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
     prior_family_attempts: int | None = Field(default=None, ge=0)
 
+    def offers_turn(self, turn: ModelTurn) -> bool:
+        """模型可自行分配新的调用 ID,所选工具和旧参数身份必须与当前通知一致。"""
+        offered = self.return_to_retry_alone
+        return (
+            offered is not None
+            and isinstance(offered.decision, ToolBatch)
+            and isinstance(turn.decision, ToolBatch)
+            and turn.reuse_arguments_from_call_id == offered.reuse_arguments_from_call_id
+            and turn.decision.calls[0].tool_name == offered.decision.calls[0].tool_name
+        )
+
     @model_validator(mode="after")
     def bound_notice(self) -> Self:
+        if (self.schema_version == 8) != (self.return_to_retry_alone is not None):
+            raise ValueError("a referenced singleton requires notice v8")
+        if self.return_to_retry_alone is not None and not (
+            self.reason == "feedback_budget"
+            and self.proposed_calls >= 2
+            and self.recommended_max_calls == 1
+            and self.remaining_tool_calls > 0
+            and self.return_to_retry_alone.schema_version == 3
+        ):
+            raise ValueError("referenced singleton must bind one feasible mixed-batch alternative")
         if self.schema_version == 7:
             if self.reason != "feedback_budget" or self.recommended_max_calls != int(
                 self.retry_read is not None
@@ -228,16 +261,20 @@ class AdmissionNotice(BaseModel):
         advice = (self.page_call_index, self.page_parameter, self.page_maximum)
         if any(x is not None for x in advice):
             if (
-                self.schema_version not in {2, 3}
+                self.schema_version not in {2, 3, 8}
                 or self.reason != "feedback_budget"
                 or any(x is None for x in advice)
             ):
                 raise ValueError("page advice requires a complete feedback-budget notice")
             if self.page_call_index is not None and self.page_call_index >= self.proposed_calls:
                 raise ValueError("page advice must reference a proposed call")
-        if (self.schema_version == 3) != (self.artifact_page_retry is not None) or (
-            self.artifact_page_retry is not None
-            and (self.page_parameter != "length" or not self.page_maximum)
+        if (
+            (self.schema_version == 3 and self.artifact_page_retry is None)
+            or (self.schema_version not in {3, 8} and self.artifact_page_retry is not None)
+            or (
+                self.artifact_page_retry is not None
+                and (self.page_parameter != "length" or not self.page_maximum)
+            )
         ):
             raise ValueError("an artifact retry cursor requires feasible v3 length advice")
         progress = self.reason == "no_progress"
@@ -754,7 +791,7 @@ class ControlEvent(BaseModel):
                     self.data.schema_version not in (1, 3) or self.data.recovery_sha256 is not None
                 )
             )
-            or (isinstance(self.data, TurnDecided) and self.data.turn.schema_version != 1)
+            or (isinstance(self.data, TurnDecided) and self.data.turn.schema_version == 2)
         ):
             raise ValueError("recovery facts require ControlEvent v4")
         if (

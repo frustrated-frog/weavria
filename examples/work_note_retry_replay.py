@@ -9,7 +9,7 @@ import tempfile
 from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import TypeAdapter
 
@@ -58,7 +58,15 @@ from weavria.harness import (
 )
 from weavria.harness.work import WorkDraft, WorkReference, work_tool
 from weavria.memory import MemoryAccess, MemoryScope, SQLiteMemoryStore
-from weavria.models import FakeModelProvider, FakeSessionProvider, OpenAICompatibleTokenCounter
+from weavria.models import (
+    FakeModelProvider,
+    FakeSessionProvider,
+    ModelCallError,
+    OpenAICompatibleConfig,
+    OpenAICompatibleSessionProvider,
+    OpenAICompatibleTokenCounter,
+    call_session_model,
+)
 from weavria.sessions import SessionEngine, SessionTaskContext, SessionTaskPreparation
 from weavria.tools import ArtifactReadOutput
 
@@ -167,6 +175,28 @@ class ReplayFinished(asyncio.CancelledError):
     """在分支第一次调用完成或被拒后终止离线试验。"""
 
 
+class CopyOfferTransport:
+    """本地回送适配器实际编码的选项。也可原样回送归档中的漏字段决策。"""
+
+    def __init__(self, response: ModelTurn | None = None) -> None:
+        self.response = response
+
+    async def complete(self, body: dict[str, Any]) -> object:
+        user = json.loads(body["messages"][1]["content"])
+        offered = user["current"]["control"]["return_to_retry_alone"]
+        if offered["decision"]["kind"] != "retry_offered_call" or "calls" in offered["decision"]:
+            raise ValueError("wire offer can be confused with an empty tool invocation")
+        text = json.dumps(offered) if self.response is None else self.response.model_dump_json()
+        return {"choices": [{"finish_reason": "stop", "message": {"content": text}}]}
+
+
+async def copy_or_replay(request: SessionRequest, response: ModelTurn | None = None) -> ModelTurn:
+    provider = OpenAICompatibleSessionProvider(
+        OpenAICompatibleConfig(model="offline"), transport=CopyOfferTransport(response)
+    )
+    return await call_session_model(provider, request)
+
+
 class Choice(FakeSessionProvider):
     """每步比对完整请求摘要,只在指定的下一次决策替换一个调用。"""
 
@@ -176,6 +206,7 @@ class Choice(FakeSessionProvider):
         self.calls = 0
         self.chosen: ToolCallAction | None = None
         self.following: SessionRequest | None = None
+        self.fork_digest: str | None = None
 
     async def generate_session(self, request: SessionRequest) -> ModelTurn:
         self.calls += 1
@@ -185,21 +216,65 @@ class Choice(FakeSessionProvider):
             self.following = request
             raise ReplayFinished
         digest = hashlib.sha256(request.model_dump_json().encode()).hexdigest()
-        if digest != scene.requests[self.calls]:
-            raise ValueError(f"archived request differs at call {self.calls}: {digest}")
         turn = scene.turns[self.calls]
-        if self.calls != scene.fork:
+        fork = self.calls == scene.fork
+        notice = request.current.control
+        archived = request
+        if fork:
+            self.fork_digest = digest
+        if fork and self.arm != "control":
+            if (
+                not isinstance(notice, AdmissionNotice)
+                or notice.return_to_retry_alone is None
+                or scene.notice is None
+            ):
+                raise ValueError("new notice did not offer a single proposal")
+            # 仅新控制字段允许变化。分别检查原来的预算和分页通知、以及替回旧通知后的
+            # 整份模型请求摘要。其它历史、权限、任务和剩余预算必须与现场逐字相同。
+            restored = notice.model_copy(
+                update={
+                    "schema_version": scene.notice.schema_version,
+                    "return_to_retry_alone": None,
+                }
+            )
+            if restored != scene.notice:
+                raise ValueError("original admission advice changed")
+            old_hint = (
+                "feedback_budget: retry advised page alone with its cursor and page_maximum. "
+                "Obey recommended_max_calls. If page_maximum=0 change source. "
+                "Correct completion gaps."
+            )
+            new_hint = (
+                "feedback_budget: copy return_to_retry_alone to submit the original proposal, or "
+                "read one advised page using its cursor and page_maximum. Correct completion gaps."
+            )
+            if request.current.instructions.count(new_hint) != 1:
+                raise ValueError("missing model-visible choice between the two alternatives")
+            archived = request.model_copy(
+                update={
+                    "current": request.current.model_copy(
+                        update={
+                            "control": scene.notice,
+                            "instructions": request.current.instructions.replace(
+                                new_hint, old_hint
+                            ),
+                        }
+                    )
+                }
+            )
+        if (
+            hashlib.sha256(archived.model_dump_json().encode()).hexdigest()
+            != scene.requests[self.calls]
+        ):
+            raise ValueError(f"archived request differs at call {self.calls}: {digest}")
+        if not fork:
             return turn
-        observed = turn.decision
-        assert isinstance(observed, ToolBatch)
-        # 复用当轮模型端生成的调用 ID,只改变选择,保留原笔记的全部参数与字节开销。
-        call_id = observed.calls[0].call_id
         if self.arm == "control":
             self.chosen = scene.proposal
             return turn
-        notice = request.current.control
-        if not isinstance(notice, AdmissionNotice) or notice != scene.notice:
-            raise ValueError("reproduced advice differs")
+        assert isinstance(notice, AdmissionNotice) and notice.return_to_retry_alone is not None
+        # 与真实适配器一样为新请求分配新的调用 ID。笔记分支只使用模型实际收到的选项。
+        call_id = f"wvr-{digest}-0"
         if self.arm == "page":
             cursor = notice.artifact_page_retry
             if cursor is None or not notice.page_maximum:
@@ -213,7 +288,8 @@ class Choice(FakeSessionProvider):
                 },
             )
         else:
-            call = scene.proposal.model_copy(update={"call_id": call_id})
+            self.chosen = scene.proposal.model_copy(update={"call_id": call_id})
+            return await copy_or_replay(request)
         self.chosen = call
         return ModelTurn(decision=ToolBatch(calls=(call,)))
 
@@ -288,7 +364,11 @@ async def audit(
     ):
         entries.extend(event_page)
     result: dict[str, object] = dict(
-        trial=trial, arm=arm, model_call=scene.fork, request=scene.requests[scene.fork]
+        trial=trial,
+        arm=arm,
+        model_call=scene.fork,
+        archived_request=scene.requests[scene.fork],
+        request=model.fork_digest,
     )
     fork_seq = next(
         e.sequence
@@ -348,21 +428,15 @@ async def audit(
         ],
     )
     if isinstance(choice, BatchRejected):
-        result.update(
-            rejected=choice.notice.reason,
-            required=choice.notice.required_bytes,
-            limit=choice.notice.budget_bytes,
-        )
-        if any(isinstance(e, ToolRecorded) for e in decisions) or work.notes:
-            raise ValueError("rejected proposal changed state")
-        return result
+        raise ValueError(f"{trial}/{arm}: offered action rejected: {choice.notice.reason}")
     record = next(e.record for e in decisions if isinstance(e, ToolRecorded))
     if record.exchange.action != model.chosen:
         raise ValueError("recorded action differs")
     result.update(required=choice.reserved_bytes, limit=choice.budget_bytes)
     if isinstance(record.exchange.observation, ToolFailedObservation):
-        result["error"] = record.exchange.observation.error.category.value
-        return result
+        raise ValueError(
+            f"{trial}/{arm}: tool failed: {record.exchange.observation.error.category}"
+        )
     assert record.artifact is not None
 
     if arm == "page":
@@ -395,6 +469,10 @@ async def audit(
             raise ValueError("original page did not reach the following request")
         result["delivered_page"] = [page.start, page.end]
     else:
+        if arm == "note" and (
+            work.last_notice != "accepted" or work.revision != 1 or not model.following
+        ):
+            raise ValueError("offered note did not commit and reach the next decision")
         result["notice"] = work.last_notice
         if work.last_notice == "accepted" and not any(
             saved.kind == "result"
@@ -436,7 +514,125 @@ async def main(batch: Path) -> None:
                 print(json.dumps(result, ensure_ascii=False), flush=True)
 
 
+async def audit_trial(batch: Path, trial: str) -> dict[str, object]:
+    """把实际模型请求、原始决策和 SQLite 工作状态按模型调用序号联结。"""
+    report = json.loads((batch / f"{trial}.json").read_text())
+    path = batch / trial / "session.db"
+    with closing(sqlite3.connect(path.resolve(strict=True).as_uri() + "?mode=ro", uri=True)) as db:
+        requests = {
+            n: SessionRequest.model_validate_json(raw)
+            for n, raw in db.execute(
+                "SELECT v.model_call,v.data FROM request_views v JOIN runs r ON v.run_id=r.id "
+                "WHERE r.session_id='work'"
+            )
+        }
+        events = [
+            SessionEvent.model_validate_json(raw).data
+            for (raw,) in db.execute(
+                "SELECT data FROM session_events WHERE session_id='work' ORDER BY sequence"
+            )
+        ]
+    calls: dict[str, ToolCallAction] = {}
+    choices: dict[int, str] = {}
+    writes: list[int] = []
+    decisions: dict[int, ModelTurn] = {}
+    result_notes = 0
+    model_call = revision = 0
+    for e in events:
+        if isinstance(e, SessionContextCompiled):
+            model_call = e.model_call
+            control = requests[model_call].current.control
+            if isinstance(control, AdmissionNotice) and control.return_to_retry_alone is not None:
+                choices[model_call] = "no_decision"
+        elif isinstance(e, SessionRunEvent) and isinstance(e.event.data, TurnDecided):
+            turn = e.event.data.turn
+            decisions[model_call] = turn
+            if model_call in choices:
+                notice = requests[model_call].current.control
+                assert isinstance(notice, AdmissionNotice) and notice.return_to_retry_alone
+                ref = notice.return_to_retry_alone.reuse_arguments_from_call_id
+                assert ref is not None
+                proposed = calls[ref]
+                choice = "other"
+                if notice.offers_turn(turn):
+                    choice = "reuse"
+                elif isinstance(turn.decision, ToolBatch) and len(turn.decision.calls) == 1:
+                    (selected,) = turn.decision.calls
+                    if selected.tool_name == proposed.tool_name:
+                        choice = (
+                            "same_arguments"
+                            if selected.arguments == proposed.arguments
+                            else "changed_arguments"
+                            if selected.arguments
+                            else "empty_arguments"
+                        )
+                    elif (cursor := notice.artifact_page_retry) is not None:
+                        args = selected.arguments
+                        length = args.get("length")
+                        if (
+                            selected.tool_name == "read_artifact"
+                            and args.get("artifact_id") == cursor.artifact_id
+                            and args.get("start", 0) == cursor.start
+                            and args.get("pointer", "") == cursor.pointer
+                            and type(length) is int
+                            and 0 < length <= (notice.page_maximum or 0)
+                        ):
+                            choice = "page"
+                choices[model_call] = choice
+            if isinstance(turn.decision, ToolBatch):
+                calls.update((call.call_id, call) for call in turn.decision.calls)
+        elif isinstance(e, SessionSemanticCommitted) and e.snapshot.working_state is not None:
+            state = WorkingState.model_validate_json(json.dumps(e.snapshot.working_state))
+            if state.revision > revision and state.last_notice == "accepted":
+                writes.append(model_call)
+            revision = state.revision
+            result_notes = sum(n.kind == "result" and bool(n.sources) for n in state.notes)
+    guarded: list[int] = []
+    for n, choice in choices.items():
+        if choice != "empty_arguments":
+            continue
+        # 回放当时已被接受的空提案。按当前协议它必须先得到模型修复反馈;
+        # 同一实际输入中的显式选择仍能由正式适配器解码成原提案的唯一引用。
+        archived = decisions[n]
+        try:
+            await copy_or_replay(requests[n], archived)
+        except ModelCallError as exc:
+            if exc.output_diagnostic is None or exc.output_diagnostic.code != "schema_mismatch":
+                raise
+        else:
+            raise ValueError("bare empty call still accepted")
+        notice = requests[n].current.control
+        assert isinstance(notice, AdmissionNotice)
+        if not notice.offers_turn(await copy_or_replay(requests[n])):
+            raise ValueError("wire choice did not bind the original proposal")
+        guarded.append(n)
+    return {
+        "trial": trial,
+        "passed": report["passed"],
+        "grades": report.get("grades"),
+        "offers": choices,
+        "empty_calls_rejected_in_replay": guarded,
+        "committed_at": writes,
+        "sourced_result_notes": result_notes,
+        "terminations": [item["reason"] for item in report.get("terminations", [])],
+    }
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--batch", type=Path, default=BATCH)
-    asyncio.run(main(parser.parse_args().batch))
+    parser.add_argument("--audit-run", type=Path, help="核对六次定向运行实际收到的选择及工作写入")
+    args = parser.parse_args()
+    if args.audit_run is None:
+        asyncio.run(main(args.batch))
+    else:
+        for arm in ("coverage", "recent"):
+            for repeat in (1, 2, 3):
+                print(
+                    json.dumps(
+                        asyncio.run(
+                            audit_trial(args.audit_run, f"repository_long_context-{arm}-{repeat}")
+                        ),
+                        ensure_ascii=False,
+                    )
+                )

@@ -3,7 +3,14 @@
 from datetime import datetime
 from typing import Annotated, Literal, Self
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    SerializerFunctionWrapHandler,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 from ._schema import ContractModel, NonBlankString
 from .actions import FinishAction, ToolCallAction
@@ -48,8 +55,17 @@ class ModelTurn(BaseModel):
     """One model decision: a nonempty batch or completion, never both."""
 
     model_config = ContractModel.model_config
-    schema_version: Literal[1, 2] = 1
+    schema_version: Literal[1, 2, 3] = 1
     decision: Annotated[ToolBatch | FinishAction | RecoverContext, Field(discriminator="kind")]
+
+    reuse_arguments_from_call_id: NonBlankString | None = None
+
+    @model_serializer(mode="wrap")
+    def preserve_legacy_wire(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        data = handler(self)
+        if self.schema_version != 3:
+            data.pop("reuse_arguments_from_call_id", None)
+        return data
 
     @field_validator("schema_version", mode="before")
     @classmethod
@@ -58,6 +74,15 @@ class ModelTurn(BaseModel):
 
     @model_validator(mode="after")
     def validate_recovery(self) -> Self:
+        if (self.schema_version == 3) != (self.reuse_arguments_from_call_id is not None):
+            raise ValueError("argument reuse requires ModelTurn v3")
+        if self.schema_version == 3 and not (
+            isinstance(self.decision, ToolBatch)
+            and len(self.decision.calls) == 1
+            and not self.decision.calls[0].arguments
+            and self.decision.calls[0].call_id != self.reuse_arguments_from_call_id
+        ):
+            raise ValueError("argument reuse requires one fresh call with empty arguments")
         if isinstance(self.decision, RecoverContext) and self.schema_version != 2:
             raise ValueError("context recovery requires ModelTurn v2")
         return self

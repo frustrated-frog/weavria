@@ -6,7 +6,7 @@ import json
 import math
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Literal, Protocol
+from typing import Literal, Protocol, runtime_checkable
 
 from pydantic import (
     BaseModel,
@@ -61,7 +61,7 @@ class ToolDescriptor(BaseModel):
         validate_default=True,
         revalidate_instances="always",
     )
-    schema_version: Literal[2, 3, 4, 5, 6, 7, 8, 9] = 2
+    schema_version: Literal[2, 3, 4, 5, 6, 7, 8, 9, 10] = 2
     name: str = Field(min_length=1, pattern=r"^[a-zA-Z][a-zA-Z0-9_]*$")
     version: str = Field(min_length=1)
     description: str = Field(min_length=1)
@@ -89,6 +89,9 @@ class ToolDescriptor(BaseModel):
     # None 保留整个决策视图。这份声明只供宿主预算和派发使用。
     artifact_read_inputs: tuple[str, ...] | None = Field(default=None, max_length=8)
 
+    # 嵌套结构由工具用已校验参数解析,无须让 Runtime 理解笔记或 JSON Schema。
+    artifact_read_resolver_version: str | None = Field(default=None, min_length=1, max_length=64)
+
     @field_validator("schema_version", "max_attempts", mode="before")
     @classmethod
     def validate_literal_integer(cls, value: object) -> object:
@@ -99,7 +102,9 @@ class ToolDescriptor(BaseModel):
     @model_serializer(mode="wrap")
     def preserve_legacy_wire(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
         data = handler(self)
-        if self.schema_version < 9:
+        if self.schema_version != 10:
+            data.pop("artifact_read_resolver_version", None)
+        if self.schema_version != 9:
             data.pop("artifact_read_inputs", None)
         if self.schema_version < 7:
             data.pop("poll_interval_seconds", None)
@@ -117,6 +122,14 @@ class ToolDescriptor(BaseModel):
     def validate_feedback_delivery_version(self) -> "ToolDescriptor":
         if (self.schema_version == 9) != (self.artifact_read_inputs is not None):
             raise ValueError("declared read inputs require descriptor v9")
+        if (self.schema_version == 10) != (self.artifact_read_resolver_version is not None):
+            raise ValueError("an argument-bound read resolver requires descriptor v10")
+        if self.schema_version == 10 and (
+            self.behavior != "read_only"
+            or self.idempotency != "replay_safe"
+            or self.poll_interval_seconds is not None
+        ):
+            raise ValueError("a read resolver requires replay-safe synchronous reads")
         if self.artifact_read_inputs is not None:
             properties = self.input_schema.get("properties")
             if (
@@ -378,6 +391,8 @@ class TypedTool[Input: BaseModel, Output: BaseModel]:
         source_group: str | None = None,
         poll_interval_seconds: float | None = None,
         artifact_read_inputs: tuple[str, ...] | None = None,
+        artifact_read_resolver_version: str | None = None,
+        artifact_read_resolver: Callable[[Input], tuple[str, ...]] | None = None,
     ) -> None:
         if isinstance(timeout_seconds, bool) or not math.isfinite(timeout_seconds):
             raise ValueError("tool timeout must be finite")
@@ -389,8 +404,12 @@ class TypedTool[Input: BaseModel, Output: BaseModel]:
         ):
             raise ValueError("adaptive feedback cannot declare a complete-data bound")
         adapter = TypeAdapter[dict[str, JsonValue]](dict[str, JsonValue])
+        if (artifact_read_resolver is None) != (artifact_read_resolver_version is None):
+            raise ValueError("artifact read resolvers must be versioned")
         descriptor = ToolDescriptor(
-            schema_version=9
+            schema_version=10
+            if artifact_read_resolver is not None
+            else 9
             if artifact_read_inputs is not None
             else 8
             if behavior == "isolated_compute"
@@ -428,12 +447,14 @@ class TypedTool[Input: BaseModel, Output: BaseModel]:
             source_group=source_group,
             poll_interval_seconds=poll_interval_seconds,
             artifact_read_inputs=artifact_read_inputs,
+            artifact_read_resolver_version=artifact_read_resolver_version,
         )
         self._descriptor_json = descriptor.model_dump_json()
         self._input_type = input_type
         self._output_type = output_type
         self._execute = execute
         self._feedback_data_bound = feedback_data_bound
+        self._artifact_read_resolver = artifact_read_resolver
 
     @property
     def descriptor(self) -> ToolDescriptor:
@@ -457,6 +478,12 @@ class TypedTool[Input: BaseModel, Output: BaseModel]:
         if type(estimated) is not int or estimated <= 0:
             raise ToolExecutionError("tool feedback estimator returned an invalid byte bound")
         return estimated
+
+    def resolve_artifact_reads(self, arguments: BaseModel) -> tuple[str, ...]:
+        """在已校验输入上列出可能访问的旧 Artifact,仅 v10 注册启用。"""
+        if self._artifact_read_resolver is None:
+            raise ToolExecutionError("tool has no artifact read resolver")
+        return self._artifact_read_resolver(self._input_type.model_validate(arguments))
 
     async def invoke(self, arguments: BaseModel, context: ToolContext) -> JsonValue:
         normalized = self._input_type.model_validate(arguments.model_dump(), strict=True)
@@ -507,12 +534,19 @@ class ReadOnlyPolicy:
         )
 
 
+@runtime_checkable
+class _ArtifactReadResolver(Protocol):
+    def resolve_artifact_reads(self, arguments: BaseModel) -> tuple[str, ...]: ...
+
+
 class ToolRegistry:
     """An immutable registration set; duplicate stable names are rejected."""
 
     def __init__(self, tools: tuple[RegisteredTool, ...]) -> None:
         self._tools: dict[str, RegisteredTool] = {}
         for tool in tools:
+            if tool.descriptor.schema_version == 10 and not isinstance(tool, _ArtifactReadResolver):
+                raise ValueError("v10 tool omitted its registered artifact read resolver")
             name = tool.descriptor.name
             if name in self._tools:
                 raise ValueError("duplicate tool registration")
@@ -527,6 +561,20 @@ class ToolRegistry:
             return self._tools[name]
         except KeyError as exc:
             raise ToolFault(ErrorCategory.UNKNOWN_TOOL, "Unknown tool") from exc
+
+    def resolve_artifact_reads(self, name: str, arguments: BaseModel) -> tuple[str, ...]:
+        """调用已注册工具的确定性 v10 读集解析器。旧后端无需实现这个扩展。"""
+        tool = self.get(name)
+        if tool.descriptor.artifact_read_resolver_version is None or not isinstance(
+            tool, _ArtifactReadResolver
+        ):
+            raise ToolExecutionError("tool has no registered artifact read resolver")
+        try:
+            return TypeAdapter(tuple[str, ...]).validate_python(
+                tool.resolve_artifact_reads(arguments), strict=True
+            )
+        except ValidationError as exc:
+            raise ToolExecutionError("artifact read resolver returned invalid identities") from exc
 
     def action_identity(self, action: ToolCallAction) -> ToolActionIdentity:
         """Return a stable identity without authorizing or dispatching the proposed call.

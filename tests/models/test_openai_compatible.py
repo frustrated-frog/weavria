@@ -6,6 +6,7 @@ import pytest
 from pydantic import JsonValue, TypeAdapter
 
 from weavria.core import (
+    AdmissionNotice,
     ControlRequest,
     ConversationView,
     ErrorCategory,
@@ -13,6 +14,7 @@ from weavria.core import (
     Message,
     MessageRole,
     ModelRequest,
+    ModelTurn,
     SemanticVersion,
     SessionRequest,
     TaskInput,
@@ -521,3 +523,70 @@ async def test_session_recovery_normalizes_omitted_envelope_version_only_if_enab
     assert turn.schema_version == 2
     assert turn.decision.kind == "recover_context"
     assert turn.decision.query == "runtime/agent.py"
+
+
+async def test_budget_choice_round_trips_as_a_distinct_decision_and_never_as_an_empty_write() -> (
+    None
+):
+    call = ToolCallAction(tool_name="propose_work", call_id="fresh", arguments={})
+    offer = ModelTurn(
+        schema_version=3, reuse_arguments_from_call_id="rejected", decision=ToolBatch(calls=(call,))
+    )
+    notice = AdmissionNotice(
+        schema_version=8,
+        reason="feedback_budget",
+        proposal_sha256="a" * 64,
+        proposed_calls=2,
+        required_bytes=1001,
+        budget_bytes=1000,
+        remaining_tool_calls=3,
+        recommended_max_calls=1,
+        return_to_retry_alone=offer,
+    )
+    base = _session_request()
+    request = base.model_copy(
+        update={"current": base.current.model_copy(update={"control": notice})}
+    )
+    transport = Transport(_response('{"decision":{"kind":"finish","output":"ok"}}'))
+    provider = OpenAICompatibleSessionProvider(
+        OpenAICompatibleConfig(model="test"), transport=transport
+    )
+    await call_session_model(provider, request)
+    observed = json.loads(transport.requests[-1]["messages"][1]["content"])
+    wire = observed["current"]["control"]["return_to_retry_alone"]
+    assert wire == {
+        "decision": {
+            "kind": "retry_offered_call",
+            "tool_name": "propose_work",
+            "source_call_id": "rejected",
+        }
+    }
+    transport.response = _response(json.dumps(wire))
+    selected = await call_session_model(provider, request)
+    assert notice.offers_turn(selected) and isinstance(selected.decision, ToolBatch)
+    assert (
+        selected.decision.calls[0].call_id
+        == f"wvr-{sha256(request.model_dump_json().encode()).hexdigest()}-0"
+    )
+    # 同一格式不能访问别的提案,也不能夹带参数。选择离开本轮控制视图即失效。
+    with pytest.raises(ModelCallError):
+        await call_session_model(provider, base)
+    changes: tuple[dict[str, JsonValue], ...] = (
+        {"source_call_id": "elsewhere"},
+        {"tool_name": "other"},
+        {"arguments": {"notes": []}},
+    )
+    for change in changes:
+        transport.response = _response(json.dumps({"decision": {**wire["decision"], **change}}))
+        with pytest.raises(ModelCallError):
+            await call_session_model(provider, request)
+    transport.response = _response(ModelTurn(decision=ToolBatch(calls=(call,))).model_dump_json())
+    with pytest.raises(ModelCallError) as empty:
+        await call_session_model(provider, request)
+    assert empty.value.output_diagnostic and empty.value.output_diagnostic.repairable
+    # 明确表达空列表仍按工具正常语义校验。无通知时也保留普通空参调用的行为。
+    assert (await call_session_model(provider, base)).reuse_arguments_from_call_id is None
+    clear = call.model_copy(update={"arguments": {"notes": []}})
+    transport.response = _response(ModelTurn(decision=ToolBatch(calls=(clear,))).model_dump_json())
+    decision = (await call_session_model(provider, request)).decision
+    assert isinstance(decision, ToolBatch) and decision.calls[0].arguments == {"notes": []}

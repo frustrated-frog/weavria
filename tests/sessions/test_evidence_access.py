@@ -31,6 +31,7 @@ from weavria.core import (
     ToolRecorded,
     ToolSucceededObservation,
 )
+from weavria.harness.work import work_tool
 from weavria.models import FakeSessionProvider, ModelCapabilities, OpenAICompatibleTokenCounter
 from weavria.runtime import EventAcceptanceError, RunLimits, reduce_event
 from weavria.runtime.feedback_budget import ReadFeedbackBudget
@@ -442,3 +443,78 @@ async def test_read_budget_prices_and_dispatches_the_same_transitive_scope() -> 
     assert not reservation.fits and allowed == scope
     advice = hidden_budget.retry(invalid, {"read_artifact"})
     assert advice is not None and not advice.feasible
+
+
+async def test_work_draft_prices_only_its_authorized_nested_sources() -> None:
+    store = InMemoryArtifactStore()
+    tools = ToolRegistry((registry().get("read"), work_tool()))
+    executor = ToolExecutor("r", tools, store, ReadOnlyPolicy())
+    parent = await executor.execute(call("root"), max_duration=1)
+    assert parent.artifact is not None
+    child = await executor.execute(
+        call("cited", parent=parent.artifact.artifact_id), max_duration=1
+    )
+    other = await executor.execute(call("unrelated"), max_duration=1)
+    assert child.artifact and other.artifact
+    records = (parent, child, other)
+    access = EvidenceAccessView.from_records(
+        records, ("root", "cited", "unrelated"), task_revision=1, request_sha256="c" * 64
+    )
+    draft = ToolCallAction(
+        call_id="write",
+        tool_name="propose_work",
+        arguments={
+            "task_revision": 1,
+            "base_revision": 0,
+            "notes": [
+                {
+                    "kind": "result",
+                    "summary": "saved",
+                    "sources": [
+                        {
+                            "artifact_id": child.artifact.artifact_id,
+                            "pointer": "/value",
+                            "quote": "opaque",
+                        },
+                        {
+                            "artifact_id": child.artifact.artifact_id,
+                            "pointer": "/value",
+                            "start": 0,
+                            "end": 3,
+                        },
+                    ],
+                }
+            ],
+        },
+    )
+    budget = ReadFeedbackBudget(
+        tools,
+        "inspect",
+        TaskInput(goal="use sources"),
+        None,
+        records,
+        FeedbackBounds(),
+        20000,
+        access,
+        None,
+    )
+    single = ToolBatch(calls=(draft,))
+    identity = (tools.action_identity(draft),)
+    full, _ = budget.measure(single, identity)
+    tight = replace(budget, budget_bytes=full.required_bytes - 1)
+    priced, scope = tight.measure(single, identity)
+    assert priced.fits and scope and scope.call_ids == ("root", "cited")
+    stored = await executor.execute(draft, max_duration=1, accepted_artifacts=scope.artifacts)
+    assert stored.artifact and stored.dependencies == ("cited",)
+    # ID 已知但证据离开本轮视图。即使原件还在库中,也不能建议单提或读到它。
+    hidden = EvidenceAccessView.from_records(
+        records, ("root",), task_revision=1, request_sha256="d" * 64
+    )
+    missing = replace(tight, access=hidden)
+    assert (
+        missing.retry_alone(ToolBatch(calls=(call("read"), draft)), {"read", "propose_work"})
+        is None
+    )
+    failed = await executor.execute(draft, max_duration=1, accepted_artifacts=hidden.artifacts)
+    assert isinstance(failed.exchange.observation, ToolFailedObservation)
+    assert failed.exchange.observation.error.category is ErrorCategory.POLICY_DENIED

@@ -10,12 +10,14 @@ from typing import Any, Literal, Protocol, cast
 from pydantic import BaseModel, ConfigDict, JsonValue, TypeAdapter, ValidationError
 
 from weavria.core import (
+    AdmissionNotice,
     ModelOutputDiagnostic,
     ModelRequest,
     ModelRequestDiagnostic,
     ModelResponse,
     ModelTurn,
     SessionRequest,
+    ToolBatch,
 )
 
 from .provider import ModelCapabilities, ModelInputError, ModelOutputError
@@ -214,11 +216,29 @@ _SESSION_PROTOCOL = (
 )
 
 
+def _offered_response(request: SessionRequest) -> dict[str, JsonValue] | None:
+    """给无状态模型一个不可拆成普通空参工具调用的选择。原参数只留在宿主。"""
+    notice = request.current.control
+    if not isinstance(notice, AdmissionNotice) or notice.return_to_retry_alone is None:
+        return None
+    offer = notice.return_to_retry_alone
+    assert isinstance(offer.decision, ToolBatch)
+    return {
+        "decision": {
+            "kind": "retry_offered_call",
+            "tool_name": offer.decision.calls[0].tool_name,
+            "source_call_id": offer.reuse_arguments_from_call_id,
+        }
+    }
+
+
 def _session_observations(request: SessionRequest) -> tuple[str, dict[str, Any]]:
     """Encode v5 with its immutable definition before all mutable model-view fields."""
     observations = request.model_dump(mode="json")
     current = observations["current"]
     trusted = current.pop("instructions")
+    if (choice := _offered_response(request)) is not None:
+        current["control"]["return_to_retry_alone"] = choice
     if request.current.schema_version == 5:
         # 这里只调整供应商 JSON 对象的键顺序,不删除或复制字段。定义与任务先于
         # phase/source/progress,使计量器能够证明一个真实的固定 BPE 前缀。
@@ -619,6 +639,14 @@ def _normalize_session_turn(
 ) -> dict[str, JsonValue]:
     """Normalize host-owned call identities and an omitted recovery envelope version."""
     decision = payload.get("decision")
+    if isinstance(decision, dict) and decision.get("kind") == "retry_offered_call":
+        # 只接受眼前通知中的完整选择。过期 ID、附加参数或额外动作都不能被丢弃后执行。
+        if payload != _offered_response(request):
+            raise ValueError("reply does not match the offered action")
+        notice = request.current.control
+        assert isinstance(notice, AdmissionNotice) and notice.return_to_retry_alone is not None
+        payload = notice.return_to_retry_alone.model_dump(mode="json")
+        decision = payload["decision"]
     if (
         isinstance(decision, dict)
         and decision.get("kind") == "recover_context"
@@ -671,7 +699,7 @@ class OpenAICompatibleTokenCounter:
 
     @property
     def version(self) -> str:
-        return f"openai-compatible-session/8[{self._tokenizer.version};frame={self._framing}]"
+        return f"openai-compatible-session/9[{self._tokenizer.version};frame={self._framing}]"
 
     @property
     def output_tokens(self) -> int:

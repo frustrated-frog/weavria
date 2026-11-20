@@ -10,6 +10,7 @@ from typing import Protocol
 from pydantic import BaseModel, ValidationError
 
 from weavria.core import (
+    AdmissionNotice,
     ControlRequest,
     ErrorCategory,
     ModelOutputDiagnostic,
@@ -150,6 +151,7 @@ async def call_session_model(
         max_duration,
     )
     # 新请求格式不自动授予恢复能力; v5 必须读取显式特性位。
+    _validate_offered_turn(result, request.current.control)
     _validate_recovery(result, request.current.recovery_enabled)
     _validate_batch_capabilities(result, capabilities)
     return result
@@ -167,6 +169,7 @@ async def call_controlled_model(
         ModelTurn,
         max_duration,
     )
+    _validate_offered_turn(result, request.control)
     _validate_recovery(result, request.recovery_enabled)
     _validate_batch_capabilities(result, capabilities)
     return result
@@ -209,6 +212,7 @@ async def call_model_turn(
         ModelTurn,
         max_duration,
     )
+    _validate_offered_turn(result, None)
     _validate_recovery(result, False)
     _validate_batch_capabilities(result, capabilities)
     return result
@@ -355,6 +359,31 @@ async def _invoke_model[Input: BaseModel, Response: BaseModel](
             output_diagnostic=ModelOutputDiagnostic(code="schema_mismatch"),
         ) from exc
     return result, capabilities
+
+
+def _validate_offered_turn(result: ModelTurn, control: object) -> None:
+    offered = control.return_to_retry_alone if isinstance(control, AdmissionNotice) else None
+    if result.reuse_arguments_from_call_id is not None:
+        if isinstance(control, AdmissionNotice) and control.offers_turn(result):
+            return
+    elif not (
+        offered is not None
+        and isinstance(offered.decision, ToolBatch)
+        and isinstance(result.decision, ToolBatch)
+        and len(result.decision.calls) == 1
+        and result.decision.calls[0].tool_name == offered.decision.calls[0].tool_name
+        and not result.decision.calls[0].arguments
+    ):
+        return
+    # 模型若把“沿用原参数”误抄成 {},合法的默认值可能清空笔记。只在当前
+    # 有对应选择时返回可修复的模型错误。显式 notes=[] 仍是普通的全量替换。
+    raise ModelCallError(
+        RunError(
+            category=ErrorCategory.INVALID_MODEL_RESPONSE,
+            message="Argument reuse does not match an offered single call",
+        ),
+        output_diagnostic=ModelOutputDiagnostic(code="schema_mismatch"),
+    )
 
 
 def _validate_recovery(result: ModelTurn, enabled: bool) -> None:

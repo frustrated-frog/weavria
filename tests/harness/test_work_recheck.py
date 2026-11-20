@@ -215,6 +215,9 @@ async def test_grounded_recheck_updates_frontier_and_replays_without_model(
 ) -> None:
     provider = FakeModelProvider((response(), response(note="c")))
     run = RecheckRun(provider, session_counter, compact=compact)
+    # 旧节点和父节点都可能提供额外来源,启用重验或局部补丁时必须保留完整视图。
+    assert work_tool(rechecker=run.checker).descriptor.artifact_read_resolver_version is None
+    assert work_patch_tool(rechecker=run.checker).descriptor.artifact_read_resolver_version is None
     a, b, c, d = await run.prepare()
     assert provider.requests == ()
     b = b.model_copy(

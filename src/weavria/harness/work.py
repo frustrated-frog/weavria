@@ -811,6 +811,14 @@ def work_tool(*, rechecker: WorkRechecker | None = None) -> TypedTool[WorkDraft,
                 else ""
             )
         ),
+        # 普通提案仅循环读取 draft 的引用。重验器还可能查旧节点与父节点,
+        # 其读集取决于已提交状态,沿用完整可见范围。
+        artifact_read_resolver_version="work-sources/1" if rechecker is None else None,
+        artifact_read_resolver=(
+            (lambda draft: tuple(ref.artifact_id for note in draft.notes for ref in note.sources))
+            if rechecker is None
+            else None
+        ),
         execute=propose,
     )
 

@@ -1,5 +1,6 @@
 """从同一决策的可见证据和字节预算计算只读调用的反馈预留。"""
 
+import hashlib
 from dataclasses import dataclass
 
 from weavria.context import FeedbackReservation, reserve_feedback
@@ -7,6 +8,7 @@ from weavria.core import (
     ControlRequest,
     EvidenceAccessView,
     FeedbackBounds,
+    ModelTurn,
     TaskInput,
     TaskObservation,
     ToolBatch,
@@ -48,14 +50,18 @@ class ReadFeedbackBudget:
             return None
         tool = self.tools.get(call.tool_name)
         fields = tool.descriptor.artifact_read_inputs
-        if fields is None:
+        if fields is None and tool.descriptor.artifact_read_resolver_version is None:
             return None
-        # 使用执行器所用的归一化参数。只能引用当前视图中的 Artifact,再向前闭合实际依赖。
-        arguments = tool.validate_arguments(call.arguments).model_dump(mode="json")
+        # 使用执行器所用的归一化参数。未知来源不能通过预算计算扩大可读范围。
+        validated = tool.validate_arguments(call.arguments)
+        if fields is None:
+            values = self.tools.resolve_artifact_reads(call.tool_name, validated)
+        else:
+            arguments = validated.model_dump(mode="json")
+            values = tuple(arguments.get(field) for field in fields)
         roots = {a.artifact_id: a.call_id for a in access.artifacts}
         chosen: set[str] = set()
-        for field in fields:
-            value = arguments.get(field)
+        for value in values:
             if not isinstance(value, str) or value not in roots:
                 return None
             chosen.add(roots[value])
@@ -168,6 +174,37 @@ class ReadFeedbackBudget:
                 return ReadRetry(page=(index, parameter, feasible))
             blocked = ReadRetry(page=(index, parameter, 0))
         return blocked
+
+    def retry_alone(self, batch: ToolBatch, visible: set[str]) -> ModelTurn | None:
+        """为带嵌套来源的提案提供按旧参数单提的选择,不在通知中复制笔记正文。"""
+        if self.access is None or len(batch.calls) < 2:
+            return None
+        for call in batch.calls:
+            if call.tool_name not in visible or not call.arguments:
+                continue
+            descriptor = self.tools.get(call.tool_name).descriptor
+            if (
+                descriptor.artifact_read_resolver_version is None
+                or descriptor.approval_required
+                or descriptor.sensitivity != "public"
+                or descriptor.risk != "low"
+            ):
+                continue
+            if (
+                self.tools.action_identity(call).normalization != "validated"
+                or self._read_scope(call) is None
+            ):
+                continue
+            fresh = "retry-" + hashlib.sha256(call.call_id.encode()).hexdigest()[:24]
+            retry = call.model_copy(update={"call_id": fresh})
+            if fresh == call.call_id or not self._single_fits(call) or not self._single_fits(retry):
+                continue
+            return ModelTurn(
+                schema_version=3,
+                reuse_arguments_from_call_id=call.call_id,
+                decision=ToolBatch(calls=(retry.model_copy(update={"arguments": {}}),)),
+            )
+        return None
 
     def _largest_page(self, call: ToolCallAction, parameter: str, low: int, high: int) -> int:
         # 只缩短同一游标的页长。连最低页都不够时,直接考察下一个候选。

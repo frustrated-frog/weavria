@@ -318,7 +318,9 @@ _FINALIZATION_SUFFIX = (
 )
 
 
-def _instructions_for(instructions: str, tools: ToolRegistry, journal_version: int) -> str:
+def _instructions_for(
+    instructions: str, tools: ToolRegistry, journal_version: int, *, offered: bool = False
+) -> str:
     # 新控制协议压缩目录表示;旧 Journal 的请求字节和冻结实验保留原样。
     compact = journal_version >= 3
     advertised = [model_tool_view(d, compact=compact) for d in tools.descriptors]
@@ -349,7 +351,13 @@ def _instructions_for(instructions: str, tools: ToolRegistry, journal_version: i
             "\nRejected calls did not run. capability_view: omit unavailable_calls; "
             "use Available tools. "
             "no_progress: use replan (zero-based), reuse prior evidence or change operation. "
-            "feedback_budget: retry advised page alone with its cursor and page_maximum. "
+        )
+        # 新通知允许二选一。只有该轮替换旧分页指令,两段的序列化字节相同。
+        assembled += (
+            "feedback_budget: copy return_to_retry_alone to submit the original proposal, or "
+            "read one advised page using its cursor and page_maximum. Correct completion gaps."
+            if offered
+            else "feedback_budget: retry advised page alone with its cursor and page_maximum. "
             "Obey recommended_max_calls. If page_maximum=0 change source. Correct completion gaps."
         )
     if journal_version == 4:
@@ -741,6 +749,16 @@ class _AgentKernel:
                             )
                         raise
                     self._check_cancel(owner, cancellation_count)
+                    proposed_response = response
+                    if (
+                        isinstance(response, ModelTurn)
+                        and response.reuse_arguments_from_call_id is not None
+                        and self.state.finalization is None
+                    ):
+                        if task.revision != self.state.task.revision:
+                            await self._accept(DecisionDiscarded())
+                            continue
+                        response = self.state.resolve_offered_turn(response)
                     if self._journal_version >= 3 and not (
                         isinstance(response, ModelTurn)
                         and isinstance(response.decision, RecoverContext)
@@ -816,9 +834,9 @@ class _AgentKernel:
                             ),
                         )
                     accepted = await self._accept(
-                        ModelDecided(action=response.action)
-                        if isinstance(response, ModelResponse)
-                        else TurnDecided(turn=response),
+                        ModelDecided(action=proposed_response.action)
+                        if isinstance(proposed_response, ModelResponse)
+                        else TurnDecided(turn=proposed_response),
                         expected_revision=task.revision,
                     )
                     if not accepted:
@@ -1251,6 +1269,13 @@ class _AgentKernel:
         instructions = self._instructions
         if finalizing:
             instructions = self._instruction_source + _FINALIZATION_SUFFIX
+        elif (
+            isinstance(notice := self.state.control, AdmissionNotice)
+            and notice.return_to_retry_alone
+        ):
+            instructions = _instructions_for(
+                self._instruction_source, self._visible_tools, self._journal_version, offered=True
+            )
         required_call_ids = tuple(
             dict.fromkeys((*self.state.feedback_call_ids, *required_call_ids))
         )
@@ -1935,7 +1960,9 @@ class _AgentKernel:
         revision = self.state.model_revision
         budget = ReadFeedbackBudget(
             tools=self._tool_ceiling,
-            instructions=self._instructions,
+            instructions=self._feedback_template.instructions
+            if self._feedback_template
+            else self._instructions,
             task=self.state.task,
             observation=self._task_observation
             if self._task_observation is not None
@@ -2153,6 +2180,19 @@ class _AgentKernel:
                         else None
                     ),
                 )
+                if reason == "feedback_budget" and remaining and notice.retry_read is None:
+                    offered = budget.retry_alone(batch, visible)
+                    if offered is not None:
+                        # 同时给两个选择,通知超过 1 KiB 时优先保留已有分页路径。
+                        candidate = notice.model_copy(
+                            update={
+                                "schema_version": 8,
+                                "return_to_retry_alone": offered,
+                                "recommended_max_calls": 1,
+                            }
+                        )
+                        if len(candidate.model_dump_json().encode()) <= CONTROL_FEEDBACK_BYTES:
+                            notice = AdmissionNotice.model_validate(candidate)
                 if reason == "capability_view":
                     # 先为所有调用位置留空间,再按实际 JSON 大小填入可容纳的工具名。
                     details = dict(notice.unavailable_calls)
