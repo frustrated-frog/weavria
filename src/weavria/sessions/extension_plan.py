@@ -22,7 +22,7 @@ class ExtensionDescriptor(BaseModel):
     """随 Run 固定的公开身份。版本须涵盖会改变行为的插件配置。"""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
-    schema_version: int = Field(default=1, strict=True, ge=1, le=2)
+    schema_version: int = Field(default=1, strict=True, ge=1, le=3)
     name: ExtensionName
     version: str = Field(min_length=1, max_length=128, pattern=r"^\S+$")
     hooks: tuple[Hook, ...] = Field(max_length=2)
@@ -30,6 +30,7 @@ class ExtensionDescriptor(BaseModel):
     provides_selector: ExtensionName | None = None
     uses_selector: ExtensionName | None = None
     source_byte_limit: ByteLimit | None = None
+    conditional_material: bool = Field(default=False, strict=True)
 
     @model_validator(mode="after")
     def validate_declaration(self) -> Self:
@@ -39,6 +40,10 @@ class ExtensionDescriptor(BaseModel):
             not self.hooks or self.provides_selector or self.uses_selector or self.source_byte_limit
         ):
             raise ValueError("extension capabilities require descriptor v2")
+        if self.conditional_material and (
+            self.schema_version < 3 or "before_compile" not in self.hooks
+        ):
+            raise ValueError("conditional material requires a v3 before_compile contributor")
         if not (self.hooks or self.provides_selector or self.source_byte_limit):
             raise ValueError("empty extension")
         if self.uses_selector and "before_compile" not in self.hooks:
@@ -48,6 +53,8 @@ class ExtensionDescriptor(BaseModel):
     @model_serializer(mode="wrap")
     def preserve_descriptor(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
         data = handler(self)
+        if self.schema_version < 3:
+            data.pop("conditional_material", None)
         if self.schema_version == 1:
             for key in ("provides_selector", "uses_selector", "source_byte_limit"):
                 data.pop(key, None)

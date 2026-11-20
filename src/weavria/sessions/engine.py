@@ -637,13 +637,13 @@ class _SessionAdapter:
             else None
         )
 
-        extension_bundles, material_selections = (
+        extension_bundles, material_selections, material_reads = (
             await self._extensions.collect(
                 ExtensionQuery(task.goal, task.constraints, task.revision, phase),
                 max_bytes=compiler.config.max_source_bytes,
             )
             if self._extensions is not None
-            else ((), ())
+            else ((), (), ())
         )
         retrieval = None
         if self._retrieval_config is not None and not finalizing:
@@ -686,6 +686,7 @@ class _SessionAdapter:
                 supply=supply,
                 extension_bundles=extension_bundles,
                 material_selections=material_selections,
+                material_reads=material_reads,
                 recovery_ranges=recovery_ranges,
                 synthesis_range=synthesis_range,
                 next_step_reserve_bytes=(

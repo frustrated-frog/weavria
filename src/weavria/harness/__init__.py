@@ -1,6 +1,7 @@
 """Domain-independent Agent Harness capabilities above the Runtime."""
 
 from weavria.sessions import (
+    ConditionalMaterial,
     ExtensionAssembly,
     ExtensionDescriptor,
     ExtensionHooks,
@@ -273,6 +274,7 @@ __all__ = [
     "CompletionCriterion",
     "CompletionEvaluation",
     "CompletionObligation",
+    "ConditionalMaterial",
     "ConsequenceAwareQuestionSelector",
     "ConservativeMemoryAdmission",
     "CoverageAdjustment",

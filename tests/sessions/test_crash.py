@@ -70,7 +70,7 @@ async def main():
     global crash_fork
     config={}
     composing = extension_variant and extension_variant.startswith('binding-')
-    if point.startswith('fork-') or composing:
+    if point.startswith('fork-') or composing or extension_variant=='conditional':
         from weavria.context import ContextCompilerConfig, HistoryRetrievalConfig
         from weavria.models import OpenAICompatibleConfig, OpenAICompatibleTokenCounter
         config={
@@ -80,7 +80,15 @@ async def main():
                 encoding='cl100k_base'),
             'history_retrieval': HistoryRetrievalConfig() if point=='fork-resume' else None,
         }
-    if composing:
+    if extension_variant=='conditional':
+        from examples.conditional_material import PublishedFile
+        from weavria.harness import ExtensionAssembly, HarnessExtensions
+        import hashlib
+        data=b'original request'
+        source=PublishedFile('docs',Path(sys.argv[1]).parent,hashlib.sha256(data).hexdigest())
+        (source.directory/source.revision).write_bytes(data)
+        config['extensions']=HarnessExtensions(ExtensionAssembly((source.extension(conditional=True),)))
+    elif composing:
         from examples.extension_composition import compose_documents
         from weavria.harness import HarnessExtensions
         config['extensions'] = HarnessExtensions(compose_documents(
@@ -131,6 +139,11 @@ async def main():
                 facts=[e.data.event.data.kind for e in events if e.data.kind=='run_event']
                 assert facts.count('model_started')==2 and facts.count('tool_started')==1
                 assert facts.count('run_started')==1
+                if extension_variant=='conditional':
+                    first=await engine.store.explain_extension_request('s',old.run_id,1)
+                    second=await engine.store.explain_extension_request('s',old.run_id,2)
+                    assert first.material_reads==second.material_reads
+                    assert second.material_reads[0].outcome=='loaded' and source.full_reads==1
                 assert (await engine.store.history('s'))[0].status=='completed'
             else:
                 from weavria.sessions import SessionConflictError
@@ -356,6 +369,7 @@ async def test_uninterrupted_baseline_matches_resume_call_counts(tmp_path: Path)
     [
         ("original", "changed", "original"),
         ("binding-original", "binding-changed", "binding-shuffled"),
+        ("conditional", "changed", "conditional"),
     ],
 )
 async def test_resume_requires_original_extension_assembly(

@@ -12,7 +12,13 @@ from typing import Literal
 from pydantic import TypeAdapter, ValidationError
 
 from weavria.context import ContextSourceError
-from weavria.core import ContextBundle, ContextChoice, MaterialSelection, SelectorCandidate
+from weavria.core import (
+    ContextBundle,
+    ContextChoice,
+    MaterialRead,
+    MaterialSelection,
+    SelectorCandidate,
+)
 
 from .extension_plan import ExtensionDescriptor, ExtensionPlan, SelectorBinding, resolve_plan
 
@@ -31,6 +37,22 @@ class ExtensionQuery:
     constraints: tuple[str, ...]
     revision: int
     phase: Literal["decision", "synthesis"]
+
+
+@dataclass(frozen=True, slots=True)
+class ConditionalMaterial:
+    """同一次来源读取的修订标记及完整材料。None 确认宿主传回的标记仍有效,() 表示空快照。"""
+
+    revision: str
+    bundles: tuple[ContextBundle, ...] | None
+
+
+@dataclass(frozen=True, slots=True)
+class _CachedMaterial:
+    revision: str
+    encoded: tuple[bytes, ...]
+    byte_count: int
+    digest: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +82,7 @@ class ExtensionRequestExplanation:
     request_sha256: str
     input_tokens: int
     input_budget_tokens: int
+    material_reads: tuple[MaterialRead, ...] = ()
 
 
 type MaterialSelector = Callable[
@@ -72,6 +95,9 @@ class ExtensionHooks:
     before_compile: Callable[[ExtensionQuery], Awaitable[tuple[ContextBundle, ...]]] | None = None
     after_run: Callable[[ExtensionTrace], Awaitable[None]] | None = None
     select_material: MaterialSelector | None = None
+    read_material: Callable[[ExtensionQuery, str | None], Awaitable[ConditionalMaterial]] | None = (
+        None
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,7 +147,7 @@ class HarnessExtensions:
         for item in chain:
             desc = item.descriptor
             if desc.schema_version != 1:
-                raise ValueError("descriptor v2 requires ExtensionAssembly")
+                raise ValueError("versioned descriptor requires ExtensionAssembly")
             if desc.name in seen or not set(desc.requires) <= seen:
                 raise ValueError("duplicate extension or dependency absent from preceding entries")
             seen.add(desc.name)
@@ -141,6 +167,8 @@ class RunExtensions:
         self._plan = plan
         self._bindings = {edge.consumer: edge for edge in plan.bindings} if plan else {}
         self._selectors: dict[str, MaterialSelector] = {}
+        self._previous_query: ExtensionQuery | None = None
+        self._cache: dict[str, _CachedMaterial] = {}
         self._stack = AsyncExitStack()
         self._hooks: list[tuple[str, ExtensionHooks]] = []
 
@@ -148,7 +176,12 @@ class RunExtensions:
         for item in chain:
             hooks = await self._stack.enter_async_context(item.mount(scope))
             desc = item.descriptor
-            if (hooks.before_compile is not None) != ("before_compile" in desc.hooks) or (
+            expects_live = "before_compile" in desc.hooks and not desc.conditional_material
+            if (hooks.read_material is not None) != desc.conditional_material:
+                raise ValueError(
+                    f"mounted conditional reader differs from manifest for {desc.name}"
+                )
+            if (hooks.before_compile is not None) != expects_live or (
                 hooks.after_run is not None
             ) != ("after_run" in desc.hooks):
                 raise ValueError(f"mounted hooks differ from manifest for {desc.name}")
@@ -158,34 +191,113 @@ class RunExtensions:
                 self._selectors[desc.name] = hooks.select_material
             self._hooks.append((desc.name, hooks))
 
+    @staticmethod
+    def _snapshot(
+        name: str,
+        entries: tuple[ContextBundle, ...],
+        remaining_count: int,
+        remaining_bytes: int,
+        *,
+        retain_bytes: bool = False,
+    ) -> tuple[tuple[ContextBundle, ...], int, tuple[bytes, ...]]:
+        if type(entries) is not tuple:
+            raise ContextSourceError("invalid_snapshot")
+        if len(entries) > remaining_count:
+            raise ContextSourceError("capacity")
+        bundles: list[ContextBundle] = []
+        encoded: list[bytes] = []
+        byte_count = 0
+        seen: set[str] = set()
+        for entry in _BUNDLES.validate_python(entries, strict=True):
+            identity = f"extension:{name}:{entry.bundle_id}"
+            if len(identity) > 256 or identity in seen:
+                raise ContextSourceError("invalid_snapshot")
+            seen.add(identity)
+            bundle = entry.model_copy(update={"bundle_id": identity})
+            wire = bundle.model_dump_json().encode()
+            byte_count += len(wire)
+            if byte_count > remaining_bytes:
+                raise ContextSourceError("capacity")
+            bundles.append(bundle)
+            if retain_bytes:
+                encoded.append(wire)
+        return tuple(bundles), byte_count, tuple(encoded)
+
+    async def _conditional_read(
+        self,
+        name: str,
+        reader: Callable[[ExtensionQuery, str | None], Awaitable[ConditionalMaterial]],
+        query: ExtensionQuery,
+        remaining_count: int,
+        remaining_bytes: int,
+    ) -> tuple[tuple[ContextBundle, ...], _CachedMaterial, MaterialRead]:
+        previous = self._cache.get(name) if query == self._previous_query else None
+        answer = await reader(query, previous.revision if previous else None)
+        if (
+            type(answer) is not ConditionalMaterial
+            or type(answer.revision) is not str
+            or not (1 <= len(answer.revision) <= 256 and answer.revision.strip())
+        ):
+            raise ContextSourceError("invalid_snapshot")
+        try:
+            revision_hash = hashlib.sha256(answer.revision.encode("utf-8")).hexdigest()
+        except UnicodeEncodeError as exc:
+            raise ContextSourceError("invalid_snapshot") from exc
+        if answer.bundles is None:
+            if previous is None or previous.revision != answer.revision:
+                raise ContextSourceError("invalid_snapshot")
+            if previous.byte_count > remaining_bytes or len(previous.encoded) > remaining_count:
+                raise ContextSourceError("capacity")
+            # 每次从私有不可变字节重建。插件修改上次看到的嵌套对象不会污染复用结果。
+            snapshots = tuple(ContextBundle.model_validate_json(wire) for wire in previous.encoded)
+            cached = previous
+        else:
+            snapshots, byte_count, encoded = self._snapshot(
+                name, answer.bundles, remaining_count, remaining_bytes, retain_bytes=True
+            )
+            if previous and previous.revision == answer.revision and previous.encoded != encoded:
+                raise ContextSourceError("invalid_snapshot")
+            cached = _CachedMaterial(
+                answer.revision,
+                encoded,
+                byte_count,
+                MaterialRead.digest(hashlib.sha256(wire).hexdigest() for wire in encoded),
+            )
+        receipt = MaterialRead(
+            producer=name,
+            revision_sha256=revision_hash,
+            outcome="reused" if answer.bundles is None else "loaded",
+            candidate_count=len(snapshots),
+            candidates_sha256=cached.digest,
+        )
+        return snapshots, cached, receipt
+
     async def collect(
         self, query: ExtensionQuery, *, max_bytes: int
-    ) -> tuple[tuple[ContextBundle, ...], tuple[MaterialSelection, ...]]:
+    ) -> tuple[tuple[ContextBundle, ...], tuple[MaterialSelection, ...], tuple[MaterialRead, ...]]:
         selections: list[MaterialSelection] = []
-        if self._plan:
-            max_bytes = self._plan.effective_source_bytes(max_bytes)
+        reads: list[MaterialRead] = []
+        pending: dict[str, _CachedMaterial] = {}
+        remaining_bytes = self._plan.effective_source_bytes(max_bytes) if self._plan else max_bytes
+        remaining_count = 100
         bundles: list[ContextBundle] = []
-        seen: set[str] = set()
-        used_bytes = 0
         for name, hooks in self._hooks:
-            if hooks.before_compile is None:
-                continue
             try:
-                entries = await hooks.before_compile(query)
-                if len(entries) + len(seen) > 100:
-                    raise ContextSourceError("capacity")
-                # 严格校验并复制嵌套值。后续插件无法回头改写已收材料。
-                snapshots: list[ContextBundle] = []
-                for entry in _BUNDLES.validate_python(entries, strict=True):
-                    identity = f"extension:{name}:{entry.bundle_id}"
-                    if len(identity) > 256 or identity in seen:
-                        raise ContextSourceError("invalid_snapshot")
-                    seen.add(identity)
-                    bundle = entry.model_copy(update={"bundle_id": identity})
-                    used_bytes += len(bundle.model_dump_json().encode())
-                    if used_bytes > max_bytes:
-                        raise ContextSourceError("capacity")
-                    snapshots.append(bundle)
+                if hooks.read_material is not None:
+                    snapshots, cached, receipt = await self._conditional_read(
+                        name, hooks.read_material, query, remaining_count, remaining_bytes
+                    )
+                    pending[name] = cached
+                    remaining_bytes -= cached.byte_count
+                    reads.append(receipt)
+                elif hooks.before_compile is not None:
+                    snapshots, byte_count, _ = self._snapshot(
+                        name, await hooks.before_compile(query), remaining_count, remaining_bytes
+                    )
+                    remaining_bytes -= byte_count
+                else:
+                    continue
+                remaining_count -= len(snapshots)
                 if binding := self._bindings.get(name):
                     # 候选计入容量后策略才可以筛选。只接受本生产者原有编号,
                     # 即使策略改动收到的嵌套内容或重排编号也不能篡改交付快照。
@@ -202,10 +314,14 @@ class RunExtensions:
                 raise
             except Exception as exc:
                 raise ContextSourceError("unavailable") from exc
-        return tuple(bundles), tuple(selections)
+        # 只有整次取材及筛选成功才替换上一批。容量约束覆盖所有候选,
+        # 所以保留的单批字节总量有界。崩溃恢复重新挂载时从空缓存开始。
+        self._previous_query = query if pending else None
+        self._cache = pending
+        return tuple(bundles), tuple(selections), tuple(reads)
 
     async def _select(
-        self, binding: SelectorBinding, query: ExtensionQuery, snapshots: list[ContextBundle]
+        self, binding: SelectorBinding, query: ExtensionQuery, snapshots: tuple[ContextBundle, ...]
     ) -> MaterialSelection:
         copies = tuple(b.model_copy(deep=True) for b in snapshots)
         selected = await self._selectors[binding.provider](query, copies)
@@ -261,4 +377,6 @@ class RunExtensions:
     async def close(self) -> None:
         # 同一任务进入和退出,允许插件用 ContextVar/token 管理资源。将原异常传入
         # 清理函数,但插件的 __aexit__ 无权抑制 Run 的取消或失败。
+        self._cache.clear()
+        self._previous_query = None
         await self._stack.__aexit__(*sys.exc_info())

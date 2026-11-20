@@ -18,6 +18,7 @@ from weavria.core import (
     ConversationView,
     EvidenceDeliveryManifest,
     HistoryRetrievalReport,
+    MaterialRead,
     MaterialSelection,
     RecoverContext,
     RecoveryLimits,
@@ -205,6 +206,7 @@ class SessionContextCompiler:
         supply: ContextSupply | None = None,
         extension_bundles: tuple[ContextBundle, ...] = (),
         material_selections: tuple[MaterialSelection, ...] = (),
+        material_reads: tuple[MaterialRead, ...] = (),
         recovery_ranges: tuple[RecoveryRange, ...] = (),
         synthesis_range: RecoveryRange | None = None,
         next_step_reserve_bytes: int = 0,
@@ -901,6 +903,7 @@ class SessionContextCompiler:
                             supply=supply,
                             extension_bundles=extension_bundles,
                             material_selections=material_selections,
+                            material_reads=material_reads,
                             recovery_ranges=prospective_ranges,
                             next_step_reserve_bytes=next_step_reserve_bytes,
                             feedback_reserve_floor_bytes=feedback_reserve_floor_bytes,
@@ -1017,7 +1020,7 @@ class SessionContextCompiler:
             else policy_version
         )
         report = ContextCompilation(
-            schema_version=report_version,
+            schema_version=20 if material_reads else report_version,
             policy_version=f"context-compiler/{report_version}[{self.config.policy}]"
             + ("+complete-source/1" if preferred else "")
             + (
@@ -1079,6 +1082,7 @@ class SessionContextCompiler:
             supply=supply.report if supply else None,
             extension_bundle_ids=extension_ids,
             material_selections=material_selections,
+            material_reads=material_reads,
             recovery_ranges=recovery_ranges,
             delivery_manifest=delivery_manifest,
             transport_request_bytes=transport_bytes(request),

@@ -3,6 +3,7 @@
 from .engine import SessionEngine, SessionForkAccess
 from .extension_plan import ExtensionDescriptor, ExtensionPlan, SelectorBinding
 from .extensions import (
+    ConditionalMaterial,
     ExtensionAssembly,
     ExtensionHooks,
     ExtensionQuery,
@@ -36,6 +37,7 @@ from .task_continuation import TaskAccessPolicy, TaskContinuationResult, TaskRun
 __all__ = [
     "ClarificationAssociationPolicy",
     "ClarificationDeliveryPlan",
+    "ConditionalMaterial",
     "ExplicitClarificationOnly",
     "ExtensionAssembly",
     "ExtensionDescriptor",

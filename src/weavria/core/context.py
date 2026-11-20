@@ -1,5 +1,7 @@
 """Content-free, versioned evidence of one context compilation."""
 
+import hashlib
+from collections.abc import Iterable
 from typing import Literal, Self
 
 from pydantic import (
@@ -68,11 +70,28 @@ class MaterialSelection(ContractModel):
         return len(ids) - len(admitted)
 
 
+class MaterialRead(ContractModel):
+    """条件读取的来源和结果。修订标记只归档散列,材料摘要包含顺序和编号。"""
+
+    producer: NonBlankString
+    revision_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    outcome: Literal["loaded", "reused"]
+    candidate_count: int = Field(ge=0, le=100)
+    candidates_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+
+    @staticmethod
+    def digest(hashes: Iterable[str]) -> str:
+        """每项是定长 SHA-256,顺序拼接能区分候选调序与增删。"""
+        return hashlib.sha256(b"".join(bytes.fromhex(value) for value in hashes)).hexdigest()
+
+
 class ContextCompilation(BaseModel):
     """Bind allocation diagnostics to the exact complete request sent to a provider."""
 
     model_config = ContractModel.model_config
-    schema_version: Literal[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19] = 1
+    schema_version: Literal[
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20
+    ] = 1
 
     policy_version: NonBlankString
     counter_version: NonBlankString
@@ -101,6 +120,7 @@ class ContextCompilation(BaseModel):
     # 包括最终被裁掉的条目。choices 保存各自内容摘要与交付结果。
     extension_bundle_ids: tuple[NonBlankString, ...] = Field(default=(), max_length=100)
     material_selections: tuple[MaterialSelection, ...] = Field(default=(), max_length=32)
+    material_reads: tuple[MaterialRead, ...] = Field(default=(), max_length=32)
     retrieval: HistoryRetrievalReport | None = None
     recovery_ranges: tuple[RecoveryRange, ...] = Field(default=(), max_length=8)
     delivery_manifest: EvidenceDeliveryManifest | None = None
@@ -120,6 +140,8 @@ class ContextCompilation(BaseModel):
     @model_serializer(mode="wrap")
     def preserve_v1_wire(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
         data = handler(self)
+        if self.schema_version < 20:
+            data.pop("material_reads", None)
         if self.schema_version < 19:
             data.pop("material_selections", None)
         if self.schema_version < 18:
@@ -267,7 +289,9 @@ class ContextCompilation(BaseModel):
             or not extension_ids <= {c.source_id for c in bundle_choices}
         ):
             raise ValueError("extension materials must identify unique compiled candidates")
-        if (self.schema_version == 19) != bool(self.material_selections):
+        if self.schema_version < 20 and (self.schema_version == 19) != bool(
+            self.material_selections
+        ):
             raise ValueError("selector decisions require compilation v19")
         if self.material_selections:
             choices_by_id = {choice.source_id: choice for choice in bundle_choices}
@@ -281,6 +305,28 @@ class ContextCompilation(BaseModel):
                 )
             if rejected_count + len(extension_ids) > 100:
                 raise ValueError("selector candidates exceed material capacity")
+        if (self.schema_version == 20) != bool(self.material_reads):
+            raise ValueError("conditional reads require compilation v20")
+        if self.material_reads:
+            # 没有选择器的候选全部进入分配器。有选择器时必须核对筛选前的全集,
+            # 否则一次命中可以悄悄丢掉上轮被拒的材料。
+            selections = {s.consumer: s for s in self.material_selections}
+            sources = {c.source_id: c.source_sha256 for c in bundle_choices}
+            if len({r.producer for r in self.material_reads}) != len(self.material_reads):
+                raise ValueError("duplicate conditional material read")
+            for read in self.material_reads:
+                if selection := selections.get(read.producer):
+                    hashes = [c.source_sha256 for c in selection.candidates]
+                else:
+                    hashes = [
+                        sources[f"bundle:{key}"]
+                        for key in self.extension_bundle_ids
+                        if key.startswith(f"extension:{read.producer}:")
+                    ]
+                if read.candidate_count != len(
+                    hashes
+                ) or read.candidates_sha256 != MaterialRead.digest(hashes):
+                    raise ValueError("conditional read differs from material candidates")
         if any(c.representation not in ("raw", "omitted") for c in bundle_choices):
             raise ValueError("context bundles require an atomic representation")
         if len(bundle_choices) > len(extension_ids) and self.supply is None:

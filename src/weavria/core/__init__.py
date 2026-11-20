@@ -5,6 +5,7 @@ from .compaction import CompactedExcerpt, ContextCompaction
 from .context import (
     ContextChoice,
     ContextCompilation,
+    MaterialRead,
     MaterialSelection,
     SelectorCandidate,
     SessionContextCompiled,
@@ -313,6 +314,7 @@ __all__ = [
     "LoopData",
     "LoopEvent",
     "LoopResult",
+    "MaterialRead",
     "MaterialSelection",
     "Message",
     "MessageRole",

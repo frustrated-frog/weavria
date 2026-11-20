@@ -1791,6 +1791,7 @@ class SQLiteSessionStore:
                 plan=plan,
                 source_byte_limit=ceiling,
                 selections=report.material_selections,
+                material_reads=report.material_reads,
                 choices=tuple(by_id[f"bundle:{key}"] for key in report.extension_bundle_ids),
                 policy_version=report.policy_version,
                 request_sha256=report.request_sha256,
@@ -1959,6 +1960,18 @@ class SQLiteSessionStore:
                 )
                 if actual_bindings != expected_bindings:
                     raise SessionConflictError("material decisions differ from run bindings")
+                expected_readers = [
+                    item["name"]
+                    for item in config.get("extensions", ())
+                    if item.get("conditional_material")
+                ]
+                readers = (
+                    [read.producer for read in compilation.material_reads] if compilation else []
+                )
+                if readers != expected_readers:
+                    raise SessionConflictError(
+                        "conditional material reads differ from run assembly"
+                    )
                 if compilation and compilation.extension_bundle_ids:
                     # 从 Run 接受时冻结的顺序核对生产者,不借当前进程的插件配置背书。
                     producers = {
