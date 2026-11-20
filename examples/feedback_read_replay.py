@@ -461,6 +461,32 @@ async def verify_read(
     )
 
 
+def replay_catalogue(
+    request: SessionRequest, docs: ToolRegistry, session_store: SQLiteSessionStore, run_id: str
+) -> tuple[str, tuple[str, ...], ToolRegistry]:
+    """按归档请求重建可见工具集,逐项核对当时暴露的模型接口。"""
+    source, separator, _ = request.current.instructions.partition("\nTool/artifact data")
+    if not separator:
+        raise ValueError("missing host catalogue")
+    raw_entries, _ = json.JSONDecoder().raw_decode(
+        request.current.instructions.split("Available tools:\n", 1)[1]
+    )
+    entries = TypeAdapter(list[dict[str, object]]).validate_python(raw_entries)
+    names = TypeAdapter(tuple[str, ...]).validate_python([entry["name"] for entry in entries])
+    tools = ToolRegistry(
+        (
+            *(docs.get(d.name) for d in docs.descriptors),
+            artifact_read_tool(),
+            work_tool(),
+            session_source_tool(session_store, "work", run_id),
+            session_history_tool(session_store, "work"),
+        )
+    ).select(names)
+    if [model_tool_view(d) for d in tools.descriptors] != entries:
+        raise ValueError("replayed capability schemas differ")
+    return source, names, tools
+
+
 async def run_one(
     scene: Scene, trial: str, at: int, data: Dataset, *, legacy: bool
 ) -> dict[str, object]:
@@ -483,27 +509,11 @@ async def run_one(
             raise ValueError("prefix artifact differs")
     start = scene.events[0].data
     assert isinstance(start, RunStarted)
-    source, separator, _ = scene.outer.current.instructions.partition("\nTool/artifact data")
-    if not separator:
-        raise ValueError("missing host catalogue")
-    raw_entries, _ = json.JSONDecoder().raw_decode(
-        scene.outer.current.instructions.split("Available tools:\n", 1)[1]
-    )
-    entries = TypeAdapter(list[dict[str, object]]).validate_python(raw_entries)
-    names = TypeAdapter(tuple[str, ...]).validate_python([entry["name"] for entry in entries])
     with tempfile.TemporaryDirectory() as directory:
         async with SQLiteSessionStore(Path(directory) / "unused.db") as session_store:
-            tools = ToolRegistry(
-                (
-                    *(docs.get(d.name) for d in docs.descriptors),
-                    artifact_read_tool(),
-                    work_tool(),
-                    session_source_tool(session_store, "work", scene.head.run_id),
-                    session_history_tool(session_store, "work"),
-                )
-            ).select(names)
-            if [model_tool_view(d) for d in tools.descriptors] != entries:
-                raise ValueError("replayed capability schemas differ")
+            source, names, tools = replay_catalogue(
+                scene.outer, docs, session_store, scene.head.run_id
+            )
             if legacy:
                 tools = ToolRegistry(
                     tuple(

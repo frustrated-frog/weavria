@@ -257,6 +257,29 @@ class LongTaskDelivery:
         return await self._output.verify(context)
 
 
+def long_task_delivery(domain: Domain) -> LongTaskDelivery:
+    """真实验收与归档回放使用同一套工作记录和交付字段检查。"""
+    return LongTaskDelivery(
+        JsonOutputContract(
+            {
+                "reconsiderations": "integer",
+                "first_start": "integer",
+                "continuation_start": "expression",
+                "tool": "string",
+                "sources": "string_array",
+            }
+            if domain == "repository"
+            else {
+                "memory_write": "string",
+                "max_notes": "integer",
+                "summary_characters": "integer",
+                "state_bytes": "integer",
+                "sources": "string_array",
+            }
+        )
+    )
+
+
 class ObservedModel:
     """观察公开请求;仅注入预先冻结的用户修订,不改写任务解释或模型决策。"""
 
@@ -396,27 +419,7 @@ async def run_trial(
                 tools=corpus.registry(
                     documents=case.domain == "documents", bundle=case.scenario == "long_context"
                 ),
-                completion=LongTaskDelivery(
-                    JsonOutputContract(
-                        {
-                            "reconsiderations": "integer",
-                            "first_start": "integer",
-                            "continuation_start": "expression",
-                            "tool": "string",
-                            "sources": "string_array",
-                        }
-                    )
-                    if case.domain == "repository"
-                    else JsonOutputContract(
-                        {
-                            "memory_write": "string",
-                            "max_notes": "integer",
-                            "summary_characters": "integer",
-                            "state_bytes": "integer",
-                            "sources": "string_array",
-                        }
-                    )
-                )
+                completion=long_task_delivery(case.domain)
                 if case.scenario == "long_context"
                 else None,
                 token_counter=counter,

@@ -20,6 +20,7 @@ from weavria.core import (
     ModelResponse,
     ModelTurn,
     RecoveryRange,
+    RunEnded,
     RunStatus,
     TaskDirective,
     TaskInput,
@@ -286,6 +287,8 @@ async def test_no_evidence_at_reserve_does_not_fabricate_an_answer() -> None:
     result = await agent.execute()
     assert result.status is RunStatus.BUDGET_EXHAUSTED
     assert result.output is None and agent.state.model_calls == 1
+    ended = agent.events[-1].data
+    assert isinstance(ended, RunEnded) and ended.reason == "finalization_evidence_unavailable"
 
 
 async def test_publication_repair_is_not_bypassed_in_synthesis() -> None:
@@ -933,9 +936,19 @@ async def test_synthesis_recompiles_once_and_only_selects_improved_coverage(
     assert (agent.state.finalization is not None) is improved
 
 
-@pytest.mark.parametrize("max_calls", [3, 5])
+@pytest.mark.parametrize(
+    ("max_calls", "max_tools", "reason"),
+    [
+        (3, 12, "finalization_prerequisite_model_reserve"),
+        (5, 1, "finalization_prerequisite_tool_budget"),
+        (3, 1, "finalization_prerequisite_model_reserve"),
+        (5, 12, "completion_checked"),
+    ],
+)
 async def test_publication_prerequisite_keeps_tools_open_or_reports_exhaustion(
     max_calls: int,
+    max_tools: int,
+    reason: str,
 ) -> None:
     class NeedsSecondRead:
         version = "two-reads/1"
@@ -948,10 +961,19 @@ async def test_publication_prerequisite_keeps_tools_open_or_reports_exhaustion(
 
     policy = LayeredCompletionPolicy(TaskObligationCompletionPolicy(), NeedsSecondRead())
     agent, provider = await setup(
-        (read(), read("read-2"), finish()), max_calls=max_calls, completion=policy
+        (read(), read("read-2"), finish()),
+        limits=RunLimits(
+            max_model_calls=max_calls,
+            max_tool_calls=max_tools,
+            finalization_model_calls=2,
+            max_request_bytes=24_000,
+        ),
+        completion=policy,
     )
     result = await agent.execute()
-    if max_calls == 3:
+    ended = agent.events[-1].data
+    assert isinstance(ended, RunEnded) and ended.reason == reason
+    if reason != "completion_checked":
         assert result.status is RunStatus.BUDGET_EXHAUSTED
         assert agent.state.finalization is None
         assert len(provider.requests) == 1
@@ -960,3 +982,44 @@ async def test_publication_prerequisite_keeps_tools_open_or_reports_exhaustion(
         assert agent.state.finalization is not None
         assert "FINALIZATION" not in provider.requests[1].instructions
         assert "FINALIZATION" in provider.requests[2].instructions
+
+
+async def test_publication_precondition_at_time_reserve_retains_the_read() -> None:
+    class SlowNextPreparation:
+        attempts = 0
+
+        async def prepare_turn(self, task: TaskInput) -> TurnPreparation:
+            self.attempts += 1
+            if self.attempts == 2:
+                await asyncio.Event().wait()
+            return TurnPreparation(task.revision, 24_000)
+
+    class NeedsMore:
+        version = "more/1"
+
+        def can_finalize(self, records: tuple[ToolRecord, ...]) -> bool:
+            return len(records) > 1
+
+        async def verify(self, context: CompletionContext) -> CompletionDecision:
+            raise AssertionError("no candidate should have been requested")
+
+    # 仍有调用和工具配额,仅普通决策的期限先到。已接受的成功读取保留在事件中。
+    agent, provider = await setup(
+        (read(),),
+        preparation=SlowNextPreparation(),
+        limits=RunLimits(
+            max_model_calls=6,
+            max_tool_calls=4,
+            max_request_bytes=24_000,
+            finalization_model_calls=1,
+            max_duration=0.5,
+            finalization_seconds=0.25,
+        ),
+        completion=NeedsMore(),
+    )
+    result = await agent.execute()
+    ended = agent.events[-1].data
+    assert result.status is RunStatus.BUDGET_EXHAUSTED
+    assert isinstance(ended, RunEnded) and ended.reason == "finalization_prerequisite_time_reserve"
+    assert len(provider.requests) == len(agent.state.records) == 1
+    assert agent.state.records[0].artifact is not None

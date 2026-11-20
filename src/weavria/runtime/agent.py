@@ -8,6 +8,7 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import StrEnum
 from typing import Literal, Protocol
 
 from pydantic import JsonValue, TypeAdapter
@@ -199,6 +200,20 @@ class SystemClock:
 
     def now(self) -> datetime:
         return datetime.now(UTC)
+
+
+class _PrerequisiteBlock(StrEnum):
+    """工具关闭时发布条件仍未满足。字符串直接成为 RunEnded 的稳定原因。"""
+
+    MODEL_RESERVE = "finalization_prerequisite_model_reserve"
+    TIME_RESERVE = "finalization_prerequisite_time_reserve"
+    TOOL_BUDGET = "finalization_prerequisite_tool_budget"
+    CLOSED = "finalization_prerequisite_unmet"
+
+
+type _DecisionPreparation = (
+    EvidencePlan | TurnEvidencePlan | ControlEvidencePlan | _PrerequisiteBlock | None
+)
 
 
 class _ContextDependencyTimeout(TimeoutError):
@@ -627,12 +642,22 @@ class _AgentKernel:
                             continue
                     try:
                         plan = await self._prepare_decision_context(task, deadline)
-                        if plan is None:
-                            if task.revision != self.state.task.revision:
-                                continue
-                            return await self._end(
-                                RunStatus.BUDGET_EXHAUSTED, "finalization_evidence_unavailable"
+                        if plan is None or isinstance(plan, _PrerequisiteBlock):
+                            # 准备期间可能收到修订。只对接受这次预检的版本提交终态。
+                            result = AgentResult(
+                                run_id=self._run_id, status=RunStatus.BUDGET_EXHAUSTED
                             )
+                            reason = (
+                                plan.value
+                                if plan is not None
+                                else "finalization_evidence_unavailable"
+                            )
+                            if await self._accept(
+                                RunEnded(result=result, reason=reason),
+                                expected_revision=task.revision,
+                            ):
+                                return result
+                            continue
                         if isinstance(plan, ControlEvidencePlan):
                             if not 0 < plan.budget_bytes <= self._request_budget:
                                 raise ValueError("compiled context increased the request budget")
@@ -1017,7 +1042,7 @@ class _AgentKernel:
 
     async def _prepare_decision_context(
         self, task: TaskInput, deadline: float
-    ) -> EvidencePlan | TurnEvidencePlan | ControlEvidencePlan | None:
+    ) -> _DecisionPreparation:
         if not self._limits.finalization_model_calls:
             return await self._prepare_ordinary_context(task, deadline)
         if (
@@ -1040,7 +1065,7 @@ class _AgentKernel:
 
     async def _prepare_ordinary_context(
         self, task: TaskInput, deadline: float
-    ) -> EvidencePlan | TurnEvidencePlan | ControlEvidencePlan | None:
+    ) -> _DecisionPreparation:
         if self._preparation is not None:
             prepared = await self._preparation.prepare_turn(task)
             if task.revision != self.state.task.revision:
@@ -1051,7 +1076,7 @@ class _AgentKernel:
 
     async def _prepare_finalization_context(
         self, task: TaskInput, deadline: float
-    ) -> EvidencePlan | TurnEvidencePlan | ControlEvidencePlan | None:
+    ) -> _DecisionPreparation:
         if task.revision != self.state.task.revision or self.state.pending_poll is not None:
             return None
         if isinstance(self._preparation, FinalizationPreparer):
@@ -1085,7 +1110,7 @@ class _AgentKernel:
 
     async def _finalization_context(
         self, task: TaskInput, deadline: float, *, force_reserve: bool = False
-    ) -> EvidencePlan | TurnEvidencePlan | ControlEvidencePlan | None:
+    ) -> _DecisionPreparation:
         if not self._limits.finalization_model_calls:
             return await self._build_context(task)
         if self.state.pending_poll is not None:
@@ -1096,12 +1121,12 @@ class _AgentKernel:
         before = await self._assess_finalization(task)
         if task.revision != self.state.task.revision:
             return None
-        reserve_reached = (
-            force_reserve
-            or self._limits.max_model_calls - self.state.model_calls
+        model_reserve = (
+            self._limits.max_model_calls - self.state.model_calls
             <= self._limits.finalization_model_calls
-            or self._remaining(deadline) <= self._finalization_reserve
         )
+        time_reserve = self._remaining(deadline) <= self._finalization_reserve
+        reserve_reached = force_reserve or model_reserve or time_reserve
         tool_budget = self.state.tool_calls >= self._limits.max_tool_calls
         if existing is None and not before.eligible and not reserve_reached and not tool_budget:
             return await self._build_context(task)
@@ -1117,7 +1142,15 @@ class _AgentKernel:
             if not ready:
                 if existing is None and not reserve_reached and not tool_budget:
                     return await self._build_context(task)
-                return None
+                # 此处尚未编译收尾请求。即使上轮取回了原文,缺少必须由工具完成的
+                # 发布条件也会阻止交付。多个边界同时命中时按模型、工具、时间归因。
+                if model_reserve:
+                    return _PrerequisiteBlock.MODEL_RESERVE
+                if tool_budget:
+                    return _PrerequisiteBlock.TOOL_BUDGET
+                if time_reserve:
+                    return _PrerequisiteBlock.TIME_RESERVE
+                return _PrerequisiteBlock.CLOSED
         known = {record.exchange.action.call_id for record in self.state.records}
         required = tuple(identity for identity in before.required_call_ids if identity in known)
         plan = await self._build_context(task, finalizing=True, required_call_ids=required)
