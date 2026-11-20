@@ -73,6 +73,8 @@ async def test_adapter_separates_trusted_instructions_from_observations() -> Non
 
     assert isinstance(result.action, FinishAction) and result.action.output == "done"
     body = transport.requests[0]
+    assert body["temperature"] == 0.0 and body["max_tokens"] == 4096
+    assert "max_completion_tokens" not in body
     assert body["response_format"] == {"type": "json_object"}
     messages = TypeAdapter(list[dict[str, object]]).validate_python(body["messages"])
     system_message = messages[0]
@@ -98,6 +100,27 @@ async def test_adapter_forwards_explicit_reasoning_effort_only_as_transport_conf
     await provider.generate(_request())
 
     assert transport.requests[0]["reasoning_effort"] == "none"
+
+
+async def test_reasoning_chat_options_apply_to_both_provider_paths() -> None:
+    # 单次推理与会话执行走不同编码器,两种请求都必须适配推理端点。
+    config = OpenAICompatibleConfig(
+        model="gpt-6-luna",
+        reasoning_effort="medium",
+        temperature=None,
+        max_output_tokens=4096,
+        output_token_parameter="max_completion_tokens",
+    )
+    single = Transport(_response('{"action":{"kind":"finish","output":"done"}}'))
+    session = Transport(_response('{"decision":{"kind":"finish","output":"done"}}'))
+    await OpenAICompatibleProvider(config, transport=single).generate(_request())
+    await OpenAICompatibleSessionProvider(config, transport=session).generate_session(
+        _session_request()
+    )
+    for body in (single.requests[0], session.requests[0]):
+        assert body["model"] == "gpt-6-luna" and body["reasoning_effort"] == "medium"
+        assert body["max_completion_tokens"] == 4096
+        assert "temperature" not in body and "max_tokens" not in body
 
 
 async def test_adapter_rejects_oversized_request_before_transport_dispatch() -> None:

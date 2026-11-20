@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "dataset_version": "m1-harness/2",
+  "dataset_version": "m1-harness/3",
   "source_commit": "f026796054a10132561faa4f2e7225a6e23390d4",
   "corpora": {
     "documents": {
@@ -33,14 +33,15 @@
     }
   },
   "model": {
-    "name": "deepseek-flash",
-    "temperature": 0.0,
+    "name": "gpt-6-luna",
+    "temperature": null,
     "output_tokens": 4096,
     "window_tokens": 32768,
     "safety_tokens": 1024,
     "max_request_bytes": 96000,
     "json_mode": true,
-    "reasoning_effort": "none"
+    "reasoning_effort": "medium",
+    "output_token_parameter": "max_completion_tokens"
   },
   "budgets": {
     "request_seconds": 240,

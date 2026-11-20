@@ -14,7 +14,7 @@ from typing import Literal
 from pydantic import TypeAdapter
 
 from examples.m1_corpus import ReadOutput, SnapshotCorpus
-from examples.m1_harness import DATA, Dataset, assemble_config, load_dataset
+from examples.m1_harness import DATA, Dataset, ModelSettings, assemble_config, load_dataset
 from weavria.artifacts import InMemoryArtifactStore
 from weavria.context import (
     CompiledSessionContext,
@@ -59,7 +59,7 @@ from weavria.core import (
 from weavria.harness import NeedFinalizationPolicy
 from weavria.harness.context import project_context_focus
 from weavria.harness.work import work_tool
-from weavria.models import FakeControlProvider, OpenAICompatibleConfig, OpenAICompatibleTokenCounter
+from weavria.models import FakeControlProvider, OpenAICompatibleTokenCounter
 from weavria.runtime import AgentLoop, TurnPreparation
 from weavria.sessions import SQLiteSessionStore
 from weavria.sessions.evidence import session_history_tool, session_source_tool
@@ -398,23 +398,6 @@ class FrozenDecision(EvidenceContextBuilder):
             self.finished = True
 
 
-def counter_for(data: Dataset) -> OpenAICompatibleTokenCounter:
-    m = data.model
-    return OpenAICompatibleTokenCounter(
-        OpenAICompatibleConfig(
-            model=m.name,
-            temperature=m.temperature,
-            max_output_tokens=m.output_tokens,
-            context_window_tokens=m.window_tokens,
-            safety_tokens=m.safety_tokens,
-            max_request_bytes=m.max_request_bytes,
-            json_mode=m.json_mode,
-            reasoning_effort=m.reasoning_effort,
-        ),
-        encoding="cl100k_base",
-    )
-
-
 async def verify_read(
     store: InMemoryArtifactStore,
     corpus: SnapshotCorpus,
@@ -478,9 +461,10 @@ async def verify_read(
     )
 
 
-async def run_one(scene: Scene, trial: str, at: int, *, legacy: bool) -> dict[str, object]:
+async def run_one(
+    scene: Scene, trial: str, at: int, data: Dataset, *, legacy: bool
+) -> dict[str, object]:
     case_id, arm, _ = trial.split("-")
-    data = load_dataset()
     case = next(x for x in data.cases if x.case_id == case_id)
     config = assemble_config(data, "coverage" if arm == "coverage" else "recent")
     corpus = SnapshotCorpus.load(DATA / "corpus.json", data.corpora[case.domain])
@@ -535,7 +519,9 @@ async def run_one(scene: Scene, trial: str, at: int, *, legacy: bool) -> dict[st
                 SessionContextCompiler(
                     store,
                     config=config.context,
-                    counter=counter_for(data),
+                    counter=OpenAICompatibleTokenCounter(
+                        data.model.provider_config(), encoding="cl100k_base"
+                    ),
                     recovery_limits=start.recovery_limits,
                 ),
                 names,
@@ -603,10 +589,18 @@ async def run_one(scene: Scene, trial: str, at: int, *, legacy: bool) -> dict[st
 
 
 async def run(batch: Path) -> None:
+    # 回放的计量器绑定归档时的模型参数,独立于新验收所用的模型。
+    manifest = json.loads(await asyncio.to_thread((batch / "manifest.json").read_text))
+    data = load_dataset().model_copy(
+        update={
+            "model": ModelSettings.model_validate(manifest["model"]),
+            "dataset_version": manifest["dataset_version"],
+        }
+    )
     for trial, at in SCENES:
         s = await asyncio.to_thread(capture, batch / trial / "session.db", at)
-        old = await run_one(s, trial, at, legacy=True)
-        current = await run_one(s, trial, at, legacy=False)
+        old = await run_one(s, trial, at, data, legacy=True)
+        current = await run_one(s, trial, at, data, legacy=False)
         if not (
             current["dispatched"]
             and current["required_source"]

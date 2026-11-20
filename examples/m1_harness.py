@@ -103,13 +103,28 @@ class Case(Frozen):
 
 class ModelSettings(Frozen):
     name: str
-    temperature: float
+    temperature: float | None
     output_tokens: int
     window_tokens: int
     safety_tokens: int
     max_request_bytes: int
     json_mode: bool
-    reasoning_effort: Literal["none"]
+    reasoning_effort: Literal["none", "medium"]
+    output_token_parameter: Literal["max_tokens", "max_completion_tokens"] = "max_tokens"
+
+    def provider_config(self) -> OpenAICompatibleConfig:
+        """所有模型角色及预算计量使用同一份已冻结的请求参数。"""
+        return OpenAICompatibleConfig(
+            model=self.name,
+            temperature=self.temperature,
+            max_output_tokens=self.output_tokens,
+            context_window_tokens=self.window_tokens,
+            safety_tokens=self.safety_tokens,
+            max_request_bytes=self.max_request_bytes,
+            json_mode=self.json_mode,
+            reasoning_effort=self.reasoning_effort,
+            output_token_parameter=self.output_token_parameter,
+        )
 
 
 class Budgets(Frozen):
@@ -126,7 +141,7 @@ class Budgets(Frozen):
 
 class Dataset(Frozen):
     schema_version: Literal[1]
-    dataset_version: Literal["m1-harness/1", "m1-harness/2"]
+    dataset_version: Literal["m1-harness/1", "m1-harness/2", "m1-harness/3"]
     source_commit: str = Field(pattern=r"^[a-f0-9]{40}$")
     corpora: dict[Domain, dict[str, str]]
     model: ModelSettings
@@ -334,17 +349,7 @@ async def run_trial(
         SnapshotCorpus.load, DATA / "corpus.json", data.corpora[case.domain]
     )
     corpus.fail_primary = case.scenario == "failure"
-    settings = data.model
-    model_config = OpenAICompatibleConfig(
-        model=settings.name,
-        temperature=settings.temperature,
-        max_output_tokens=settings.output_tokens,
-        context_window_tokens=settings.window_tokens,
-        safety_tokens=settings.safety_tokens,
-        max_request_bytes=settings.max_request_bytes,
-        json_mode=settings.json_mode,
-        reasoning_effort=settings.reasoning_effort,
-    )
+    model_config = data.model.provider_config()
     # 三个模型角色分别计量;共享的是冻结配置,不是可变的运行状态。
     transports = {
         role: TrialTransport(base, key, data.budgets.model_seconds)
@@ -727,6 +732,8 @@ async def main() -> None:
     base, key = os.environ.get("WEAVRIA_MODEL_BASE_URL"), os.environ.get("WEAVRIA_MODEL_API_KEY")
     if not base or not key or os.environ.get("WEAVRIA_MODEL_NAME") != data.model.name:
         parser.error("需要冻结模型匹配的 WEAVRIA_MODEL_NAME、BASE_URL 与 API_KEY")
+    if base.rstrip("/") != "https://api.openai.com/v1":
+        parser.error("请将本轮 M1 的 BASE_URL 设置为 OpenAI 官方 API 端点")
     if args.case and args.case not in {c.case_id for c in data.cases}:
         parser.error("未知任务标识")
     args.out.mkdir(parents=True, exist_ok=False)
@@ -737,7 +744,8 @@ async def main() -> None:
             "diagnostic_repetitions": args.diagnostic_repetitions,
             "model": data.model.model_dump(),
             "budgets": data.budgets.model_dump(),
-            "runner_version": "m1-runner/2",
+            "runner_version": "m1-runner/3",
+            "base_url": base.rstrip("/"),
             "memory_include_unknown_time": True,
             "implementation": implementation_identity(),
         }

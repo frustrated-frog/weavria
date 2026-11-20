@@ -39,7 +39,7 @@ class OpenAICompatibleConfig:
     """Supplier-neutral request settings for a chat-completions endpoint."""
 
     model: str
-    temperature: float = 0.0
+    temperature: float | None = 0.0
     max_output_tokens: int = 4096
     json_mode: bool = False
     reasoning_effort: ReasoningEffort | None = None
@@ -48,10 +48,14 @@ class OpenAICompatibleConfig:
     safety_tokens: int = 256
     max_request_bytes: int | None = None
 
+    output_token_parameter: Literal["max_tokens", "max_completion_tokens"] = "max_tokens"
+
     def __post_init__(self) -> None:
+        if self.output_token_parameter not in {"max_tokens", "max_completion_tokens"}:
+            raise ValueError("unsupported output token parameter")
         if not self.model.strip():
             raise ValueError("model name is required")
-        if not math.isfinite(self.temperature):
+        if self.temperature is not None and not math.isfinite(self.temperature):
             raise ValueError("model temperature must be finite")
         if type(self.max_output_tokens) is not int or self.max_output_tokens <= 0:
             raise ValueError("model output budget must be a positive integer")
@@ -154,6 +158,17 @@ class OpenAICompatibleProvider:
             raise ModelInputError(diagnostic)
 
 
+def _chat_options(config: OpenAICompatibleConfig) -> dict[str, Any]:
+    # 两个模型入口与请求计量器共用实际报文。某些推理模型只接受默认采样,
+    # 省略 temperature 与显式发送 null 或 0 在供应商协议中含义不同。
+    return {
+        "model": config.model,
+        **({"temperature": config.temperature} if config.temperature is not None else {}),
+        "stream": False,
+        config.output_token_parameter: config.max_output_tokens,
+    }
+
+
 def _model_request_body(config: OpenAICompatibleConfig, request: ModelRequest) -> dict[str, Any]:
     observations = request.model_dump(mode="json")
     trusted = observations.pop("instructions")
@@ -169,10 +184,7 @@ def _model_request_body(config: OpenAICompatibleConfig, request: ModelRequest) -
         f"host instructions.\n\n{trusted}"
     )
     result: dict[str, Any] = {
-        "model": config.model,
-        "temperature": config.temperature,
-        "stream": False,
-        "max_tokens": config.max_output_tokens,
+        **_chat_options(config),
         "messages": [
             {"role": "system", "content": protocol},
             {
@@ -307,10 +319,7 @@ def _session_request_body(
 ) -> dict[str, Any]:
     trusted, observations = _session_observations(request)
     body: dict[str, Any] = {
-        "model": config.model,
-        "temperature": config.temperature,
-        "stream": False,
-        "max_tokens": config.max_output_tokens,
+        **_chat_options(config),
         "messages": [
             {"role": "system", "content": _session_protocol(request) + str(trusted)},
             {
