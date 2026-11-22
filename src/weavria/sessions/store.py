@@ -30,6 +30,7 @@ from weavria.core import (
     ContextCompilation,
     ContextSelected,
     ControlEvent,
+    ControlRequest,
     ConversationTurn,
     EvidenceDeliveryRange,
     PastCall,
@@ -123,6 +124,7 @@ class ResumeClaim:
     semantic: SemanticSnapshot | None
     remaining_seconds: float
     legacy_fork_history: bool = False
+    admitted_request: ControlRequest | None = None
 
 
 def _validate_semantic_transition(
@@ -1260,10 +1262,16 @@ class SQLiteSessionStore:
                     "FROM resume_boundaries WHERE run_id=?",
                     (run_id,),
                 ).fetchone()
-                # 只有最后一个持久化事件恰好落在已结算的接受边界上才能接续.
-                # 若进程死在工具副作用与结果落库之间, 这里没有足够事实判断是否应重放,
-                # 所以不会把一个任意快照伪装成安全 Checkpoint.
-                if boundary is None or boundary[0] != row[4]:
+                state = self._state(run_id)
+                if state is None or state.sequence != row[4]:
+                    raise SessionConflictError("resume_unsafe_boundary")
+                suffix = state.undispatched_read_suffix()
+                settled = (
+                    boundary is not None
+                    and boundary[0] == state.sequence
+                    and state.phase is Phase.READY
+                )
+                if not settled and not suffix:
                     raise SessionConflictError("resume_unsafe_boundary")
                 previous, current = json.loads(row[3]), json.loads(config)
                 duration = min(
@@ -1290,14 +1298,6 @@ class SQLiteSessionStore:
                         "SELECT data FROM run_events WHERE run_id=? ORDER BY sequence", (run_id,)
                     )
                 )
-                state = self._state(run_id)
-                if (
-                    state is None
-                    or state.phase is not Phase.READY
-                    or state.sequence != boundary[0]
-                    or not any(isinstance(event.data, TurnSettled) for event in events)
-                ):
-                    raise SessionConflictError("resume_unsafe_boundary")
                 resolutions = tuple(
                     TurnResolution.model_validate_json(item[0])
                     for item in conn.execute(
@@ -1305,23 +1305,37 @@ class SQLiteSessionStore:
                         (run_id,),
                     )
                 )
-                if not resolutions or resolutions[-1].sequence != boundary[1]:
-                    raise SessionConflictError("resume_resolution_changed")
+                if settled and not any(isinstance(event.data, TurnSettled) for event in events):
+                    raise SessionConflictError("resume_unsafe_boundary")
+                admitted_request = None
                 semantic = None
-                if boundary[2] is not None:
-                    head = conn.execute(
-                        "SELECT data FROM semantic_heads WHERE session_id=? AND work_id=?",
-                        (session_id, boundary[2]),
-                    ).fetchone()
-                    semantic = SemanticSnapshot.model_validate_json(head[0]) if head else None
-                    if (
-                        semantic is None
-                        or semantic.run_id != run_id
-                        or semantic.version.semantic_sequence != boundary[3]
-                        or semantic.version.task_revision != state.task.revision
-                        or semantic.work_status != "active"
-                    ):
-                        raise SessionConflictError("resume_task_version_changed")
+                if suffix:
+                    admitted_request, semantic = self._partial_read_resume(
+                        conn,
+                        session_id,
+                        state,
+                        events,
+                        resolutions,
+                        semantic_required=previous["task_preparation_version"] != "none/1",
+                    )
+                else:
+                    assert boundary is not None
+                    if not resolutions or resolutions[-1].sequence != boundary[1]:
+                        raise SessionConflictError("resume_resolution_changed")
+                    if boundary[2] is not None:
+                        head = conn.execute(
+                            "SELECT data FROM semantic_heads WHERE session_id=? AND work_id=?",
+                            (session_id, boundary[2]),
+                        ).fetchone()
+                        semantic = SemanticSnapshot.model_validate_json(head[0]) if head else None
+                        if (
+                            semantic is None
+                            or semantic.run_id != run_id
+                            or semantic.version.semantic_sequence != boundary[3]
+                            or semantic.version.task_revision != state.task.revision
+                            or semantic.work_status != "active"
+                        ):
+                            raise SessionConflictError("resume_task_version_changed")
                 start = conn.execute(
                     """SELECT json_extract(data,'$.occurred_at') FROM session_events
                     WHERE session_id=? AND json_extract(data,'$.data.kind')='input_accepted'
@@ -1334,7 +1348,11 @@ class SQLiteSessionStore:
                     0.0, (self._clock.now() - datetime.fromisoformat(start[0])).total_seconds()
                 )
                 remaining = min(duration, previous["limits"]["max_duration"]) - elapsed
-                if remaining <= 0 or state.model_calls >= previous["limits"]["max_model_calls"]:
+                if (
+                    remaining <= 0
+                    or state.model_calls >= previous["limits"]["max_model_calls"]
+                    or state.tool_calls + len(suffix) > previous["limits"]["max_tool_calls"]
+                ):
                     raise SessionConflictError("resume_budget_exhausted")
                 # 中断视图是临时终态投影。只允许最新 ordinal, 从而不会改写已被后续
                 # Run 消费的历史。索引水位额外检查, 防止破坏已建立的来源索引。
@@ -1363,9 +1381,84 @@ class SQLiteSessionStore:
                     semantic,
                     remaining,
                     legacy_fork_history,
+                    admitted_request,
                 )
 
         return await self._submit(claim)
+
+    @staticmethod
+    def _partial_read_resume(
+        conn: sqlite3.Connection,
+        session_id: str,
+        state: RunState,
+        events: tuple[ControlEvent, ...],
+        resolutions: tuple[TurnResolution, ...],
+        *,
+        semantic_required: bool,
+    ) -> tuple[ControlRequest, SemanticSnapshot | None]:
+        # 原提案与原模型请求都是已接受事实。恢复不用重新征询模型或重建旧请求。
+        proposal = resolutions[-1] if resolutions else None
+        turn = state.turn
+        assert turn is not None
+        if (
+            not events
+            or not isinstance(events[-1].data, ToolRecorded)
+            or proposal is None
+            or proposal.stage != "proposal"
+            or proposal.next_step != "dispatch"
+            or proposal.task_revision != state.task.revision
+            or proposal.proposal_revision != state.model_revision
+            or proposal.proposal_sha256
+            != hashlib.sha256(turn.model_dump_json().encode()).hexdigest()
+        ):
+            raise SessionConflictError("resume_resolution_changed")
+        row = conn.execute(
+            "SELECT data FROM request_views WHERE run_id=? AND model_call=?",
+            (state.run_id, state.model_calls),
+        ).fetchone()
+        if row is None:
+            raise SessionConflictError("resume_request_unavailable")
+        request = SessionRequest.model_validate_json(row[0])
+        current = request.current
+        if (
+            request.conversation.session_id != session_id
+            or current.task != state.task
+            or hashlib.sha256(current.model_dump_json().encode()).hexdigest()
+            != state.context_request_sha256
+        ):
+            raise SessionConflictError("resume_request_changed")
+        if not semantic_required:
+            return current, None
+        rows = conn.execute(
+            """SELECT s.data FROM semantic_heads s JOIN work_heads w
+            ON w.session_id=s.session_id AND w.work_id=s.work_id
+            WHERE w.session_id=? AND w.run_id=? LIMIT 2""",
+            (session_id, state.run_id),
+        ).fetchall()
+        if len(rows) != 1:
+            raise SessionConflictError("resume_semantic_snapshot_missing")
+        semantic = SemanticSnapshot.model_validate_json(rows[0][0])
+        view = current.task_model_view
+        if (
+            semantic.run_id != state.run_id
+            or semantic.work_status != "active"
+            or semantic.version.task_revision != state.task.revision
+            or (
+                semantic.observation != current.task_observation
+                if view is None
+                else (
+                    semantic.work_id != view.source.work_id
+                    or semantic.version != view.source.version
+                    or hashlib.sha256(semantic.observation.model_dump_json().encode()).hexdigest()
+                    != view.source.observation_sha256
+                    or task_view_digest(semantic.need_ledger) != view.source.ledger_sha256
+                    or task_view_digest(semantic.visible_tool_names)
+                    != view.source.visible_tools_sha256
+                )
+            )
+        ):
+            raise SessionConflictError("resume_task_version_changed")
+        return current, semantic
 
     async def interrupt(self, run_id: str, reason: str = "owner_exit") -> None:
         await self._submit(lambda: self._interrupt(run_id, reason))

@@ -455,6 +455,9 @@ class _AgentKernel:
         self._feedback_reserve_revision: int | None = None
         self._evidence_access: EvidenceAccessView | None = None
         self._feedback_template: ControlRequest | None = None
+        self._restored_batch: (
+            tuple[tuple[ToolCallAction, ...], tuple[ToolActionIdentity, ...]] | None
+        ) = None
         self._artifacts = artifacts
         self._completion = completion if completion is not None else NoVerification()
         self._bounds = (
@@ -594,6 +597,14 @@ class _AgentKernel:
                 if cancelled:
                     raise asyncio.CancelledError
             async with run_timeout:
+                if self._restored_batch is not None:
+                    calls, identities = self._restored_batch
+                    turn, revision = self.state.turn, self.state.model_revision
+                    assert turn is not None and revision is not None
+                    await self._execute_turn(
+                        calls, deadline - self._finalization_reserve, identities
+                    )
+                    await self._resolve_execution(turn, revision, deadline)
                 while self.state.phase is not Phase.TERMINAL:
                     if self._remaining(deadline) <= 0:
                         return await self._end(RunStatus.BUDGET_EXHAUSTED, "deadline")
@@ -909,15 +920,7 @@ class _AgentKernel:
                         )
                         if self._journal_version >= 3:
                             assert isinstance(response, ModelTurn)
-                            progress_assessment = await self._prepare_turn_settlement(
-                                task.revision, deadline
-                            )
-                            await self._resolve(
-                                "execution",
-                                response,
-                                task.revision,
-                                progress_assessment=progress_assessment,
-                            )
+                            await self._resolve_execution(response, task.revision, deadline)
         except asyncio.CancelledError as exc:
             self._failure_cause = exc
             if self._journal_failed:
@@ -2335,6 +2338,10 @@ class _AgentKernel:
             raise _CompletionRepairStalled(assessment.decision.issue_codes)
         return assessment
 
+    async def _resolve_execution(self, turn: ModelTurn, revision: int, deadline: float) -> None:
+        progress = await self._prepare_turn_settlement(revision, deadline)
+        await self._resolve("execution", turn, revision, progress_assessment=progress)
+
     async def _prepare_turn_settlement(
         self, revision: int, deadline: float
     ) -> ProgressAssessment | None:
@@ -2390,11 +2397,18 @@ class _AgentKernel:
         deadline: float,
         action_identities: tuple[ToolActionIdentity, ...] = (),
     ) -> None:
-        accepted = tuple(r.artifact for r in self.state.records if r.artifact is not None)
-        if self._journal_version >= 3:
-            admission = self.state.admission
-            if admission is not None and admission.evidence_access is not None:
-                accepted = admission.evidence_access.artifacts
+        admission = self.state.admission if self._journal_version >= 3 else None
+        # 恢复时兄弟结果可能已经进入 records。读取权限仍来自原批次准入,
+        # 与首次派发一致, 不能把新提交的兄弟结果追加到可读范围。
+        readable = set(admission.readable_call_ids) if admission is not None else None
+        accepted = tuple(
+            record.artifact
+            for record in self.state.records
+            if record.artifact is not None
+            and (readable is None or record.artifact.call_id in readable)
+        )
+        if admission is not None and admission.evidence_access is not None:
+            accepted = admission.evidence_access.artifacts
         revision = self.state.model_revision
         if action_identities and len(action_identities) != len(calls):
             raise ValueError("tool action identities must align with the admitted batch")
@@ -2406,14 +2420,14 @@ class _AgentKernel:
             if action_identities
             else {}
         )
-        envelopes: dict[str, FeedbackEnvelopeBound] = {}
-        if self._journal_version >= 3:
-            admission = self.state.admission
-            if admission is not None:
-                envelopes = {item.call_id: item for item in admission.feedback_envelopes}
+        envelopes = (
+            {item.call_id: item for item in admission.feedback_envelopes}
+            if admission is not None
+            else {}
+        )
 
         async def execute(call: ToolCallAction) -> None:
-            if self.state.task.revision != revision or self._remaining(deadline) <= 0:
+            if self.state.task.revision != revision:
                 await self._accept(CallSkipped(call_id=call.call_id))
                 return
             await self._execute_call(
@@ -2423,7 +2437,7 @@ class _AgentKernel:
                 expected_revision=revision,
                 expected_identity=identities.get(call.call_id),
                 feedback_envelope=envelopes.get(call.call_id),
-                allow_polling=self._journal_version >= 3 and len(calls) == 1,
+                allow_polling=self._journal_version >= 3 and len(envelopes or calls) == 1,
             )
 
         async def skip(call: ToolCallAction) -> None:
@@ -2434,7 +2448,7 @@ class _AgentKernel:
                 calls,
                 self._scheduling,
                 execute,
-                lambda: self.state.task.revision != revision or self._remaining(deadline) <= 0,
+                lambda: self.state.task.revision != revision,
                 skip,
             )
         except ExceptionGroup as exc:
@@ -2988,9 +3002,13 @@ class AgentLoop(_AgentKernel):
         )
 
     def restore_decision_boundary(
-        self, events: tuple[ControlEvent, ...], resolutions: tuple[TurnResolution, ...]
+        self,
+        events: tuple[ControlEvent, ...],
+        resolutions: tuple[TurnResolution, ...],
+        *,
+        admitted_request: ControlRequest | None = None,
     ) -> None:
-        """重放已接受事实, 由持久化宿主确认结算边界并持有执行权后调用。"""
+        """Replay facts after the durable owner has claimed a valid recovery boundary."""
         if self._journal is None or self._executed or len(self._events_json) != 1:
             raise ValueError("restore requires a fresh durable loop")
         state = None
@@ -2998,16 +3016,49 @@ class AgentLoop(_AgentKernel):
             if event.run_id != self._run_id or event.schema_version != self._journal_version:
                 raise ValueError("restore journal identity changed")
             state = reduce_event(state, event)
-        if (
-            state is None
-            or state.phase is not Phase.READY
-            or state.task != self.state.task
-            or state.finalization is not None
-            or not resolutions
-            or resolutions[-1].observed_sequence != state.sequence
-            or resolutions[-1].stage != "execution"
-        ):
-            raise ValueError("restore requires a settled decision boundary")
+        if state is None or state.task != self.state.task or state.finalization is not None:
+            raise ValueError("restore requires the original task and an open lifecycle")
+        if admitted_request is None:
+            if (
+                state.phase is not Phase.READY
+                or not resolutions
+                or resolutions[-1].observed_sequence != state.sequence
+                or resolutions[-1].stage != "execution"
+            ):
+                raise ValueError("restore requires a settled decision boundary")
+        else:
+            calls = state.undispatched_read_suffix()
+            admission = state.admission
+            if (
+                not calls
+                or admission is None
+                or admission.bounds != self._bounds
+                or admitted_request.task != state.task
+                or hashlib.sha256(admitted_request.model_dump_json().encode()).hexdigest()
+                != state.context_request_sha256
+                or state.tool_calls + len(calls) > self._limits.max_tool_calls
+                or state.model_calls >= self._limits.max_model_calls
+            ):
+                raise ValueError("restore requires an admitted read suffix")
+            original_envelopes = {item.call_id: item for item in admission.feedback_envelopes}
+            identities = tuple(self._tool_ceiling.action_identity(call) for call in calls)
+            for call, identity in zip(calls, identities, strict=True):
+                if identity.normalization != "validated":
+                    raise ValueError("restored read arguments cannot be validated")
+                descriptor = self._tool_ceiling.get(call.tool_name).descriptor
+                if (
+                    descriptor.behavior != "read_only"
+                    or descriptor.idempotency != "replay_safe"
+                    or descriptor.approval_required
+                    or descriptor.poll_interval_seconds is not None
+                    or self._tool_ceiling.feedback_envelope(
+                        call, identity=identity, bounds=admission.bounds
+                    )
+                    != original_envelopes.get(call.call_id)
+                ):
+                    raise ValueError("restored read no longer matches admission")
+            self._restored_batch = calls, identities
+            self._feedback_template = admitted_request if admitted_request.task_model_view else None
         self._state = state
         self._events_json = [event.model_dump_json() for event in events]
         self._resolutions_json = [resolution.model_dump_json() for resolution in resolutions]

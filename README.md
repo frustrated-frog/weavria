@@ -4,7 +4,7 @@ Weavria 是一套实验性的 Python Agent Harness 与 Runtime，重点是让模
 
 当前已实现类型化核心契约、单动作与批量轮次 Agent 循环、有界只读工具调度、完整反馈汇合、执行前反馈预算准入、可替换成果验收与纠正、成果快照及按需读取、任务相关的片段选择、任务修订、预算和取消、事件驱动的状态投影，以及位于 Runtime 之上的版本化 Task Frame 与最小能力视图。任务理解已经进入 `SessionEngine` / `AgentLoop` v3 主路径，同时保留原始用户请求并明确标记模型推断的低信任边界。已提供 OpenAI-compatible JSON Action 适配边界，但仍处于内核验证阶段，已有范围受限的[工作视图真实模型对照](docs/decisions/0066-模型工作视图的真实模型对照与适配器注入.md)和[记忆消费对照](docs/记忆消费真实模型评测.md)，尚未实现未完成执行的自动恢复。开发规范见 [AGENTS.md](AGENTS.md)。
 
-当前支持本地单用户持久多轮会话与运行中 steering：`SessionEngine` 连接独立 Run，用户中途改变要求时修订当前任务、停止旧调用继续派发、保留已启动工作的结果，并逐轮重建历史上下文和重新验收。Harness 用独立 `TurnResolution` 表达重规划、继续、修正与完成；模型 Finish 仍需经过验收。重启后可追问、查看补充要求及重读历史成果，可在已结算的只读决策边界显式 Resume。恢复条件见[只读任务结算边界恢复](docs/decisions/0085-只读任务结算边界恢复.md)。使用与限制见 [持久会话](docs/persistent-sessions.md)，机制和设计取舍见 [ADR 0008](docs/decisions/0008-interactive-turn-harness.md)。
+当前支持本地单用户持久多轮会话与运行中 steering：`SessionEngine` 连接独立 Run，用户中途改变要求时修订当前任务、停止旧调用继续派发、保留已启动工作的结果，并逐轮重建历史上下文和重新验收。Harness 用独立 `TurnResolution` 表达重规划、继续、修正与完成；模型 Finish 仍需经过验收。重启后可追问、查看补充要求及重读历史成果，可在已结算的只读决策边界或只剩尚未派发的只读批次尾部时显式 Resume。恢复条件见[只读任务结算边界恢复](docs/decisions/0085-只读任务结算边界恢复.md)和[恢复尚未派发的只读批次尾部](docs/decisions/0145-恢复尚未派发的只读批次尾部.md)。使用与限制见 [持久会话](docs/persistent-sessions.md)，机制和设计取舍见 [ADR 0008](docs/decisions/0008-interactive-turn-harness.md)。
 
 推荐 Harness 入口支持显式跨会话任务接续。宿主以 `task_id` 登记已有 Run，新会话经授权创建新 Run，继承任务目标与有来源的工作上下文，最终以任务版本比较交换提交进展。见[跨会话任务接续](docs/decisions/0086-跨会话任务接续.md)。
 

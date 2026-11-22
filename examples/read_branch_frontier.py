@@ -27,6 +27,7 @@ from weavria.core import (
     ToolBatch,
     ToolCallAction,
     ToolExchange,
+    ToolStarted,
     ToolSucceededObservation,
     TurnDecided,
     TurnResolution,
@@ -42,7 +43,7 @@ from weavria.models import (
 )
 from weavria.runtime import RunLimits, ToolScheduling
 from weavria.sessions import SessionConflictError, SQLiteSessionStore
-from weavria.tools import ToolContext, ToolFault, ToolRegistry, TypedTool
+from weavria.tools import ToolContext, ToolFault, ToolPolicy, ToolRegistry, TypedTool
 
 type Arm = Literal["batch", "frontier", "autonomous"]
 type Scenario = Literal["failure", "revision", "crash"]
@@ -279,6 +280,8 @@ def make_harness(
     model: ProbeModel,
     *,
     max_in_flight: int = 2,
+    policy: ToolPolicy | None = None,
+    feedback_bound: int = 768,
 ) -> AgentHarness:
     registry = ToolRegistry(
         (
@@ -292,7 +295,7 @@ def make_harness(
                 artifact_read_inputs=(),
                 feedback_delivery="complete",
                 feedback_bound_version="snapshot/1",
-                feedback_data_bound=lambda _args, _bounds: 768,
+                feedback_data_bound=lambda _args, _bounds: feedback_bound,
             ),
         )
     )
@@ -301,6 +304,7 @@ def make_harness(
         model=model,
         tools=registry,
         token_counter=counter,
+        policy=policy,
         scheduling=ToolScheduling(max_in_flight, frozenset({"snapshot_read"})),
         config=HarnessConfig(
             context=ContextCompilerConfig(window_tokens=32000, output_tokens=counter.output_tokens),
@@ -438,9 +442,10 @@ class Recovery:
     reads_after: tuple[str, ...]
     correct: bool
     model_turns_after: int
+    original_tool_starts: tuple[str, ...]
 
 
-async def run_crash(path: Path, point: CrashPoint) -> Recovery:
+async def interrupt_probe(path: Path, point: CrashPoint) -> None:
     # 子进程只用于故障注入;恢复端用新连接和新的 AgentHarness。
     child = await asyncio.create_subprocess_exec(
         sys.executable,
@@ -460,6 +465,10 @@ async def run_crash(path: Path, point: CrashPoint) -> Recovery:
             await child.wait()
     if child.returncode != 73:
         raise RuntimeError(f"unexpected child exit {child.returncode}: {error.decode()}")
+
+
+async def run_crash(path: Path, point: CrashPoint) -> Recovery:
+    await interrupt_probe(path, point)
     task = TASKS[0]
     counter = OpenAICompatibleTokenCounter(provider_config(), encoding="cl100k_base")
     reads = ScenarioReads(task, corpus_data(), "crash")
@@ -492,6 +501,12 @@ async def run_crash(path: Path, point: CrashPoint) -> Recovery:
             # 计量显式整题重跑的基线。新会话使重跑与旧会话历史内容隔离。
             await harness.create("restart")
             result = (await harness.send("restart", task.goal, input_id="task")).session
+        original_starts = tuple(
+            event.data.event.data.call_id
+            for event in await harness.sessions.store.events("s")
+            if isinstance(event.data, SessionRunEvent)
+            and isinstance(event.data.event.data, ToolStarted)
+        )
         return Recovery(
             point,
             durable,
@@ -501,6 +516,7 @@ async def run_crash(path: Path, point: CrashPoint) -> Recovery:
             tuple(reads.calls),
             matches_answer(result.report.output, task.expected),
             len(model.requests),
+            original_starts,
         )
 
 

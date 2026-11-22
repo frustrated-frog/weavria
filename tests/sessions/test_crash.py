@@ -166,7 +166,10 @@ async def main():
 async def semantic_main():
     from weavria.context import ContextCompilerConfig
     from weavria.core import ModelResponse
-    from weavria.harness import AgentHarness, CompletionCriterion, HarnessConfig, TaskSpecification
+    from weavria.harness import (
+        AgentHarness, CapabilityNeed, CompletionCriterion, HarnessConfig, InformationNeed,
+        TaskSpecification,
+    )
     from weavria.models import FakeModelProvider, OpenAICompatibleConfig
     from weavria.models import OpenAICompatibleTokenCounter
     from weavria.runtime import RunLimits
@@ -176,24 +179,51 @@ async def semantic_main():
         if resolution.stage=='execution': os._exit(73)
     if point in ('semantic-boundary', 'semantic-clarification-boundary'):
         SQLiteSessionStore.record_resolution=crash_at_commit
+    original_append=SQLiteSessionStore.append
+    async def crash_at_work_receipt(self,event):
+        await original_append(self,event)
+        if event.data.kind=='tool_recorded': os._exit(73)
+    partial=point in ('semantic-partial-boundary','semantic-partial-resume')
+    if point=='semantic-partial-boundary':
+        SQLiteSessionStore.append=crash_at_work_receipt
+    async def check_view(args, context):
+        assert point=='semantic-partial-resume'
+        assert context.task_view.progress['working_state']['revision']==0
+        return Out(value=args.value)
     class SemanticProvider:
         capabilities=ModelCapabilities(True,True)
         async def generate_session(self,request):
             if point=='semantic-clarification-boundary' and request.current.task.revision==1:
                 return ModelTurn(decision=FinishAction(output='Which language?'))
             work=request.current.task_model_view.progress['working_state']
-            if point in ('semantic-resume','semantic-clarification-resume'):
+            if point.endswith('-resume'):
                 if point=='semantic-clarification-resume':
                     assert request.current.task.revision==2
 
                 assert work['revision']==1 and work['notes'][0]['summary']=='Check second case'
+                if partial:
+                    assert [c.call_id for c in request.current.feedback.calls]==['work','check']
+                    assert [c.status for c in request.current.feedback.calls]==['succeeded']*2
                 return ModelTurn(decision=FinishAction(output='resumed with working state'))
             assert work['revision']==0
-            return ModelTurn(decision=ToolBatch(calls=(ToolCallAction(
-                call_id='work',tool_name='propose_work',arguments={
-                    'notes':[{'kind':'plan','summary':'Check second case'}]}),)))
+            work_action=ToolCallAction(call_id='work',tool_name='propose_work',arguments={
+                'notes':[{'kind':'plan','summary':'Check second case'}]})
+            check_action=ToolCallAction(call_id='check',tool_name='check_view',
+                                        arguments={'value':'bound view'})
+            return ModelTurn(decision=ToolBatch(
+                calls=(work_action,check_action) if partial else (work_action,)))
     spec=TaskSpecification(route='direct',intent='Answer',goal='Explain',
         completion_criteria=(CompletionCriterion(kind='response',description='Answer'),))
+    if partial:
+        spec=TaskSpecification(route='execute', intent='Check', goal='Explain',
+            information_needs=(InformationNeed(description='Check bound work', source='external',
+                capability_names=('check_view',)),),
+            capability_needs=(CapabilityNeed(name='check_view',purpose='Check bound work',
+                necessity='required'),),
+            completion_criteria=(
+                CompletionCriterion(kind='response',description='Answer'),
+                CompletionCriterion(kind='capability_result',description='Check',
+                    capability='check_view'),))
     def declare(specification):
         return ModelResponse(action=ToolCallAction(
             call_id='interpret',tool_name='declare_task_specification',
@@ -222,7 +252,8 @@ async def semantic_main():
         })
         reasoning=FakeModelProvider((declare(clarify),declare(resolved)))
     else:
-        reasoning=FakeModelProvider((declare(spec),) if point=='semantic-boundary' else ())
+        reasoning=FakeModelProvider((declare(spec),) if point in (
+            'semantic-boundary','semantic-partial-boundary') else ())
     counter=OpenAICompatibleTokenCounter(
         OpenAICompatibleConfig(model='fake',max_output_tokens=256,context_window_tokens=64000),
         encoding='cl100k_base')
@@ -230,10 +261,13 @@ async def semantic_main():
         context=ContextCompilerConfig(window_tokens=64000,output_tokens=256),
         limits=RunLimits(max_request_bytes=64001 if point=='semantic-clarification-changed'
                          else 64000))
+    check=TypedTool(name='check_view',version='1',description='Read bound model view',
+                    input_type=In,output_type=Out,execute=check_view)
     async with AgentHarness.from_config(Path(sys.argv[1]),config=profile,
-            model=SemanticProvider(),tools=ToolRegistry(()),token_counter=counter,
+            model=SemanticProvider(),tools=ToolRegistry((check,) if partial else ()),
+            token_counter=counter,
             reasoning_model=reasoning,reasoning_counter=counter) as harness:
-        if point=='semantic-boundary':
+        if point in ('semantic-boundary','semantic-partial-boundary'):
             await harness.create('s')
             await harness.send('s','Explain the rule',input_id='original')
         elif point=='semantic-clarification-boundary':
@@ -313,6 +347,7 @@ async def test_reopen_preserves_exact_acceptance_boundary_after_process_death(
         ("boundary", "resume", ""),
         ("fork-boundary", "fork-resume", ""),
         ("semantic-boundary", "semantic-resume", ""),
+        ("semantic-partial-boundary", "semantic-partial-resume", ""),
         ("semantic-clarification-boundary", "semantic-clarification-resume", ""),
         (
             "semantic-clarification-boundary",
@@ -327,7 +362,7 @@ async def test_reopen_preserves_exact_acceptance_boundary_after_process_death(
         ("boundary", "resume-expired", "resume_budget_exhausted"),
     ],
 )
-async def test_resume_only_at_durable_settlement_boundary(
+async def test_resume_validates_durable_boundary(
     tmp_path: Path, crash: str, resume: str, reason: str
 ) -> None:
     path = tmp_path / "resume.db"

@@ -150,6 +150,31 @@ class RunState:
     recovery_seen_json: tuple[str, ...] = ()
     recovery_attempts: tuple[tuple[str, str], ...] = ()
 
+    def undispatched_read_suffix(self) -> tuple[ToolCallAction, ...]:
+        """Return a partially settled admission with no uncertain dispatch, or no suffix."""
+        turn, admission = self.turn, self.admission
+        if (
+            self.phase is not Phase.TOOL
+            or self.model_revision != self.task.revision
+            or self.finalization is not None
+            or self.pending_poll is not None
+            or self.active_call_ids
+            or self.skipped_call_ids
+            or not self.settled_call_ids
+            or turn is None
+            or not isinstance(turn.decision, ToolBatch)
+            or admission is None
+            or admission.schema_version < 3
+        ):
+            return ()
+        # 兄弟可乱序完成, 但调度器按提案顺序启动。没有进行中的调用时, 已结算
+        # 的身份必须构成前缀。ToolStarted 后缺 ToolRecorded 的位置不能视为未派发。
+        calls = turn.decision.calls
+        count = len(self.settled_call_ids)
+        if set(self.settled_call_ids) != {call.call_id for call in calls[:count]}:
+            return ()
+        return calls[count:]
+
     @property
     def finalization(self) -> FinalizationStarted | None:
         return (

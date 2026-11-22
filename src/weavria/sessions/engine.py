@@ -89,6 +89,7 @@ from weavria.runtime import (
 from weavria.tools import (
     ReadOnlyPolicy,
     RegisteredTool,
+    ToolExecutionError,
     ToolPolicy,
     ToolRegistry,
     artifact_read_tool,
@@ -1145,7 +1146,7 @@ class SessionEngine:
         )
 
     async def resume(self, session_id: str, run_id: str) -> SessionResult:
-        """接续同一会话内最新的中断 Run, 仅限已结算的只读决策边界。"""
+        """接续最新中断 Run 的只读结算边界或尚未派发的批次尾部。"""
         return await self._run(session_id, "", resume_run_id=run_id)
 
     async def continue_task(
@@ -1569,32 +1570,16 @@ class SessionEngine:
                 self._context_source,
                 support_tools,
                 extensions=mounted,
-                settled_records=len(restored.state.records) if restored is not None else 0,
+                # 部分批次的回执尚未归约到语义头。全批结算时一次处理 A/B/C。
+                settled_records=(
+                    len(restored.state.records) - len(restored.state.settled_call_ids)
+                    if restored is not None
+                    else 0
+                ),
             )
             if restored is not None:
-                policy = self._policy if self._policy is not None else ReadOnlyPolicy()
                 async with asyncio.timeout(root_budget.remaining(self._clock.monotonic())):
-                    for record in restored.state.records:
-                        action = record.exchange.action
-                        descriptor = registry.get(action.tool_name).descriptor
-                        authorization = record.authorization
-                        if (
-                            authorization is None
-                            or not authorization.allowed
-                            or authorization.tool_version != descriptor.version
-                            or descriptor.behavior != "read_only"
-                            or descriptor.idempotency != "replay_safe"
-                        ):
-                            raise SessionConflictError("resume_source_authorization_unavailable")
-                        decision = await policy.authorize(
-                            run_id, descriptor, authorization.normalized_arguments
-                        )
-                        if not decision.allowed:
-                            raise SessionConflictError("resume_source_authorization_revoked")
-                        if record.artifact is not None:
-                            snapshot = await self.store.get(run_id, record.artifact.artifact_id)
-                            if snapshot.reference != record.artifact:
-                                raise SessionConflictError("resume_source_changed")
+                    await self._reauthorize_resume_sources(restored, registry)
             remaining = min(
                 self._limits.max_duration,
                 root_budget.remaining(self._clock.monotonic()),
@@ -1644,7 +1629,7 @@ class SessionEngine:
                 context_recovery=self._recovery_limits,
             )
             if restored is not None:
-                loop.restore_decision_boundary(restored.events, restored.resolutions)
+                self._restore_loop(loop, restored, visible_tool_names)
             self._loops[session_id] = loop
             self._run_tasks[run_id] = owner
             report = await loop.execute()
@@ -1753,6 +1738,50 @@ class SessionEngine:
                         await mounted.close()
                 finally:
                     self._tasks.discard(owner)
+
+    async def _reauthorize_resume_sources(self, claim: ResumeClaim, registry: ToolRegistry) -> None:
+        policy = self._policy if self._policy is not None else ReadOnlyPolicy()
+        for record in claim.state.records:
+            # 部分批次的失败反馈与成功回执一起结算。失败无原文可授权, 也无需重试。
+            if claim.admitted_request is not None and record.artifact is None:
+                continue
+            descriptor = registry.get(record.exchange.action.tool_name).descriptor
+            authorization = record.authorization
+            if (
+                authorization is None
+                or not authorization.allowed
+                or authorization.tool_version != descriptor.version
+                or descriptor.behavior != "read_only"
+                or descriptor.idempotency != "replay_safe"
+            ):
+                raise SessionConflictError("resume_source_authorization_unavailable")
+            decision = await policy.authorize(
+                claim.state.run_id, descriptor, authorization.normalized_arguments
+            )
+            if not decision.allowed:
+                raise SessionConflictError("resume_source_authorization_revoked")
+            if record.artifact is not None:
+                snapshot = await self.store.get(claim.state.run_id, record.artifact.artifact_id)
+                if snapshot.reference != record.artifact:
+                    raise SessionConflictError("resume_source_changed")
+
+    @staticmethod
+    def _restore_loop(
+        loop: AgentLoop, claim: ResumeClaim, visible_tool_names: tuple[str, ...]
+    ) -> None:
+        if claim.admitted_request is not None and any(
+            call.tool_name not in visible_tool_names
+            for call in claim.state.undispatched_read_suffix()
+        ):
+            raise SessionConflictError("resume_capability_view_changed")
+        try:
+            loop.restore_decision_boundary(
+                claim.events, claim.resolutions, admitted_request=claim.admitted_request
+            )
+        except (ValueError, ToolExecutionError) as exc:
+            if claim.admitted_request is None:
+                raise
+            raise SessionConflictError("resume_admission_changed") from exc
 
     async def steer(
         self,
