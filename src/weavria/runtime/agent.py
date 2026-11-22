@@ -173,6 +173,7 @@ from .journal import (
     settle_mutation,
 )
 from .progress import ProgressCheck, ProgressPolicy, SemanticProgressPolicy
+from .read_retry_review import SemanticReadRetry
 from .scheduling import ToolScheduling, dispatch_batch
 from .state import (
     EventAcceptanceError,
@@ -418,6 +419,7 @@ class _AgentKernel:
         context_recovery: RecoveryLimits | None = None,
         read_retry_lookup: ReadRetryLookup | None = None,
         read_retry_transfer: ReadRetryTransfer | None = None,
+        semantic_read_retry: SemanticReadRetry | None = None,
         finalization: FinalizationPolicy | None = None,
     ) -> None:
         if context_recovery is not None and (
@@ -426,6 +428,8 @@ class _AgentKernel:
             raise ValueError("context recovery requires a recovery compiler builder")
         self._read_retry_lookup = read_retry_lookup
         self._read_retry_transfer = read_retry_transfer
+        self._semantic_read_retry = semantic_read_retry
+        self._read_retry_review_attempted = False
         self._journal = journal
         self._preparation = preparation
         self._prepared_task_revision: int | None = None
@@ -904,6 +908,7 @@ class _AgentKernel:
                             self._capability_epoch,
                             checked_identities=checked_identities,
                             action_value_context=value_context,
+                            deadline=deadline,
                         )
                         if not admitted:
                             if self.state.phase is Phase.ACTION:
@@ -1967,6 +1972,7 @@ class _AgentKernel:
         *,
         checked_identities: tuple[ToolActionIdentity, ...],
         action_value_context: ActionValueContext,
+        deadline: float,
     ) -> tuple[bool, tuple[ToolActionIdentity, ...]]:
         revision = self.state.model_revision
         budget = ReadFeedbackBudget(
@@ -2057,6 +2063,13 @@ class _AgentKernel:
                         checked_identities,
                         self._read_retry_lookup,
                         self._read_retry_transfer,
+                        semantic=(
+                            None if self._read_retry_review_attempted else self._semantic_read_retry
+                        ),
+                        review_seconds=min(
+                            self._limits.max_intervention_duration,
+                            self._remaining(deadline) - self._finalization_reserve,
+                        ),
                     )
                     if self._read_retry_lookup is not None
                     else None
@@ -2065,6 +2078,8 @@ class _AgentKernel:
                     retry = budget.retry(batch, visible)
                 else:
                     retry, prediction = choice
+                    if prediction.review is not None:
+                        self._read_retry_review_attempted = True
             page_advice = retry.page if retry else None
             checked_single = retry is not None and page_advice is None
             page_retry = self._artifact_page_retry(batch, page_advice)
@@ -2943,6 +2958,7 @@ class AgentLoop(_AgentKernel):
         context_recovery: RecoveryLimits | None = None,
         read_retry_lookup: ReadRetryLookup | None = None,
         read_retry_transfer: ReadRetryTransfer | None = None,
+        semantic_read_retry: SemanticReadRetry | None = None,
         finalization: FinalizationPolicy | None = None,
         # 构造函数只建立依赖、初始状态和首个事件,不在初始化阶段执行模型或工具。
     ) -> None:
@@ -3009,6 +3025,7 @@ class AgentLoop(_AgentKernel):
             context_recovery=context_recovery,
             read_retry_lookup=read_retry_lookup,
             read_retry_transfer=read_retry_transfer,
+            semantic_read_retry=semantic_read_retry,
             finalization=finalization,
             # 完成共享内核初始化;此时实例已拥有初始状态,但尚未进入异步执行循环。
         )
@@ -3073,6 +3090,13 @@ class AgentLoop(_AgentKernel):
             self._feedback_template = admitted_request if admitted_request.task_model_view else None
         self._state = state
         self._events_json = [event.model_dump_json() for event in events]
+        # 恢复时从已提交的拒绝事实重建额外审查额度, 不在同一 Run 重复请求。
+        self._read_retry_review_attempted = any(
+            isinstance(event.data, BatchRejected)
+            and event.data.read_prediction is not None
+            and event.data.read_prediction.review is not None
+            for event in events
+        )
         self._resolutions_json = [resolution.model_dump_json() for resolution in resolutions]
 
     # 将 plans 暴露为只读属性,调用方不能通过该接口替换内核保存的计划集合。

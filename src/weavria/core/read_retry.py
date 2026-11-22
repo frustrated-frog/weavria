@@ -59,11 +59,42 @@ class ReadRetryScope(ContractModel):
         return self
 
 
+class ReadRetryQuote(ContractModel):
+    """原件中的可定位引句。Trace 只存内容摘要和字符区间。"""
+
+    receipt: ReadRetryOutcome
+    artifact_sha256: ActionDigest
+    pointer: _ScopePointer
+    start: int = Field(ge=0)
+    end: int = Field(gt=0)
+    quote_sha256: ActionDigest
+    requirement_sha256: ActionDigest
+
+    @model_validator(mode="after")
+    def validate_span(self) -> Self:
+        if self.receipt.delivery != "full" or self.start >= self.end:
+            raise ValueError("read retry quote requires complete delivery and a positive span")
+        return self
+
+
+class ReadRetryReview(ContractModel):
+    """Model assessment of transfer, independent of subsequent delivery."""
+
+    status: Literal["selected", "abstained", "invalid", "unavailable", "timeout"]
+    quote: ReadRetryQuote | None = None
+
+    @model_validator(mode="after")
+    def validate_selection(self) -> Self:
+        if (self.status == "selected") != (self.quote is not None):
+            raise ValueError("only a selected review may carry a quote receipt")
+        return self
+
+
 class ReadRetryPrediction(BaseModel):
     """在工具执行前记录当前选择、按原顺序的基线和用于排序的近期试验。"""
 
     model_config = ContractModel.model_config
-    schema_version: Literal[1, 2] = 1
+    schema_version: Literal[1, 2, 3] = 1
     scene_sha256: ActionDigest
     candidate_sha256s: tuple[ActionDigest, ...] = Field(min_length=2, max_length=32)
     selected_sha256: ActionDigest
@@ -73,6 +104,7 @@ class ReadRetryPrediction(BaseModel):
     scope: ReadRetryScope | None = None
     scope_sha256: ActionDigest | None = None
     transfer: ReadRetryOutcome | None = None
+    review: ReadRetryReview | None = None
 
     @field_validator("schema_version", mode="before")
     @classmethod
@@ -80,11 +112,13 @@ class ReadRetryPrediction(BaseModel):
         return ContractModel.validate_version_type(value)
 
     @model_serializer(mode="wrap")
-    def preserve_v1(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+    def preserve_versions(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
         data = handler(self)
-        if self.schema_version == 1:
+        if self.schema_version != 2:
             for key in ("scope", "scope_sha256", "transfer"):
                 data.pop(key, None)
+        if self.schema_version != 3:
+            data.pop("review", None)
         return data
 
     @property
@@ -93,6 +127,17 @@ class ReadRetryPrediction(BaseModel):
 
     @model_validator(mode="after")
     def validate_evidence(self) -> Self:
+        if (self.schema_version == 3) != (self.review is not None) or (
+            self.review is not None
+            and (
+                self.observations
+                or (
+                    self.review.status != "selected"
+                    and self.selected_sha256 != self.baseline_sha256
+                )
+            )
+        ):
+            raise ValueError("review requires prediction v3 and preserves baseline on abstention")
         if (self.schema_version == 2) != (self.scope is not None) or (
             (self.scope is None) != (self.scope_sha256 is None)
         ):

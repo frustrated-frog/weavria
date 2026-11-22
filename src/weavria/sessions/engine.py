@@ -77,11 +77,14 @@ from weavria.runtime import (
     FinalizationPolicy,
     JournalCommitError,
     LayeredCompletionPolicy,
+    ModelReadRetryReviewer,
     ProgressPolicyFactory,
+    ReadRetryHistory,
     ReadRetryScopeResolver,
     ReadRetryTransfer,
     RootBudget,
     RunLimits,
+    SemanticReadRetry,
     SystemClock,
     TaskModelProjector,
     ToolScheduling,
@@ -959,6 +962,7 @@ class SessionEngine:
         configuration_metadata: dict[str, JsonValue] | None = None,
         read_retry_experience: bool = False,
         read_retry_scope_resolver: ReadRetryScopeResolver | None = None,
+        read_retry_reviewer: ModelReadRetryReviewer | None = None,
         task_model_projector: TaskModelProjector | None = None,
         context_source: ContextSource | None = None,
         extensions: HarnessExtensions | None = None,
@@ -992,6 +996,15 @@ class SessionEngine:
             or len(self._read_retry_scope_version) > 128
         ):
             raise ValueError("scoped read experience requires a versioned resolver and experience")
+        self._read_retry_reviewer = read_retry_reviewer
+        if read_retry_reviewer is not None and (
+            not read_retry_experience
+            or read_retry_scope_resolver is not None
+            or not read_retry_reviewer.configuration_id.strip()
+            or len(read_retry_reviewer.version) > 128
+            or not read_retry_reviewer.model.capabilities.tool_calls
+        ):
+            raise ValueError("semantic read experience requires one versioned structured reviewer")
         self._task_model_projector = task_model_projector
         self._recovery_limits = (
             RecoveryLimits.model_validate_json(context_recovery.model_dump_json())
@@ -1233,39 +1246,34 @@ class SessionEngine:
                 resume_run_id is None
                 or await self.store.uses_read_retry_experience(session_id, resume_run_id)
             )
+            retry_schema, retry_config = self._read_retry_config(read_retry_experience)
             config = json.dumps(
                 {
                     "schema_version": (
-                        10
-                        if self._read_retry_scope_version is not None
-                        else 9
-                        if read_retry_experience
-                        else 8
-                        if plan
-                        else 7
-                        if chain
-                        else 6
-                        if self._context_source is not None
-                        else 5
-                        if self._configuration_metadata_json is not None
-                        else 4
-                        if self._recovery_limits is not None
-                        else 3
-                        if retrieval_config is not None
+                        retry_schema
                         or (
-                            self._compiler_config is not None
-                            and self._compiler_config.max_history_spans > 1
+                            8
+                            if plan
+                            else 7
+                            if chain
+                            else 6
+                            if self._context_source is not None
+                            else 5
+                            if self._configuration_metadata_json is not None
+                            else 4
+                            if self._recovery_limits is not None
+                            else 3
+                            if retrieval_config is not None
+                            or (
+                                self._compiler_config is not None
+                                and self._compiler_config.max_history_spans > 1
+                            )
+                            else 2
+                            if self._compiler_config is not None
+                            else 1
                         )
-                        else 2
-                        if self._compiler_config is not None
-                        else 1
                     ),
-                    **({"read_retry_experience": "delivery/1"} if read_retry_experience else {}),
-                    **(
-                        {"read_retry_scope_version": self._read_retry_scope_version}
-                        if self._read_retry_scope_version is not None
-                        else {}
-                    ),
+                    **retry_config,
                     **({"extension_plan": plan.model_dump(mode="json")} if plan else {}),
                     **(
                         {"extensions": [item.descriptor.model_dump(mode="json") for item in chain]}
@@ -1633,6 +1641,7 @@ class SessionEngine:
                 if read_retry_experience
                 else None,
                 read_retry_transfer=self._read_retry_transfer(run_id),
+                semantic_read_retry=self._semantic_read_retry(run_id, registry),
                 preparation=adapter,
                 task_observation=task_observation,
                 progress=(
@@ -1760,6 +1769,22 @@ class SessionEngine:
                 finally:
                     self._tasks.discard(owner)
 
+    def _read_retry_config(self, enabled: bool) -> tuple[int | None, dict[str, str]]:
+        settings = {"read_retry_experience": "delivery/1"} if enabled else {}
+        if self._read_retry_reviewer is not None:
+            return 11, {**settings, "read_retry_review_version": self._read_retry_reviewer.version}
+        if self._read_retry_scope_version is not None:
+            return 10, {**settings, "read_retry_scope_version": self._read_retry_scope_version}
+        return (9, settings) if enabled else (None, settings)
+
+    def _semantic_read_retry(self, run_id: str, registry: ToolRegistry) -> SemanticReadRetry | None:
+        reviewer = self._read_retry_reviewer
+        if reviewer is None:
+            return None
+        return SemanticReadRetry(
+            reviewer, partial(self._authorized_read_retry_history, run_id, registry)
+        )
+
     def _read_retry_transfer(self, run_id: str) -> ReadRetryTransfer | None:
         resolver = self._read_retry_scope_resolver
         return (
@@ -1767,6 +1792,29 @@ class SessionEngine:
             if resolver is not None
             else None
         )
+
+    async def _authorized_read_retry_history(
+        self, run_id: str, registry: ToolRegistry, tools: tuple[str, ...]
+    ) -> tuple[ReadRetryHistory, ...]:
+        history = await self.store.read_retry_history(run_id, tools)
+        policy = self._policy if self._policy is not None else ReadOnlyPolicy()
+        readable: list[ReadRetryHistory] = []
+        for item in history:
+            record = item.record
+            descriptor = registry.get(record.exchange.action.tool_name).descriptor
+            auth = record.authorization
+            if (
+                auth is None
+                or not auth.allowed
+                or auth.tool_version != descriptor.version
+                or record.artifact != item.artifact.reference
+            ):
+                continue
+            # 过去允许读取不代表当前仍可向模型披露。按当前 Run 和旧入参重做授权。
+            decision = await policy.authorize(run_id, descriptor, auth.normalized_arguments)
+            if decision.allowed:
+                readable.append(item)
+        return tuple(readable)
 
     async def _reauthorize_resume_sources(self, claim: ResumeClaim, registry: ToolRegistry) -> None:
         policy = self._policy if self._policy is not None else ReadOnlyPolicy()

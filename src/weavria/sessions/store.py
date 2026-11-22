@@ -72,7 +72,15 @@ from weavria.core import (
     TurnSettled,
     task_view_digest,
 )
-from weavria.runtime import Clock, Phase, RunState, SystemClock, reduce_event, settle_mutation
+from weavria.runtime import (
+    Clock,
+    Phase,
+    ReadRetryHistory,
+    RunState,
+    SystemClock,
+    reduce_event,
+    settle_mutation,
+)
 from weavria.tools import ToolExecutionError
 
 from .extension_plan import ExtensionDescriptor, ExtensionPlan
@@ -92,10 +100,12 @@ from .history_search import search_history
 from .history_validation import validate_history_item, validate_history_request
 from .preparation import SemanticTransitionReducer
 from .read_retry import (
+    create_read_retry_review_index,
     create_read_retry_schema,
     create_read_retry_scope_index,
     project_read_retry,
     recall_read_retries,
+    recall_read_retry_history,
     recall_scoped_read_retries,
 )
 from .task_continuation import TaskRun, TaskVersion
@@ -295,7 +305,7 @@ class SQLiteSessionStore:
         conn = sqlite3.connect(self.path, timeout=2.0)
         self._connection = conn
         version = conn.execute("PRAGMA user_version").fetchone()[0]
-        if version not in (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12):
+        if version not in (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13):
             raise SessionConflictError("unsupported session database schema")
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA journal_mode=WAL")
@@ -375,6 +385,10 @@ class SQLiteSessionStore:
             with self._transaction() as migration:
                 create_read_retry_scope_index(migration)
                 migration.execute("PRAGMA user_version=12")
+        if version < 13:
+            with self._transaction() as migration:
+                create_read_retry_review_index(migration)
+                migration.execute("PRAGMA user_version=13")
         # Only the exclusive DB owner can classify an old live run as interrupted.
         active = conn.execute("SELECT id FROM runs WHERE status='running'").fetchall()
         for row in active:
@@ -1969,6 +1983,11 @@ class SQLiteSessionStore:
     async def read_retry_outcomes(self, run_id: str, scene: str) -> tuple[ReadRetryOutcome, ...]:
         """按当前 Run 的会话与冻结配置检索最多十六条已核验的交付。"""
         return await self._submit(lambda: recall_read_retries(self._conn(), run_id, scene))
+
+    async def read_retry_history(
+        self, run_id: str, tools: tuple[str, ...]
+    ) -> tuple[ReadRetryHistory, ...]:
+        return await self._submit(lambda: recall_read_retry_history(self._conn(), run_id, tools))
 
     async def scoped_read_retry_outcomes(
         self,

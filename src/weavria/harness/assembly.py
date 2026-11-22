@@ -29,6 +29,7 @@ from weavria.memory import (
 from weavria.models import ModelCallError, ModelProvider, SessionModelProvider
 from weavria.runtime import (
     CompletionPolicy,
+    ModelReadRetryReviewer,
     ReadRetryScopeResolver,
     RunLimits,
     TaskModelProjector,
@@ -265,6 +266,7 @@ class AgentHarness:
         policy: ToolPolicy | None = None,
         scheduling: ToolScheduling | None = None,
         read_retry_scope_resolver: ReadRetryScopeResolver | None = None,
+        read_retry_reviewer: ModelReadRetryReviewer | None = None,
     ) -> Self:
         """按同一配置装配已有组件;应用无需构造理解器、记忆形成或恢复链路。
 
@@ -377,6 +379,7 @@ class AgentHarness:
             discovery_policy=evidence.discovery_policy if evidence is not None else None,
             read_retry_experience=config.read_retry_experience,
             read_retry_scope_resolver=read_retry_scope_resolver,
+            read_retry_reviewer=read_retry_reviewer,
             working_records=config.working_records,
             work_updates=config.work_updates,
             work_material_handoff=config.work_material_handoff,
@@ -436,6 +439,7 @@ class AgentHarness:
         policy: ToolPolicy | None = None,
         scheduling: ToolScheduling | None = None,
         read_retry_scope_resolver: ReadRetryScopeResolver | None = None,
+        read_retry_reviewer: ModelReadRetryReviewer | None = None,
         configuration_id: str | None = None,
         configuration_metadata: dict[str, JsonValue] | None = None,
         extensions: HarnessExtensions | None = None,
@@ -514,6 +518,7 @@ class AgentHarness:
             path,
             read_retry_experience=read_retry_experience,
             read_retry_scope_resolver=read_retry_scope_resolver,
+            read_retry_reviewer=read_retry_reviewer,
             model=model,
             tools=tools,
             instructions=instructions,

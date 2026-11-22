@@ -1,5 +1,6 @@
 """从同一决策的可见证据和字节预算计算只读调用的反馈预留。"""
 
+import asyncio
 import hashlib
 import json
 from collections import Counter
@@ -16,6 +17,7 @@ from weavria.core import (
     ModelTurn,
     ReadRetryOutcome,
     ReadRetryPrediction,
+    ReadRetryReview,
     ReadRetryScope,
     TaskInput,
     TaskObservation,
@@ -24,6 +26,8 @@ from weavria.core import (
     ToolRecord,
 )
 from weavria.tools import ToolActionIdentity, ToolRegistry
+
+from .read_retry_review import SemanticReadRetry
 
 type ReadRetryLookup = Callable[[str], Awaitable[tuple[ReadRetryOutcome, ...]]]
 
@@ -213,12 +217,16 @@ class ReadFeedbackBudget:
         identities: tuple[ToolActionIdentity, ...],
         lookup: ReadRetryLookup,
         transfer: ReadRetryTransfer | None = None,
+        *,
+        semantic: SemanticReadRetry | None = None,
+        review_seconds: float = 0,
     ) -> tuple[ReadRetry, ReadRetryPrediction] | None:
         """只在同一层级的外部单读之间选择。分页、依赖原文或未知操作沿用原策略。"""
         if self.access is None or len(batch.calls) < 2:
             return None
         candidates: dict[str, ToolCallAction] = {}
         scopes: dict[str, tuple[ReadRetryScope, str]] = {}
+        normalized: list[ToolCallAction] = []
         for call, identity in zip(batch.calls, identities, strict=True):
             if call.tool_name not in visible or identity.normalization != "validated":
                 return None
@@ -237,7 +245,7 @@ class ReadFeedbackBudget:
             key = identity.canonical_action_sha256
             if key not in candidates and self._can_suggest_whole_read(call):
                 candidates[key] = call
-                if transfer is not None:
+                if transfer is not None or semantic is not None:
                     tool = self.tools.get(call.tool_name)
                     bound = call.model_copy(
                         update={
@@ -246,9 +254,11 @@ class ReadFeedbackBudget:
                             ),
                         }
                     )
-                    scope = transfer.resolver.resolve(self.task, bound)
-                    if scope is not None:
-                        scopes[key] = scope, scope.key(identity.action_family_sha256)
+                    normalized.append(bound)
+                    if transfer is not None:
+                        scope = transfer.resolver.resolve(self.task, bound)
+                        if scope is not None:
+                            scopes[key] = scope, scope.key(identity.action_family_sha256)
         if len(candidates) < 2:
             return None
         scene = hashlib.sha256(
@@ -271,9 +281,26 @@ class ReadFeedbackBudget:
             if len(supported) == 1:
                 selected = supported[0]
                 receipt = history[scopes[selected][1]]
+        review = None
+        if not observations and semantic is not None and review_seconds > 0:
+            try:
+                async with asyncio.timeout(review_seconds):
+                    history = await semantic.lookup(
+                        tuple(dict.fromkeys(call.tool_name for call in normalized))
+                    )
+                    result = await semantic.reviewer.choose(
+                        self.task, tuple(normalized), history, max_duration=review_seconds
+                    )
+            except TimeoutError:
+                review = ReadRetryReview(status="timeout")
+            else:
+                if result is not None:
+                    index, review = result
+                    if index is not None:
+                        selected = tuple(candidates)[index]
         scope, scope_key = scopes[selected] if selected in scopes else (None, None)
         return ReadRetry(call=candidates[selected]), ReadRetryPrediction(
-            schema_version=2 if scope is not None else 1,
+            schema_version=3 if review is not None else 2 if scope is not None else 1,
             scene_sha256=scene,
             candidate_sha256s=tuple(candidates),
             selected_sha256=selected,
@@ -281,6 +308,7 @@ class ReadFeedbackBudget:
             scope=scope,
             scope_sha256=scope_key,
             transfer=receipt,
+            review=review,
         )
 
     def retry_alone(self, batch: ToolBatch, visible: set[str]) -> ModelTurn | None:

@@ -12,6 +12,7 @@ from weavria.core import (
     ReadRetryOutcome,
     ReadRetryScope,
     SessionRequest,
+    TaskInput,
     ToolExchange,
     ToolFailedObservation,
     ToolRecord,
@@ -19,7 +20,7 @@ from weavria.core import (
     complete_exchange,
     minimum_exchange,
 )
-from weavria.runtime import RunState
+from weavria.runtime import ReadRetryHistory, RunState
 
 from .history_index import MODEL_VISIBLE_RUN_PREDICATE
 
@@ -47,6 +48,58 @@ def create_read_retry_scope_index(conn: sqlite3.Connection) -> None:
     conn.execute("""CREATE INDEX retry_scope ON read_retry_trials(
         session_id,profile,scope_sha256,ordinal DESC,rejection_sequence DESC)
         WHERE field_support=1""")
+
+
+def create_read_retry_review_index(conn: sqlite3.Connection) -> None:
+    conn.execute("""CREATE INDEX retry_full_history ON read_retry_trials(
+        session_id,profile,ordinal DESC,rejection_sequence DESC) WHERE delivery='full'""")
+
+
+def recall_read_retry_history(
+    conn: sqlite3.Connection, run_id: str, tools: tuple[str, ...]
+) -> tuple[ReadRetryHistory, ...]:
+    """沿已核验回执找原件与当时模型看到的任务, 不从会话摘要恢复正文。"""
+    if not 1 <= len(tools) <= 32:
+        return ()
+    current = conn.execute(
+        "SELECT session_id,ordinal,config FROM runs WHERE id=?", (run_id,)
+    ).fetchone()
+    if current is None:
+        return ()
+    placeholders = ",".join("?" for _ in tools)
+    rows = conn.execute(
+        f"""SELECT t.run_id,t.rejection_sequence,t.model_call+2,t.action,
+        json_extract(v.data,'$.current.task'),o.record,a.reference,a.content
+        FROM read_retry_trials t JOIN runs r ON r.id=t.run_id
+        JOIN request_views v ON v.run_id=t.run_id AND v.model_call=t.model_call
+        JOIN outcomes o ON o.run_id=t.run_id AND o.call_id=t.call_id
+        JOIN artifacts a ON a.run_id=o.run_id AND a.id=o.artifact_id
+        WHERE t.session_id=? AND t.profile=? AND t.ordinal<? AND t.delivery='full'
+        AND r.status IN ('completed','budget_exhausted','failed')
+        AND {MODEL_VISIBLE_RUN_PREDICATE}
+        AND json_extract(o.record,'$.exchange.action.tool_name') IN ({placeholders})
+        AND length(CAST(a.content AS BLOB))<=2200
+        AND length(CAST(json_extract(v.data,'$.current.task') AS BLOB))<=1800
+        AND length(CAST(json_extract(o.record,'$.authorization.normalized_arguments') AS BLOB))
+            <=1000
+        ORDER BY t.ordinal DESC,t.rejection_sequence DESC LIMIT 4""",
+        (current[0], _profile_digest(current[2]), current[1], *tools),
+    )
+    return tuple(
+        ReadRetryHistory(
+            ReadRetryOutcome(
+                run_id=source,
+                rejection_sequence=seq,
+                model_call=model_call,
+                action_sha256=action,
+                delivery="full",
+            ),
+            TaskInput.model_validate_json(task),
+            ToolRecord.model_validate_json(record),
+            ArtifactSnapshot(reference, content),
+        )
+        for source, seq, model_call, action, task, record, reference, content in rows
+    )
 
 
 def _profile_digest(config: str) -> str:
