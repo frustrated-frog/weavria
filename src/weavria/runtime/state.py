@@ -151,7 +151,11 @@ class RunState:
     recovery_attempts: tuple[tuple[str, str], ...] = ()
 
     def undispatched_read_suffix(self) -> tuple[ToolCallAction, ...]:
-        """Return a partially settled admission with no uncertain dispatch, or no suffix."""
+        """Return calls to dispatch when available, retaining the original empty-tuple default."""
+        return self.read_batch_resume_suffix() or ()
+
+    def read_batch_resume_suffix(self) -> tuple[ToolCallAction, ...] | None:
+        """Return pending calls for a safe open batch; an empty tuple needs only settlement."""
         turn, admission = self.turn, self.admission
         if (
             self.phase is not Phase.TOOL
@@ -166,13 +170,13 @@ class RunState:
             or admission is None
             or admission.schema_version < 3
         ):
-            return ()
+            return None
         # 兄弟可乱序完成, 但调度器按提案顺序启动。没有进行中的调用时, 已结算
         # 的身份必须构成前缀。ToolStarted 后缺 ToolRecorded 的位置不能视为未派发。
         calls = turn.decision.calls
         count = len(self.settled_call_ids)
         if set(self.settled_call_ids) != {call.call_id for call in calls[:count]}:
-            return ()
+            return None
         return calls[count:]
 
     @property

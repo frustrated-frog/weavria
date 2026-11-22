@@ -1146,7 +1146,7 @@ class SessionEngine:
         )
 
     async def resume(self, session_id: str, run_id: str) -> SessionResult:
-        """接续最新中断 Run 的只读结算边界或尚未派发的批次尾部。"""
+        """接续最新中断 Run 的只读结算边界或可安全继续的未结算批次。"""
         return await self._run(session_id, "", resume_run_id=run_id)
 
     async def continue_task(

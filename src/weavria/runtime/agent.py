@@ -601,9 +601,13 @@ class _AgentKernel:
                     calls, identities = self._restored_batch
                     turn, revision = self.state.turn, self.state.model_revision
                     assert turn is not None and revision is not None
-                    await self._execute_turn(
-                        calls, deadline - self._finalization_reserve, identities
-                    )
+                    if calls:
+                        await self._execute_turn(
+                            calls, deadline - self._finalization_reserve, identities
+                        )
+                    else:
+                        # 所有回执都已接受。只提交汇合事件, 避免进入工具执行路径。
+                        await self._accept(TurnSettled())
                     await self._resolve_execution(turn, revision, deadline)
                 while self.state.phase is not Phase.TERMINAL:
                     if self._remaining(deadline) <= 0:
@@ -3027,10 +3031,10 @@ class AgentLoop(_AgentKernel):
             ):
                 raise ValueError("restore requires a settled decision boundary")
         else:
-            calls = state.undispatched_read_suffix()
+            calls = state.read_batch_resume_suffix()
             admission = state.admission
             if (
-                not calls
+                calls is None
                 or admission is None
                 or admission.bounds != self._bounds
                 or admitted_request.task != state.task

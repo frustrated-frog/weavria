@@ -31,6 +31,7 @@ from weavria.core import (
     ToolSucceededObservation,
     TurnDecided,
     TurnResolution,
+    TurnSettled,
 )
 from weavria.evaluation import RecordingHTTPTransport
 from weavria.harness import AgentHarness, HarnessConfig
@@ -47,7 +48,7 @@ from weavria.tools import ToolContext, ToolFault, ToolPolicy, ToolRegistry, Type
 
 type Arm = Literal["batch", "frontier", "autonomous"]
 type Scenario = Literal["failure", "revision", "crash"]
-type CrashPoint = Literal["batch-active", "batch-queued", "frontier-settled"]
+type CrashPoint = Literal["batch-active", "batch-queued", "batch-recorded", "frontier-settled"]
 
 
 @dataclass(frozen=True)
@@ -207,9 +208,11 @@ class ScenarioReads:
         scenario: Scenario,
         *,
         kill_batch: bool = False,
+        defer_first: bool = False,
         all_in_flight: bool = False,
     ) -> None:
         self.task, self.scenario, self.kill_batch = task, scenario, kill_batch
+        self.defer_first = defer_first
         self.corpus = {path: corpus[path] for path in (*task.paths, task.replacement)}
         self.calls: list[str] = []
         # 修订故障预设旧分支在队列中或已经派发, 以便分开验证两种边界。
@@ -221,7 +224,10 @@ class ScenarioReads:
     async def read(self, action: Read, context: ToolContext) -> Source:
         path = action.path
         self.calls.append(path)
-        c = self.task.paths[2]
+        a, _, c = self.task.paths
+        if self.defer_first and path == a:
+            # 固定 A 最后落盘, 用实际乱序的 journal 验证恢复后的反馈排序。
+            await self.both_durable.wait()
         if path == c and self.scenario == "failure" and self.calls.count(c) == 1:
             raise ToolFault(
                 ErrorCategory.TOOL_FAILURE,
@@ -252,6 +258,9 @@ class CrashStore(SQLiteSessionStore):
         await super().append(event)
         if self.point != "frontier-settled" and event.data.kind == "tool_recorded":
             records = await self.run_records("s", event.run_id)
+            if self.point == "batch-recorded" and len(records) == len(self.reads.task.paths):
+                # 最后一条 ToolRecorded 已提交; 批次派发器尚未收到返回。
+                os._exit(73)
             if len(records) == 2:
                 if self.point == "batch-queued":
                     # 串行调度的第二个结果已落盘, append 返回前不会派发第三个。
@@ -412,11 +421,17 @@ def corpus_data() -> dict[str, str]:
     return TypeAdapter(dict[str, str]).validate_json(CORPUS.read_bytes())
 
 
-async def crash_child(path: Path, point: CrashPoint) -> None:
+async def crash_child(path: Path, point: CrashPoint, *, failed_receipt: bool) -> None:
     task = TASKS[0]
     arm: Arm = "frontier" if point == "frontier-settled" else "batch"
     counter = OpenAICompatibleTokenCounter(provider_config(), encoding="cl100k_base")
-    reads = ScenarioReads(task, corpus_data(), "crash", kill_batch=point == "batch-active")
+    reads = ScenarioReads(
+        task,
+        corpus_data(),
+        "failure" if failed_receipt else "crash",
+        kill_batch=point == "batch-active",
+        defer_first=point == "batch-recorded",
+    )
     harness = make_harness(
         path,
         reads,
@@ -445,7 +460,7 @@ class Recovery:
     original_tool_starts: tuple[str, ...]
 
 
-async def interrupt_probe(path: Path, point: CrashPoint) -> None:
+async def interrupt_probe(path: Path, point: CrashPoint, *, failed_receipt: bool = False) -> None:
     # 子进程只用于故障注入;恢复端用新连接和新的 AgentHarness。
     child = await asyncio.create_subprocess_exec(
         sys.executable,
@@ -454,6 +469,7 @@ async def interrupt_probe(path: Path, point: CrashPoint) -> None:
         "--crash-child",
         str(path),
         point,
+        *(("--failed-receipt",) if failed_receipt else ()),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -489,8 +505,14 @@ async def run_crash(path: Path, point: CrashPoint) -> Recovery:
         )
         records = await harness.sessions.store.run_records("s", old.run_id)
         durable = tuple(sorted(str(r.exchange.action.arguments["path"]) for r in records))
-        if old.status != "interrupted" or durable != tuple(sorted(task.paths[:2])):
-            raise RuntimeError("crash fixture did not persist precisely the two sibling results")
+        expected = task.paths if point == "batch-recorded" else task.paths[:2]
+        if old.status != "interrupted" or durable != tuple(sorted(expected)):
+            raise RuntimeError("crash fixture did not persist the expected receipts")
+        if point == "batch-recorded" and any(
+            isinstance(e.data, SessionRunEvent) and isinstance(e.data.event.data, TurnSettled)
+            for e in events
+        ):
+            raise RuntimeError("recorded batch settled before crash")
         reason = None
         try:
             result = (await harness.resume("s", old.run_id)).session
@@ -529,12 +551,13 @@ async def main() -> None:
         "--autonomous", action="store_true", help="补跑首个动作也由模型决定的失败任务"
     )
     parser.add_argument("--crash-child", nargs=2)
+    parser.add_argument("--failed-receipt", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.crash_child:
         filename, point = args.crash_child
-        if point not in ("batch-active", "batch-queued", "frontier-settled"):
+        if point not in ("batch-active", "batch-queued", "batch-recorded", "frontier-settled"):
             parser.error("invalid crash point")
-        await crash_child(Path(filename), point)
+        await crash_child(Path(filename), point, failed_receipt=args.failed_receipt)
         return
     if args.autonomous and not args.live:
         parser.error("--autonomous requires --live")
@@ -556,6 +579,7 @@ async def main() -> None:
             crash_points: tuple[CrashPoint, ...] = (
                 "batch-active",
                 "batch-queued",
+                "batch-recorded",
                 "frontier-settled",
             )
             for point in crash_points:

@@ -182,12 +182,15 @@ async def semantic_main():
     original_append=SQLiteSessionStore.append
     async def crash_at_work_receipt(self,event):
         await original_append(self,event)
-        if event.data.kind=='tool_recorded': os._exit(73)
-    partial=point in ('semantic-partial-boundary','semantic-partial-resume')
-    if point=='semantic-partial-boundary':
+        if event.data.kind=='tool_recorded':
+            receipts=await self.run_records('s',event.run_id)
+            if len(receipts)==(2 if point=='semantic-recorded-boundary' else 1):
+                os._exit(73)
+    open_batch=point.startswith(('semantic-partial-','semantic-recorded-'))
+    if open_batch and point.endswith('-boundary'):
         SQLiteSessionStore.append=crash_at_work_receipt
     async def check_view(args, context):
-        assert point=='semantic-partial-resume'
+        assert point in ('semantic-partial-resume','semantic-recorded-boundary')
         assert context.task_view.progress['working_state']['revision']==0
         return Out(value=args.value)
     class SemanticProvider:
@@ -201,7 +204,7 @@ async def semantic_main():
                     assert request.current.task.revision==2
 
                 assert work['revision']==1 and work['notes'][0]['summary']=='Check second case'
-                if partial:
+                if open_batch:
                     assert [c.call_id for c in request.current.feedback.calls]==['work','check']
                     assert [c.status for c in request.current.feedback.calls]==['succeeded']*2
                 return ModelTurn(decision=FinishAction(output='resumed with working state'))
@@ -211,10 +214,10 @@ async def semantic_main():
             check_action=ToolCallAction(call_id='check',tool_name='check_view',
                                         arguments={'value':'bound view'})
             return ModelTurn(decision=ToolBatch(
-                calls=(work_action,check_action) if partial else (work_action,)))
+                calls=(work_action,check_action) if open_batch else (work_action,)))
     spec=TaskSpecification(route='direct',intent='Answer',goal='Explain',
         completion_criteria=(CompletionCriterion(kind='response',description='Answer'),))
-    if partial:
+    if open_batch:
         spec=TaskSpecification(route='execute', intent='Check', goal='Explain',
             information_needs=(InformationNeed(description='Check bound work', source='external',
                 capability_names=('check_view',)),),
@@ -252,8 +255,7 @@ async def semantic_main():
         })
         reasoning=FakeModelProvider((declare(clarify),declare(resolved)))
     else:
-        reasoning=FakeModelProvider((declare(spec),) if point in (
-            'semantic-boundary','semantic-partial-boundary') else ())
+        reasoning=FakeModelProvider((declare(spec),) if point.endswith('-boundary') else ())
     counter=OpenAICompatibleTokenCounter(
         OpenAICompatibleConfig(model='fake',max_output_tokens=256,context_window_tokens=64000),
         encoding='cl100k_base')
@@ -264,10 +266,10 @@ async def semantic_main():
     check=TypedTool(name='check_view',version='1',description='Read bound model view',
                     input_type=In,output_type=Out,execute=check_view)
     async with AgentHarness.from_config(Path(sys.argv[1]),config=profile,
-            model=SemanticProvider(),tools=ToolRegistry((check,) if partial else ()),
+            model=SemanticProvider(),tools=ToolRegistry((check,) if open_batch else ()),
             token_counter=counter,
             reasoning_model=reasoning,reasoning_counter=counter) as harness:
-        if point in ('semantic-boundary','semantic-partial-boundary'):
+        if point=='semantic-boundary' or (open_batch and point.endswith('-boundary')):
             await harness.create('s')
             await harness.send('s','Explain the rule',input_id='original')
         elif point=='semantic-clarification-boundary':
@@ -289,6 +291,11 @@ async def semantic_main():
             result=await harness.resume('s',old.run_id)
             assert result.session.run_id==old.run_id
             assert result.session.report.output=='resumed with working state', result
+            if open_batch:
+                events=await harness.sessions.store.events('s',limit=256)
+                starts=[e.data.event.data.call_id for e in events if e.data.kind=='run_event'
+                    and e.data.event.data.kind=='tool_started']
+                assert starts==['work','check']
             assert not reasoning.requests
 asyncio.run(semantic_main() if point.startswith('semantic-') else main())
 """
@@ -348,6 +355,7 @@ async def test_reopen_preserves_exact_acceptance_boundary_after_process_death(
         ("fork-boundary", "fork-resume", ""),
         ("semantic-boundary", "semantic-resume", ""),
         ("semantic-partial-boundary", "semantic-partial-resume", ""),
+        ("semantic-recorded-boundary", "semantic-recorded-resume", ""),
         ("semantic-clarification-boundary", "semantic-clarification-resume", ""),
         (
             "semantic-clarification-boundary",

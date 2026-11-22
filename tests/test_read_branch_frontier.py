@@ -29,9 +29,12 @@ from weavria.core import (
     FinishAction,
     ModelStarted,
     ModelTurn,
+    SessionControlDecided,
     SessionRunEvent,
     TaskRevised,
     ToolFailedObservation,
+    ToolStarted,
+    TurnSettled,
 )
 from weavria.core.execution import ToolRecorded
 from weavria.models import FakeSessionProvider, OpenAICompatibleTokenCounter
@@ -123,19 +126,22 @@ async def test_default_completion_cannot_verify_a_missing_branch(
     assert row.tool_reads == TASKS[0].paths[:2] and not row.grounded_correct
 
 
-@pytest.mark.parametrize("point", ("batch-active", "batch-queued", "frontier-settled"))
+@pytest.mark.parametrize(
+    "point", ("batch-active", "batch-queued", "batch-recorded", "frontier-settled")
+)
 async def test_process_death_resumes_only_a_safe_batch_suffix_or_settled_turn(
     tmp_path: Path, point: CrashPoint
 ) -> None:
     task = TASKS[0]
     result = await run_crash(tmp_path / "crash.db", point)
-    assert result.durable_before == tuple(sorted(task.paths[:2])) and result.correct
+    expected = task.paths if point == "batch-recorded" else task.paths[:2]
+    assert result.durable_before == tuple(sorted(expected)) and result.correct
     assert result.interrupted_calls == int(point == "batch-active")
     if point != "batch-active":
         assert result.same_run and result.resume_error is None
-        assert result.reads_after == (task.paths[2],)
+        assert result.reads_after == (() if point == "batch-recorded" else (task.paths[2],))
         assert len(set(result.original_tool_starts)) == len(result.original_tool_starts) == 3
-        if point == "batch-queued":
+        if point in ("batch-queued", "batch-recorded"):
             assert result.model_turns_after == 1  # 只调用汇总模型, 第三个调用仍由旧提案授权。
             assert result.original_tool_starts[-1] == "read-1-0-2"
     else:
@@ -367,3 +373,61 @@ async def test_cancelling_resumed_suffix_joins_tool_and_terminates_run(tmp_path:
         assert closed.run_id == old.run_id and closed.status == "cancelled"
         with pytest.raises(SessionConflictError, match="resume_run_not_interrupted"):
             await harness.resume("s", old.run_id)
+
+
+@pytest.mark.parametrize("failed_receipt", (False, True), ids=("success", "mixed"))
+async def test_reopened_recorded_batch_settles_in_proposal_order_without_dispatch(
+    tmp_path: Path, failed_receipt: bool
+) -> None:
+    path = tmp_path / "recorded.db"
+    await interrupt_probe(path, "batch-recorded", failed_receipt=failed_receipt)
+    task = TASKS[0]
+    reads = ScenarioReads(task, corpus_data(), "crash")
+    finish = FakeSessionProvider((ModelTurn(decision=FinishAction(output="summarized")),))
+    model = ProbeModel(task, "batch", finish)
+    counter = OpenAICompatibleTokenCounter(provider_config(), encoding="cl100k_base")
+    async with make_harness(path, reads, counter, model) as harness:
+        (old,) = await harness.sessions.store.history("s")
+        before = await harness.sessions.store.events("s")
+        durable = await harness.sessions.store.run_records("s", old.run_id)
+        proposal_ids = ("read-1-0-0", "read-1-0-1", "read-1-0-2")
+        # A 后于 B/C 到达。三份记录均可重放, 但恢复前还没有结算。
+        assert tuple(r.exchange.action.call_id for r in durable) == (
+            proposal_ids[1],
+            proposal_ids[2],
+            proposal_ids[0],
+        )
+        assert old.status == "interrupted" and not old.unfinished_call_ids
+        assert isinstance(durable[1].exchange.observation, ToolFailedObservation) == failed_receipt
+        assert not any(
+            isinstance(e.data, SessionRunEvent) and isinstance(e.data.event.data, TurnSettled)
+            for e in before
+        )
+
+        result = (await harness.resume("s", old.run_id)).session
+        assert result.run_id == old.run_id and result.report.output == "summarized"
+        assert not reads.calls and len(model.requests) == 1
+        feedback = model.requests[0].current.feedback
+        assert feedback and tuple(call.call_id for call in feedback.calls) == proposal_ids
+        assert [call.status for call in feedback.calls] == [
+            "succeeded",
+            "succeeded",
+            "failed" if failed_receipt else "succeeded",
+        ]
+        latest = await harness.sessions.store.run_records("s", old.run_id)
+        assert latest == (durable[2], durable[0], durable[1])
+
+        after = await harness.sessions.store.events("s", after=before[-1].sequence)
+        execution = [e.data.event.data for e in after if isinstance(e.data, SessionRunEvent)]
+        assert isinstance(execution[0], TurnSettled)
+        assert sum(isinstance(e, TurnSettled) for e in execution) == 1
+        assert not any(isinstance(e, (ToolStarted, ToolRecorded)) for e in execution)
+        assert (
+            sum(
+                isinstance(e.data, SessionControlDecided) and e.data.resolution.stage == "execution"
+                for e in after
+            )
+            == 1
+        )
+        duplicate = await harness.send("s", task.goal, input_id="task")
+        assert duplicate.session == result and len(model.requests) == 1

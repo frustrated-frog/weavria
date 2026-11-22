@@ -1265,13 +1265,14 @@ class SQLiteSessionStore:
                 state = self._state(run_id)
                 if state is None or state.sequence != row[4]:
                     raise SessionConflictError("resume_unsafe_boundary")
-                suffix = state.undispatched_read_suffix()
+                # None 表示无法安全恢复; 空尾部表示回执齐全, 仍需提交整批结算。
+                suffix = state.read_batch_resume_suffix()
                 settled = (
                     boundary is not None
                     and boundary[0] == state.sequence
                     and state.phase is Phase.READY
                 )
-                if not settled and not suffix:
+                if not settled and suffix is None:
                     raise SessionConflictError("resume_unsafe_boundary")
                 previous, current = json.loads(row[3]), json.loads(config)
                 duration = min(
@@ -1309,8 +1310,8 @@ class SQLiteSessionStore:
                     raise SessionConflictError("resume_unsafe_boundary")
                 admitted_request = None
                 semantic = None
-                if suffix:
-                    admitted_request, semantic = self._partial_read_resume(
+                if suffix is not None:
+                    admitted_request, semantic = self._open_read_batch_resume(
                         conn,
                         session_id,
                         state,
@@ -1351,7 +1352,7 @@ class SQLiteSessionStore:
                 if (
                     remaining <= 0
                     or state.model_calls >= previous["limits"]["max_model_calls"]
-                    or state.tool_calls + len(suffix) > previous["limits"]["max_tool_calls"]
+                    or state.tool_calls + len(suffix or ()) > previous["limits"]["max_tool_calls"]
                 ):
                     raise SessionConflictError("resume_budget_exhausted")
                 # 中断视图是临时终态投影。只允许最新 ordinal, 从而不会改写已被后续
@@ -1387,7 +1388,7 @@ class SQLiteSessionStore:
         return await self._submit(claim)
 
     @staticmethod
-    def _partial_read_resume(
+    def _open_read_batch_resume(
         conn: sqlite3.Connection,
         session_id: str,
         state: RunState,
