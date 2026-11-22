@@ -153,7 +153,7 @@ from .controller import (
     resolve_turn,
 )
 from .delivery import artifact_page_source_ranges
-from .feedback_budget import ReadFeedbackBudget, ReadRetryLookup
+from .feedback_budget import ReadFeedbackBudget, ReadRetryLookup, ReadRetryTransfer
 from .finalization import FinalizationAssessment, FinalizationPolicy
 from .intervention import (
     ACTION_VALUE_LEDGER_VERSION,
@@ -417,6 +417,7 @@ class _AgentKernel:
         context_builder: ControlContextBuilder | None = None,
         context_recovery: RecoveryLimits | None = None,
         read_retry_lookup: ReadRetryLookup | None = None,
+        read_retry_transfer: ReadRetryTransfer | None = None,
         finalization: FinalizationPolicy | None = None,
     ) -> None:
         if context_recovery is not None and (
@@ -424,6 +425,7 @@ class _AgentKernel:
         ):
             raise ValueError("context recovery requires a recovery compiler builder")
         self._read_retry_lookup = read_retry_lookup
+        self._read_retry_transfer = read_retry_transfer
         self._journal = journal
         self._preparation = preparation
         self._prepared_task_revision: int | None = None
@@ -2050,7 +2052,11 @@ class _AgentKernel:
             if reason == "feedback_budget":
                 choice = (
                     await budget.experienced_retry(
-                        batch, visible, checked_identities, self._read_retry_lookup
+                        batch,
+                        visible,
+                        checked_identities,
+                        self._read_retry_lookup,
+                        self._read_retry_transfer,
                     )
                     if self._read_retry_lookup is not None
                     else None
@@ -2936,6 +2942,7 @@ class AgentLoop(_AgentKernel):
         context_builder: ControlContextBuilder | None = None,
         context_recovery: RecoveryLimits | None = None,
         read_retry_lookup: ReadRetryLookup | None = None,
+        read_retry_transfer: ReadRetryTransfer | None = None,
         finalization: FinalizationPolicy | None = None,
         # 构造函数只建立依赖、初始状态和首个事件,不在初始化阶段执行模型或工具。
     ) -> None:
@@ -3001,6 +3008,7 @@ class AgentLoop(_AgentKernel):
             context_builder=context_builder,
             context_recovery=context_recovery,
             read_retry_lookup=read_retry_lookup,
+            read_retry_transfer=read_retry_transfer,
             finalization=finalization,
             # 完成共享内核初始化;此时实例已拥有初始状态,但尚未进入异步执行循环。
         )

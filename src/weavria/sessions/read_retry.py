@@ -4,12 +4,13 @@ import hashlib
 import json
 import sqlite3
 
-from weavria.artifacts import ArtifactSnapshot
+from weavria.artifacts import ArtifactSnapshot, resolve_pointer
 from weavria.core import (
     BatchAdmitted,
     BatchRejected,
     ControlEvent,
     ReadRetryOutcome,
+    ReadRetryScope,
     SessionRequest,
     ToolExchange,
     ToolFailedObservation,
@@ -35,6 +36,17 @@ def create_read_retry_schema(conn: sqlite3.Connection) -> None:
     conn.execute("""CREATE INDEX retry_scene ON read_retry_trials(
         session_id,profile,scene,ordinal DESC,rejection_sequence DESC)
         WHERE delivery IS NOT NULL""")
+
+
+def create_read_retry_scope_index(conn: sqlite3.Connection) -> None:
+    conn.execute("ALTER TABLE read_retry_trials ADD COLUMN scope_sha256 TEXT")
+    conn.execute("ALTER TABLE read_retry_trials ADD COLUMN scope TEXT")
+    conn.execute(
+        "ALTER TABLE read_retry_trials ADD COLUMN field_support INTEGER NOT NULL DEFAULT 0"
+    )
+    conn.execute("""CREATE INDEX retry_scope ON read_retry_trials(
+        session_id,profile,scope_sha256,ordinal DESC,rejection_sequence DESC)
+        WHERE field_support=1""")
 
 
 def _profile_digest(config: str) -> str:
@@ -76,6 +88,44 @@ def recall_read_retries(
     )
 
 
+def recall_scoped_read_retries(
+    conn: sqlite3.Connection,
+    run_id: str,
+    scopes: tuple[str, ...],
+) -> dict[str, ReadRetryOutcome]:
+    """每个当前作用域最多回取一条正向证据; 失败经验不会跨实体扣分。"""
+    if len(scopes) > 32:
+        raise ValueError("scoped read lookup exceeds the batch limit")
+    current = conn.execute(
+        "SELECT session_id,ordinal,config FROM runs WHERE id=?", (run_id,)
+    ).fetchone()
+    if current is None:
+        return {}
+    session, ordinal, config = current
+    profile = _profile_digest(config)
+    found: dict[str, ReadRetryOutcome] = {}
+    for scope in scopes:
+        row = conn.execute(
+            f"""SELECT t.run_id,t.rejection_sequence,t.model_call+2,t.action
+            FROM read_retry_trials t JOIN runs r ON r.id=t.run_id
+            WHERE t.session_id=? AND t.profile=? AND t.scope_sha256=? AND t.ordinal<?
+            AND t.field_support=1 AND r.status IN ('completed','budget_exhausted','failed')
+            AND {MODEL_VISIBLE_RUN_PREDICATE}
+            ORDER BY t.ordinal DESC,t.rejection_sequence DESC LIMIT 1""",
+            (session, profile, scope, ordinal),
+        ).fetchone()
+        if row is not None:
+            source, sequence, model_call, action = row
+            found[scope] = ReadRetryOutcome(
+                run_id=source,
+                rejection_sequence=sequence,
+                model_call=model_call,
+                action_sha256=action,
+                delivery="full",
+            )
+    return found
+
+
 def project_read_retry(
     conn: sqlite3.Connection, event: ControlEvent, state: RunState, session_id: str, ordinal: int
 ) -> None:
@@ -85,8 +135,9 @@ def project_read_retry(
         (config,) = conn.execute("SELECT config FROM runs WHERE id=?", (event.run_id,)).fetchone()
         conn.execute(
             """INSERT INTO read_retry_trials(
-            run_id,rejection_sequence,session_id,ordinal,profile,scene,action,revision,model_call
-            ) VALUES(?,?,?,?,?,?,?,?,?)""",
+            run_id,rejection_sequence,session_id,ordinal,profile,scene,action,revision,model_call,
+            scope_sha256,scope
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 event.run_id,
                 event.sequence,
@@ -97,6 +148,8 @@ def project_read_retry(
                 trial.selected_sha256,
                 state.task.revision,
                 model_call,
+                trial.scope_sha256,
+                trial.scope.model_dump_json() if trial.scope is not None else None,
             ),
         )
     elif isinstance(data, BatchAdmitted) and model_call >= 2 and len(data.feedback_envelopes) == 1:
@@ -116,7 +169,7 @@ def project_read_retry(
     elif isinstance(data, TurnDecided) and model_call >= 3:
         revision = state.task.revision
         row = conn.execute(
-            """SELECT t.call_id,v.data FROM read_retry_trials t
+            """SELECT t.call_id,v.data,t.scope FROM read_retry_trials t
             JOIN request_views v ON v.run_id=t.run_id AND v.model_call=t.model_call+2
             WHERE t.run_id=? AND t.model_call=? AND t.revision=? AND t.call_id IS NOT NULL""",
             (event.run_id, model_call - 2, revision),
@@ -133,18 +186,24 @@ def project_read_retry(
             or feedback.calls[0].call_id != row[0]
         ):
             return
-        delivery = _observed_delivery(conn, event.run_id, row[0], request.history)
-        if delivery is not None:
+        scope = ReadRetryScope.model_validate_json(row[2]) if row[2] is not None else None
+        observation = _observed_delivery(conn, event.run_id, row[0], request.history, scope)
+        if observation is not None:
+            delivery, field_support = observation
             conn.execute(
-                """UPDATE read_retry_trials SET delivery=?
+                """UPDATE read_retry_trials SET delivery=?,field_support=?
                 WHERE run_id=? AND model_call=?""",
-                (delivery, event.run_id, model_call - 2),
+                (delivery, int(field_support), event.run_id, model_call - 2),
             )
 
 
 def _observed_delivery(
-    conn: sqlite3.Connection, run_id: str, call_id: str, history: tuple[object, ...]
-) -> str | None:
+    conn: sqlite3.Connection,
+    run_id: str,
+    call_id: str,
+    history: tuple[object, ...],
+    scope: ReadRetryScope | None,
+) -> tuple[str, bool] | None:
     exchange = next(
         (e for e in history if isinstance(e, ToolExchange) and e.action.call_id == call_id), None
     )
@@ -159,7 +218,11 @@ def _observed_delivery(
     if record.exchange.action != exchange.action:
         return None
     if isinstance(exchange.observation, ToolFailedObservation):
-        return "failed" if isinstance(record.exchange.observation, ToolFailedObservation) else None
+        return (
+            ("failed", False)
+            if isinstance(record.exchange.observation, ToolFailedObservation)
+            else None
+        )
     output, ref = exchange.observation.output, record.artifact
     if not isinstance(output, dict) or ref is None or output.get("artifact_id") != ref.artifact_id:
         return None
@@ -174,8 +237,24 @@ def _observed_delivery(
         if source is None:
             return None
         snapshot = ArtifactSnapshot(*source)
-        expected = complete_exchange(record.exchange.action, snapshot.reference, snapshot.value)
-        return "full" if expected.model_dump_json() == exchange.model_dump_json() else None
+        original = snapshot.value
+        expected = complete_exchange(record.exchange.action, snapshot.reference, original)
+        if expected.model_dump_json() != exchange.model_dump_json():
+            return None
+        supported = False
+        if scope is not None:
+            try:
+                subject = resolve_pointer(original, scope.subject_pointer)
+                values = [resolve_pointer(original, field) for field in scope.required_fields]
+            except (KeyError, IndexError, ValueError):
+                pass
+            else:
+                supported = (
+                    isinstance(subject, str)
+                    and scope.subject_digest(subject) == scope.subject_sha256
+                    and all(value not in (None, "", [], {}) for value in values)
+                )
+        return "full", supported
     if output.get("representation") == "excerpts" and output.get("passages"):
-        return "partial"
-    return "reference" if exchange == minimum_exchange(record) else None
+        return "partial", False
+    return ("reference", False) if exchange == minimum_exchange(record) else None

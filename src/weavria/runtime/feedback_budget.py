@@ -6,6 +6,7 @@ from collections import Counter
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from fractions import Fraction
+from typing import Protocol
 
 from weavria.context import FeedbackReservation, reserve_feedback
 from weavria.core import (
@@ -15,6 +16,7 @@ from weavria.core import (
     ModelTurn,
     ReadRetryOutcome,
     ReadRetryPrediction,
+    ReadRetryScope,
     TaskInput,
     TaskObservation,
     ToolBatch,
@@ -24,6 +26,24 @@ from weavria.core import (
 from weavria.tools import ToolActionIdentity, ToolRegistry
 
 type ReadRetryLookup = Callable[[str], Awaitable[tuple[ReadRetryOutcome, ...]]]
+
+
+class ReadRetryScopeResolver(Protocol):
+    """Host-owned, versioned applicability projection. Return None on ambiguity."""
+
+    @property
+    def version(self) -> str: ...
+
+    def resolve(self, task: TaskInput, call: ToolCallAction) -> ReadRetryScope | None: ...
+
+
+type ReadRetryTransferLookup = Callable[[tuple[str, ...]], Awaitable[dict[str, ReadRetryOutcome]]]
+
+
+@dataclass(frozen=True, slots=True)
+class ReadRetryTransfer:
+    resolver: ReadRetryScopeResolver
+    lookup: ReadRetryTransferLookup
 
 
 @dataclass(frozen=True, slots=True)
@@ -192,11 +212,13 @@ class ReadFeedbackBudget:
         visible: set[str],
         identities: tuple[ToolActionIdentity, ...],
         lookup: ReadRetryLookup,
+        transfer: ReadRetryTransfer | None = None,
     ) -> tuple[ReadRetry, ReadRetryPrediction] | None:
         """只在同一层级的外部单读之间选择。分页、依赖原文或未知操作沿用原策略。"""
         if self.access is None or len(batch.calls) < 2:
             return None
         candidates: dict[str, ToolCallAction] = {}
+        scopes: dict[str, tuple[ReadRetryScope, str]] = {}
         for call, identity in zip(batch.calls, identities, strict=True):
             if call.tool_name not in visible or identity.normalization != "validated":
                 return None
@@ -215,6 +237,18 @@ class ReadFeedbackBudget:
             key = identity.canonical_action_sha256
             if key not in candidates and self._can_suggest_whole_read(call):
                 candidates[key] = call
+                if transfer is not None:
+                    tool = self.tools.get(call.tool_name)
+                    bound = call.model_copy(
+                        update={
+                            "arguments": tool.validate_arguments(call.arguments).model_dump(
+                                mode="json"
+                            ),
+                        }
+                    )
+                    scope = transfer.resolver.resolve(self.task, bound)
+                    if scope is not None:
+                        scopes[key] = scope, scope.key(identity.action_family_sha256)
         if len(candidates) < 2:
             return None
         scene = hashlib.sha256(
@@ -229,11 +263,24 @@ class ReadFeedbackBudget:
         attempts = Counter(item.action_sha256 for item in observations)
         complete = Counter(item.action_sha256 for item in observations if item.delivery == "full")
         selected = max(candidates, key=lambda key: Fraction(1 + complete[key], 2 + attempts[key]))
+        receipt = None
+        if not observations and scopes and transfer is not None:
+            history = await transfer.lookup(tuple(dict.fromkeys(key for _, key in scopes.values())))
+            supported = [action for action, (_, key) in scopes.items() if key in history]
+            # 跨现场的交付证据只在一个当前动作具备支持记录时打破原顺序。
+            if len(supported) == 1:
+                selected = supported[0]
+                receipt = history[scopes[selected][1]]
+        scope, scope_key = scopes[selected] if selected in scopes else (None, None)
         return ReadRetry(call=candidates[selected]), ReadRetryPrediction(
+            schema_version=2 if scope is not None else 1,
             scene_sha256=scene,
             candidate_sha256s=tuple(candidates),
             selected_sha256=selected,
             observations=observations,
+            scope=scope,
+            scope_sha256=scope_key,
+            transfer=receipt,
         )
 
     def retry_alone(self, batch: ToolBatch, visible: set[str]) -> ModelTurn | None:

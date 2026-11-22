@@ -78,6 +78,8 @@ from weavria.runtime import (
     JournalCommitError,
     LayeredCompletionPolicy,
     ProgressPolicyFactory,
+    ReadRetryScopeResolver,
+    ReadRetryTransfer,
     RootBudget,
     RunLimits,
     SystemClock,
@@ -956,6 +958,7 @@ class SessionEngine:
         context_recovery: RecoveryLimits | None = None,
         configuration_metadata: dict[str, JsonValue] | None = None,
         read_retry_experience: bool = False,
+        read_retry_scope_resolver: ReadRetryScopeResolver | None = None,
         task_model_projector: TaskModelProjector | None = None,
         context_source: ContextSource | None = None,
         extensions: HarnessExtensions | None = None,
@@ -979,6 +982,16 @@ class SessionEngine:
         if type(read_retry_experience) is not bool:
             raise ValueError("read_retry_experience must be a boolean")
         self._read_retry_experience = read_retry_experience
+        self._read_retry_scope_resolver = read_retry_scope_resolver
+        self._read_retry_scope_version = (
+            read_retry_scope_resolver.version if read_retry_scope_resolver is not None else None
+        )
+        if self._read_retry_scope_version is not None and (
+            not read_retry_experience
+            or not self._read_retry_scope_version.strip()
+            or len(self._read_retry_scope_version) > 128
+        ):
+            raise ValueError("scoped read experience requires a versioned resolver and experience")
         self._task_model_projector = task_model_projector
         self._recovery_limits = (
             RecoveryLimits.model_validate_json(context_recovery.model_dump_json())
@@ -1223,7 +1236,9 @@ class SessionEngine:
             config = json.dumps(
                 {
                     "schema_version": (
-                        9
+                        10
+                        if self._read_retry_scope_version is not None
+                        else 9
                         if read_retry_experience
                         else 8
                         if plan
@@ -1246,6 +1261,11 @@ class SessionEngine:
                         else 1
                     ),
                     **({"read_retry_experience": "delivery/1"} if read_retry_experience else {}),
+                    **(
+                        {"read_retry_scope_version": self._read_retry_scope_version}
+                        if self._read_retry_scope_version is not None
+                        else {}
+                    ),
                     **({"extension_plan": plan.model_dump(mode="json")} if plan else {}),
                     **(
                         {"extensions": [item.descriptor.model_dump(mode="json") for item in chain]}
@@ -1612,6 +1632,7 @@ class SessionEngine:
                 read_retry_lookup=partial(self.store.read_retry_outcomes, run_id)
                 if read_retry_experience
                 else None,
+                read_retry_transfer=self._read_retry_transfer(run_id),
                 preparation=adapter,
                 task_observation=task_observation,
                 progress=(
@@ -1738,6 +1759,14 @@ class SessionEngine:
                         await mounted.close()
                 finally:
                     self._tasks.discard(owner)
+
+    def _read_retry_transfer(self, run_id: str) -> ReadRetryTransfer | None:
+        resolver = self._read_retry_scope_resolver
+        return (
+            ReadRetryTransfer(resolver, partial(self.store.scoped_read_retry_outcomes, run_id))
+            if resolver is not None
+            else None
+        )
 
     async def _reauthorize_resume_sources(self, claim: ResumeClaim, registry: ToolRegistry) -> None:
         policy = self._policy if self._policy is not None else ReadOnlyPolicy()
