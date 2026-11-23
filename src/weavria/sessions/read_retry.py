@@ -14,6 +14,8 @@ from weavria.core import (
     ReadRetryScope,
     SessionRequest,
     TaskInput,
+    ToolBatch,
+    ToolCallAction,
     ToolExchange,
     ToolFailedObservation,
     ToolRecord,
@@ -57,7 +59,11 @@ def create_read_retry_review_index(conn: sqlite3.Connection) -> None:
 
 
 def recall_read_retry_history(
-    conn: sqlite3.Connection, run_id: str, tools: tuple[str, ...]
+    conn: sqlite3.Connection,
+    run_id: str,
+    tools: tuple[str, ...],
+    *,
+    receipt: ReadRetryOutcome | None = None,
 ) -> tuple[ReadRetryHistory, ...]:
     """沿已核验回执找原件与当时模型看到的任务, 不从会话摘要恢复正文。"""
     if not 1 <= len(tools) <= 32:
@@ -68,6 +74,9 @@ def recall_read_retry_history(
     if current is None:
         return ()
     placeholders = ",".join("?" for _ in tools)
+    # 排序归因已有精确主键。按主键核验可见性, 不让其他场景的新记录挤掉原件。
+    receipt_filter = "AND t.run_id=? AND t.rejection_sequence=?" if receipt is not None else ""
+    receipt_args = (receipt.run_id, receipt.rejection_sequence) if receipt is not None else ()
     rows = conn.execute(
         f"""SELECT t.run_id,t.rejection_sequence,t.model_call+2,t.action,
         json_extract(v.data,'$.current.task'),o.record,a.reference,a.content
@@ -79,12 +88,13 @@ def recall_read_retry_history(
         AND r.status IN ('completed','budget_exhausted','failed')
         AND {MODEL_VISIBLE_RUN_PREDICATE}
         AND json_extract(o.record,'$.exchange.action.tool_name') IN ({placeholders})
+        {receipt_filter}
         AND length(CAST(a.content AS BLOB))<=2200
         AND length(CAST(json_extract(v.data,'$.current.task') AS BLOB))<=1800
         AND length(CAST(json_extract(o.record,'$.authorization.normalized_arguments') AS BLOB))
             <=1000
         ORDER BY t.ordinal DESC,t.rejection_sequence DESC LIMIT 4""",
-        (current[0], _profile_digest(current[2]), current[1], *tools),
+        (current[0], _profile_digest(current[2]), current[1], *tools, *receipt_args),
     )
     return tuple(
         ReadRetryHistory(
@@ -101,6 +111,41 @@ def recall_read_retry_history(
         )
         for source, seq, model_call, action, task, record, reference, content in rows
     )
+
+
+def displaced_read(
+    conn: sqlite3.Connection, run_id: str, call_id: str, revision: int
+) -> tuple[ToolCallAction, ReadRetryOutcome, ReadRetryHistory] | None:
+    """只重建刚执行的推荐动作; 同一反馈在后续模型轮次仍可见, 不能重复展示。"""
+    row = conn.execute(
+        """SELECT e.data,(
+        SELECT proposal.data FROM run_events proposal WHERE proposal.run_id=t.run_id
+        AND proposal.sequence<t.rejection_sequence
+        AND json_extract(proposal.data,'$.data.kind')='turn_decided'
+        ORDER BY proposal.sequence DESC LIMIT 1)
+        FROM read_retry_trials t JOIN run_events e ON e.run_id=t.run_id
+        AND e.sequence=t.rejection_sequence
+        WHERE t.run_id=? AND t.model_call=(
+            SELECT max(v.model_call)-1 FROM request_views v WHERE v.run_id=t.run_id)
+        AND t.call_id=? AND t.revision=?
+        AND json_extract(e.data,'$.data.read_prediction.schema_version')=4""",
+        (run_id, call_id, revision),
+    ).fetchone()
+    if row is None or row[1] is None:
+        return None
+    refused, proposed = (ControlEvent.model_validate_json(encoded).data for encoded in row)
+    if not isinstance(refused, BatchRejected) or not isinstance(proposed, TurnDecided):
+        return None
+    prediction, batch = refused.read_prediction, proposed.turn.decision
+    if prediction is None or prediction.displacement is None or not isinstance(batch, ToolBatch):
+        return None
+    reason = prediction.displacement
+    if reason.proposal_index >= len(batch.calls):
+        return None
+    candidate = batch.calls[reason.proposal_index]
+    receipt = prediction.observations[reason.observation_index]
+    matches = recall_read_retry_history(conn, run_id, (candidate.tool_name,), receipt=receipt)
+    return (candidate, receipt, matches[0]) if matches else None
 
 
 def _profile_digest(config: str) -> str:

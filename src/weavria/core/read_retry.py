@@ -7,6 +7,7 @@ from typing import Annotated, Literal, Self
 from pydantic import (
     BaseModel,
     Field,
+    JsonValue,
     SerializerFunctionWrapHandler,
     field_validator,
     model_serializer,
@@ -142,11 +143,30 @@ class ReadRetryReview(ContractModel):
         return self
 
 
+class ReadDisplacement(ContractModel):
+    """指向被原文反证改变的决定, 两个下标分别属于原提案和持久经验窗口。"""
+
+    proposal_index: int = Field(ge=0, lt=32)
+    observation_index: int = Field(ge=0, lt=16)
+
+
+class PriorReadEvidence(ContractModel):
+    """只描述旧来源对于旧需求的判断; 原文按字符区间核验, 不授予新任务证据地位。"""
+
+    previous_requirement: str = Field(min_length=1, max_length=1800)
+    previous_constraints: tuple[str, ...] = ()
+    previous_verdict: Literal["inapplicable"] = "inapplicable"
+    source_tool: NonBlankString
+    source_arguments: dict[str, JsonValue]
+    version_sha256: ActionDigest
+    source_quote: str = Field(min_length=1, max_length=384)
+
+
 class ReadRetryPrediction(BaseModel):
     """在工具执行前记录当前选择、按原顺序的基线和用于排序的近期试验。"""
 
     model_config = ContractModel.model_config
-    schema_version: Literal[1, 2, 3] = 1
+    schema_version: Literal[1, 2, 3, 4] = 1
     scene_sha256: ActionDigest
     candidate_sha256s: tuple[ActionDigest, ...] = Field(min_length=2, max_length=32)
     selected_sha256: ActionDigest
@@ -157,6 +177,7 @@ class ReadRetryPrediction(BaseModel):
     scope_sha256: ActionDigest | None = None
     transfer: ReadRetryOutcome | None = None
     review: ReadRetryReview | None = None
+    displacement: ReadDisplacement | None = None
 
     @field_validator("schema_version", mode="before")
     @classmethod
@@ -166,7 +187,9 @@ class ReadRetryPrediction(BaseModel):
     @model_serializer(mode="wrap")
     def preserve_versions(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
         data = handler(self)
-        if self.schema_version != 2:
+        if self.schema_version != 4:
+            data.pop("displacement", None)
+        if self.scope is None and self.schema_version != 2:
             for key in ("scope", "scope_sha256", "transfer"):
                 data.pop(key, None)
         if self.schema_version != 3:
@@ -190,9 +213,22 @@ class ReadRetryPrediction(BaseModel):
             )
         ):
             raise ValueError("review requires prediction v3 and preserves baseline on abstention")
-        if (self.schema_version == 2) != (self.scope is not None) or (
-            (self.scope is None) != (self.scope_sha256 is None)
-        ):
+        if (self.schema_version == 4) != (self.displacement is not None):
+            raise ValueError("recording a displaced read requires prediction v4")
+        if self.displacement is not None:
+            index = self.displacement.observation_index
+            if index >= len(self.observations):
+                raise ValueError("counterevidence is outside the observation window")
+            old = self.observations[index]
+            if (
+                old.assessment is None
+                or old.assessment.quote is None
+                or old.action_sha256 == self.selected_sha256
+            ):
+                raise ValueError("displaced read requires counterevidence for another action")
+        if (
+            self.schema_version != 4 and (self.schema_version == 2) != (self.scope is not None)
+        ) or ((self.scope is None) != (self.scope_sha256 is None)):
             raise ValueError("read scope requires prediction v2 and its scope key")
         if self.transfer is not None and (
             self.scope is None or self.transfer.delivery != "full" or self.observations

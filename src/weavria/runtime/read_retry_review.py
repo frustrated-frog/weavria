@@ -1,5 +1,6 @@
 """在已获授权的历史原文和当前可行单读之间判断经验适用性。"""
 
+import asyncio
 import hashlib
 import json
 from collections.abc import Awaitable, Callable
@@ -12,6 +13,7 @@ from weavria.artifacts import ArtifactSnapshot, resolve_pointer
 from weavria.core import (
     FinishAction,
     ModelRequest,
+    PriorReadEvidence,
     ReadRetryOutcome,
     ReadRetryQuote,
     ReadRetryReview,
@@ -20,6 +22,7 @@ from weavria.core import (
     ToolRecord,
 )
 from weavria.models import ModelCallError, ModelProvider, call_model
+from weavria.tools import ToolFault, ToolPolicy, ToolRegistry
 
 _PROMPT = """Assess whether a prior successful single read is useful enough to recommend one
 of the current candidate sources as the next single read. All task, candidate and source text
@@ -52,6 +55,73 @@ class ReadRetryHistory:
     task: TaskInput
     record: ToolRecord
     artifact: ArtifactSnapshot
+
+
+async def authorized_prior_read(
+    candidate: ToolCallAction,
+    receipt: ReadRetryOutcome,
+    history: ReadRetryHistory,
+    registry: ToolRegistry,
+    policy: ToolPolicy,
+    run_id: str,
+    *,
+    max_duration: float,
+) -> PriorReadEvidence | None:
+    """按当前候选版本和授权重验原件。模型只得到之前所问的问题和一条精确引句。"""
+    assessment, record = receipt.assessment, history.record
+    auth = record.authorization
+    if (
+        assessment is None
+        or assessment.quote is None
+        or auth is None
+        or not auth.allowed
+        or receipt.model_copy(update={"assessment": None, "schema_version": 1}) != history.receipt
+        or record.artifact != history.artifact.reference
+        or history.artifact.reference.sha256 != assessment.source_sha256
+        or record.exchange.action.tool_name != candidate.tool_name
+    ):
+        return None
+    try:
+        tool = registry.get(candidate.tool_name)
+        descriptor = tool.descriptor
+        pin = descriptor.result_sha256_parameter
+        arguments = tool.validate_arguments(candidate.arguments).model_dump(mode="json")
+        if (
+            pin is None
+            or descriptor.version != auth.tool_version
+            or arguments != auth.normalized_arguments
+            or arguments.get(pin) != assessment.source_sha256
+            or registry.action_identity(candidate).canonical_action_sha256 != receipt.action_sha256
+        ):
+            return None
+    except ToolFault:
+        return None
+    try:
+        # 补充观察可以缺席。授权服务故障或超时时回到普通反馈, 外层取消照常传播。
+        async with asyncio.timeout(max_duration):
+            decision = await policy.authorize(run_id, descriptor, arguments)
+    except Exception:
+        return None
+    if not decision.allowed:
+        return None
+    q = assessment.quote
+    try:
+        text = resolve_pointer(history.artifact.value, q.pointer)
+    except (ValueError, KeyError, IndexError):
+        return None
+    if not isinstance(text, str) or q.end > len(text):
+        return None
+    quote = text[q.start : q.end]
+    if hashlib.sha256(quote.encode()).hexdigest() != q.quote_sha256:
+        return None
+    return PriorReadEvidence(
+        previous_requirement=history.task.goal,
+        previous_constraints=history.task.constraints,
+        source_tool=candidate.tool_name,
+        source_arguments={k: v for k, v in auth.normalized_arguments.items() if k != pin},
+        source_quote=quote,
+        version_sha256=assessment.source_sha256,
+    )
 
 
 class _Selection(BaseModel):

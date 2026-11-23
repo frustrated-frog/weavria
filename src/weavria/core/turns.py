@@ -34,7 +34,7 @@ from .model_io import (
     validate_task_observation,
 )
 from .outcomes import ToolFailedObservation
-from .read_retry import ReadAssessment
+from .read_retry import PriorReadEvidence, ReadAssessment
 from .recovery import RecoverContext
 
 
@@ -122,14 +122,35 @@ class CallFeedback(ContractModel):
     status: Literal["succeeded", "failed", "skipped"]
 
 
-class TurnFeedback(ContractModel):
+class TurnFeedback(BaseModel):
     """Runtime-owned summary of the last settled decision, in proposal order."""
+
+    model_config = ContractModel.model_config
+    schema_version: Literal[1, 2] = 1
+    previous_read: PriorReadEvidence | None = None
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def validate_version(cls, value: object) -> object:
+        return ContractModel.validate_version_type(value)
+
+    @model_serializer(mode="wrap")
+    def preserve_v1(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        data = handler(self)
+        if self.schema_version == 1:
+            data.pop("previous_read", None)
+        return data
 
     task_revision: int = Field(ge=1)
     calls: tuple[CallFeedback, ...] = Field(min_length=1, max_length=32)
 
     @model_validator(mode="after")
     def validate_identifiers(self) -> Self:
+        if (self.schema_version == 2) != (self.previous_read is not None) or (
+            self.previous_read is not None
+            and (len(self.calls) != 1 or self.calls[0].status != "succeeded")
+        ):
+            raise ValueError("prior evidence requires a single succeeded feedback and schema v2")
         identities = [call.call_id for call in self.calls]
         if len(set(identities)) != len(identities):
             raise ValueError("feedback call identifiers must be unique")

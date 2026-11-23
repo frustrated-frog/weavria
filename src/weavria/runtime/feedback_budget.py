@@ -15,6 +15,7 @@ from weavria.core import (
     EvidenceAccessView,
     FeedbackBounds,
     ModelTurn,
+    ReadDisplacement,
     ReadRetryOutcome,
     ReadRetryPrediction,
     ReadRetryReview,
@@ -286,22 +287,33 @@ class ReadFeedbackBudget:
         complete = Counter(item.action_sha256 for item in observations if item.delivery == "full")
         # 完整送达不等于适用。只比较同一现场且当前动作明确指定的内容版本。
         # 同一版本上较新的明确判断取代较旧判断; 弃权不能抹掉已核验反证。
-        decisions: dict[str, bool] = {}
-        for item in observations:  # 检索按最近一次在前排序
+        decisions: dict[str, int] = {}
+        for index, item in enumerate(observations):  # 检索按最近一次在前排序
             assessment = item.assessment
             if (
                 assessment is not None
                 and assessment.source_sha256 == pinned.get(item.action_sha256)
                 and assessment.verdict != "uncertain"
             ):
-                decisions.setdefault(item.action_sha256, assessment.verdict == "inapplicable")
-        selected = max(
-            candidates,
-            key=lambda key: (
-                not decisions.get(key, False),
-                Fraction(1 + complete[key], 2 + attempts[key]),
-            ),
-        )
+                decisions.setdefault(item.action_sha256, index)
+        rejected = {
+            key: index
+            for key, index in decisions.items()
+            if (assessment := observations[index].assessment) is not None
+            and assessment.quote is not None
+        }
+        delivery_scores = {
+            key: Fraction(1 + complete[key], 2 + attempts[key]) for key in candidates
+        }
+        preferred = max(candidates, key=delivery_scores.__getitem__)
+        selected = max(candidates, key=lambda key: (key not in rejected, delivery_scores[key]))
+        displacement = None
+        if selected != preferred:
+            # 只在反证确实改变赢家时留下原因; 下轮用原提案下标重新归一化与授权。
+            displacement = ReadDisplacement(
+                proposal_index=batch.calls.index(candidates[preferred]),
+                observation_index=rejected[preferred],
+            )
         receipt = None
         if not observations and scopes and transfer is not None:
             history = await transfer.lookup(tuple(dict.fromkeys(key for _, key in scopes.values())))
@@ -329,7 +341,14 @@ class ReadFeedbackBudget:
                         selected = tuple(candidates)[index]
         scope, scope_key = scopes[selected] if selected in scopes else (None, None)
         return ReadRetry(call=candidates[selected]), ReadRetryPrediction(
-            schema_version=3 if review is not None else 2 if scope is not None else 1,
+            displacement=displacement,
+            schema_version=4
+            if displacement
+            else 3
+            if review is not None
+            else 2
+            if scope is not None
+            else 1,
             scene_sha256=scene,
             candidate_sha256s=tuple(candidates),
             selected_sha256=selected,

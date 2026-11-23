@@ -378,6 +378,7 @@ class AgentHarness:
             bounded_fact=evidence.bounded_fact if evidence is not None else None,
             discovery_policy=evidence.discovery_policy if evidence is not None else None,
             read_retry_experience=config.read_retry_experience,
+            read_retry_feedback=config.read_retry_feedback,
             read_retry_scope_resolver=read_retry_scope_resolver,
             read_retry_reviewer=read_retry_reviewer,
             working_records=config.working_records,
@@ -426,6 +427,7 @@ class AgentHarness:
         bounded_fact: BoundedFactContract | None = None,
         discovery_policy: CapabilityDiscoveryPolicy | None = None,
         read_retry_experience: bool = False,
+        read_retry_feedback: bool = True,
         working_records: bool = False,
         work_updates: Literal["replace", "patch"] = "replace",
         work_material_handoff: bool = False,
@@ -517,6 +519,7 @@ class AgentHarness:
         self.sessions = SessionEngine(
             path,
             read_retry_experience=read_retry_experience,
+            read_retry_feedback=read_retry_feedback,
             read_retry_scope_resolver=read_retry_scope_resolver,
             read_retry_reviewer=read_retry_reviewer,
             model=model,

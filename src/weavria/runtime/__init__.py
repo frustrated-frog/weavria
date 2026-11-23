@@ -52,7 +52,12 @@ from .progress import (
     SemanticProgressPolicy,
     SemanticProgressPolicyFactory,
 )
-from .read_retry_review import ModelReadRetryReviewer, ReadRetryHistory, SemanticReadRetry
+from .read_retry_review import (
+    ModelReadRetryReviewer,
+    ReadRetryHistory,
+    SemanticReadRetry,
+    authorized_prior_read,
+)
 from .scheduling import ToolScheduling
 from .state import EventAcceptanceError, Phase, RunState, reduce_event
 from .task_view import TaskModelProjector
@@ -110,6 +115,7 @@ __all__ = [
     "TurnSettler",
     "action_value_state_sha256",
     "artifact_page_source_ranges",
+    "authorized_prior_read",
     "evaluate_action_intervention",
     "observe_action_value",
     "prepare_task",

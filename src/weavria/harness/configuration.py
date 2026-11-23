@@ -37,6 +37,7 @@ class HarnessConfig:
     work_material_handoff: bool = False
     # 同一会话重遇反馈预算拒绝时, 以先前实际交付的原文指导单读顺序。
     read_retry_experience: bool = True
+    read_retry_feedback: bool = True
 
     def __post_init__(self) -> None:
         if not self.configuration_id.strip() or len(self.configuration_id) > 128:
@@ -51,6 +52,7 @@ class HarnessConfig:
             self.work_recheck,
             self.work_material_handoff,
             self.read_retry_experience,
+            self.read_retry_feedback,
         ):
             if type(enabled) is not bool:
                 raise ValueError("Harness feature switches must be booleans")

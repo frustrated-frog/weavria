@@ -89,6 +89,7 @@ from weavria.runtime import (
     TaskModelProjector,
     ToolScheduling,
     TurnPreparation,
+    authorized_prior_read,
     settle_mutation,
 )
 from weavria.tools import (
@@ -202,7 +203,12 @@ class _SessionAdapter:
         support_tools: tuple[RegisteredTool, ...] = (),
         settled_records: int = 0,
         extensions: RunExtensions | None = None,
+        *,
+        read_feedback_policy: ToolPolicy | None,
+        read_feedback_timeout: float,
     ) -> None:
+        self._read_feedback_policy = read_feedback_policy
+        self._read_feedback_timeout = read_feedback_timeout
         self._extensions = extensions
         self._provider, self._budget = provider, budget
         self._store, self._run_id = store, run_id
@@ -598,6 +604,45 @@ class _SessionAdapter:
         self._prepared = {outer.current.task.revision: outer.conversation}
         self._compilation = report
 
+    async def _prior_read_feedback(
+        self, base: ControlRequest, compiled: CompiledSessionContext
+    ) -> TurnFeedback | None:
+        """仅在推荐的单读首次完整送达后, 以当前权限补充改变排序的旧原文。"""
+        feedback = base.feedback
+        if (
+            self._read_feedback_policy is None
+            or base.control is not None
+            or feedback is None
+            or feedback.task_revision != base.task.revision
+            or len(feedback.calls) != 1
+            or feedback.calls[0].status != "succeeded"
+        ):
+            return None
+        call_id = feedback.calls[0].call_id
+        if not any(
+            c.source_id == f"call:{call_id}" and c.representation == "raw"
+            for c in compiled.compilation.choices
+        ):
+            return None
+        displaced = await self._store.displaced_read(self._run_id, call_id, base.task.revision)
+        if displaced is None or displaced[0].tool_name not in self._visible_tool_names:
+            return None
+        note = await authorized_prior_read(
+            *displaced,
+            self._tools,
+            self._read_feedback_policy,
+            self._run_id,
+            max_duration=self._read_feedback_timeout,
+        )
+        if note is None:
+            return None
+        return TurnFeedback(
+            schema_version=2,
+            task_revision=feedback.task_revision,
+            calls=feedback.calls,
+            previous_read=note,
+        )
+
     async def build_control_request(
         self,
         *,
@@ -677,12 +722,14 @@ class _SessionAdapter:
             )
             self._history, retrieval = discovered.turns, discovered.report
 
-        async def compile_with_floor(floor: int) -> CompiledSessionContext:
+        async def compile_with_floor(
+            floor: int, template: ControlRequest = base
+        ) -> CompiledSessionContext:
             return await compiler.compile(
                 run_id=run_id,
                 session_id=self._session_id,
                 sequence=self._history_sequence,
-                base=base,
+                base=template,
                 turns=self._history,
                 total_turns=self._history_count,
                 records=records,
@@ -716,6 +763,25 @@ class _SessionAdapter:
             # source is removed. Preserve the original rejection-and-replan
             # path instead of converting that condition into Run exhaustion.
             compiled = await compile_with_floor(0)
+        if not finalizing and (annotated := await self._prior_read_feedback(base, compiled)):
+            try:
+                enriched = await compile_with_floor(
+                    compiled.compilation.feedback_reserve_floor_bytes,
+                    base.model_copy(update={"feedback": annotated}),
+                )
+            except (ContextBudgetError, ContextTokenBudgetError):
+                pass
+            else:
+                # 历史判断不能挤掉当前原文、对话或其他材料。还原该字段后必须逐字节相同。
+                original_view = enriched.request.model_copy(
+                    update={
+                        "current": enriched.request.current.model_copy(
+                            update={"feedback": base.feedback}
+                        )
+                    }
+                )
+                if original_view.model_dump_json() == compiled.request.model_dump_json():
+                    compiled = enriched
         outer, report = compiled.request, compiled.compilation
         overhead = report.request_bytes - len(outer.current.model_dump_json().encode())
         choices = {c.source_id: c for c in report.choices}
@@ -961,6 +1027,7 @@ class SessionEngine:
         context_recovery: RecoveryLimits | None = None,
         configuration_metadata: dict[str, JsonValue] | None = None,
         read_retry_experience: bool = False,
+        read_retry_feedback: bool = True,
         read_retry_scope_resolver: ReadRetryScopeResolver | None = None,
         read_retry_reviewer: ModelReadRetryReviewer | None = None,
         task_model_projector: TaskModelProjector | None = None,
@@ -985,6 +1052,13 @@ class SessionEngine:
             raise ValueError("task model projection requires complete transport byte accounting")
         if type(read_retry_experience) is not bool:
             raise ValueError("read_retry_experience must be a boolean")
+        if type(read_retry_feedback) is not bool:
+            raise ValueError("read_retry_feedback must be a boolean")
+        self._read_retry_feedback = (
+            read_retry_feedback
+            and context_compiler is not None
+            and any(d.result_sha256_parameter is not None for d in tools.descriptors)
+        )
         self._read_retry_experience = read_retry_experience
         self._read_retry_scope_resolver = read_retry_scope_resolver
         self._read_retry_scope_version = (
@@ -1242,11 +1316,12 @@ class SessionEngine:
             contributes_context = any("before_compile" in item.descriptor.hooks for item in chain)
             if contributes_context and self._compiler_config is None:
                 raise ValueError("context extensions require the context compiler")
-            read_retry_experience = self._read_retry_experience and (
-                resume_run_id is None
-                or await self.store.uses_read_retry_experience(session_id, resume_run_id)
-            )
-            retry_schema, retry_config = self._read_retry_config(read_retry_experience)
+            (
+                read_retry_experience,
+                retry_schema,
+                retry_config,
+                feedback_policy,
+            ) = await self._read_retry_config(session_id, resume_run_id)
             config = json.dumps(
                 {
                     "schema_version": (
@@ -1598,6 +1673,8 @@ class SessionEngine:
                 self._context_source,
                 support_tools,
                 extensions=mounted,
+                read_feedback_policy=feedback_policy,
+                read_feedback_timeout=self._limits.max_intervention_duration,
                 # 部分批次的回执尚未归约到语义头。全批结算时一次处理 A/B/C。
                 settled_records=(
                     len(restored.state.records) - len(restored.state.settled_call_ids)
@@ -1769,13 +1846,39 @@ class SessionEngine:
                 finally:
                     self._tasks.discard(owner)
 
-    def _read_retry_config(self, enabled: bool) -> tuple[int | None, dict[str, str]]:
+    async def _read_retry_config(
+        self,
+        session_id: str,
+        resume_run_id: str | None,
+    ) -> tuple[bool, int | None, dict[str, str], ToolPolicy | None]:
+        enabled = self._read_retry_experience and (
+            resume_run_id is None
+            or await self.store.uses_read_retry_experience(session_id, resume_run_id)
+        )
         settings = {"read_retry_experience": "delivery/1"} if enabled else {}
+        schema = 9 if enabled else None
         if self._read_retry_reviewer is not None:
-            return 11, {**settings, "read_retry_review_version": self._read_retry_reviewer.version}
-        if self._read_retry_scope_version is not None:
-            return 10, {**settings, "read_retry_scope_version": self._read_retry_scope_version}
-        return (9, settings) if enabled else (None, settings)
+            schema = 11
+            settings["read_retry_review_version"] = self._read_retry_reviewer.version
+        elif self._read_retry_scope_version is not None:
+            schema = 10
+            settings["read_retry_scope_version"] = self._read_retry_scope_version
+        if (
+            enabled
+            and self._read_retry_feedback
+            and (
+                resume_run_id is None
+                or await self.store.uses_read_retry_feedback(session_id, resume_run_id)
+            )
+        ):
+            settings["read_retry_feedback"] = "observation/1"
+            return (
+                enabled,
+                12,
+                settings,
+                self._policy if self._policy is not None else ReadOnlyPolicy(),
+            )
+        return enabled, schema, settings, None
 
     def _semantic_read_retry(self, run_id: str, registry: ToolRegistry) -> SemanticReadRetry | None:
         reviewer = self._read_retry_reviewer

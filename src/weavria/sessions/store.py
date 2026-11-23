@@ -65,6 +65,7 @@ from weavria.core import (
     TaskRevised,
     TaskUpdate,
     ToolBatch,
+    ToolCallAction,
     ToolFailedObservation,
     ToolRecord,
     ToolRecorded,
@@ -103,6 +104,7 @@ from .read_retry import (
     create_read_retry_review_index,
     create_read_retry_schema,
     create_read_retry_scope_index,
+    displaced_read,
     project_read_retry,
     recall_read_retries,
     recall_read_retry_history,
@@ -1966,6 +1968,29 @@ class SQLiteSessionStore:
                         )
 
         await self._submit(rebuild)
+
+    async def displaced_read(
+        self, run_id: str, call_id: str, revision: int
+    ) -> tuple[ToolCallAction, ReadRetryOutcome, ReadRetryHistory] | None:
+        """取回唯一归因的历史来源供宿主核验, 调用方必须重做当前权限检查。"""
+        return await self._submit(lambda: displaced_read(self._conn(), run_id, call_id, revision))
+
+    async def uses_read_retry_feedback(self, session_id: str, run_id: str) -> bool:
+        """恢复旧版本运行时保留原反馈格式。"""
+
+        def read() -> bool:
+            row = (
+                self._conn()
+                .execute(
+                    "SELECT json_extract(config,'$.read_retry_feedback') FROM runs "
+                    "WHERE session_id=? AND id=?",
+                    (session_id, run_id),
+                )
+                .fetchone()
+            )
+            return row is not None and row[0] == "observation/1"
+
+        return await self._submit(read)
 
     async def uses_read_retry_experience(self, session_id: str, run_id: str) -> bool:
         """恢复时按原 Run 冻结的策略执行, 包括升级前没有此字段的配置。"""
