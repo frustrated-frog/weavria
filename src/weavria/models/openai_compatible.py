@@ -18,8 +18,13 @@ from weavria.core import (
     ModelRequestDiagnostic,
     ModelResponse,
     ModelTurn,
+    ReadAssessment,
+    ReadCounterquote,
     SessionRequest,
     ToolBatch,
+    ToolExchange,
+    ToolSucceededObservation,
+    resolve_pointer,
 )
 
 from .provider import ModelCapabilities, ModelInputError, ModelOutputError
@@ -671,10 +676,82 @@ def _assign_call_id(payload: dict[str, JsonValue], request: ModelRequest) -> dic
     return {**payload, "action": {**action, "call_id": f"wvr-{request_digest}"}}
 
 
+def _read_assessment(value: JsonValue, request: SessionRequest) -> ReadAssessment | None:
+    """绑定当轮唯一反馈。附注无效时丢弃附注, 正常动作仍独立接受校验。"""
+    current = request.current
+    feedback = current.feedback
+    if (
+        not isinstance(value, dict)
+        or feedback is None
+        or len(feedback.calls) != 1
+        or feedback.task_revision != current.task.revision
+    ):
+        return None
+    call_id = feedback.calls[0].call_id
+    exchange = next(
+        (e for e in current.history if isinstance(e, ToolExchange) and e.action.call_id == call_id),
+        None,
+    )
+    if exchange is None or not isinstance(exchange.observation, ToolSucceededObservation):
+        return None
+    output = exchange.observation.output
+    if not isinstance(output, dict) or output.get("representation") != "full":
+        return None
+    digest, verdict = output.get("sha256"), value.get("verdict")
+    if not isinstance(digest, str):
+        return None
+    try:
+        if verdict in ("applicable", "uncertain") and value.keys() == {"verdict"}:
+            return ReadAssessment.model_validate({"source_sha256": digest, "verdict": verdict})
+        pointer, quote = value.get("pointer"), value.get("quote")
+        if (
+            verdict != "inapplicable"
+            or value.keys() != {"verdict", "pointer", "quote"}
+            or not isinstance(pointer, str)
+            or len(pointer) > 256
+            or not isinstance(quote, str)
+            or not 1 <= len(quote) <= 384
+            or not any(c.isalnum() for c in quote)
+        ):
+            return None
+        original = resolve_pointer(output.get("data"), pointer)
+        if not isinstance(original, str):
+            return None
+        start = original.find(quote)
+        if start < 0 or original.find(quote, start + 1) >= 0:
+            return None
+        return ReadAssessment(
+            source_sha256=digest,
+            verdict="inapplicable",
+            quote=ReadCounterquote(
+                pointer=pointer,
+                start=start,
+                end=start + len(quote),
+                quote_sha256=sha256(quote.encode()).hexdigest(),
+            ),
+        )
+    except (KeyError, IndexError, ValueError):
+        return None
+
+
 def _normalize_session_turn(
     payload: dict[str, JsonValue], request: SessionRequest
 ) -> dict[str, JsonValue]:
     """Normalize host-owned call identities and an omitted recovery envelope version."""
+    version = payload.get("schema_version", 1)
+    if "read_assessment" in payload and type(version) is int and version in (1, 2, 3, 4):
+        payload = dict(payload)
+        assessment = _read_assessment(payload.pop("read_assessment"), request)
+        decision = payload.get("decision")
+        if (
+            version in (1, 4)
+            and isinstance(decision, dict)
+            and decision.get("kind") in ("tool_batch", "finish")
+        ):
+            if assessment is not None:
+                payload.update(schema_version=4, read_assessment=assessment.model_dump(mode="json"))
+            elif version == 4:
+                payload["schema_version"] = 1
     decision = payload.get("decision")
     if isinstance(decision, dict) and decision.get("kind") == "retry_offered_call":
         # 只接受眼前通知中的完整选择。过期 ID、附加参数或额外动作都不能被丢弃后执行。

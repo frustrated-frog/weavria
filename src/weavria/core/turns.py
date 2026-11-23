@@ -34,6 +34,7 @@ from .model_io import (
     validate_task_observation,
 )
 from .outcomes import ToolFailedObservation
+from .read_retry import ReadAssessment
 from .recovery import RecoverContext
 
 
@@ -55,14 +56,17 @@ class ModelTurn(BaseModel):
     """One model decision: a nonempty batch or completion, never both."""
 
     model_config = ContractModel.model_config
-    schema_version: Literal[1, 2, 3] = 1
+    schema_version: Literal[1, 2, 3, 4] = 1
     decision: Annotated[ToolBatch | FinishAction | RecoverContext, Field(discriminator="kind")]
 
+    read_assessment: ReadAssessment | None = None
     reuse_arguments_from_call_id: NonBlankString | None = None
 
     @model_serializer(mode="wrap")
     def preserve_legacy_wire(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
         data = handler(self)
+        if self.schema_version != 4:
+            data.pop("read_assessment", None)
         if self.schema_version != 3:
             data.pop("reuse_arguments_from_call_id", None)
         return data
@@ -74,6 +78,8 @@ class ModelTurn(BaseModel):
 
     @model_validator(mode="after")
     def validate_recovery(self) -> Self:
+        if (self.schema_version == 4) != (self.read_assessment is not None):
+            raise ValueError("read assessment requires ModelTurn v4")
         if (self.schema_version == 3) != (self.reuse_arguments_from_call_id is not None):
             raise ValueError("argument reuse requires ModelTurn v3")
         if self.schema_version == 3 and not (

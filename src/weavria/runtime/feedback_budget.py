@@ -226,6 +226,7 @@ class ReadFeedbackBudget:
             return None
         candidates: dict[str, ToolCallAction] = {}
         scopes: dict[str, tuple[ReadRetryScope, str]] = {}
+        pinned: dict[str, str] = {}
         normalized: list[ToolCallAction] = []
         for call, identity in zip(batch.calls, identities, strict=True):
             if call.tool_name not in visible or identity.normalization != "validated":
@@ -245,7 +246,8 @@ class ReadFeedbackBudget:
             key = identity.canonical_action_sha256
             if key not in candidates and self._can_suggest_whole_read(call):
                 candidates[key] = call
-                if transfer is not None or semantic is not None:
+                pin = descriptor.result_sha256_parameter
+                if transfer is not None or semantic is not None or pin is not None:
                     tool = self.tools.get(call.tool_name)
                     bound = call.model_copy(
                         update={
@@ -255,15 +257,25 @@ class ReadFeedbackBudget:
                         }
                     )
                     normalized.append(bound)
+                    if pin and isinstance(digest := bound.arguments.get(pin), str):
+                        pinned[key] = digest
                     if transfer is not None:
                         scope = transfer.resolver.resolve(self.task, bound)
                         if scope is not None:
                             scopes[key] = scope, scope.key(identity.action_family_sha256)
         if len(candidates) < 2:
             return None
+        scene_inputs: list[object] = [self.task.goal, self.task.constraints, sorted(candidates)]
+        # 外部任务解释可改变同一句目标的指代。只有内容和版本都一致才复用反证。
+        if pinned:
+            view = self.template.task_model_view if self.template is not None else None
+            if view is not None:
+                scene_inputs.append([view.projector_version, view.definition_sha256])
+            elif self.observation is not None:
+                scene_inputs.append(self.observation.model_dump(mode="json"))
         scene = hashlib.sha256(
             json.dumps(
-                [self.task.goal, self.task.constraints, sorted(candidates)],
+                scene_inputs,
                 ensure_ascii=False,
                 separators=(",", ":"),
             ).encode()
@@ -272,7 +284,24 @@ class ReadFeedbackBudget:
         # Beta(1,1) 平滑。没有观测为 1/2, 同分保留原提案顺序。
         attempts = Counter(item.action_sha256 for item in observations)
         complete = Counter(item.action_sha256 for item in observations if item.delivery == "full")
-        selected = max(candidates, key=lambda key: Fraction(1 + complete[key], 2 + attempts[key]))
+        # 完整送达不等于适用。只比较同一现场且当前动作明确指定的内容版本。
+        # 同一版本上较新的明确判断取代较旧判断; 弃权不能抹掉已核验反证。
+        decisions: dict[str, bool] = {}
+        for item in observations:  # 检索按最近一次在前排序
+            assessment = item.assessment
+            if (
+                assessment is not None
+                and assessment.source_sha256 == pinned.get(item.action_sha256)
+                and assessment.verdict != "uncertain"
+            ):
+                decisions.setdefault(item.action_sha256, assessment.verdict == "inapplicable")
+        selected = max(
+            candidates,
+            key=lambda key: (
+                not decisions.get(key, False),
+                Fraction(1 + complete[key], 2 + attempts[key]),
+            ),
+        )
         receipt = None
         if not observations and scopes and transfer is not None:
             history = await transfer.lookup(tuple(dict.fromkeys(key for _, key in scopes.values())))

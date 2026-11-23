@@ -369,6 +369,19 @@ def _instructions_for(
             "round/byte limits. Stop on limit; do not repeat unsuccessful queries. "
             "Continuous recovery can retain prior excerpts; normal actions release the lease."
         )
+    if journal_version >= 3 and any(d.result_sha256_parameter for d in tools.descriptors):
+        # 版本固定的读取允许在同一次决策里结算适用性。协议在预算预留与实际请求间保持定长。
+        assembled += (
+            "\nFor this toolset the response envelope has TWO top-level keys. Write "
+            "read_assessment FIRST, then decision. If current.feedback has one succeeded call "
+            "with full data, decide whether THAT source supports the current task. When it "
+            "explicitly disqualifies itself use "
+            '{"read_assessment":{"verdict":"inapplicable","pointer":"<JSON Pointer in data>",'
+            '"quote":"<unique exact substring>"},"decision":{...}}. For a string in data.text '
+            'use "/text". For other full results use {"verdict":"applicable"} or '
+            '{"verdict":"uncertain"}. Without that feedback use null. Always take your normal '
+            "next action in decision. If offered retry_read, you can issue that single call."
+        )
     return assembled
 
 

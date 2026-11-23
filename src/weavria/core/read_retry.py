@@ -21,14 +21,66 @@ type ReadDelivery = Literal["full", "partial", "reference", "failed"]
 type _ScopePointer = Annotated[JsonPointer, Field(max_length=256)]
 
 
-class ReadRetryOutcome(ContractModel):
+class ReadCounterquote(ContractModel):
+    """模型引用的唯一原文片段。持久事实只保留位置和摘要。"""
+
+    pointer: _ScopePointer
+    start: int = Field(ge=0)
+    end: int = Field(gt=0)
+    quote_sha256: ActionDigest
+
+    @model_validator(mode="after")
+    def validate_length(self) -> Self:
+        if not 1 <= self.end - self.start <= 384:
+            raise ValueError("counterquote must name a bounded nonempty span")
+        return self
+
+
+class ReadAssessment(ContractModel):
+    """模型对刚交付原件的任务相关性判断, 与交付事实独立。"""
+
+    source_sha256: ActionDigest
+    verdict: Literal["applicable", "inapplicable", "uncertain"]
+    quote: ReadCounterquote | None = None
+
+    @model_validator(mode="after")
+    def validate_proof(self) -> Self:
+        if (self.verdict == "inapplicable") != (self.quote is not None):
+            raise ValueError("only counterevidence requires a quote")
+        return self
+
+
+class ReadRetryOutcome(BaseModel):
     """在指定模型请求上已经观测到的结果, 可沿 Run 和拒绝序号找回现场。"""
 
+    model_config = ContractModel.model_config
+    schema_version: Literal[1, 2] = 1
     run_id: NonBlankString
     rejection_sequence: int = Field(gt=0)
     model_call: int = Field(gt=0)
     action_sha256: ActionDigest
     delivery: ReadDelivery
+    assessment: ReadAssessment | None = None
+
+    @model_serializer(mode="wrap")
+    def preserve_versions(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        data = handler(self)
+        if self.schema_version == 1:
+            data.pop("assessment", None)
+        return data
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def validate_version(cls, value: object) -> object:
+        return ContractModel.validate_version_type(value)
+
+    @model_validator(mode="after")
+    def validate_assessment(self) -> Self:
+        if (self.schema_version == 2) != (self.assessment is not None) or (
+            self.assessment is not None and self.delivery != "full"
+        ):
+            raise ValueError("assessed outcomes require full delivery and schema v2")
+        return self
 
 
 class ReadRetryScope(ContractModel):

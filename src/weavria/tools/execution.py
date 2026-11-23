@@ -61,7 +61,7 @@ class ToolDescriptor(BaseModel):
         validate_default=True,
         revalidate_instances="always",
     )
-    schema_version: Literal[2, 3, 4, 5, 6, 7, 8, 9, 10] = 2
+    schema_version: Literal[2, 3, 4, 5, 6, 7, 8, 9, 10, 11] = 2
     name: str = Field(min_length=1, pattern=r"^[a-zA-Z][a-zA-Z0-9_]*$")
     version: str = Field(min_length=1)
     description: str = Field(min_length=1)
@@ -89,6 +89,9 @@ class ToolDescriptor(BaseModel):
     # None 保留整个决策视图。这份声明只供宿主预算和派发使用。
     artifact_read_inputs: tuple[str, ...] | None = Field(default=None, max_length=8)
 
+    # 该输入固定本次读取的完整规范 JSON 摘要, 仅用于可按内容寻址的外部来源。
+    result_sha256_parameter: str | None = Field(default=None, min_length=1, max_length=128)
+
     # 嵌套结构由工具用已校验参数解析,无须让 Runtime 理解笔记或 JSON Schema。
     artifact_read_resolver_version: str | None = Field(default=None, min_length=1, max_length=64)
 
@@ -104,7 +107,9 @@ class ToolDescriptor(BaseModel):
         data = handler(self)
         if self.schema_version != 10:
             data.pop("artifact_read_resolver_version", None)
-        if self.schema_version != 9:
+        if self.schema_version != 11:
+            data.pop("result_sha256_parameter", None)
+        if self.schema_version not in (9, 11):
             data.pop("artifact_read_inputs", None)
         if self.schema_version < 7:
             data.pop("poll_interval_seconds", None)
@@ -120,7 +125,17 @@ class ToolDescriptor(BaseModel):
 
     @model_validator(mode="after")
     def validate_feedback_delivery_version(self) -> "ToolDescriptor":
-        if (self.schema_version == 9) != (self.artifact_read_inputs is not None):
+        if (self.schema_version == 11) != (self.result_sha256_parameter is not None):
+            raise ValueError("result digest binding requires descriptor v11")
+        if self.result_sha256_parameter is not None:
+            properties = self.input_schema.get("properties")
+            if (
+                self.artifact_read_inputs != ()
+                or not isinstance(properties, dict)
+                or (self.result_sha256_parameter not in properties)
+            ):
+                raise ValueError("result digest binding requires an external read and input field")
+        if (self.schema_version in (9, 11)) != (self.artifact_read_inputs is not None):
             raise ValueError("declared read inputs require descriptor v9")
         if (self.schema_version == 10) != (self.artifact_read_resolver_version is not None):
             raise ValueError("an argument-bound read resolver requires descriptor v10")
@@ -391,6 +406,7 @@ class TypedTool[Input: BaseModel, Output: BaseModel]:
         source_group: str | None = None,
         poll_interval_seconds: float | None = None,
         artifact_read_inputs: tuple[str, ...] | None = None,
+        result_sha256_parameter: str | None = None,
         artifact_read_resolver_version: str | None = None,
         artifact_read_resolver: Callable[[Input], tuple[str, ...]] | None = None,
     ) -> None:
@@ -407,7 +423,10 @@ class TypedTool[Input: BaseModel, Output: BaseModel]:
         if (artifact_read_resolver is None) != (artifact_read_resolver_version is None):
             raise ValueError("artifact read resolvers must be versioned")
         descriptor = ToolDescriptor(
-            schema_version=10
+            result_sha256_parameter=result_sha256_parameter,
+            schema_version=11
+            if result_sha256_parameter is not None
+            else 10
             if artifact_read_resolver is not None
             else 9
             if artifact_read_inputs is not None
@@ -845,6 +864,11 @@ class ToolExecutor:
                         raise ToolExecutionError(
                             "tool result exceeded its admitted complete-feedback bound"
                         )
+                # 绑定参数非空时, 即使外部后端返回了同名新版, 也不能按旧版本发布成功。
+                pin = descriptor.result_sha256_parameter
+                expected = normalized.get(pin) if pin is not None else None
+                if expected is not None and expected != _canonical_sha256(value):
+                    raise ToolFault(ErrorCategory.INVALID_TOOL_OUTPUT, "Source digest mismatch")
                 snapshot = await self._store.put(self._run_id, action.call_id, value)
             if attempt_expired():
                 raise TimeoutError("tool returned after its deadline")

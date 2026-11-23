@@ -9,6 +9,7 @@ from weavria.core import (
     BatchAdmitted,
     BatchRejected,
     ControlEvent,
+    ReadAssessment,
     ReadRetryOutcome,
     ReadRetryScope,
     SessionRequest,
@@ -121,7 +122,7 @@ def recall_read_retries(
     if current is None:
         return ()
     rows = conn.execute(
-        f"""SELECT t.run_id,t.rejection_sequence,t.model_call+2,t.action,t.delivery
+        f"""SELECT t.run_id,t.rejection_sequence,t.model_call+2,t.action,t.delivery,t.assessment
         FROM read_retry_trials t JOIN runs r ON r.id=t.run_id
         WHERE t.session_id=? AND t.profile=? AND t.scene=? AND t.ordinal<?
         AND t.delivery IS NOT NULL AND r.status IN ('completed','budget_exhausted','failed')
@@ -136,8 +137,12 @@ def recall_read_retries(
             model_call=model_call,
             action_sha256=action,
             delivery=delivery,
+            schema_version=2 if assessed is not None else 1,
+            assessment=ReadAssessment.model_validate_json(assessed)
+            if assessed is not None
+            else None,
         )
-        for source, seq, model_call, action, delivery in rows
+        for source, seq, model_call, action, delivery, assessed in rows
     )
 
 
@@ -240,13 +245,21 @@ def project_read_retry(
         ):
             return
         scope = ReadRetryScope.model_validate_json(row[2]) if row[2] is not None else None
-        observation = _observed_delivery(conn, event.run_id, row[0], request.history, scope)
+        observation = _observed_delivery(
+            conn, event.run_id, row[0], request.history, scope, data.turn.read_assessment
+        )
         if observation is not None:
-            delivery, field_support = observation
+            delivery, field_support, assessment = observation
             conn.execute(
-                """UPDATE read_retry_trials SET delivery=?,field_support=?
+                """UPDATE read_retry_trials SET delivery=?,field_support=?,assessment=?
                 WHERE run_id=? AND model_call=?""",
-                (delivery, int(field_support), event.run_id, model_call - 2),
+                (
+                    delivery,
+                    int(field_support),
+                    assessment.model_dump_json() if assessment else None,
+                    event.run_id,
+                    model_call - 2,
+                ),
             )
 
 
@@ -256,7 +269,8 @@ def _observed_delivery(
     call_id: str,
     history: tuple[object, ...],
     scope: ReadRetryScope | None,
-) -> tuple[str, bool] | None:
+    assessment: ReadAssessment | None,
+) -> tuple[str, bool, ReadAssessment | None] | None:
     exchange = next(
         (e for e in history if isinstance(e, ToolExchange) and e.action.call_id == call_id), None
     )
@@ -272,7 +286,7 @@ def _observed_delivery(
         return None
     if isinstance(exchange.observation, ToolFailedObservation):
         return (
-            ("failed", False)
+            ("failed", False, None)
             if isinstance(record.exchange.observation, ToolFailedObservation)
             else None
         )
@@ -307,7 +321,25 @@ def _observed_delivery(
                     and scope.subject_digest(subject) == scope.subject_sha256
                     and all(value not in (None, "", [], {}) for value in values)
                 )
-        return "full", supported
+        # 独立核验原件, 不能信任供应商适配器或自定义 ModelProvider 给出的坐标。
+        if assessment is not None and assessment.source_sha256 != ref.sha256:
+            assessment = None
+        if assessment is not None and (q := assessment.quote) is not None:
+            try:
+                text = resolve_pointer(original, q.pointer)
+            except (ValueError, KeyError, IndexError):
+                text = None
+            excerpt = text[q.start : q.end] if isinstance(text, str) else ""
+            if (
+                not isinstance(text, str)
+                or q.end > len(text)
+                or not any(c.isalnum() for c in excerpt)
+                or text.find(excerpt) != q.start
+                or text.find(excerpt, q.start + 1) >= 0
+                or hashlib.sha256(excerpt.encode()).hexdigest() != q.quote_sha256
+            ):
+                assessment = None
+        return "full", supported, assessment
     if output.get("representation") == "excerpts" and output.get("passages"):
-        return "partial", False
-    return ("reference", False) if exchange == minimum_exchange(record) else None
+        return "partial", False, None
+    return ("reference", False, None) if exchange == minimum_exchange(record) else None

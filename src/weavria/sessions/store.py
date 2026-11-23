@@ -305,7 +305,7 @@ class SQLiteSessionStore:
         conn = sqlite3.connect(self.path, timeout=2.0)
         self._connection = conn
         version = conn.execute("PRAGMA user_version").fetchone()[0]
-        if version not in (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13):
+        if version not in (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14):
             raise SessionConflictError("unsupported session database schema")
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA journal_mode=WAL")
@@ -389,6 +389,10 @@ class SQLiteSessionStore:
             with self._transaction() as migration:
                 create_read_retry_review_index(migration)
                 migration.execute("PRAGMA user_version=13")
+        if version < 14:
+            with self._transaction() as migration:
+                migration.execute("ALTER TABLE read_retry_trials ADD COLUMN assessment TEXT")
+                migration.execute("PRAGMA user_version=14")
         # Only the exclusive DB owner can classify an old live run as interrupted.
         active = conn.execute("SELECT id FROM runs WHERE status='running'").fetchall()
         for row in active:

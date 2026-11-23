@@ -87,13 +87,13 @@ async def test_v11_delivery_rows_survive_without_inventing_field_proof(
         assert len(before) == 2 and all(row[-1] == "full" for row in before)
         conn.execute("DROP INDEX retry_scope")
         conn.execute("DROP INDEX retry_full_history")
-        for column in ("scope_sha256", "scope", "field_support"):
+        for column in ("scope_sha256", "scope", "field_support", "assessment"):
             conn.execute(f"ALTER TABLE read_retry_trials DROP COLUMN {column}")
         conn.execute("PRAGMA user_version=11")
 
     async with SQLiteSessionStore(db):
         with sqlite3.connect(db) as conn:
-            assert conn.execute("PRAGMA user_version").fetchone()[0] == 13
+            assert conn.execute("PRAGMA user_version").fetchone()[0] == 14
             assert conn.execute(query).fetchall() == before
             assert conn.execute(
                 "SELECT DISTINCT scope_sha256,scope,field_support FROM read_retry_trials"
