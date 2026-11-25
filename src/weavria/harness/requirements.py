@@ -652,7 +652,7 @@ class EvidenceResolver:
     @property
     def version(self) -> str:
         strategies = ",".join(f"{item.key}@{item.version}" for item in self._extractors)
-        return f"evidence-resolver/7[{strategies}]"
+        return f"evidence-resolver/8[{strategies}]"
 
     async def resolve(
         self,
@@ -1348,12 +1348,15 @@ def _one_scope_covers(
             for field in dict.fromkeys((*required_fields, *declared_gaps))
             if field not in covered
         )
-        if (
-            not missing
-            and (required_fields or any(item.relation == "supports" for item in scoped))
-            and _scope_result_can_complete(completion_mode, scoped)
-        ):
-            return True, ()
+        if not missing:
+            # 字段齐全后仍可能只看到了第一页或空结果。把尚缺的证明投影到
+            # 工作状态, 让修订与收尾能区分范围不足和缺少正值。不能跨范围凑证明。
+            if not _scope_result_can_complete(completion_mode, scoped):
+                missing = ("$result" if completion_mode == "positive_value_required" else "$scope",)
+            elif required_fields or any(item.relation == "supports" for item in scoped):
+                return True, ()
+            else:
+                missing = ("$proof",)
         if best_missing is None or len(missing) < len(best_missing):
             best_missing = missing
     return False, best_missing if best_missing is not None else required_fields

@@ -273,6 +273,31 @@ async def test_missing_or_partial_evidence_requests_repair() -> None:
     assert decision.issue_codes == ("missing_evidence",)
 
 
+async def test_complete_fields_with_unproven_enumeration_explain_scope_gap() -> None:
+    registry = _registry()
+    task, frame, observation = await _frame(registry)
+    requirement = frame.requirements[0].model_copy(
+        update={"completion_mode": "exhaust_bounded_scope"}
+    )
+    frame = frame.model_copy(update={"requirements": (requirement,)})
+    observation = observation.model_copy(update={"payload": frame.model_dump(mode="json")})
+    store = InMemoryArtifactStore()
+    record = await ToolExecutor("run", registry, store, ReadOnlyPolicy()).execute(
+        ToolCallAction(call_id="read-1", tool_name="read_value", arguments={"key": "alpha"}),
+        max_duration=1,
+    )
+    context = CompletionContext(
+        "run", task, FinishAction(output="alpha"), (record,), store, observation
+    )
+    try:
+        decision = await TaskObligationCompletionPolicy().verify(context)
+        assert isinstance(decision, CompletionRepair)
+        assert decision.issue_codes == ("missing_evidence",)
+        assert "$scope" in decision.guidance
+    finally:
+        context.close()
+
+
 async def test_successful_output_with_no_matching_fields_converges_as_unverifiable() -> None:
     class MismatchingExtractor:
         key = "mismatching"

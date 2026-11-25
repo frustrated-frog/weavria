@@ -339,6 +339,7 @@ async def test_profile_match_checks_normalized_parameters_and_semantic_proof() -
         ("report_findings", "complete", NeedStatus.SATISFIED),
         ("report_findings", "partial", NeedStatus.PARTIAL),
         ("exhaust_bounded_scope", "complete", NeedStatus.SATISFIED),
+        ("exhaust_bounded_scope", "partial", NeedStatus.PARTIAL),
     ],
 )
 async def test_empty_result_requires_compatible_completion_mode_and_complete_scope(
@@ -360,7 +361,15 @@ async def test_empty_result_requires_compatible_completion_mode_and_complete_sco
         read_artifact=lambda artifact_id: store.get("run-1", artifact_id),
     )
 
-    assert ledger.state_for(requirement.need_id).status is expected
+    state = ledger.state_for(requirement.need_id)
+    assert state.status is expected
+    # 空列表的字段存在。正值要求缺结果, 报告空集或遍历全域要求缺范围证明。
+    if expected is NeedStatus.PARTIAL:
+        assert state.missing_fields == (
+            "$result" if completion_mode == "positive_value_required" else "$scope",
+        )
+    else:
+        assert state.missing_fields == ()
 
 
 async def test_progress_digest_advances_for_new_attributed_source_not_duplicate_call() -> None:

@@ -68,7 +68,7 @@ class CandidateAnswerVerifier(Protocol):
 class TaskCompletionEvaluator:
     """Evaluate declared obligations without trusting model claims of completion."""
 
-    version = "task-obligations/13"
+    version = "task-obligations/14"
 
     def __init__(
         self,
@@ -317,14 +317,20 @@ class TaskCompletionEvaluator:
                     ),
                 )
             retryable = any(item.can_retry for item in incomplete)
+            guidance = "Obtain the missing required fields or report the limitation"
+            if retryable:
+                guidance = "Try a different authorized source or arguments"
+            elif any("$scope" in item.missing_fields for item in incomplete):
+                # 列全结果或对齐同一范围的回执才能弥补范围缺口。重交相同候选
+                # 不会改变证据。这里不承诺工具一定支持完整遍历。
+                guidance = (
+                    "Check the needs marked $scope. Obtain evidence covering the required "
+                    "scope from an authorized source, or report the scope limitation."
+                )
             return CompletionEvaluation(
                 disposition="repair",
                 verdicts=verdicts,
-                next_required_actions=(
-                    "Try a different authorized source or arguments"
-                    if retryable
-                    else "Obtain the missing required fields or report the limitation",
-                ),
+                next_required_actions=(guidance,),
                 outcome="unverifiable",
                 reason_code=("retryable_source_failure" if retryable else "missing_evidence"),
             )
