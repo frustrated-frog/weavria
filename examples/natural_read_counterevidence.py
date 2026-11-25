@@ -7,7 +7,7 @@ import json
 import os
 import sqlite3
 from collections.abc import Sequence
-from contextlib import closing
+from contextlib import closing, nullcontext
 from dataclasses import asdict, dataclass
 from itertools import permutations
 from pathlib import Path
@@ -17,11 +17,12 @@ from urllib.parse import quote
 
 from pydantic import model_validator
 
+from examples.direct_read_correction import extract_correction, trace_digest
 from examples.m1_harness import load_environment
 from examples.read_counterevidence import CURRENT, NOTICE, TABLE, VersionedSource
 from examples.read_retry_experience import Document
 from examples.semantic_read_retry import CORPUS, model_config
-from weavria.context import ContextCompilerConfig
+from weavria.context import ContextCompilerConfig, SessionTokenCounter
 from weavria.core import (
     BatchRejected,
     ControlEvent,
@@ -115,6 +116,8 @@ class Trial:
     displacements: int
     shown: int
     provider: dict[str, object]
+    direct_correction: dict[str, object] | None = None
+    trace_sha256: str | None = None
 
 
 def observe(
@@ -208,6 +211,7 @@ def observe(
         and case.current in delivered
         and (report.output or "").strip() == f"{case.answer} [{case.current}]"
     )
+    correction = extract_correction(db, report.run_id)
     return Trial(
         status=report.status.value,
         answer=report.output,
@@ -226,6 +230,10 @@ def observe(
         displacements=displacements,
         shown=shown,
         provider=summarize_samples(tuple(samples)),
+        trace_sha256=trace_digest(db, report.run_id),
+        direct_correction={**asdict(correction), "quote": correction.quote.model_dump(mode="json")}
+        if correction is not None
+        else None,
     )
 
 
@@ -235,7 +243,7 @@ async def run_series(
     arm: Arm,
     reverse: bool,
     model: SessionModelProvider,
-    counter: OpenAICompatibleTokenCounter,
+    counter: SessionTokenCounter,
     samples: Sequence[ModelCallSample],
 ) -> list[Trial]:
     documents = {case.old: case.old_text, case.current: case.current_text}
@@ -302,7 +310,12 @@ async def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--env-file", type=Path, required=True)
     parser.add_argument("--rounds", type=int, default=6, choices=range(1, 7))
+    parser.add_argument(
+        "--trace-dir", type=Path, help="为这批合成任务新建目录, 保存可离线核验的 SQLite 原件"
+    )
     args = parser.parse_args()
+    if args.trace_dir is not None:
+        args.trace_dir.mkdir(parents=True, exist_ok=False)
     load_environment(args.env_file)
     config = model_config()
     counter = OpenAICompatibleTokenCounter(config, encoding="cl100k_base")
@@ -342,7 +355,7 @@ async def main() -> None:
         if None in hashes or len(hashes) != 1:
             raise ValueError("first model request differed across arms")
 
-    with TemporaryDirectory() as folder:
+    with TemporaryDirectory() if args.trace_dir is None else nullcontext(args.trace_dir) as folder:
         for i in range(args.rounds):
             async with asyncio.TaskGroup() as group:
                 for case in CASES:
