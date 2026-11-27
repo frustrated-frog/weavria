@@ -265,9 +265,10 @@ async def turn(
     transport: Transport,
     task: ReviewTask = UPGRADE_TASK,
     evidence: HarnessEvidence | None = None,
+    reuse_receipts: bool = False,
 ) -> dict[str, object]:
     docs = task.documents(revised)
-    corpus = SnapshotCorpus(docs)
+    corpus = SnapshotCorpus(docs, reuse_receipts=reuse_receipts)
     counter = OpenAICompatibleTokenCounter(model, encoding="cl100k_base")
     offset = transport.calls
     output = None
@@ -322,6 +323,7 @@ async def turn(
         attempts=attempts,
         journal=journal.model_dump() if journal is not None else None,
         reads=[path for _, path in corpus.reads],
+        reused=corpus.reused,
         failures=failures,
         passed=not failures,
         provider=transport.observations[offset:],

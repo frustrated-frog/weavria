@@ -64,6 +64,7 @@ from weavria.core import (
     TaskPreparationAttemptDiagnostic,
     TaskRevised,
     TaskUpdate,
+    ToolAuthorization,
     ToolBatch,
     ToolCallAction,
     ToolFailedObservation,
@@ -2419,6 +2420,60 @@ class SQLiteSessionStore:
             return ArtifactSnapshot(row[0], row[1])
 
         return await self._submit(read)
+
+    async def prior_result(
+        self,
+        run_id: str,
+        call_id: str,
+        tool_name: str,
+        authorization: ToolAuthorization,
+        digest: str,
+    ) -> ArtifactSnapshot | None:
+        """查同一会话紧邻的已完成 Run。命中仍通过当前活跃调用的来源授权与审计。"""
+
+        def find() -> tuple[str, ArtifactRef] | None:
+            conn = self._conn()
+            # 只查已结算的生产回执。失败的 Run、分叉前的祖先或仅写入尚未接受的
+            # Artifact 都不在连接结果中。当前调用的 Policy 已由 ToolExecutor 重跑。
+            rows = conn.execute(
+                """SELECT c.session_id,p.id,o.call_id,o.artifact_id,o.record FROM runs c JOIN runs p
+                   ON p.session_id=c.session_id AND p.ordinal=c.ordinal-1
+                   JOIN outcomes o ON o.run_id=p.id
+                   WHERE c.id=? AND c.status='running' AND p.status='completed'
+                   AND o.artifact_id IS NOT NULL
+                   AND json_extract(o.record,'$.artifact.sha256')=?
+                   AND json_extract(o.record,'$.exchange.action.tool_name')=?
+                   ORDER BY o.call_id""",
+                (run_id, digest, tool_name),
+            )
+            for session_id, producer_run, producer_call, artifact_id, raw in rows:
+                record = ToolRecord.model_validate_json(raw)
+                ref = record.artifact
+                if ref is None or (ref.run_id, ref.call_id, ref.artifact_id) != (
+                    producer_run,
+                    producer_call,
+                    artifact_id,
+                ):
+                    raise ToolExecutionError("prior receipt differs from its committed outcome")
+                prior = record.authorization
+                if (
+                    authorization.allowed
+                    and prior is not None
+                    and prior.allowed
+                    and prior.tool_version == authorization.tool_version
+                    and prior.policy_version == authorization.policy_version
+                    and task_view_digest(prior.normalized_arguments)
+                    == task_view_digest(authorization.normalized_arguments)
+                    and not record.dependencies
+                ):
+                    return session_id, ref
+            return None
+
+        candidate = await self._submit(find)
+        if candidate is None:
+            return None
+        session_id, reference = candidate
+        return await self.read_source(session_id, run_id, call_id, reference)
 
     async def read_source(
         self, session_id: str, consumer_run: str, consumer_call: str, reference: ArtifactRef

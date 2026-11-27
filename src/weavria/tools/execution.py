@@ -246,6 +246,18 @@ class ToolExecutionError(RuntimeError):
     """A framework port broke execution identity; cannot be ordinary tool feedback."""
 
 
+@runtime_checkable
+class _PriorResultStore(Protocol):
+    async def prior_result(
+        self,
+        run_id: str,
+        call_id: str,
+        tool_name: str,
+        authorization: ToolAuthorization,
+        digest: str,
+    ) -> ArtifactSnapshot | None: ...
+
+
 class ToolContext:
     """Invocation-scoped read capability; captures dependencies and closes on exit."""
 
@@ -258,9 +270,11 @@ class ToolContext:
         call_id: str | None = None,
         task_view: TaskModelView | None = None,
         attachment_limit: int = 4_000_000,
+        authorized_read: tuple[str, ToolAuthorization] | None = None,
     ) -> None:
         if type(attachment_limit) is not int or not 1 <= attachment_limit <= 4_000_000:
             raise ValueError("attachment_limit must be in 1..4000000")
+        self._authorized_read = authorized_read
         self._attachment_limit = attachment_limit
         self._task_view_json = task_view.model_dump_json() if task_view else None
         self._call_id = call_id
@@ -297,6 +311,28 @@ class ToolContext:
     @property
     def dependencies(self) -> tuple[str, ...]:
         return tuple(dict.fromkeys(self._reads))
+
+    async def reuse_verified_result(self, expected_sha256: str) -> ArtifactSnapshot | None:
+        """按本次授权的调用和来源独立确认的完整输出摘要查找上轮原件。未命中返回 None。"""
+        if not self._active:
+            raise RuntimeError("tool invocation context is closed")
+        if len(expected_sha256) != 64 or any(c not in "0123456789abcdef" for c in expected_sha256):
+            raise ValueError("expected canonical result SHA-256")
+        if (
+            not self._authorized_read
+            or not self._call_id
+            or not isinstance(self._store, _PriorResultStore)
+        ):
+            return None
+        name, auth = self._authorized_read
+        snapshot = await self._store.prior_result(
+            self._run_id, self._call_id, name, auth, expected_sha256
+        )
+        if not self._active:
+            raise RuntimeError("tool invocation context is closed")
+        if snapshot is not None and snapshot.reference.sha256 != expected_sha256:
+            raise ToolExecutionError("prior result differs from the current source digest")
+        return snapshot
 
     async def read_artifact(self, artifact_id: str) -> ArtifactSnapshot:
         """Read within the owning run and record the producing call."""
@@ -737,16 +773,7 @@ class ToolExecutor:
             _validate_feedback_envelope(action, expected_identity, feedback_envelope)
         owner = asyncio.current_task()
         cancellations = owner.cancelling() if owner is not None else 0
-        context = ToolContext(
-            self._run_id,
-            self._store,
-            accepted_artifacts,
-            call_id=action.call_id,
-            task_view=task_view,
-            attachment_limit=min(4_000_000, self._bounds.max_result_bytes)
-            if self._bounds
-            else 4_000_000,
-        )
+        context: ToolContext | None = None
         authorization: ToolAuthorization | None = None
         retryable = False
         loop = asyncio.get_running_loop()
@@ -827,6 +854,23 @@ class ToolExecutor:
                 )
                 if not decision.allowed:
                     raise ToolFault(ErrorCategory.POLICY_DENIED, "Tool execution denied by policy")
+                context = ToolContext(
+                    self._run_id,
+                    self._store,
+                    accepted_artifacts,
+                    call_id=action.call_id,
+                    task_view=task_view,
+                    authorized_read=(action.tool_name, authorization)
+                    if descriptor.behavior == "read_only"
+                    and descriptor.artifact_read_inputs == ()
+                    and descriptor.artifact_read_resolver_version is None
+                    and not descriptor.context_paths
+                    and descriptor.poll_interval_seconds is None
+                    else None,
+                    attachment_limit=min(4_000_000, self._bounds.max_result_bytes)
+                    if self._bounds
+                    else 4_000_000,
+                )
                 value = await tool.invoke(arguments, context)
                 poll_after_seconds = None
                 if descriptor.poll_interval_seconds is not None:
@@ -945,7 +989,8 @@ class ToolExecutor:
             else:
                 category, message, cause = ErrorCategory.TOOL_FAILURE, "Tool backend failed", exc
         finally:
-            context.close()
+            if context is not None:
+                context.close()
         if owner is not None and owner.cancelling() > cancellations:
             raise asyncio.CancelledError
         if cause is not None:
@@ -964,7 +1009,7 @@ class ToolExecutor:
                     ),
                 ),
             ),
-            dependencies=context.dependencies,
+            dependencies=context.dependencies if context is not None else (),
             authorization=authorization,
         )
         if feedback_envelope is not None and (

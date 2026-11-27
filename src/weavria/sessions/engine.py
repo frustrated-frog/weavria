@@ -63,6 +63,7 @@ from weavria.core import (
     TaskInput,
     TaskObservation,
     TaskUpdate,
+    ToolAuthorization,
     ToolRecord,
     TurnFeedback,
     TurnResolution,
@@ -147,6 +148,18 @@ class _RunArtifacts:
             validated, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
         )
         return await self._store.put(run_id, call_id, encoded)
+
+    async def prior_result(
+        self,
+        run_id: str,
+        call_id: str,
+        tool_name: str,
+        authorization: ToolAuthorization,
+        digest: str,
+    ) -> ArtifactSnapshot | None:
+        if run_id != self._run_id:
+            raise ValueError("source consumer does not match active run")
+        return await self._store.prior_result(run_id, call_id, tool_name, authorization, digest)
 
     async def get(self, run_id: str, artifact_id: str) -> ArtifactSnapshot:
         if run_id != self._run_id:

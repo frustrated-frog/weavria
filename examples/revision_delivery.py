@@ -8,12 +8,12 @@ import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Literal
 
 from pydantic import BaseModel, Field
 
 from examples import dependency_migration as migration
 from examples import upgrade_review as upgrade
+from examples.inventory_time import clone
 from examples.live_memory_formation import Transport
 from examples.m1_harness import implementation_identity, load_dataset, load_environment
 from examples.snapshot_catalogue_evidence import SnapshotCatalogueEvidence
@@ -168,6 +168,7 @@ def write(path: Path, value: object) -> None:
 
 
 async def run(args: argparse.Namespace) -> int:
+    compare_receipts: bool = args.compare_receipts
     cases = scenarios()
     frozen = load_dataset()
     setting, budget = frozen.model, frozen.budgets
@@ -199,6 +200,7 @@ async def run(args: argparse.Namespace) -> int:
         "repeats": args.repeats,
         "audit_requirements": True,
         "catalogue_proof": args.catalogue_proof,
+        "compare_receipts": compare_receipts,
         "transport_timeout": budget.model_seconds,
         "implementation": implementation_identity(),
         "evaluation_sources": {
@@ -255,11 +257,17 @@ async def run(args: argparse.Namespace) -> int:
                 initial: Stage | None = None
                 metrics: dict[str, dict[str, object]] = {}
                 # 每对共用一个实际首版, 交替安排冷重做和续接的先后以减少顺序偏差。
-                middle: tuple[Literal["continuation", "cold"], ...] = (
+                middle: tuple[str, ...] = (
                     ("continuation", "cold") if (n + i) % 2 else ("cold", "continuation")
                 )
+                if compare_receipts:
+                    middle = tuple("verified" if arm == "cold" else arm for arm in middle)
                 for arm in ("initial", *middle):
-                    if arm == "continuation" and initial and initial.status != "completed":
+                    if (
+                        arm in ("continuation", "verified")
+                        and initial
+                        and initial.status != "completed"
+                    ):
                         continue
                     start = time.monotonic()
                     evidence = HarnessEvidence(
@@ -271,8 +279,9 @@ async def run(args: argparse.Namespace) -> int:
                         else (),
                     )
                     raw = await upgrade.turn(
-                        folder / ("cold.db" if arm == "cold" else "session.db"),
-                        revised=arm == "continuation",
+                        folder / (arm + ".db" if arm in ("cold", "verified") else "session.db"),
+                        revised=arm in ("continuation", "verified"),
+                        reuse_receipts=arm == "verified",
                         config=config,
                         model=model,
                         transport=transport,
@@ -283,9 +292,15 @@ async def run(args: argparse.Namespace) -> int:
                     stage = Stage.model_validate(raw)
                     observed = measure(stage, case, initial, revised=arm != "initial")
                     observed["elapsed_seconds"] = round(time.monotonic() - start, 3)
+                    observed["reused"] = raw.get("reused", [])
                     metrics[arm] = observed
                     if arm == "initial":
                         initial = stage
+                        if compare_receipts and stage.status == "completed":
+                            # 上轮 send 关库后备份, 两个修订臂从完全相同的已接受事件出发。
+                            await asyncio.to_thread(
+                                clone, folder / "session.db", folder / "verified.db"
+                            )
                     print(case.name, n, arm, stage.status, stage.failures, flush=True)
                 summary.append(
                     {
@@ -304,15 +319,25 @@ async def run(args: argparse.Namespace) -> int:
                         ),
                     }
                 )
+                if compare_receipts:
+                    summary[-1]["verified_pair_passed"] = (
+                        metrics["initial"]["passed"] is True
+                        and metrics.get("verified", {}).get("passed") is True
+                    )
                 write(out / "summary.json", summary)
     finally:
         await transport.client.aclose()
-    return int(any(not row["pair_passed"] for row in summary))
+    return int(
+        any(not row["pair_passed"] or row.get("verified_pair_passed") is False for row in summary)
+    )
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--live", action="store_true")
+    parser.add_argument(
+        "--compare-receipts", action="store_true", help="从同一首版备份配对比较正常读取和按内容复用"
+    )
     parser.add_argument("--catalogue-proof", action="store_true", help="核验完整目录回执")
     parser.add_argument("--env-file", type=Path)
     parser.add_argument("--out", type=Path, default=Path(".weavria/revision-delivery/batch-1"))

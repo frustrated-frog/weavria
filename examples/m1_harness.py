@@ -365,12 +365,21 @@ def assemble_config(data: Dataset, arm: Arm) -> HarnessConfig:
 
 
 async def run_trial(
-    data: Dataset, case: Case, arm: Arm, repetition: int, directory: Path, *, base: str, key: str
+    data: Dataset,
+    case: Case,
+    arm: Arm,
+    repetition: int,
+    directory: Path,
+    *,
+    base: str,
+    key: str,
+    source_links: bool = False,
 ) -> dict[str, object]:
     await asyncio.to_thread(directory.mkdir, parents=True, exist_ok=False)
     corpus = await asyncio.to_thread(
         SnapshotCorpus.load, DATA / "corpus.json", data.corpora[case.domain]
     )
+    corpus.source_links = source_links
     corpus.fail_primary = case.scenario == "failure"
     model_config = data.model.provider_config()
     # 三个模型角色分别计量;共享的是冻结配置,不是可变的运行状态。
@@ -722,10 +731,15 @@ async def main() -> None:
     parser.add_argument("--env-file", type=Path)
     parser.add_argument("--out", type=Path, default=Path(".weavria/m1/batch-0"))
     parser.add_argument("--case", help="单项诊断不计作完整验收;必须保留结果")
+    parser.add_argument(
+        "--source-links", action="store_true", help="定向诊断中展示快照内已解析的文档引用"
+    )
     parser.add_argument("--diagnostic-repetitions", type=int, choices=(1, 2, 3))
     args = parser.parse_args()
     if args.diagnostic_repetitions is not None and not args.case:
         parser.error("--diagnostic-repetitions requires --case")
+    if args.source_links and not args.case:
+        parser.error("--source-links requires a diagnostic case")
     data = load_dataset()
     manifest = verify(data)
     if not args.run:
@@ -744,6 +758,7 @@ async def main() -> None:
         {
             "started_at": datetime.now(UTC).isoformat(),
             "selection": args.case,
+            "source_links": args.source_links,
             "diagnostic_repetitions": args.diagnostic_repetitions,
             "model": data.model.model_dump(),
             "budgets": data.budgets.model_dump(),
@@ -760,7 +775,14 @@ async def main() -> None:
         name = f"{case.case_id}-{arm}-{repetition}"
         async with semaphore:
             result = await run_trial(
-                data, case, arm, repetition, args.out / name, base=base, key=key
+                data,
+                case,
+                arm,
+                repetition,
+                args.out / name,
+                base=base,
+                key=key,
+                source_links=args.source_links,
             )
             (args.out / f"{name}.json").write_text(json.dumps(result, ensure_ascii=False, indent=2))
             print(
