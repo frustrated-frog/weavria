@@ -106,7 +106,14 @@ async def test_failed_first_turn_stays_in_denominator_and_cold_task_runs(
     monkeypatch.setattr(upgrade, "turn", fail)
     out = tmp_path / "batch"
     args = argparse.Namespace(
-        live=True, out=out, repeats=1, env_file=None, catalogue_proof=False, compare_receipts=False
+        live=True,
+        out=out,
+        repeats=1,
+        env_file=None,
+        catalogue_proof=False,
+        compare_receipts=False,
+        compare_located=False,
+        case=None,
     )
     assert await review.run(args) == 1
     summaries = json.loads((out / "summary.json").read_text())

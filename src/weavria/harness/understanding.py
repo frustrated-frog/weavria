@@ -77,6 +77,7 @@ from .intent import (
     RiskAwareAskOrActPolicy,
     intent_uncertainty_sha256,
 )
+from .located_read import LocatedReadPlan, LocatedReadRoute, LookupQuery
 from .requirements import (
     CompletionObligation,
     EvidenceMatchPlan,
@@ -86,7 +87,7 @@ from .requirements import (
 )
 from .targets import (
     LiteralTargetResolver,
-    TargetedContract,
+    MaterialContract,
     TargetResolver,
     TargetSelection,
     bind_targets,
@@ -146,7 +147,7 @@ class _VersionSixContract(BaseModel):
         return value
 
 
-class InformationNeed(TargetedContract):
+class InformationNeed(MaterialContract):
     """One fact dependency, separated from the capability used to obtain it."""
 
     description: _Text
@@ -158,7 +159,8 @@ class InformationNeed(TargetedContract):
     completion_mode: Literal[
         "positive_value_required", "report_findings", "exhaust_bounded_scope"
     ] = "positive_value_required"
-    schema_version: Literal[1, 2] = 1
+    schema_version: Literal[1, 2, 3] = 1
+    lookup_query: LookupQuery | None = Field(default=None, exclude_if=lambda v: v is None)
     targets: tuple[TargetSelection, ...] = Field(default=(), max_length=8)
 
     @model_serializer(mode="wrap")
@@ -170,6 +172,16 @@ class InformationNeed(TargetedContract):
 
     @model_validator(mode="after")
     def validate_freshness(self) -> Self:
+        if (self.schema_version == 3) != (self.lookup_query is not None):
+            raise ValueError("lookup_query requires InformationNeed v3")
+        if self.lookup_query is not None and (
+            not self.required_fields
+            or not self.capability_names
+            or self.source != "external"
+            or self.freshness == "current"
+            or self.completion_mode != "positive_value_required"
+        ):
+            raise ValueError("located read proves stable positive material only")
         if self.targets and (self.schema_version != 2 or self.source != "external"):
             raise ValueError("external target selections require InformationNeed v2")
         if len({item.key for item in self.targets}) != len(self.targets):
@@ -800,7 +812,8 @@ class CapabilityView(BaseModel):
     """Bounded, immutable capability metadata visible to task understanding."""
 
     model_config = _Contract.model_config
-    schema_version: Literal[1, 2] = 1
+    schema_version: Literal[1, 2, 3] = 1
+    located_read: LocatedReadRoute | None = Field(default=None, exclude_if=lambda v: v is None)
     name: _CapabilityName
     version: _Text
     description: Annotated[str, StringConstraints(min_length=1, pattern=r"\S")]
@@ -821,6 +834,8 @@ class CapabilityView(BaseModel):
 
     @model_validator(mode="after")
     def validate_evidence_profile(self) -> Self:
+        if (self.schema_version == 3) != (self.located_read is not None):
+            raise ValueError("located read metadata requires capability view v3")
         if (self.schema_version == 2) != (self.behavior == "isolated_compute"):
             raise ValueError("isolated computation requires capability view v2")
         if (self.evidence_profile_version is None) != (not self.evidence_surfaces):
@@ -1241,6 +1256,58 @@ def _has_material_surface(request: TaskUnderstandingInput) -> bool:
     )
 
 
+class _LocatedDeclarationError(ValueError):
+    """消息只含宿主字段名, 可直接传给有界纠错请求。"""
+
+
+def _bind_located_sources(
+    arguments: dict[str, JsonValue], capabilities: tuple[CapabilityView, ...]
+) -> dict[str, JsonValue]:
+    """模型只选择读取器和查询。其余字段由已注册的关系派生,显式冲突不能被覆盖。"""
+    needs = arguments.get("information_needs")
+    if not isinstance(needs, list):
+        return arguments
+    routes = {cap.name: cap.located_read for cap in capabilities if cap.located_read}
+    normalized: list[JsonValue] = []
+    for need in needs:
+        if not isinstance(need, dict) or "located_source" not in need:
+            normalized.append(need)
+            continue
+        item = dict(need)
+        choice = item.pop("located_source")
+        if not isinstance(choice, dict) or set(choice) != {"reader", "query"}:
+            raise _LocatedDeclarationError("located_source requires reader and query")
+        reader, query = choice["reader"], choice["query"]
+        route = routes.get(reader) if isinstance(reader, str) else None
+        if route is None or not isinstance(query, str) or not query.strip():
+            raise _LocatedDeclarationError(
+                "located_source must select a registered reader and a nonempty query"
+            )
+        if (
+            "lookup_query" in item
+            or item.get("targets")
+            or type(item.get("schema_version", 1)) is not int
+            or item.get("schema_version", 1) != 1
+        ):
+            raise _LocatedDeclarationError("located_source derives a single version and query")
+        for key, values in (
+            ("capability_names", (route.locator, route.reader)),
+            ("required_fields", (route.candidates_output, route.material_output)),
+        ):
+            explicit = item.get(key, [])
+            if (
+                not isinstance(explicit, list)
+                or any(not isinstance(v, str) or v not in values for v in explicit)
+                or len(explicit) != len(set(explicit))
+            ):
+                raise _LocatedDeclarationError(
+                    "located_source conflicts with declared producer or field"
+                )
+            item[key] = list(values)
+        normalized.append({**item, "schema_version": 3, "lookup_query": query})
+    return {**arguments, "information_needs": normalized}
+
+
 def _bind_time_requirement(arguments: dict[str, JsonValue]) -> dict[str, JsonValue]:
     """映射模型声明的时间条件。对旧声明保留原有时效强度,拒绝同时提供两种条件。"""
     needs = arguments.get("information_needs")
@@ -1351,6 +1418,22 @@ def _task_specification_request(
             "enum": ["stable_or_named_edition", "independent_wall_clock_recency", "not_applicable"],
             "description": "Does the user also require proof of real-world recency?",
         }
+    routes = {cap.name: cap.located_read for cap in request.capabilities if cap.located_read}
+    need_fields = declaration["$defs"]["InformationNeed"]["properties"]
+    need_fields.pop("lookup_query")
+    if "enum" in need_fields["schema_version"]:
+        need_fields["schema_version"]["enum"] = [1, 2]
+    if routes:
+        need_fields["located_source"] = {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["reader", "query"],
+            "properties": {
+                "reader": {"enum": sorted(routes)},
+                "query": {"type": "string", "minLength": 1, "maxLength": 200},
+            },
+            "description": "Locate one source by this query, then read that exact identity.",
+        }
     schema = json.dumps(declaration, ensure_ascii=False, separators=(",", ":"))
     instructions = (
         "Analyze the task, not the answer. Return exactly one tool call named "
@@ -1448,6 +1531,16 @@ def _task_specification_request(
             "cannot prove absence. Required selected capability completion edges are "
             "host-derived; do not duplicate them. Include the response completion criterion."
         )
+    if routes:
+        instructions += (
+            " For a fact that requires locating a source then reading its material, set "
+            "located_source={reader,query} on the information need. Choose the registered reader "
+            "and a specific nonempty search query expected to identify one source for this fact. "
+            "Select its locator and reader in capability_needs. The host derives the need's "
+            "paired fields, producer names and wire version. Omit required_fields and "
+            "capability_names on that need or declare only the corresponding fields and names. "
+            "Use separate queries for distinct sources. Omit located_source for ordinary needs."
+        )
     target_hints: tuple[str, ...] = ()
     if material:
         instructions = instructions.replace(
@@ -1522,6 +1615,13 @@ def _validate_model_specification(
             proposal = arguments.get("action_proposal")
             if isinstance(proposal, dict):
                 arguments = {**arguments, "action_proposal": _bind_time_requirement(proposal)}
+        arguments = _bind_located_sources(arguments, request.capabilities)
+        proposed = arguments.get("action_proposal")
+        if isinstance(proposed, dict):
+            arguments = {
+                **arguments,
+                "action_proposal": _bind_located_sources(proposed, request.capabilities),
+            }
         if base is not None:
             revision = _SpecificationRepair.model_validate_json(
                 json.dumps(arguments, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
@@ -1590,7 +1690,7 @@ def _validate_model_specification(
             None,
             "Task interpreter proposed unavailable capabilities",
         )
-    selector_feedback = _evidence_selector_feedback(specification, capability_catalogue)
+    selector_feedback = _evidence_selector_feedback(specification, request.capabilities)
     if selector_feedback is not None:
         return (
             None,
@@ -1644,8 +1744,9 @@ def _target_selection_feedback(
 
 def _evidence_selector_feedback(
     specification: TaskSpecification,
-    capability_catalogue: dict[str, dict[str, JsonValue]],
+    capabilities: tuple[CapabilityView, ...],
 ) -> str | None:
+    capability_catalogue = {cap.name: cap.output_schema for cap in capabilities}
     actions: tuple[tuple[tuple[InformationNeed, ...], tuple[CapabilityNeed, ...]], ...] = (
         (specification.information_needs, specification.capability_needs),
     )
@@ -1668,6 +1769,11 @@ def _evidence_selector_feedback(
             candidate_names = need.capability_names or (
                 required_names if need.required else selected_names
             )
+            route = _located_route(need, candidate_names, capabilities)
+            if need.lookup_query is not None and route is None:
+                return "lookup_query requires the declared locator, reader and both output fields"
+            if route is not None and need.lookup_query is None:
+                return "select located_source with a reader and query, or declare independent needs"
             schemas = tuple(
                 capability_catalogue[name]
                 for name in candidate_names
@@ -1733,7 +1839,7 @@ def _validate_engine_specification(
         )
     selector_feedback = _evidence_selector_feedback(
         specification,
-        {item.name: item.output_schema for item in capabilities},
+        capabilities,
     )
     if selector_feedback is not None:
         raise TaskUnderstandingError(
@@ -1802,6 +1908,8 @@ def _normalize_action_completion_criteria(
 
 
 def _validation_feedback(error: ValidationError | ValueError) -> str:
+    if isinstance(error, _LocatedDeclarationError):
+        return str(error)
     if isinstance(error, ValidationError):
         details: list[str] = []
         for item in error.errors(include_url=False, include_context=False, include_input=False)[:8]:
@@ -1956,6 +2064,7 @@ class TaskUnderstandingEngine:
         coverage_validator: RequirementCoverageValidator | None = None,
         coverage_repairer: TaskSpecificationRepairer | None = None,
         evidence_profiles: tuple[CapabilityEvidenceProfile, ...] = (),
+        located_reads: tuple[LocatedReadRoute, ...] = (),
         target_resolver: TargetResolver | None = None,
         max_coverage_repairs: int = 1,
         normalize_required_needs: bool = True,
@@ -1995,6 +2104,9 @@ class TaskUnderstandingEngine:
         ]
         if len(surface_ids) != len(set(surface_ids)):
             raise ValueError("evidence-surface identities must be globally unique")
+        if len({r.reader for r in located_reads}) != len(located_reads):
+            raise ValueError("located read reader must have one route")
+        self._located_reads = located_reads
         self._evidence_profiles = {item.capability_name: item for item in evidence_profiles}
         self._max_duration = max_duration
         if type(max_catalogue_bytes) is not int or max_catalogue_bytes < 1024:
@@ -2031,14 +2143,40 @@ class TaskUnderstandingEngine:
             f"{coverage_version};{repairer_version};repairs={self._max_coverage_repairs};"
             f"normalize_required_needs={self._normalize_required_needs};"
             f"profiles={profiles or 'none'};targets={self._target_resolver.version}]"
+            + (";located-read/1" if self._located_reads else "")
             + (f";{self._discovery.version}" if self._discovery is not None else "")
         )
 
     def _capability_views(self, tools: ToolRegistry) -> tuple[CapabilityView, ...]:
-        return tuple(
-            _capability_view(descriptor, self._evidence_profiles.get(descriptor.name))
-            for descriptor in tools.descriptors
-        )
+        views = {
+            d.name: _capability_view(d, self._evidence_profiles.get(d.name))
+            for d in tools.descriptors
+        }
+        for route in self._located_reads:
+            locator, reader = views.get(route.locator), views.get(route.reader)
+            if locator is None or reader is None:
+                continue  # 发现和授权可以合法裁掉任一端,不能借配置重新暴露它。
+            if (
+                locator.behavior != "read_only"
+                or reader.behavior != "read_only"
+                or locator.version != route.locator_version
+                or reader.version != route.reader_version
+                or not all(
+                    schema_supports_pointer(schema, pointer)
+                    for schema, pointer in (
+                        (locator.input_schema, route.query_input),
+                        (locator.output_schema, route.candidates_output),
+                        (reader.input_schema, route.identity_input),
+                        (reader.output_schema, route.identity_output),
+                        (reader.output_schema, route.material_output),
+                    )
+                )
+            ):
+                raise ValueError("located read route exceeds registered capability contracts")
+            views[reader.name] = reader.model_copy(
+                update={"schema_version": 3, "located_read": route}
+            )
+        return tuple(views.values())
 
     async def prepare(
         self,
@@ -2239,7 +2377,7 @@ class TaskUnderstandingEngine:
             )
         selector_feedback = _evidence_selector_feedback(
             specification,
-            {item.name: item.output_schema for item in snapshot.capabilities},
+            snapshot.capabilities,
         )
         if selector_feedback is not None:
             raise TaskUnderstandingError(
@@ -2857,6 +2995,7 @@ def _compile_requirements(
                 requirement.capability_names,
                 requirement.completion_mode,
                 requirement.evidence_match_plans,
+                requirement.located_read,
             )
             existing.setdefault(fingerprint, []).append(requirement)
     required_capabilities = tuple(
@@ -2899,6 +3038,20 @@ def _compile_requirements(
             )
         ):
             raise ValueError("targeted evidence requires selected trusted surfaces")
+        route = _located_route(need, capabilities, capability_views)
+        located = (
+            LocatedReadPlan(**route.model_dump(), query=need.lookup_query)
+            if route is not None and need.lookup_query is not None
+            else None
+        )
+        if located is not None:
+            locator = next(cap for cap in capability_views if cap.name == located.locator)
+            if not schema_allows_value_at_pointer(
+                locator.input_schema, located.query_input, located.query
+            ):
+                raise ValueError("lookup query exceeds the locator input contract")
+        if located is not None and match_plans:
+            raise ValueError("located read cannot override a trusted evidence surface")
         fingerprint = _requirement_fingerprint(
             need.description,
             need.source,
@@ -2908,6 +3061,7 @@ def _compile_requirements(
             capabilities,
             need.completion_mode,
             match_plans,
+            located,
         )
         occurrence = occurrences.get(fingerprint, 0)
         occurrences[fingerprint] = occurrence + 1
@@ -2928,7 +3082,8 @@ def _compile_requirements(
         material = any(plan.minimum_proof == "scoped_structural" for plan in match_plans)
         result.append(
             InformationRequirement(
-                schema_version=2 if material else 1,
+                schema_version=3 if located else 2 if material else 1,
+                located_read=located,
                 need_id=need_id,
                 description=need.description,
                 source=need.source,
@@ -3080,6 +3235,22 @@ def _coverage_failure_summary(diagnostic: CoverageAttemptDiagnostic) -> str:
     return ",".join(f"{reason}={counts[reason]}" for reason in sorted(counts)) or "unknown=1"
 
 
+def _located_route(
+    need: InformationNeed, names: tuple[str, ...], capabilities: tuple[CapabilityView, ...]
+) -> LocatedReadRoute | None:
+    for cap in capabilities:
+        route = cap.located_read
+        if (
+            route is not None
+            and set(names) == {route.locator, route.reader}
+            and set(need.required_fields) == {route.candidates_output, route.material_output}
+            and need.freshness != "current"
+            and need.completion_mode == "positive_value_required"
+        ):
+            return route
+    return None
+
+
 def _requirement_fingerprint(
     description: str,
     source: str,
@@ -3089,6 +3260,7 @@ def _requirement_fingerprint(
     capability_names: tuple[str, ...],
     completion_mode: str,
     evidence_match_plans: tuple[EvidenceMatchPlan, ...],
+    located_read: LocatedReadPlan | None = None,
 ) -> str:
     return hashlib.sha256(
         json.dumps(
@@ -3100,6 +3272,7 @@ def _requirement_fingerprint(
                 "required_fields": required_fields,
                 "capability_names": capability_names,
                 "completion_mode": completion_mode,
+                **({"located_read": located_read.model_dump()} if located_read else {}),
                 "evidence_match_plans": [
                     item.model_dump(mode="json") for item in evidence_match_plans
                 ],

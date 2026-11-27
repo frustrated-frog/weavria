@@ -18,11 +18,12 @@ from pydantic import (
 )
 
 from weavria.artifacts import ArtifactSnapshot
-from weavria.core import ErrorCategory, ToolFailedObservation, ToolRecord
+from weavria.core import ErrorCategory, ToolFailedObservation, ToolRecord, task_view_digest
 from weavria.tools import resolve_pointer
 
+from .located_read import LocatedReadPlan, field_at
 from .outcome_contracts import CapabilityOutcome
-from .targets import EvidenceTargetBinding, MaterialContract, TargetedContract, same_target_value
+from .targets import EvidenceTargetBinding, MaterialContract, same_target_value
 
 _Identifier = Annotated[
     str,
@@ -111,10 +112,11 @@ class EvidenceMatchPlan(MaterialContract):
         return self
 
 
-class InformationRequirement(TargetedContract):
+class InformationRequirement(MaterialContract):
     """Stable definition of a fact dependency; mutable state lives in the ledger."""
 
-    schema_version: Literal[1, 2] = 1
+    schema_version: Literal[1, 2, 3] = 1
+    located_read: LocatedReadPlan | None = Field(default=None, exclude_if=lambda v: v is None)
     need_id: _Identifier
     description: _Text
     source: Literal["available_context", "model_knowledge", "external"]
@@ -142,6 +144,11 @@ class InformationRequirement(TargetedContract):
             or not _proof_at_least(binding.proof_strength, self.minimum_proof)
         ):
             return False
+        if self.located_read is not None and (
+            binding.evaluator_key != _LocatedReadEvidence.key
+            or binding.evaluator_version != _LocatedReadEvidence.version
+        ):
+            return False
         if not self.evidence_match_plans:
             return binding.match_plan_id is None
         return any(
@@ -156,6 +163,19 @@ class InformationRequirement(TargetedContract):
 
     @model_validator(mode="after")
     def validate_requirement(self) -> Self:
+        plan = self.located_read
+        if (self.schema_version == 3) != (plan is not None):
+            raise ValueError("located read requires requirement v3")
+        if plan is not None and (
+            self.source != "external"
+            or self.freshness == "current"
+            or self.completion_mode != "positive_value_required"
+            or self.minimum_proof != "structural"
+            or self.evidence_match_plans
+            or set(self.capability_names) != {plan.locator, plan.reader}
+            or set(self.required_fields) != {plan.candidates_output, plan.material_output}
+        ):
+            raise ValueError("located read requires its exact stable structural acquisition fields")
         if self.freshness == "current" and self.source != "external":
             raise ValueError("current requirements must use an external source")
         if self.source == "external" and self.required and not self.capability_names:
@@ -643,6 +663,76 @@ class StructuralEvidenceExtractor:
 ArtifactReader = Callable[[str], Awaitable[ArtifactSnapshot]]
 
 
+class _LocatedReadEvidence:
+    """一个需求的一次归约私有此索引。只让随后实际读到同一标识的回执加入定位范围。"""
+
+    key = "located-read"
+    version = "1"
+
+    def __init__(self, plan: LocatedReadPlan) -> None:
+        self.plan = plan
+        self.locations: dict[str, tuple[str, str]] = {}
+
+    def supports(self, requirement: InformationRequirement, record: ToolRecord) -> bool:
+        auth = record.authorization
+        # v1 只连接单一规范输入。额外的租户、版本或过滤条件可能改变同名标识的含义。
+        if auth is None or not auth.allowed or len(auth.normalized_arguments) != 1:
+            return False
+        name = record.exchange.action.tool_name
+        plan = self.plan
+        return (
+            name == plan.locator
+            and auth.tool_version == plan.locator_version
+            and field_at(auth.normalized_arguments, plan.query_input) == plan.query
+        ) or (name == plan.reader and auth.tool_version == plan.reader_version)
+
+    async def evaluate(
+        self, requirement: InformationRequirement, record: ToolRecord, snapshot: ArtifactSnapshot
+    ) -> EvidenceEvaluation:
+        plan = self.plan
+        ref = snapshot.reference
+        if ref != record.artifact or ref.call_id != record.exchange.action.call_id:
+            raise ValueError("located read snapshot differs from accepted receipt")
+        value = snapshot.value
+        if record.exchange.action.tool_name == plan.locator:
+            self.locations.pop(ref.run_id, None)
+            candidates = field_at(value, plan.candidates_output)
+            # 一次查询必须唯一定位。多个命中时不能用任一同名文件证明目标已找到。
+            if isinstance(candidates, list) and len(candidates) == 1:
+                identity = candidates[0]
+                if isinstance(identity, str) and identity:
+                    digest = task_view_digest([ref.run_id, plan.model_dump(mode="json"), identity])
+                    self.locations[ref.run_id] = identity, digest
+                    return EvidenceEvaluation(
+                        relation="partially_supports",
+                        freshness="valid",
+                        pointers=(plan.candidates_output,),
+                        missing_fields=(plan.material_output,),
+                        scope_identity_sha256=digest,
+                    )
+        else:
+            identity = field_at(value, plan.identity_output)
+            auth = record.authorization
+            if (
+                isinstance(identity, str)
+                and auth is not None
+                and identity == field_at(auth.normalized_arguments, plan.identity_input)
+                and (location := self.locations.get(ref.run_id)) is not None
+                and location[0] == identity
+                and not _is_empty_evidence_value(field_at(value, plan.material_output))
+            ):
+                return EvidenceEvaluation(
+                    relation="partially_supports",
+                    freshness="valid",
+                    pointers=(plan.material_output,),
+                    missing_fields=(plan.candidates_output,),
+                    scope_identity_sha256=location[1],
+                )
+        return EvidenceEvaluation(
+            relation="unknown", pointers=(), missing_fields=requirement.required_fields
+        )
+
+
 class EvidenceResolver:
     """Project accepted ToolRecords into reproducible Need state."""
 
@@ -652,7 +742,7 @@ class EvidenceResolver:
     @property
     def version(self) -> str:
         strategies = ",".join(f"{item.key}@{item.version}" for item in self._extractors)
-        return f"evidence-resolver/8[{strategies}]"
+        return f"evidence-resolver/9[{strategies}]"
 
     async def resolve(
         self,
@@ -670,6 +760,11 @@ class EvidenceResolver:
         probes: list[EvidenceProbe] = []
         states: list[NeedState] = []
         for requirement in requirements:
+            # 两阶段计划独占本需求的结构判定。通用字段提取器没有查询与规范身份信息。
+            located = (
+                _LocatedReadEvidence(requirement.located_read) if requirement.located_read else None
+            )
+            extractors: tuple[EvidenceExtractor, ...] = (located,) if located else self._extractors
             requirement_bindings: list[EvidenceBinding] = []
             requirement_probes: list[EvidenceProbe] = []
             failures: list[NeedFailure] = []
@@ -678,7 +773,9 @@ class EvidenceResolver:
                 if tool_name not in requirement.capability_names:
                     continue
                 matched_plans = _matching_plans(requirement, record, task_revision)
-                if requirement.evidence_match_plans and not matched_plans:
+                if (requirement.evidence_match_plans and not matched_plans) or (
+                    located and not located.supports(requirement, record)
+                ):
                     requirement_probes.append(
                         _probe(
                             requirement=requirement,
@@ -750,7 +847,7 @@ class EvidenceResolver:
                 extractor = next(
                     (
                         candidate
-                        for candidate in self._extractors
+                        for candidate in extractors
                         if candidate.supports(requirement, record)
                     ),
                     None,
@@ -848,7 +945,7 @@ class EvidenceResolver:
                             scope_completeness=evaluation.scope_completeness,
                         )
                     )
-            if previous is not None:
+            if previous is not None and requirement.located_read is None:
                 try:
                     prior_state = previous.state_for(requirement.need_id)
                 except KeyError:

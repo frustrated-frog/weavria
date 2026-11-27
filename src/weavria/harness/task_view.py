@@ -140,6 +140,11 @@ class TaskModelViewProjector:
                     "required_fields": list(need.required_fields),
                     "capabilities": list(need.capability_names),
                     "depends_on": list(need.depends_on),
+                    **(
+                        {"located_read": need.located_read.model_dump(mode="json")}
+                        if need.located_read
+                        else {}
+                    ),
                     "targets": [
                         binding.model_dump(mode="json")
                         for plan in need.evidence_match_plans

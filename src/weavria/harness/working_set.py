@@ -152,10 +152,19 @@ class AdaptiveCapabilityPolicy:
                 continue
             target = f"need:{need.need_id}"
             weights[target] = priorities[need.need_id]
+            route = need.located_read
+            producers = need.capability_names
+            if route is not None:
+                # 两个阶段有唯一的生产者。定位后把当前需求的工具预算交给读取器;
+                # 裁掉已取得字段会破坏持久化计划, 也会让不相关的同形工具入选。
+                next_name = (
+                    route.locator
+                    if route.candidates_output in state.missing_fields
+                    else route.reader
+                )
+                producers = (next_name,)
             matches = {
-                name: 1.0
-                for name in need.capability_names
-                if name in candidates and name not in retired
+                name: 1.0 for name in producers if name in candidates and name not in retired
             }
             penalties: dict[str, float] = {}
             for failure in state.failures:
@@ -165,7 +174,7 @@ class AdaptiveCapabilityPolicy:
                     penalties[failure.tool_name] = penalties.get(failure.tool_name, 0) + (
                         0.25 if failure.retryable else 1.0
                     )
-            if discover:
+            if discover and route is None:
                 # 已覆盖字段不应继续主导候选发现。只改查询副本,不修改权威需求。
                 missing = tuple(field for field in state.missing_fields if field.startswith("/"))
                 query_need = (

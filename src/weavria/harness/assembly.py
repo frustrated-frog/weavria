@@ -54,6 +54,7 @@ from .capability_discovery import CapabilityDiscoveryReport, ModelCapabilityDisc
 from .capability_index import HybridCapabilityIndex
 from .configuration import HarnessConfig
 from .coverage import CapabilityEvidenceProfile, ModelRequirementCoverageValidator
+from .located_read import LocatedReadRoute
 from .memory_admission import ConservativeMemoryAdmission, MemoryFormationError
 from .memory_context import MemoryContextSource
 from .memory_features import MemoryReviewFeatureProvider, MemoryReviewFeatures
@@ -86,6 +87,7 @@ class HarnessEvidence:
     audit_requirements: bool = False
     outcome_verifiers: tuple[CapabilityOutcomeVerifier, ...] = ()
     bounded_fact: BoundedFactContract | None = None
+    located_reads: tuple[LocatedReadRoute, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -325,6 +327,7 @@ class AgentHarness:
                 ),
                 coverage_repairer=interpreter if audit else None,
                 evidence_profiles=evidence.profiles if evidence is not None else (),
+                located_reads=evidence.located_reads if evidence is not None else (),
                 max_duration=config.preparation_max_duration,
                 discovery=ModelCapabilityDiscovery(
                     reasoning_model,

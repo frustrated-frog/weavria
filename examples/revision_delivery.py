@@ -18,8 +18,23 @@ from examples.live_memory_formation import Transport
 from examples.m1_harness import implementation_identity, load_dataset, load_environment
 from examples.snapshot_catalogue_evidence import SnapshotCatalogueEvidence
 from weavria.context import ContextCompilerConfig
-from weavria.harness import HarnessConfig, HarnessEvidence
+from weavria.harness import HarnessConfig, HarnessEvidence, LocatedReadRoute
 from weavria.runtime import RunLimits
+
+SNAPSHOT_ROUTES = tuple(
+    LocatedReadRoute(
+        locator="search_snapshot",
+        locator_version="1",
+        query_input="/query",
+        candidates_output="/paths",
+        reader=name,
+        reader_version="1",
+        identity_input="/path",
+        identity_output="/path",
+        material_output="/text",
+    )
+    for name in ("read_document", "read_document_mirror")
+)
 
 MIGRATION_UPDATE = (
     "安装起点不变。目标组合改为 lexical-memory + openai-compatible, "
@@ -169,7 +184,10 @@ def write(path: Path, value: object) -> None:
 
 async def run(args: argparse.Namespace) -> int:
     compare_receipts: bool = args.compare_receipts
-    cases = scenarios()
+    compare_located: bool = args.compare_located
+    branch = "located" if compare_located else "verified"
+    paired = compare_receipts or compare_located
+    cases = tuple(c for c in scenarios() if args.case is None or args.case == c.name)
     frozen = load_dataset()
     setting, budget = frozen.model, frozen.budgets
     config = HarnessConfig(
@@ -201,6 +219,7 @@ async def run(args: argparse.Namespace) -> int:
         "audit_requirements": True,
         "catalogue_proof": args.catalogue_proof,
         "compare_receipts": compare_receipts,
+        "compare_located": compare_located,
         "transport_timeout": budget.model_seconds,
         "implementation": implementation_identity(),
         "evaluation_sources": {
@@ -260,11 +279,11 @@ async def run(args: argparse.Namespace) -> int:
                 middle: tuple[str, ...] = (
                     ("continuation", "cold") if (n + i) % 2 else ("cold", "continuation")
                 )
-                if compare_receipts:
-                    middle = tuple("verified" if arm == "cold" else arm for arm in middle)
+                if paired:
+                    middle = tuple(branch if arm == "cold" else arm for arm in middle)
                 for arm in ("initial", *middle):
                     if (
-                        arm in ("continuation", "verified")
+                        arm in ("continuation", branch)
                         and initial
                         and initial.status != "completed"
                     ):
@@ -272,6 +291,7 @@ async def run(args: argparse.Namespace) -> int:
                     start = time.monotonic()
                     evidence = HarnessEvidence(
                         audit_requirements=True,
+                        located_reads=SNAPSHOT_ROUTES if arm == "located" else (),
                         extractors=(
                             SnapshotCatalogueEvidence(case.task.documents(arm != "initial")),
                         )
@@ -279,9 +299,9 @@ async def run(args: argparse.Namespace) -> int:
                         else (),
                     )
                     raw = await upgrade.turn(
-                        folder / (arm + ".db" if arm in ("cold", "verified") else "session.db"),
-                        revised=arm in ("continuation", "verified"),
-                        reuse_receipts=arm == "verified",
+                        folder / (arm + ".db" if arm in ("cold", branch) else "session.db"),
+                        revised=arm in ("continuation", branch),
+                        reuse_receipts=arm == "verified" or (compare_located and arm != "initial"),
                         config=config,
                         model=model,
                         transport=transport,
@@ -296,10 +316,10 @@ async def run(args: argparse.Namespace) -> int:
                     metrics[arm] = observed
                     if arm == "initial":
                         initial = stage
-                        if compare_receipts and stage.status == "completed":
+                        if paired and stage.status == "completed":
                             # 上轮 send 关库后备份, 两个修订臂从完全相同的已接受事件出发。
                             await asyncio.to_thread(
-                                clone, folder / "session.db", folder / "verified.db"
+                                clone, folder / "session.db", folder / f"{branch}.db"
                             )
                     print(case.name, n, arm, stage.status, stage.failures, flush=True)
                 summary.append(
@@ -319,23 +339,30 @@ async def run(args: argparse.Namespace) -> int:
                         ),
                     }
                 )
-                if compare_receipts:
-                    summary[-1]["verified_pair_passed"] = (
+                if paired:
+                    summary[-1][f"{branch}_pair_passed"] = (
                         metrics["initial"]["passed"] is True
-                        and metrics.get("verified", {}).get("passed") is True
+                        and metrics.get(branch, {}).get("passed") is True
                     )
                 write(out / "summary.json", summary)
     finally:
         await transport.client.aclose()
     return int(
-        any(not row["pair_passed"] or row.get("verified_pair_passed") is False for row in summary)
+        any(not row["pair_passed"] or row.get(f"{branch}_pair_passed") is False for row in summary)
     )
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--live", action="store_true")
-    parser.add_argument(
+    comparisons = parser.add_mutually_exclusive_group()
+    comparisons.add_argument(
+        "--compare-located",
+        action="store_true",
+        help="从同一首版比较普通重验和声明两步取证,两个修订组均可复用回执",
+    )
+    parser.add_argument("--case", choices=("migration", "upgrade"))
+    comparisons.add_argument(
         "--compare-receipts", action="store_true", help="从同一首版备份配对比较正常读取和按内容复用"
     )
     parser.add_argument("--catalogue-proof", action="store_true", help="核验完整目录回执")

@@ -34,7 +34,7 @@ def reconcile_evidence(
     if not state.evidence_binding_ids:
         return ReconciledEvidence("missing", "no_accepted_binding")
     # 当前事实须重新取证。依赖需求也暂不跨 Run 提升, 避免局部覆盖掩盖上游变化。
-    if requirement.freshness == "current" or requirement.depends_on:
+    if requirement.freshness == "current" or requirement.depends_on or requirement.located_read:
         return ReconciledEvidence("recheck", "time_or_dependency_sensitive")
     bindings = tuple(
         item for item in ledger.bindings if item.binding_id in state.evidence_binding_ids
