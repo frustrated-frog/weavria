@@ -38,6 +38,8 @@ class HarnessConfig:
     # 同一会话重遇反馈预算拒绝时, 以先前实际交付的原文指导单读顺序。
     read_retry_experience: bool = True
     read_retry_feedback: bool = True
+    # 将本轮唯一定位的回执地址交给可见读取器。正文覆盖仍由实际读取结果决定。
+    source_read_handoff: bool = False
 
     def __post_init__(self) -> None:
         if not self.configuration_id.strip() or len(self.configuration_id) > 128:
@@ -51,6 +53,7 @@ class HarnessConfig:
             self.working_records,
             self.work_recheck,
             self.work_material_handoff,
+            self.source_read_handoff,
             self.read_retry_experience,
             self.read_retry_feedback,
         ):
@@ -58,6 +61,8 @@ class HarnessConfig:
                 raise ValueError("Harness feature switches must be booleans")
         if self.task_understanding and self.adaptive_capabilities and not self.project_task_view:
             raise ValueError("adaptive capabilities require task model projection")
+        if self.source_read_handoff and not (self.task_understanding and self.project_task_view):
+            raise ValueError("source read handoff requires task understanding and projection")
         if self.working_records and not self.task_understanding:
             raise ValueError("working records require task understanding")
         if self.semantic_discovery is not None and not self.task_understanding:

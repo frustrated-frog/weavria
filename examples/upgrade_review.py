@@ -130,6 +130,15 @@ class ReviewTask:
     documents: Callable[[bool], dict[str, str]]
     errors: Callable[[str | None, bool], list[str]]
     source_check: Callable[[tuple[ToolRecord, ...]], list[str]] | None = None
+    revised_source_check: Callable[[tuple[ToolRecord, ...]], list[str]] | None = None
+
+    def source_checker(self, revised: bool) -> Callable[[tuple[ToolRecord, ...]], list[str]] | None:
+        """同路径的新版本要核对本轮冻结摘要, 首轮和修订轮分别选择判据。"""
+        return (
+            self.revised_source_check
+            if revised and self.revised_source_check
+            else self.source_check
+        )
 
     def delivery(self, status: str, output: str | None, revised: bool) -> list[str]:
         return ([] if status == "completed" else ["not_completed"]) + self.errors(output, revised)
@@ -205,12 +214,13 @@ def replay(db: Path, task: ReviewTask = UPGRADE_TASK) -> dict[str, TurnEvidence]
             elif isinstance(data, SessionRunEvent) and data.event.run_id in runs:
                 run_id = data.event.run_id
                 revised, trace = runs[run_id]
+                source_check = task.source_checker(revised)
                 event = data.event.data
                 if isinstance(event, ToolRecorded):
                     exchange = event.record.exchange
                     trace.actions.append(f"{exchange.action.tool_name}:{exchange.observation.kind}")
                     if (
-                        task.source_check is not None
+                        source_check is not None
                         and event.record.artifact is not None
                         and event.record.artifact.run_id == run_id
                     ):
@@ -223,9 +233,9 @@ def replay(db: Path, task: ReviewTask = UPGRADE_TASK) -> dict[str, TurnEvidence]
                     scores: dict[str, object] = {
                         "candidate_errors": task.errors(finish.output, revised)
                     }
-                    if task.source_check is not None:
+                    if source_check is not None:
                         # 同一答案在重试前后可以有不同的取证记录。每次 Finish 都重新冻结。
-                        scores["candidate_source_errors"] = task.source_check(
+                        scores["candidate_source_errors"] = source_check(
                             tuple(records.get(run_id, ()))
                         )
                     candidates[key] = scores
@@ -248,9 +258,9 @@ def replay(db: Path, task: ReviewTask = UPGRADE_TASK) -> dict[str, TurnEvidence]
                     trace.delivery_errors = task.delivery(
                         trace.status, event.result.output, revised
                     )
-                    if task.source_check is not None:
+                    if source_check is not None:
                         # 回执只在产生它的 Run 内有效; 离线打分绝不影响宿主发布。
-                        trace.source_errors = task.source_check(tuple(records.get(run_id, ())))
+                        trace.source_errors = source_check(tuple(records.get(run_id, ())))
     finally:
         con.close()
     return stages
@@ -310,7 +320,7 @@ async def turn(
         "amendment" if revised else "original"
     )
     failures = task.delivery(status, output, revised)
-    if task.source_check is not None:
+    if task.source_checker(revised) is not None:
         failures += (
             journal.source_errors
             if journal and journal.source_errors is not None

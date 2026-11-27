@@ -4,6 +4,7 @@ import asyncio
 from dataclasses import dataclass
 from itertools import groupby
 from pathlib import Path
+from typing import Literal
 
 import pytest
 from pydantic import JsonValue
@@ -596,3 +597,254 @@ async def test_real_migration_receipts_reproduce_from_frozen_repository_sources(
             read_artifact=read,
         )
         assert [s.status for s in ledger.states] == [NeedStatus.PARTIAL, lock_status]
+
+
+async def test_current_source_handoff_after_archived_reads(tmp_path: Path) -> None:
+    """同一会话关闭重开。历史两份正文可读, 新运行只有实际读过的来源才退出待办。"""
+    from examples.revision_delivery import edition_scenario
+    from weavria.artifacts import resolve_pointer
+    from weavria.context import ContextCompilerConfig
+    from weavria.core import (
+        FinishAction,
+        ModelTurn,
+        SemanticSnapshot,
+        SessionSemanticCommitted,
+        ToolBatch,
+        ToolExchange,
+        ToolSucceededObservation,
+    )
+    from weavria.harness import AgentHarness, load_need_ledger
+    from weavria.harness.context import project_context_focus
+    from weavria.models import (
+        FakeSessionProvider,
+        OpenAICompatibleConfig,
+        OpenAICompatibleTokenCounter,
+    )
+    from weavria.runtime import RunLimits
+
+    release, register = "release.txt", "test-register.csv"
+    task = edition_scenario().task
+
+    class InterpreterForEditions:
+        version = "edition-fixture/1"
+
+        async def interpret(
+            self, request: TaskUnderstandingInput, *, max_duration: float
+        ) -> TaskSpecification:
+            spec = await Interpreter(release).interpret(request, max_duration=max_duration)
+            first = spec.information_needs[0]
+            return spec.model_copy(
+                update={
+                    "information_needs": (
+                        first,
+                        first.model_copy(
+                            update={"description": "Obtain compatibility for the build"}
+                        ),
+                        first.model_copy(
+                            update={
+                                "description": "Obtain current test receipt",
+                                "lookup_query": register,
+                            }
+                        ),
+                    )
+                }
+            )
+
+    def harness(model: FakeSessionProvider, corpus: SnapshotCorpus) -> AgentHarness:
+        return AgentHarness(
+            tmp_path / "editions.db",
+            model=model,
+            tools=corpus.registry(documents=True),
+            context=ContextCompilerConfig(
+                window_tokens=32768, output_tokens=4096, safety_tokens=1024
+            ),
+            token_counter=OpenAICompatibleTokenCounter(
+                OpenAICompatibleConfig(model="test", max_request_bytes=96000),
+                encoding="cl100k_base",
+            ),
+            understanding=TaskUnderstandingEngine(InterpreterForEditions(), located_reads=(ROUTE,)),
+            source_read_handoff=True,
+            limits=RunLimits(max_request_bytes=96000),
+        )
+
+    def step(*calls: ToolCallAction) -> ModelTurn:
+        return ModelTurn(decision=ToolBatch(calls=calls))
+
+    search = step(
+        *(
+            ToolCallAction(call_id=f"find-{i}", tool_name=ROUTE.locator, arguments={"query": name})
+            for i, name in enumerate((release, register))
+        )
+    )
+    reads = tuple(
+        ToolCallAction(call_id=f"read-{i}", tool_name=ROUTE.reader, arguments={"path": name})
+        for i, name in enumerate((release, register))
+    )
+
+    def finish(revised: bool) -> ModelTurn:
+        return ModelTurn(
+            decision=FinishAction(output=edition_scenario().reference(revised).model_dump_json())
+        )
+
+    original = SnapshotCorpus(task.documents(False))
+    async with harness(
+        FakeSessionProvider((search, step(*reads), finish(False))), original
+    ) as agent:
+        await agent.create("review")
+        first = await agent.send("review", task.initial, input_id="original")
+        original_records = await agent.sessions.store.run_records("review", first.session.run_id)
+        assert task.source_check and task.source_check(original_records) == []
+        archive_reads = step(
+            *(
+                ToolCallAction(
+                    call_id=f"old-{i}",
+                    tool_name="read_session_source",
+                    arguments={"source": r.artifact.model_dump(mode="json"), "pointer": "/text"},
+                )
+                for i, r in enumerate(original_records)
+                if r.artifact and r.exchange.action.tool_name == ROUTE.reader
+            )
+        )
+
+    current = SnapshotCorpus(task.documents(True), reuse_receipts=True)
+    model = FakeSessionProvider(
+        (archive_reads, search, step(reads[0]), step(reads[1]), finish(True))
+    )
+    async with harness(model, current) as agent:
+        second = await agent.send("review", task.update, input_id="amendment")
+        store = agent.sessions.store
+        run_id = second.session.run_id
+        records = await store.run_records("review", run_id)
+        assert (
+            second.session.report.execution.output
+            == edition_scenario().reference(True).model_dump_json()
+        )
+        assert current.reused == [release]
+        assert current.reads == [(ROUTE.reader, register)]
+        assert task.revised_source_check and task.revised_source_check(records) == []
+        assert task.revised_source_check(original_records) == [
+            "missing_current_edition:test-register.csv"
+        ]
+        snapshots = [
+            e.data.snapshot
+            for e in await store.events("review")
+            if isinstance(e.data, SessionSemanticCommitted) and e.data.snapshot.run_id == run_id
+        ]
+        history_seen = [r for r in records if r.exchange.action.tool_name == "read_session_source"]
+        assert len(history_seen) == 2 and all(r.artifact for r in history_seen)
+
+        projected: list[dict[str, int]] = []
+        for req in model.requests:
+            view = req.current.task_model_view
+            assert view
+            items = view.progress.get("pending_source_reads", [])
+            assert isinstance(items, list)
+            targets: dict[str, int] = {}
+            for item in items:
+                assert (
+                    isinstance(item, dict)
+                    and item["reader"] == ROUTE.reader
+                    and item["input_pointer"] == "/path"
+                )
+                identity, pointer, needs = item["artifact_id"], item["value_pointer"], item["needs"]
+                assert (
+                    isinstance(identity, str)
+                    and isinstance(pointer, str)
+                    and isinstance(needs, list)
+                )
+                ref = await store.get(run_id, identity)
+                assert ref.reference.call_id == item["from_call"]
+                path = resolve_pointer(ref.value, pointer)
+                assert isinstance(path, str)
+                # 模型实际收到的定位回执也须能解析出同一个值。
+                visible = next(
+                    entry.observation.output
+                    for entry in req.current.history
+                    if isinstance(entry, ToolExchange)
+                    and entry.action.call_id == item["from_call"]
+                    and isinstance(entry.observation, ToolSucceededObservation)
+                )
+                assert isinstance(visible, dict) and visible["representation"] == "full"
+                assert resolve_pointer(visible["data"], pointer) == path
+                targets[path] = len(needs)
+            projected.append(targets)
+        assert projected == [{}, {}, {release: 2, register: 1}, {register: 1}, {}]
+
+        middle = next(
+            s
+            for s in snapshots
+            if all(n.status == NeedStatus.PARTIAL for n in load_need_ledger(s.need_ledger).states)
+        )
+        focus = project_context_focus(middle, source_read_handoff=True)
+        assert len(focus.prefer_complete) == 2
+        # 隐藏的读取器、另一 Run 同名回执或收尾阶段, 都不能产生可执行提示。
+        projector = TaskModelViewProjector(source_read_handoff=True)
+        authoritative = TaskInput(goal=task.update)
+        cases: tuple[tuple[SemanticSnapshot, Literal["decision", "synthesis"]], ...] = (
+            (middle.model_copy(update={"visible_tool_names": ()}), "decision"),
+            (middle.model_copy(update={"run_id": "another"}), "decision"),
+            (middle, "synthesis"),
+        )
+        for snapshot, phase in cases:
+            assert (
+                "pending_source_reads"
+                not in projector.project(
+                    authoritative, snapshot, phase=phase, max_instruction_bytes=96000
+                ).progress
+            )
+        assert (
+            len(
+                {
+                    req.current.task_model_view.max_progress_bytes
+                    for req in model.requests
+                    if req.current.task_model_view
+                }
+            )
+            == 1
+        )
+
+
+async def test_source_handoff_drops_superseded_lookup_and_bounds_duplicate_needs() -> None:
+    import json
+
+    from weavria.harness.context import SOURCE_READ_HINT_BYTES, pending_source_reads
+
+    (base,) = (await prepare("index")).requirements
+    requirements = tuple(
+        base.model_copy(update={"need_id": f"need-{i}-" + "x" * 88}) for i in range(24)
+    )
+    store = InMemoryArtifactStore()
+
+    async def search(files: dict[str, str], call_id: str) -> ToolRecord:
+        executor = ToolExecutor(
+            "run", SnapshotCorpus(files).registry(documents=True), store, ReadOnlyPolicy()
+        )
+        return await executor.execute(
+            ToolCallAction(tool_name=ROUTE.locator, call_id=call_id, arguments={"query": "index"}),
+            max_duration=1,
+        )
+
+    async def read(identity: str) -> ArtifactSnapshot:
+        return await store.get("run", identity)
+
+    initial = await search({"a/index": "a"}, "first")
+    ambiguous = await search({"a/index": "a", "b/index": "b"}, "second")
+    for prefix in ((initial,), (initial, ambiguous)):
+        ledger = await EvidenceResolver().resolve(
+            work_id="work",
+            task_revision=1,
+            frame_revision=1,
+            requirements=requirements,
+            records=prefix,
+            read_artifact=read,
+        )
+        hints = pending_source_reads(requirements, ledger, "run", (ROUTE.reader,))
+        # 归约保留已接受绑定用于解释过去。第二次查询使唯一定位失效, 不能再提示使用旧地址。
+        assert all(n.status == NeedStatus.PARTIAL for n in ledger.states)
+        if len(prefix) == 2:
+            assert not hints
+        else:
+            (one,) = hints
+            assert 1 < len(one.need_ids) < len(requirements)
+            size = len(json.dumps([one.view()], ensure_ascii=False, separators=(",", ":")).encode())
+            assert size + len(',"pending_source_reads":') <= SOURCE_READ_HINT_BYTES

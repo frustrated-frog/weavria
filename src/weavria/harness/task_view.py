@@ -16,7 +16,12 @@ from weavria.core import (
     task_view_digest,
 )
 
-from .context import MATERIAL_HINT_BYTES, pending_material
+from .context import (
+    MATERIAL_HINT_BYTES,
+    SOURCE_READ_HINT_BYTES,
+    pending_material,
+    pending_source_reads,
+)
 from .continuation_evidence import requirement_digest
 from .located_read import repair_choices
 from .outcomes import capability_outcome_scope
@@ -65,16 +70,25 @@ class TaskModelViewProjector:
 
     version = "task-model-view/14"
     working_records_version = 1
+    # 既有自定义投影器可能独立初始化并复用 project。此可选行为须显式开启。
+    _source_read_handoff = False
 
     def __init__(
-        self, *, compact_work_summary: bool = False, material_handoff: bool = False
+        self,
+        *,
+        compact_work_summary: bool = False,
+        material_handoff: bool = False,
+        source_read_handoff: bool = False,
     ) -> None:
         self._compact_work_summary = compact_work_summary
         self._material_handoff = material_handoff
+        self._source_read_handoff = source_read_handoff
         if compact_work_summary:
             self.version = "task-model-view/15"
         if material_handoff:
             self.version += "+material-handoff/1"
+        if source_read_handoff:
+            self.version += "+source-read-handoff/1"
 
     def project(
         self,
@@ -286,6 +300,23 @@ class TaskModelViewProjector:
                 "has a selected term and material is missing, read the full returned identifier."
             )
         progress_payload: dict[str, JsonValue] = {"needs": progress}
+        source_handoff = self._source_read_handoff and any(
+            n.located_read for n in frame.requirements
+        )
+        if source_handoff:
+            definition["source_read_contract"] = (
+                "Earlier session sources recover the archived edition. Each pending_source_reads "
+                "entry identifies one current reader call covering the listed needs. Copy the full "
+                "value at value_pointer from the indicated current search result to input_pointer. "
+                "Recover that value by read_artifact if omitted. Use the reader for this run. "
+                "Backends may reuse verified results. Acquired needs already have material."
+            )
+            if phase == "decision":
+                reads = pending_source_reads(
+                    frame.requirements, ledger, snapshot.run_id, snapshot.visible_tool_names
+                )
+                if reads:
+                    progress_payload["pending_source_reads"] = [r.view() for r in reads]
         handoff_active = (
             work is not None
             and self._material_handoff
@@ -379,6 +410,7 @@ class TaskModelViewProjector:
                 if item.repair_feedback_bytes
             )
             + (MAX_WORK_BYTES + 32 if work is not None else 0)
-            + (MATERIAL_HINT_BYTES if handoff_active else 0),
+            + (MATERIAL_HINT_BYTES if handoff_active else 0)
+            + (SOURCE_READ_HINT_BYTES if source_handoff else 0),
             max_instruction_bytes=max_instruction_bytes,
         )

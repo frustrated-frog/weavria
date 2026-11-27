@@ -387,6 +387,7 @@ class AgentHarness:
             working_records=config.working_records,
             work_updates=config.work_updates,
             work_material_handoff=config.work_material_handoff,
+            source_read_handoff=config.source_read_handoff,
             work_rechecker=work_rechecker,
             adaptive_capabilities=config.adaptive_capabilities,
             memory=memory,
@@ -399,6 +400,7 @@ class AgentHarness:
                 or TaskModelViewProjector(
                     compact_work_summary=config.context.work_summary_compaction,
                     material_handoff=config.work_material_handoff,
+                    source_read_handoff=config.source_read_handoff,
                 )
                 if config.task_understanding and config.project_task_view
                 else None
@@ -434,6 +436,7 @@ class AgentHarness:
         working_records: bool = False,
         work_updates: Literal["replace", "patch"] = "replace",
         work_material_handoff: bool = False,
+        source_read_handoff: bool = False,
         work_rechecker: WorkRechecker | None = None,
         working_set: CapabilityWorkingSetPolicy | None = None,
         adaptive_capabilities: bool = True,
@@ -478,10 +481,13 @@ class AgentHarness:
                     raise ValueError(
                         "custom work selection/projection must support working records v1"
                     )
-        if working_records and task_model_projector is None:
+        if source_read_handoff and understanding is None:
+            raise ValueError("source read handoff requires task understanding")
+        if (working_records or source_read_handoff) and task_model_projector is None:
             task_model_projector = TaskModelViewProjector(
                 compact_work_summary=context.work_summary_compaction,
                 material_handoff=work_material_handoff,
+                source_read_handoff=source_read_handoff,
             )
         if working_set is not None and not adaptive_capabilities:
             raise ValueError("a custom working set requires adaptive capabilities")
@@ -546,6 +552,7 @@ class AgentHarness:
                 working_records=working_records,
                 work_recheck=work_rechecker is not None,
                 material_handoff=work_material_handoff,
+                source_read_handoff=source_read_handoff,
                 outcomes=CapabilityOutcomeResolver(outcome_verifiers)
                 if outcome_verifiers
                 else None,
@@ -579,6 +586,7 @@ class AgentHarness:
                 "working_records": working_records,
                 "work_updates": work_updates,
                 **({"work_material_handoff": True} if work_material_handoff else {}),
+                **({"source_read_handoff": True} if source_read_handoff else {}),
                 "work_recheck_version": work_rechecker.version if work_rechecker else None,
                 "harness_max_request_duration": duration,
                 "memory_catchup_fraction": memory_catchup_fraction,

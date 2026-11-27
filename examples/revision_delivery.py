@@ -6,18 +6,20 @@ import json
 import os
 import time
 from collections.abc import Callable
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 from pydantic import BaseModel, Field
 
 from examples import dependency_migration as migration
 from examples import upgrade_review as upgrade
+from examples.inventory_atp import has_receipt, read_digest
 from examples.inventory_time import clone
 from examples.live_memory_formation import Transport
 from examples.m1_harness import implementation_identity, load_dataset, load_environment
 from examples.snapshot_catalogue_evidence import SnapshotCatalogueEvidence
 from weavria.context import ContextCompilerConfig
+from weavria.core import ToolRecord
 from weavria.harness import HarnessConfig, HarnessEvidence, LocatedReadRoute
 from weavria.runtime import RunLimits
 
@@ -120,6 +122,42 @@ def scenarios() -> tuple[Scenario, ...]:
     )
 
 
+def edition_scenario() -> Scenario:
+    """两份归档沿用原路径。升级清单稳定, 依据原夹具 Q-19 将测试登记换版。"""
+    original = upgrade.archive(False)
+    release = original["release.txt"] + "\nCompatibility matrix\n" + original["compatibility.csv"]
+    register = original["test-register.csv"]
+    old = "T-643,L-730,Larch-8,cold-restore,fail"
+    if register.count(old) != 1:
+        raise ValueError("frozen QA receipt missing from baseline register")
+    updated = register.replace(old, "T-697,L-730,Larch-8,cold-restore,pass")
+
+    def documents(revised: bool) -> dict[str, str]:
+        return {"release.txt": release, "test-register.csv": updated if revised else register}
+
+    def check(revised: bool) -> Callable[[tuple[ToolRecord, ...]], list[str]]:
+        expected = {name: read_digest(name, text) for name, text in documents(revised).items()}
+
+        def missing(records: tuple[ToolRecord, ...]) -> list[str]:
+            return [
+                f"missing_current_edition:{name}"
+                for name, digest in expected.items()
+                if not any(has_receipt(r, name, digest) for r in records)
+            ]
+
+        return missing
+
+    task = upgrade.ReviewTask(
+        upgrade.INITIAL + " 归档 release.txt 包含发布与兼容性资料,test-register.csv 包含测试登记。",
+        "同名归档已重新发布。请核验本轮两份材料并更新完整升级报告,格式不变。",
+        documents,
+        upgrade.report_errors,
+        check(False),
+        check(True),
+    )
+    return Scenario("editions", task, upgrade.reference, stable_upgrade)
+
+
 def cold_task(task: upgrade.ReviewTask) -> upgrade.ReviewTask:
     # 冷启动只收到两段用户原话与修订时可见的归档。不给首版答案、证据图或路径提示。
     return upgrade.ReviewTask(
@@ -127,6 +165,7 @@ def cold_task(task: upgrade.ReviewTask) -> upgrade.ReviewTask:
         task.update,
         lambda _: task.documents(True),
         lambda output, _: task.errors(output, True),
+        task.source_checker(True),
     )
 
 
@@ -187,14 +226,28 @@ async def run(args: argparse.Namespace) -> int:
     compare_located: bool = args.compare_located
     compare_repair: bool = args.compare_query_repair
     branch = "replanned" if compare_repair else "located" if compare_located else "verified"
-    paired = compare_receipts or compare_located or compare_repair
+    compare_handoff: bool = args.compare_source_reads
+    if compare_handoff:
+        branch = "handoff"
+    paired = compare_receipts or compare_located or compare_repair or compare_handoff
     repair_routes = tuple(
         LocatedReadRoute.model_validate(
             {**route.model_dump(), "schema_version": 2, "repair": "unique_term_after_empty"}
         )
         for route in SNAPSHOT_ROUTES
     )
-    cases = tuple(c for c in scenarios() if args.case is None or args.case == c.name)
+    case_name = args.case or ("editions" if compare_handoff else None)
+    cases = (
+        (edition_scenario(),)
+        if case_name == "editions"
+        else tuple(c for c in scenarios() if case_name is None or case_name == c.name)
+    )
+    # 两个修订臂共用相同的取证契约和读取器后端, 只改变模型收到的待办与上下文偏好。
+    routes_by_arm = {"located": SNAPSHOT_ROUTES, "replanned": repair_routes}
+    if compare_repair or compare_handoff:
+        routes_by_arm["continuation"] = SNAPSHOT_ROUTES
+    if compare_handoff:
+        routes_by_arm[branch] = SNAPSHOT_ROUTES
     frozen = load_dataset()
     setting, budget = frozen.model, frozen.budgets
     config = HarnessConfig(
@@ -228,6 +281,7 @@ async def run(args: argparse.Namespace) -> int:
         "compare_receipts": compare_receipts,
         "compare_located": compare_located,
         "compare_query_repair": compare_repair,
+        "compare_source_reads": compare_handoff,
         "transport_timeout": budget.model_seconds,
         "implementation": implementation_identity(),
         "evaluation_sources": {
@@ -238,6 +292,7 @@ async def run(args: argparse.Namespace) -> int:
                 Path(migration.__file__),
                 Path(__file__).with_name("live_memory_formation.py"),
                 Path(__file__).with_name("snapshot_catalogue_evidence.py"),
+                Path(__file__).with_name("inventory_atp.py"),
             )
         },
         "cases": {
@@ -299,13 +354,7 @@ async def run(args: argparse.Namespace) -> int:
                     start = time.monotonic()
                     evidence = HarnessEvidence(
                         audit_requirements=True,
-                        located_reads=(
-                            repair_routes
-                            if arm == "replanned"
-                            else SNAPSHOT_ROUTES
-                            if arm == "located" or (compare_repair and arm == "continuation")
-                            else ()
-                        ),
+                        located_reads=routes_by_arm.get(arm, ()),
                         extractors=(
                             SnapshotCatalogueEvidence(case.task.documents(arm != "initial")),
                         )
@@ -316,8 +365,11 @@ async def run(args: argparse.Namespace) -> int:
                         folder / (arm + ".db" if arm in ("cold", branch) else "session.db"),
                         revised=arm in ("continuation", branch),
                         reuse_receipts=arm == "verified"
-                        or ((compare_located or compare_repair) and arm != "initial"),
-                        config=config,
+                        or (
+                            (compare_located or compare_repair or compare_handoff)
+                            and arm != "initial"
+                        ),
+                        config=replace(config, source_read_handoff=arm == "handoff"),
                         model=model,
                         transport=transport,
                         evidence=evidence,
@@ -328,6 +380,8 @@ async def run(args: argparse.Namespace) -> int:
                     observed = measure(stage, case, initial, revised=arm != "initial")
                     observed["elapsed_seconds"] = round(time.monotonic() - start, 3)
                     observed["reused"] = raw.get("reused", [])
+                    if compare_handoff:
+                        observed["backend_reads"] = stage.reads
                     metrics[arm] = observed
                     if arm == "initial":
                         initial = stage
@@ -381,7 +435,12 @@ if __name__ == "__main__":
         action="store_true",
         help="两组均启用两步取证,仅实验组允许空查询后的局部修订",
     )
-    parser.add_argument("--case", choices=("migration", "upgrade"))
+    comparisons.add_argument(
+        "--compare-source-reads",
+        action="store_true",
+        help="默认比较同路径的新旧版本, 两个修订组均可重验旧回执",
+    )
+    parser.add_argument("--case", choices=("migration", "upgrade", "editions"))
     comparisons.add_argument(
         "--compare-receipts", action="store_true", help="从同一首版备份配对比较正常读取和按内容复用"
     )

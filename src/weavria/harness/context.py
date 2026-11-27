@@ -10,8 +10,11 @@ from weavria.core import SemanticSnapshot
 
 from .requirements import (
     EvidenceAddress,
+    EvidenceBinding,
+    EvidenceProbe,
     InformationRequirement,
     NeedLedger,
+    NeedState,
     NeedStatus,
     load_need_ledger,
 )
@@ -19,6 +22,7 @@ from .understanding import load_task_frame
 from .work import AnalysisStatus, load_work, work_analysis_status, work_need_weights
 
 MATERIAL_HINT_BYTES = 768
+SOURCE_READ_HINT_BYTES = 1200
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,8 +103,123 @@ def pending_material(
     return tuple(chosen)
 
 
+@dataclass(frozen=True, slots=True)
+class PendingSourceRead:
+    """把当前定位原件里的一个值交给读取器。地址只用于导航, 仍须实际调用读取器。"""
+
+    reader: str
+    input_pointer: str
+    address: EvidenceAddress
+    need_ids: tuple[str, ...]
+
+    def view(self) -> dict[str, JsonValue]:
+        return {
+            "reader": self.reader,
+            "input_pointer": self.input_pointer,
+            "from_call": self.address.producer_call_id,
+            "artifact_id": self.address.artifact_id,
+            "value_pointer": self.address.json_pointer + "/0",
+            "needs": list(self.need_ids),
+        }
+
+    def anchor(self) -> EvidenceAnchor:
+        a = self.address
+        return EvidenceAnchor(
+            a.producer_run_id, a.producer_call_id, a.artifact_sha256, a.json_pointer + "/0"
+        )
+
+
+def _locator_address(
+    need: InformationRequirement,
+    state: NeedState,
+    probe: EvidenceProbe,
+    bindings: dict[str, EvidenceBinding],
+    run_id: str,
+    pointer: str,
+) -> EvidenceAddress | None:
+    # 账本保留过去的绑定。只有与最新适用探针来自同一次调用、同一原件及范围的地址可用。
+    for identity in reversed(state.evidence_binding_ids):
+        binding = bindings.get(identity)
+        if (
+            binding is None
+            or binding.scope_identity_sha256 != probe.scope_identity_sha256
+            or not need.supports_binding(binding)
+        ):
+            continue
+        for address in binding.addresses:
+            if (
+                address.producer_run_id == run_id
+                and address.producer_call_id == probe.producer_call_id
+                and address.artifact_id == probe.artifact_id
+                and address.artifact_sha256 == probe.artifact_sha256
+                and address.json_pointer == pointer
+            ):
+                return address
+    return None
+
+
+def pending_source_reads(
+    requirements: tuple[InformationRequirement, ...],
+    ledger: NeedLedger,
+    run_id: str,
+    visible_tools: tuple[str, ...],
+) -> tuple[PendingSourceRead, ...]:
+    """从最新适用定位探针和同范围的绑定生成当前读取建议, 相同读取只展示一次。"""
+    by_id = {b.binding_id: b for b in ledger.bindings}
+    states = {s.need_id: s for s in ledger.states}
+    plans = {n.need_id: n.located_read for n in requirements if n.required and n.located_read}
+    latest = {
+        probe.need_id: probe
+        for probe in ledger.probes
+        if (plan := plans.get(probe.need_id))
+        and probe.tool_name == plan.locator
+        and probe.status != "not_applicable"
+    }
+    groups: dict[tuple[str, str, str, str, str], PendingSourceRead] = {}
+    for need in requirements:
+        plan = plans.get(need.need_id)
+        probe = latest.get(need.need_id)
+        if plan is None or plan.reader not in visible_tools or probe is None:
+            continue
+        state = states[need.need_id]
+        if (
+            state.status != NeedStatus.PARTIAL
+            or state.missing_fields != (plan.material_output,)
+            or probe.status != "partial"
+            or probe.matched_fields != (plan.candidates_output,)
+            or any(f.tool_name == plan.reader and not f.retryable for f in state.failures)
+        ):
+            continue
+        address = _locator_address(need, state, probe, by_id, run_id, plan.candidates_output)
+        if address is None:
+            continue
+        key = (
+            plan.reader,
+            plan.reader_version,
+            plan.identity_input,
+            address.artifact_sha256,
+            address.json_pointer,
+        )
+        if key not in groups and len(groups) >= 2:
+            continue
+        prior = groups.get(key)
+        candidate = PendingSourceRead(
+            plan.reader,
+            plan.identity_input,
+            prior.address if prior else address,
+            (*prior.need_ids, need.need_id) if prior else (need.need_id,),
+        )
+        proposed = {**groups, key: candidate}
+        wire = json.dumps(
+            [r.view() for r in proposed.values()], ensure_ascii=False, separators=(",", ":")
+        )
+        if len(wire.encode()) + len(',"pending_source_reads":') <= SOURCE_READ_HINT_BYTES:
+            groups[key] = candidate
+    return tuple(groups.values())
+
+
 def project_context_focus(
-    snapshot: SemanticSnapshot, *, material_handoff: bool = False
+    snapshot: SemanticSnapshot, *, material_handoff: bool = False, source_read_handoff: bool = False
 ) -> ContextFocus:
     """Keep original task authority; ledger state changes allocation priority only."""
     frame = load_task_frame(snapshot.observation.payload)
@@ -233,6 +352,11 @@ def project_context_focus(
                 frame.requirements, ledger, work_analysis_status(ledger, working), snapshot.run_id
             )
         )
+    if source_read_handoff:
+        reads = pending_source_reads(
+            frame.requirements, ledger, snapshot.run_id, snapshot.visible_tool_names
+        )
+        whole = tuple(dict.fromkeys((*whole, *(r.anchor() for r in reads))))[:2]
     return ContextFocus(snapshot.version.task_revision, tuple(demands), whole)
 
 
