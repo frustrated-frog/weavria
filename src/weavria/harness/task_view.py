@@ -18,6 +18,7 @@ from weavria.core import (
 
 from .context import MATERIAL_HINT_BYTES, pending_material
 from .continuation_evidence import requirement_digest
+from .located_read import repair_choices
 from .outcomes import capability_outcome_scope
 from .requirements import EvidenceProbe, InformationRequirement, NeedStatus, load_need_ledger
 from .understanding import load_task_frame
@@ -118,6 +119,9 @@ class TaskModelViewProjector:
         probes_by_need: dict[str, list[EvidenceProbe]] = {}
         for probe in ledger.probes:
             probes_by_need.setdefault(probe.need_id, []).append(probe)
+        choices = repair_choices(
+            (need.need_id, need.located_read) for need in frame.requirements if need.located_read
+        )
         for need in frame.requirements:
             state = ledger.state_for(need.need_id)
             bindings = [
@@ -143,6 +147,11 @@ class TaskModelViewProjector:
                     **(
                         {"located_read": need.located_read.model_dump(mode="json")}
                         if need.located_read
+                        else {}
+                    ),
+                    **(
+                        {"lookup_repair_terms": list(choices[need.need_id])}
+                        if choices.get(need.need_id)
                         else {}
                     ),
                     "targets": [
@@ -191,12 +200,20 @@ class TaskModelViewProjector:
                 if latest
                 else None,
             }
+            if repair := state.lookup_replan:
+                row["lookup_repair"] = repair.replacement_query
             progress.append(row)
             # 最坏行使用完整的已知缺口集合和最长枚举,数值按 64 位上界计量。
             # 当前行再短,也不能拿它替代下一轮可能出现失败、空结果或冲突时的容量。
             maximum.append(
                 {
                     "id": need.need_id,
+                    # 修订词必为原查询的子串。预留 UTF-8 最长值及尚未选词时的 null。
+                    **(
+                        {"lookup_repair": need.located_read.query}
+                        if need.located_read and choices.get(need.need_id)
+                        else {}
+                    ),
                     "status": max(NeedStatus, key=lambda item: len(item.value)).value,
                     "analysis": "finding_recorded",
                     "missing_fields": list(known_gaps),
@@ -261,6 +278,13 @@ class TaskModelViewProjector:
                 "not archive wrappers. Follow the original user request."
             ),
         }
+        if any(choices.values()):
+            definition["lookup_repair_contract"] = (
+                "When lookup_repair is null, the original lookup returned no candidates. "
+                "Try a listed lookup_repair_term that describes the requested source. "
+                "A term must locate one identifier containing that term. When lookup_repair "
+                "has a selected term and material is missing, read the full returned identifier."
+            )
         progress_payload: dict[str, JsonValue] = {"needs": progress}
         handoff_active = (
             work is not None

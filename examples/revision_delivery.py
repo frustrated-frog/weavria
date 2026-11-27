@@ -185,8 +185,15 @@ def write(path: Path, value: object) -> None:
 async def run(args: argparse.Namespace) -> int:
     compare_receipts: bool = args.compare_receipts
     compare_located: bool = args.compare_located
-    branch = "located" if compare_located else "verified"
-    paired = compare_receipts or compare_located
+    compare_repair: bool = args.compare_query_repair
+    branch = "replanned" if compare_repair else "located" if compare_located else "verified"
+    paired = compare_receipts or compare_located or compare_repair
+    repair_routes = tuple(
+        LocatedReadRoute.model_validate(
+            {**route.model_dump(), "schema_version": 2, "repair": "unique_term_after_empty"}
+        )
+        for route in SNAPSHOT_ROUTES
+    )
     cases = tuple(c for c in scenarios() if args.case is None or args.case == c.name)
     frozen = load_dataset()
     setting, budget = frozen.model, frozen.budgets
@@ -220,6 +227,7 @@ async def run(args: argparse.Namespace) -> int:
         "catalogue_proof": args.catalogue_proof,
         "compare_receipts": compare_receipts,
         "compare_located": compare_located,
+        "compare_query_repair": compare_repair,
         "transport_timeout": budget.model_seconds,
         "implementation": implementation_identity(),
         "evaluation_sources": {
@@ -291,7 +299,13 @@ async def run(args: argparse.Namespace) -> int:
                     start = time.monotonic()
                     evidence = HarnessEvidence(
                         audit_requirements=True,
-                        located_reads=SNAPSHOT_ROUTES if arm == "located" else (),
+                        located_reads=(
+                            repair_routes
+                            if arm == "replanned"
+                            else SNAPSHOT_ROUTES
+                            if arm == "located" or (compare_repair and arm == "continuation")
+                            else ()
+                        ),
                         extractors=(
                             SnapshotCatalogueEvidence(case.task.documents(arm != "initial")),
                         )
@@ -301,7 +315,8 @@ async def run(args: argparse.Namespace) -> int:
                     raw = await upgrade.turn(
                         folder / (arm + ".db" if arm in ("cold", branch) else "session.db"),
                         revised=arm in ("continuation", branch),
-                        reuse_receipts=arm == "verified" or (compare_located and arm != "initial"),
+                        reuse_receipts=arm == "verified"
+                        or ((compare_located or compare_repair) and arm != "initial"),
                         config=config,
                         model=model,
                         transport=transport,
@@ -360,6 +375,11 @@ if __name__ == "__main__":
         "--compare-located",
         action="store_true",
         help="从同一首版比较普通重验和声明两步取证,两个修订组均可复用回执",
+    )
+    comparisons.add_argument(
+        "--compare-query-repair",
+        action="store_true",
+        help="两组均启用两步取证,仅实验组允许空查询后的局部修订",
     )
     parser.add_argument("--case", choices=("migration", "upgrade"))
     comparisons.add_argument(

@@ -2144,6 +2144,7 @@ class TaskUnderstandingEngine:
             f"normalize_required_needs={self._normalize_required_needs};"
             f"profiles={profiles or 'none'};targets={self._target_resolver.version}]"
             + (";located-read/1" if self._located_reads else "")
+            + (";located-repair/1" if any(route.repair for route in self._located_reads) else "")
             + (f";{self._discovery.version}" if self._discovery is not None else "")
         )
 
@@ -2751,6 +2752,7 @@ class TaskUnderstandingEngine:
                 work_id=accepted_work_id,
                 base_frame=base_frame,
                 capability_views=snapshot.capabilities,
+                history=snapshot.history,
                 requirement_coverage=requirement_coverage,
                 task=snapshot.task,
                 target_resolver=self._target_resolver,
@@ -2979,6 +2981,7 @@ def _compile_requirements(
     work_id: str,
     base_frame: TaskFrame | None,
     capability_views: tuple[CapabilityView, ...],
+    history: tuple[Message, ...],
     requirement_coverage: RequirementCoverageReport | None,
     task: TaskInput,
     target_resolver: TargetResolver,
@@ -3044,6 +3047,14 @@ def _compile_requirements(
             if route is not None and need.lookup_query is not None
             else None
         )
+        if located is not None and located.repair:
+            # 用户指定的来源名仍然精确匹配。仅模型自行提出的定位假设可以放宽。
+            user_text = (
+                task.goal,
+                *task.constraints,
+                *(m.content for m in history if m.role == MessageRole.USER),
+            )
+            located = located.respect_user_sources(user_text)
         if located is not None:
             locator = next(cap for cap in capability_views if cap.name == located.locator)
             if not schema_allows_value_at_pointer(

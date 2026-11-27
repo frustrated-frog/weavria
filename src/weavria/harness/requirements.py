@@ -18,10 +18,22 @@ from pydantic import (
 )
 
 from weavria.artifacts import ArtifactSnapshot
-from weavria.core import ErrorCategory, ToolFailedObservation, ToolRecord, task_view_digest
+from weavria.core import (
+    ArtifactRef,
+    ErrorCategory,
+    ToolFailedObservation,
+    ToolRecord,
+    task_view_digest,
+)
 from weavria.tools import resolve_pointer
 
-from .located_read import LocatedReadPlan, field_at
+from .located_read import (
+    LocatedReadPlan,
+    LookupReplan,
+    contains_query_term,
+    field_at,
+    repair_choices,
+)
 from .outcome_contracts import CapabilityOutcome
 from .targets import EvidenceTargetBinding, MaterialContract, same_target_value
 
@@ -146,7 +158,7 @@ class InformationRequirement(MaterialContract):
             return False
         if self.located_read is not None and (
             binding.evaluator_key != _LocatedReadEvidence.key
-            or binding.evaluator_version != _LocatedReadEvidence.version
+            or binding.evaluator_version != str(self.located_read.schema_version)
         ):
             return False
         if not self.evidence_match_plans:
@@ -267,7 +279,8 @@ class NeedFailure(_SemanticContract):
 
 class NeedState(BaseModel):
     model_config = _SemanticContract.model_config
-    schema_version: Literal[1, 2] = 2
+    schema_version: Literal[1, 2, 3] = 2
+    lookup_replan: LookupReplan | None = Field(default=None, exclude_if=lambda v: v is None)
     need_id: _Identifier
     status: NeedStatus
     evidence_binding_ids: tuple[_Identifier, ...] = ()
@@ -279,7 +292,13 @@ class NeedState(BaseModel):
 
     @model_validator(mode="after")
     def validate_state(self) -> Self:
-        if self.status is NeedStatus.ACQUIRED and self.schema_version != 2:
+        if (self.schema_version == 3) != (self.lookup_replan is not None):
+            raise ValueError("lookup replanning state requires NeedState v3")
+        if self.lookup_replan and bool(self.evidence_binding_ids) != bool(
+            self.lookup_replan.replacement_lookup
+        ):
+            raise ValueError("lookup repair bindings require the accepted replacement receipt")
+        if self.status is NeedStatus.ACQUIRED and self.schema_version == 1:
             raise ValueError("acquired status requires NeedState v2")
         if self.status in {NeedStatus.SATISFIED, NeedStatus.ACQUIRED} and (
             not self.evidence_binding_ids
@@ -423,6 +442,8 @@ class NeedLedger(BaseModel):
                     }
                 ),
             }
+            if state.lookup_replan is not None:
+                state_payload["lookup_replan"] = state.lookup_replan.model_dump(mode="json")
             if state.acquisition_status != "open":
                 state_payload["acquisition_status"] = state.acquisition_status
             state_probes = tuple(
@@ -667,10 +688,13 @@ class _LocatedReadEvidence:
     """一个需求的一次归约私有此索引。只让随后实际读到同一标识的回执加入定位范围。"""
 
     key = "located-read"
-    version = "1"
 
-    def __init__(self, plan: LocatedReadPlan) -> None:
+    def __init__(self, plan: LocatedReadPlan, alternatives: tuple[str, ...]) -> None:
         self.plan = plan
+        self.version = str(plan.schema_version)
+        self.alternatives = alternatives
+        self.replan: LookupReplan | None = None
+        self.original_found = False
         self.locations: dict[str, tuple[str, str]] = {}
 
     def supports(self, requirement: InformationRequirement, record: ToolRecord) -> bool:
@@ -683,8 +707,57 @@ class _LocatedReadEvidence:
         return (
             name == plan.locator
             and auth.tool_version == plan.locator_version
-            and field_at(auth.normalized_arguments, plan.query_input) == plan.query
+            and self.accepts_query(field_at(auth.normalized_arguments, plan.query_input), record)
         ) or (name == plan.reader and auth.tool_version == plan.reader_version)
+
+    def accepts_query(self, query: JsonValue, record: ToolRecord) -> bool:
+        repair = self.replan
+        if (
+            repair is None
+            or record.artifact is None
+            or record.artifact.run_id != repair.empty_lookup.run_id
+        ):
+            return query == self.plan.query
+        if repair.replacement_lookup is not None:
+            # 已选中的唯一回执固定本次修订的来源。后续重复检索不能暗中换掉它。
+            return False
+        return query == self.plan.query or query in self.alternatives
+
+    def _locate(self, ref: ArtifactRef, query: JsonValue, candidates: JsonValue) -> str | None:
+        """按接受顺序消化一个搜索结果, 唯一定位成功时固定后续读取使用的范围。"""
+        self.locations.pop(ref.run_id, None)
+        if query == self.plan.query:
+            if candidates == []:
+                if self.alternatives and not self.original_found and self.replan is None:
+                    self.replan = LookupReplan(empty_lookup=ref)
+                return None
+            # 歧义或无法解释的原始结果不支持放宽。稳定目录中的空回执才能启动修订。
+            self.original_found = True
+            self.replan = None
+        if not isinstance(candidates, list) or len(candidates) != 1:
+            return None
+        identity = candidates[0]
+        if not isinstance(identity, str) or not identity:
+            return None
+
+        scope: list[JsonValue] = [ref.run_id, self.plan.model_dump(mode="json"), identity]
+        if query != self.plan.query:
+            # 宿主的搜索可能也匹配正文, 不能把正文巧合出现的词当作来源标识。
+            if (
+                self.replan is None
+                or not isinstance(query, str)
+                or not contains_query_term(identity, query)
+            ):
+                return None
+            self.replan = LookupReplan(
+                empty_lookup=self.replan.empty_lookup,
+                replacement_query=query,
+                replacement_lookup=ref,
+            )
+            scope.append(self.replan.model_dump(mode="json"))
+        digest = task_view_digest(scope)
+        self.locations[ref.run_id] = identity, digest
+        return digest
 
     async def evaluate(
         self, requirement: InformationRequirement, record: ToolRecord, snapshot: ArtifactSnapshot
@@ -695,21 +768,27 @@ class _LocatedReadEvidence:
             raise ValueError("located read snapshot differs from accepted receipt")
         value = snapshot.value
         if record.exchange.action.tool_name == plan.locator:
-            self.locations.pop(ref.run_id, None)
+            assert record.authorization is not None
+            query = field_at(record.authorization.normalized_arguments, plan.query_input)
             candidates = field_at(value, plan.candidates_output)
-            # 一次查询必须唯一定位。多个命中时不能用任一同名文件证明目标已找到。
-            if isinstance(candidates, list) and len(candidates) == 1:
-                identity = candidates[0]
-                if isinstance(identity, str) and identity:
-                    digest = task_view_digest([ref.run_id, plan.model_dump(mode="json"), identity])
-                    self.locations[ref.run_id] = identity, digest
-                    return EvidenceEvaluation(
-                        relation="partially_supports",
-                        freshness="valid",
-                        pointers=(plan.candidates_output,),
-                        missing_fields=(plan.material_output,),
-                        scope_identity_sha256=digest,
-                    )
+            scope = self._locate(ref, query, candidates)
+            if self.replan is not None and candidates == []:
+                # 空目录结果是有效的搜索反馈, 但没有候选字段可以绑定到正文。
+                return EvidenceEvaluation(
+                    relation="unknown",
+                    pointers=(),
+                    freshness="valid",
+                    missing_fields=requirement.required_fields,
+                    result_kind="empty",
+                )
+            if scope is not None:
+                return EvidenceEvaluation(
+                    relation="partially_supports",
+                    freshness="valid",
+                    pointers=(plan.candidates_output,),
+                    missing_fields=(plan.material_output,),
+                    scope_identity_sha256=scope,
+                )
         else:
             identity = field_at(value, plan.identity_output)
             auth = record.authorization
@@ -759,10 +838,20 @@ class EvidenceResolver:
         bindings: list[EvidenceBinding] = []
         probes: list[EvidenceProbe] = []
         states: list[NeedState] = []
+        alternatives = repair_choices(
+            (r.need_id, r.located_read) for r in requirements if r.located_read is not None
+        )
+        if alternatives and len({r.artifact.run_id for r in records if r.artifact}) > 1:
+            # 公共归约入口也可能收到混合历史。负证据只能修订同一次 Run 的定位假设。
+            alternatives.clear()
         for requirement in requirements:
             # 两阶段计划独占本需求的结构判定。通用字段提取器没有查询与规范身份信息。
             located = (
-                _LocatedReadEvidence(requirement.located_read) if requirement.located_read else None
+                _LocatedReadEvidence(
+                    requirement.located_read, alternatives.get(requirement.need_id, ())
+                )
+                if requirement.located_read
+                else None
             )
             extractors: tuple[EvidenceExtractor, ...] = (located,) if located else self._extractors
             requirement_bindings: list[EvidenceBinding] = []
@@ -878,7 +967,10 @@ class EvidenceResolver:
                             if field in plan.required_fields or field.startswith("$")
                         )
                     )
-                    probe_status, reason_code = _probe_result(evaluation)
+                    if located is not None and evaluation.result_kind == "empty":
+                        probe_status, reason_code = "partial", "located_lookup_empty"
+                    else:
+                        probe_status, reason_code = _probe_result(evaluation)
                     requirement_probes.append(
                         _probe(
                             requirement=requirement,
@@ -997,7 +1089,13 @@ class EvidenceResolver:
             bindings.extend(requirement_bindings)
             probes.extend(requirement_probes)
             states.append(
-                _reduce_need(requirement, requirement_bindings, failures, requirement_probes)
+                _reduce_need(
+                    requirement,
+                    requirement_bindings,
+                    failures,
+                    requirement_probes,
+                    lookup_replan=located.replan if located else None,
+                )
             )
 
         revision = 1
@@ -1298,6 +1396,8 @@ def _reduce_need(
     bindings: list[EvidenceBinding],
     failures: list[NeedFailure],
     probes: list[EvidenceProbe],
+    *,
+    lookup_replan: LookupReplan | None,
 ) -> NeedState:
     contradictory = [binding for binding in bindings if binding.relation == "contradicts"]
     stale = [binding for binding in bindings if binding.freshness == "stale"]
@@ -1338,6 +1438,8 @@ def _reduce_need(
     else:
         status = NeedStatus.PENDING
     return NeedState(
+        schema_version=3 if lookup_replan else 2,
+        lookup_replan=lookup_replan,
         need_id=requirement.need_id,
         status=status,
         evidence_binding_ids=tuple(binding.binding_id for binding in bindings),

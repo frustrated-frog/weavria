@@ -113,6 +113,7 @@ async def test_failed_first_turn_stays_in_denominator_and_cold_task_runs(
         catalogue_proof=False,
         compare_receipts=False,
         compare_located=False,
+        compare_query_repair=False,
         case=None,
     )
     assert await review.run(args) == 1

@@ -114,7 +114,7 @@ from .intent import (
     RiskAwareAskOrActPolicy,
     intent_uncertainty_sha256,
 )
-from .located_read import LocatedReadPlan, LocatedReadRoute
+from .located_read import LocatedReadPlan, LocatedReadRoute, LookupReplan
 from .memory_admission import (
     ConservativeMemoryAdmission,
     MemoryFormationError,
@@ -323,6 +323,7 @@ __all__ = [
     "LiteralTargetResolver",
     "LocatedReadPlan",
     "LocatedReadRoute",
+    "LookupReplan",
     "MemoryAnswerCitation",
     "MemoryAnswerClaim",
     "MemoryAnswerDraft",
